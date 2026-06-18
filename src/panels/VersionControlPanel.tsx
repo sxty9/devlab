@@ -5,7 +5,7 @@ import { PanelHeader } from './PanelHeader';
 import { Button, IconButton } from '@/ui/Button';
 import { GitCommitIcon, RefreshIcon } from '@/ui/icons';
 import { gitStatusMeta } from '@/ui/git';
-import { basename, dirname, guessLang } from '@/lib/lang';
+import { basename, dirname } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 
 function ChangeRow({ change, onOpen }: { change: Change; onOpen: (c: Change) => void }) {
@@ -31,13 +31,13 @@ function ChangeRow({ change, onOpen }: { change: Change; onOpen: (c: Change) => 
 }
 
 export function VersionControlPanel() {
-  const { data, activeBranch, openFile } = useWorkspace();
+  const { data, activeBranch, openDiff } = useWorkspace();
   const [message, setMessage] = useState('');
 
   const staged = data.changes.filter((c) => c.staged);
   const unstaged = data.changes.filter((c) => !c.staged);
 
-  const open = (c: Change) => openFile({ id: c.path, name: basename(c.path), lang: guessLang(c.path) });
+  const open = (c: Change) => openDiff(c.path);
 
   const canCommit = staged.length > 0 && message.trim().length > 0;
 

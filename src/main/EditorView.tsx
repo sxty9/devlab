@@ -2,58 +2,18 @@ import { useCallback } from 'react';
 import Editor, { type OnMount } from '@monaco-editor/react';
 import { useWorkspace } from '@/state/workspace';
 import { useToast } from '@/ui/Toast';
+import { ensureDevlabTheme } from './monacoTheme';
 import { ChevronRightIcon, CopyIcon, SplitIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 
 /** Monaco editor surface with a path breadcrumb. Editable (per phase-1 decision); contents are
  *  mock until the backend lands. A custom dark theme matches the Holistic surface tokens.
  *  `repoId` namespaces the Monaco model so identical paths across repos don't collide. */
-let themeDefined = false;
-
 export function EditorView({ repoId, path, lang, code }: { repoId: string; path: string; lang: string; code: string }) {
   const { settings } = useWorkspace();
   const { toast } = useToast();
 
-  const onMount = useCallback<OnMount>((_editor, monaco) => {
-    if (themeDefined) {
-      monaco.editor.setTheme('devlab-dark');
-      return;
-    }
-    themeDefined = true;
-    monaco.editor.defineTheme('devlab-dark', {
-      base: 'vs-dark',
-      inherit: true,
-      rules: [
-        { token: 'comment', foreground: '6b6b70', fontStyle: 'italic' },
-        { token: 'keyword', foreground: 'ff7ab2' },
-        { token: 'string', foreground: 'a3e28b' },
-        { token: 'number', foreground: 'd0a0ff' },
-        { token: 'type', foreground: '8fd3ff' },
-      ],
-      colors: {
-        'editor.background': '#1c1c1e',
-        'editor.foreground': '#f5f5f7',
-        'editor.lineHighlightBackground': '#ffffff0a',
-        'editor.lineHighlightBorder': '#00000000',
-        'editorLineNumber.foreground': '#ffffff2e',
-        'editorLineNumber.activeForeground': '#ffffff8c',
-        'editorIndentGuide.background1': '#ffffff10',
-        'editorIndentGuide.activeBackground1': '#ffffff24',
-        'editor.selectionBackground': '#0a84ff44',
-        'editor.inactiveSelectionBackground': '#0a84ff22',
-        'editorCursor.foreground': '#0a84ff',
-        'editorGutter.background': '#1c1c1e',
-        'editorWidget.background': '#1c1c1e',
-        'editorWidget.border': '#ffffff1f',
-        'scrollbarSlider.background': '#ffffff1f',
-        'scrollbarSlider.hoverBackground': '#ffffff33',
-        'scrollbarSlider.activeBackground': '#ffffff44',
-        'editorBracketMatch.background': '#0a84ff22',
-        'editorBracketMatch.border': '#0a84ff55',
-      },
-    });
-    monaco.editor.setTheme('devlab-dark');
-  }, []);
+  const onMount = useCallback<OnMount>((_editor, monaco) => ensureDevlabTheme(monaco), []);
 
   const segments = path.split('/');
 

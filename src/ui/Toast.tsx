@@ -46,7 +46,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           <div
             key={t.id}
             role="status"
-            className="pointer-events-auto flex items-start gap-2.5 rounded-md border border-separator bg-material-thick p-3 shadow-elev-3 [backdrop-filter:var(--material-blur)] animate-toast-in"
+            className="pointer-events-auto flex items-start gap-2.5 rounded-md border border-separator bg-surface-raised p-3 shadow-elev-3 ring-1 ring-black/5 animate-toast-in"
           >
             <span className={cn('mt-0.5 shrink-0', accent[t.variant])}>
               {t.variant === 'success' ? <CheckIcon className="h-4 w-4" /> : <DotIcon className="h-3.5 w-3.5" />}

@@ -1,11 +1,13 @@
 import { useWorkspace } from '@/state/workspace';
 import type { Tab } from '@/types';
-import { SitemapIcon, FileTextIcon, XIcon } from '@/ui/icons';
+import { DiffIcon, SitemapIcon, FileTextIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
+
+const tabIcon = { structure: SitemapIcon, diff: DiffIcon, code: FileTextIcon } as const;
 
 function TabButton({ tab, active }: { tab: Tab; active: boolean }) {
   const { setActiveTab, closeTab } = useWorkspace();
-  const Icon = tab.kind === 'structure' ? SitemapIcon : FileTextIcon;
+  const Icon = tabIcon[tab.kind];
 
   return (
     <div

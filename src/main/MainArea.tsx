@@ -1,6 +1,7 @@
 import { useWorkspace } from '@/state/workspace';
 import { TabStrip } from './TabStrip';
 import { EditorView } from './EditorView';
+import { DiffView } from './DiffView';
 import { StructureView } from './StructureView';
 import { WelcomeView } from './WelcomeView';
 
@@ -14,6 +15,7 @@ export function MainArea() {
       {openTabs.length > 0 && <TabStrip />}
       {!activeTab && <WelcomeView />}
       {activeTab?.kind === 'structure' && <StructureView />}
+      {activeTab?.kind === 'diff' && activeTab.path && <DiffView key={`${activeRepo.id}/diff/${activeTab.path}`} path={activeTab.path} />}
       {activeTab?.kind === 'code' && activeTab.path && (
         <EditorView
           key={`${activeRepo.id}/${activeTab.path}`}

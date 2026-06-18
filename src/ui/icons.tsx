@@ -80,12 +80,30 @@ export const TerminalIcon = (p: IconProps) => (
   </Svg>
 );
 
-// A stylised radial "spark" — DevLab's Claude mark.
-export const ClaudeIcon = (p: IconProps) => (
-  <Svg {...p} strokeWidth={1.5}>
-    <path d="M12 3.5c.5 3.4 1.4 5.6 3.2 6.9 1.3.9 3 1.3 5.3 1.6-2.3.3-4 .7-5.3 1.6C13 16 12.5 18.2 12 20.5c-.5-2.3-1-4.5-3.2-6.9-1.3-1.4-3-1.8-5.3-2.1 2.3-.3 4-.7 5.3-1.6C10.6 8.6 11.5 6.9 12 3.5z" />
-  </Svg>
-);
+// Anthropic-style radial sunburst — DevLab's Claude mark (deliberately NOT the 4-point
+// Gemini diamond). Rays of two lengths burst from the centre.
+export const ClaudeIcon = ({ className, ...rest }: IconProps) => {
+  const cx = 12;
+  const cy = 12;
+  const rays = Array.from({ length: 12 }, (_, i) => {
+    const a = (i * Math.PI) / 6 - Math.PI / 2;
+    const inner = 2.4;
+    const outer = i % 2 === 0 ? 9 : 6.4;
+    return {
+      x1: +(cx + inner * Math.cos(a)).toFixed(2),
+      y1: +(cy + inner * Math.sin(a)).toFixed(2),
+      x2: +(cx + outer * Math.cos(a)).toFixed(2),
+      y2: +(cy + outer * Math.sin(a)).toFixed(2),
+    };
+  });
+  return (
+    <Svg className={className} strokeWidth={1.7} {...rest}>
+      {rays.map((r, i) => (
+        <line key={i} x1={r.x1} y1={r.y1} x2={r.x2} y2={r.y2} />
+      ))}
+    </Svg>
+  );
+};
 
 export const ChevronRightIcon = (p: IconProps) => (
   <Svg {...p}>
@@ -224,5 +242,24 @@ export const CopyIcon = (p: IconProps) => (
   <Svg {...p}>
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+  </Svg>
+);
+
+// A commit graph: a lane with nodes and a branch — the Git/Worktree tool.
+export const GitGraphIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="6" cy="6" r="2.2" />
+    <circle cx="6" cy="18" r="2.2" />
+    <circle cx="17" cy="12" r="2.2" />
+    <path d="M6 8.2v7.6M6 12h2.5a3 3 0 0 1 3 3 M14.8 12H8.5" />
+  </Svg>
+);
+
+// Git compare / diff — two nodes with directional arrows.
+export const DiffIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="6" cy="6" r="2.2" />
+    <circle cx="18" cy="18" r="2.2" />
+    <path d="M6 8.2V14a3 3 0 0 0 3 3h6M14 14l3 3-3 3M18 15.8V10a3 3 0 0 0-3-3H9M10 10 7 7l3-3" />
   </Svg>
 );

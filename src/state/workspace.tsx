@@ -1,6 +1,19 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab } from '@/types';
 import { DEFAULT_REPO_ID, REPOS, REPO_DATA } from '@/mock/workspace';
+import { guessLang } from '@/lib/lang';
+
+/** Fabricate a believable "before" for a modified file with no explicit diff content. */
+function synthBefore(after: string): string {
+  const lines = after.split('\n');
+  if (lines.length <= 5) return lines.slice(0, Math.max(1, lines.length - 1)).join('\n');
+  const out = lines.slice();
+  const mid = Math.floor(out.length / 2);
+  out.splice(mid, 2); // these two lines read as additions in the "after"
+  const tweak = Math.min(3, out.length - 1);
+  out[tweak] = `${out[tweak]}  // (previous)`; // one modified line
+  return out.join('\n');
+}
 
 /** Last-resort branch so an empty `branches` array (future backend) never crashes the shell. */
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
@@ -44,10 +57,14 @@ interface WorkspaceContextValue {
   activeTabId: string | null;
   openFile: (node: Pick<FileNode, 'id' | 'name' | 'lang'>) => void;
   openStructure: () => void;
+  /** Open a side-by-side diff for a changed file. */
+  openDiff: (path: string) => void;
   setActiveTab: (id: string) => void;
   closeTab: (id: string) => void;
 
   fileContent: (path: string) => FileContent;
+  /** Before/after content + language for a changed file's diff view. */
+  fileDiff: (path: string) => { before: string; after: string; lang: string };
 
   settings: EditorSettings;
   updateSettings: (patch: Partial<EditorSettings>) => void;
@@ -174,6 +191,20 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setActiveTabId(id);
   }, [activeRepoId]);
 
+  const openDiff = useCallback(
+    (path: string) => {
+      const id = `diff:${path}`;
+      const name = path.split('/').pop() ?? path;
+      setOpenTabs((tabs) =>
+        tabs.some((t) => t.id === id)
+          ? tabs
+          : [...tabs, { id, title: name, kind: 'diff', path, lang: fileIndex[path]?.lang ?? guessLang(path) }],
+      );
+      setActiveTabId(id);
+    },
+    [fileIndex],
+  );
+
   const setActiveTab = useCallback((id: string) => setActiveTabId(id), []);
 
   const closeTab = useCallback((id: string) => {
@@ -200,6 +231,19 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [data.files, fileIndex],
   );
 
+  const fileDiff = useCallback(
+    (path: string) => {
+      const after = fileContent(path);
+      const change = data.changes.find((c) => c.path === path);
+      const status = change?.status;
+      if (status === 'added' || status === 'untracked') return { before: '', after: after.code, lang: after.lang };
+      if (status === 'deleted') return { before: after.code, after: '', lang: after.lang };
+      const before = data.diffBefore?.[path] ?? synthBefore(after.code);
+      return { before, after: after.code, lang: after.lang };
+    },
+    [data.changes, data.diffBefore, fileContent],
+  );
+
   const value: WorkspaceContextValue = {
     repos: REPOS,
     activeRepo: REPOS.find((r) => r.id === activeRepoId)!,
@@ -216,9 +260,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     activeTabId,
     openFile,
     openStructure,
+    openDiff,
     setActiveTab,
     closeTab,
     fileContent,
+    fileDiff,
     settings,
     updateSettings,
     overlay,

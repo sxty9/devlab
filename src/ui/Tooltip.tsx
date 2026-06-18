@@ -18,8 +18,8 @@ export function Tooltip({ label, side = 'right', children }: { label: ReactNode;
       <span
         role="tooltip"
         className={cn(
-          'pointer-events-none absolute z-[60] whitespace-nowrap rounded-md border border-separator bg-material-thick px-2 py-1',
-          'text-caption text-text-primary shadow-elev-2 [backdrop-filter:var(--material-blur)]',
+          'pointer-events-none absolute z-[60] whitespace-nowrap rounded-md border border-separator bg-surface-raised px-2 py-1',
+          'text-caption text-text-primary shadow-elev-2',
           'opacity-0 scale-95 transition duration-fast ease-out',
           'group-hover/tt:opacity-100 group-hover/tt:scale-100 group-focus-within/tt:opacity-100 group-focus-within/tt:scale-100',
           sideClasses[side],

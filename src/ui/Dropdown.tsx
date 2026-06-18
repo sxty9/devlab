@@ -96,7 +96,7 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
           onKeyDown={onMenuKeyDown}
           className={cn(
             'absolute z-50 mt-1.5 min-w-[15rem] origin-top overflow-hidden rounded-md border border-separator',
-            'bg-material-thick p-1 shadow-elev-3 [backdrop-filter:var(--material-blur)] animate-pop-in',
+            'bg-surface-raised p-1 shadow-elev-3 ring-1 ring-black/5 animate-pop-in',
             align === 'end' ? 'right-0' : 'left-0',
             menuClassName,
           )}

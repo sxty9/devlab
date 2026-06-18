@@ -1,5 +1,5 @@
 import { Modal } from '@/ui/Modal';
-import { ClaudeIcon, FilesIcon, GitBranchIcon, LightbulbIcon, TerminalIcon } from '@/ui/icons';
+import { ClaudeIcon, FilesIcon, GitBranchIcon, GitGraphIcon, LightbulbIcon, TerminalIcon } from '@/ui/icons';
 
 const isMac = typeof navigator !== 'undefined' && /Mac|iP(hone|ad)/.test(navigator.platform);
 const mod = isMac ? '⌘' : 'Ctrl';
@@ -15,7 +15,8 @@ const SHORTCUTS: { keys: string[]; label: string }[] = [
 const TOOLS: { Icon: (p: { className?: string }) => JSX.Element; name: string; desc: string }[] = [
   { Icon: LightbulbIcon, name: 'Vision', desc: 'Specs, mindmaps & jets — the front of the pipeline' },
   { Icon: FilesIcon, name: 'Project', desc: 'Browse and open the repo file tree' },
-  { Icon: GitBranchIcon, name: 'Version Control', desc: 'Staged & unstaged changes, commit' },
+  { Icon: GitBranchIcon, name: 'Version Control', desc: 'Staged & unstaged changes → diff & commit' },
+  { Icon: GitGraphIcon, name: 'Git', desc: 'Commit graph, branches & worktrees' },
   { Icon: ClaudeIcon, name: 'Claude', desc: 'A Claude session per repo' },
   { Icon: TerminalIcon, name: 'Terminal', desc: 'A shell per repo' },
 ];

@@ -3,7 +3,7 @@
 // the backend later is a swap of the data source, not a rewrite of the UI.
 
 /** The tools in the left icon rail. */
-export type PanelId = 'vision' | 'project' | 'vcs' | 'claude' | 'terminal';
+export type PanelId = 'vision' | 'project' | 'vcs' | 'git' | 'claude' | 'terminal';
 
 /** User-tunable editor settings (Settings modal → Monaco). */
 export interface EditorSettings {
@@ -90,11 +90,42 @@ export interface TermLine {
 export interface Tab {
   id: string;
   title: string;
-  kind: 'code' | 'structure';
-  /** Present for kind: 'code'. */
+  kind: 'code' | 'structure' | 'diff';
+  /** Present for kind: 'code' | 'diff'. */
   path?: string;
   lang?: string;
   dirty?: boolean;
+}
+
+/** One drawn segment in a commit-graph row (a lane line from the row's top to its bottom). */
+export interface CommitLine {
+  from: number;
+  to: number;
+  /** Lane index that owns this segment's colour. */
+  lane: number;
+}
+
+/** A commit in the Git log graph. */
+export interface Commit {
+  hash: string;
+  message: string;
+  author: string;
+  time: string;
+  /** Branch/tag labels on this commit (e.g. ['main', 'HEAD']). */
+  refs?: string[];
+  /** Lane the commit node sits on. */
+  dotLane: number;
+  /** Lines drawn through this row. */
+  lines: CommitLine[];
+}
+
+/** A git worktree (IntelliJ-style management). */
+export interface Worktree {
+  branch: string;
+  note: string;
+  /** A live preview URL if this worktree is deployed. */
+  url?: string;
+  current?: boolean;
 }
 
 export type StageState = 'done' | 'active' | 'pending';
@@ -126,6 +157,10 @@ export interface RepoData {
   tree: FileNode[];
   files: Record<string, FileContent>;
   changes: Change[];
+  /** Optional explicit "before" content for changed files; otherwise synthesized for the diff. */
+  diffBefore?: Record<string, string>;
+  commits: Commit[];
+  worktrees: Worktree[];
   vision: VisionDoc[];
   claude: ClaudeMsg[];
   terminal: TermLine[];

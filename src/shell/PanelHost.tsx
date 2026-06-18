@@ -4,6 +4,7 @@ import { Splitter } from '@/components/Splitter';
 import { VisionPanel } from '@/panels/VisionPanel';
 import { ProjectPanel } from '@/panels/ProjectPanel';
 import { VersionControlPanel } from '@/panels/VersionControlPanel';
+import { GitPanel } from '@/panels/GitPanel';
 import { ClaudePanel } from '@/panels/ClaudePanel';
 import { TerminalPanel } from '@/panels/TerminalPanel';
 
@@ -48,6 +49,7 @@ export function PanelHost() {
         {activePanel === 'vision' && <VisionPanel />}
         {activePanel === 'project' && <ProjectPanel />}
         {activePanel === 'vcs' && <VersionControlPanel />}
+        {activePanel === 'git' && <GitPanel />}
         {activePanel === 'claude' && <ClaudePanel />}
         {activePanel === 'terminal' && <TerminalPanel />}
       </aside>

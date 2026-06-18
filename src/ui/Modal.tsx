@@ -40,7 +40,7 @@ export function Modal({
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/50 animate-overlay-in" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 animate-overlay-in" onClick={onClose} />
       <div
         ref={cardRef}
         tabIndex={-1}
@@ -48,8 +48,8 @@ export function Modal({
         aria-modal="true"
         aria-label={title}
         className={cn(
-          'relative w-full origin-center overflow-hidden rounded-card border border-separator bg-material-thick',
-          'shadow-elev-3 [backdrop-filter:var(--material-blur)] animate-pop-in focus:outline-none',
+          'relative w-full origin-center overflow-hidden rounded-card border border-separator bg-surface-raised',
+          'shadow-elev-3 ring-1 ring-black/5 animate-pop-in focus:outline-none',
           size === 'sm' ? 'max-w-sm' : size === 'lg' ? 'max-w-2xl' : 'max-w-md',
         )}
       >

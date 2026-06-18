@@ -1,4 +1,4 @@
-import type { Branch, Change, FileContent, FileNode, Repo, RepoData, Stage, Tab, TermLine } from '@/types';
+import type { Branch, Change, Commit, FileContent, FileNode, Repo, RepoData, Stage, Tab, TermLine, Worktree } from '@/types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase-1 mock workspace. Realistic but entirely local — selecting a repo/branch
@@ -32,6 +32,30 @@ const COMMON_BRANCHES = (feature: string): Branch[] => [
   { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '3h ago' },
   { name: feature, isDefault: false, ahead: 4, behind: 1, updated: 'just now' },
   { name: 'fix/regression', isDefault: false, ahead: 1, behind: 0, updated: 'yesterday' },
+];
+
+// A single-lane (linear) commit log.
+function linearLog(rows: { hash: string; message: string; author: string; time: string; refs?: string[] }[]): Commit[] {
+  return rows.map((r) => ({ ...r, dotLane: 0, lines: [{ from: 0, to: 0, lane: 0 }] }));
+}
+
+const through0 = { from: 0, to: 0, lane: 0 };
+
+// devlab's log: a feature branch (lane 1) that forks from and merges back into main (lane 0).
+const devlabCommits: Commit[] = [
+  { hash: 'af2e813', message: "Merge branch 'feature/ui-shell'", author: 'nanu', time: '40m ago', refs: ['main', 'HEAD', 'preview'], dotLane: 0, lines: [through0, { from: 1, to: 0, lane: 1 }] },
+  { hash: '6b1c9af', message: 'refine pass: Vision tool, modals, pipeline polish', author: 'Claude', time: '1h ago', dotLane: 1, lines: [through0, { from: 1, to: 1, lane: 1 }] },
+  { hash: '8309b95', message: 'fix must-fix review findings (state, a11y, tokens)', author: 'Claude', time: '2h ago', refs: ['feature/ui-shell'], dotLane: 1, lines: [through0, { from: 1, to: 1, lane: 1 }] },
+  { hash: '5f7e012', message: 'wire Monaco editor + tabs', author: 'nanu', time: '2h ago', dotLane: 1, lines: [through0, { from: 1, to: 1, lane: 1 }] },
+  { hash: 'c41a8d3', message: 'scaffold IDE panels & icon rail', author: 'Claude', time: '3h ago', dotLane: 0, lines: [through0, { from: 1, to: 0, lane: 1 }] },
+  { hash: 'b90e771', message: 'vendor Holistic Apple-dark design tokens', author: 'nanu', time: '3h ago', dotLane: 0, lines: [through0] },
+  { hash: '2ad5e60', message: 'add .sxgate/preview.conf (static mode)', author: 'nanu', time: '4h ago', dotLane: 0, lines: [through0] },
+  { hash: '739b036', message: 'DevLab phase 1: initial Vite + React scaffold', author: 'nanu', time: '4h ago', dotLane: 0, lines: [through0] },
+];
+
+const devlabWorktrees: Worktree[] = [
+  { branch: 'main', note: 'this window · /home/nanu/devlab', current: true },
+  { branch: 'preview', note: 'static preview · sxgate', url: 'https://preview-devlab.henrysoase.org' },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +210,27 @@ const devlabData: RepoData = {
     { path: '.sxgate/preview.conf', status: 'added', additions: 6, deletions: 0, staged: false },
     { path: 'src/shell/TopBar.tsx', status: 'modified', additions: 7, deletions: 2, staged: false },
   ],
+  commits: devlabCommits,
+  worktrees: devlabWorktrees,
+  diffBefore: {
+    'src/App.tsx': `import { WorkspaceProvider } from '@/state/workspace';
+import { IconRail } from '@/shell/IconRail';
+import { PanelHost } from '@/shell/PanelHost';
+import { MainArea } from '@/main/MainArea';
+
+export default function App() {
+  return (
+    <WorkspaceProvider>
+      <div className="flex h-full">
+        <IconRail />
+        <PanelHost />
+        <MainArea />
+      </div>
+    </WorkspaceProvider>
+  );
+}
+`,
+  },
   vision: [
     { id: 'v1', title: 'DevLab vision & sketches', kind: 'spec', summary: 'IntelliJ/VS-Code-style in-browser IDE: repo dropdown, left tools, editor, delivery pipeline.', state: 'done', updated: '2h ago' },
     { id: 'v2', title: 'Pipeline: Vision → Code → Preview → Delivery → main', kind: 'mindmap', summary: 'How a service flows from idea to prod through sxgate previews.', state: 'active', updated: '1h ago' },
@@ -306,6 +351,14 @@ HEALTHCHECK="/api/health"
     { path: 'services/dashboard/main.py', status: 'modified', additions: 24, deletions: 6, staged: false },
     { path: 'frontend/packages/ui/src/tokens.css', status: 'modified', additions: 3, deletions: 1, staged: false },
   ],
+  commits: linearLog([
+    { hash: 'd1a7c40', message: 'feat(dashboard): add /api/me endpoint', author: 'nanu', time: '1h ago', refs: ['feat/profile-settings', 'HEAD'] },
+    { hash: 'a02f6b8', message: 'ui: tweak surface tokens for profile cards', author: 'Claude', time: '2h ago' },
+    { hash: '77c0e51', message: 'auth: share current_user across services', author: 'nanu', time: 'yesterday', refs: ['main'] },
+    { hash: '3e9b14d', message: 'samba: file-share management service', author: 'nanu', time: '2d ago' },
+    { hash: 'f5102aa', message: 'frontend: scaffold @holistic/ui design system', author: 'nanu', time: '4d ago' },
+  ]),
+  worktrees: [{ branch: 'main', note: 'this window', current: true }, { branch: 'feat/profile-settings', note: 'sandbox · sxgate', url: 'https://feat-profile-holistic.henrysoase.org' }],
   vision: [
     { id: 'v1', title: 'Profile & settings page', kind: 'spec', summary: 'Self-serve profile, avatar, and notification settings in the dashboard.', state: 'active', updated: '1h ago' },
     { id: 'v2', title: 'Auth & service map', kind: 'mindmap', summary: 'How dashboard, samba and manifest services share one auth surface.', state: 'done', updated: 'yesterday' },
@@ -393,6 +446,13 @@ preview_up() {
     { path: 'sxgate', status: 'modified', additions: 12, deletions: 3, staged: false },
     { path: 'lib/preview.sh', status: 'modified', additions: 31, deletions: 8, staged: true },
   ],
+  commits: linearLog([
+    { hash: 'e7b3019', message: 'feat(preview): add MODE="static" path', author: 'nanu', time: '20m ago', refs: ['feat/preview-static-mode', 'HEAD'] },
+    { hash: '9c4f2ab', message: 'preview: per-branch teardown safety', author: 'nanu', time: '3d ago', refs: ['main'] },
+    { hash: '4d80e15', message: 'route: validate hostnames against managed zone', author: 'nanu', time: '5d ago' },
+    { hash: 'b22a7f9', message: 'init: cloudflared tunnel scaffold', author: 'nanu', time: '1w ago' },
+  ]),
+  worktrees: [{ branch: 'main', note: 'this window', current: true }],
   vision: [
     { id: 'v1', title: 'static preview mode (no backend)', kind: 'spec', summary: 'Serve a pure dist/ SPA with SPA fallback — what DevLab uses.', state: 'active', updated: '30m ago' },
     { id: 'v2', title: 'Wildcard ingress → dispatcher', kind: 'mindmap', summary: 'One *.<zone> ingress to a local Caddy that fans out per-branch.', state: 'done', updated: '3d ago' },
@@ -463,6 +523,12 @@ function minimalRepo(opts: {
     tree: opts.tree,
     files: opts.files,
     changes: opts.changes,
+    commits: linearLog([
+      { hash: 'aa11bb2', message: opts.claudeAsk.replace(/\.$/, ''), author: 'nanu', time: '1h ago', refs: [opts.feature, 'HEAD'] },
+      { hash: 'cc33dd4', message: 'wire the feature into the app shell', author: 'Claude', time: '3h ago' },
+      { hash: 'ee55ff6', message: 'initial scaffold', author: 'nanu', time: '2d ago', refs: ['main'] },
+    ]),
+    worktrees: [{ branch: 'main', note: 'this window', current: true }],
     vision: [
       { id: 'v1', title: opts.claudeAsk.replace(/\.$/, ''), kind: 'spec', summary: opts.claudeReply, state: 'active', updated: '1h ago' },
       { id: 'v2', title: `${opts.feature.split('/').pop()} plan`, kind: 'note', summary: 'Scoped from the feature branch; details captured here.', state: 'pending', updated: 'yesterday' },

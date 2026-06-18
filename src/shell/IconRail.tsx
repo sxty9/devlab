@@ -1,7 +1,7 @@
 import { useWorkspace } from '@/state/workspace';
 import type { PanelId } from '@/types';
 import { Tooltip } from '@/ui/Tooltip';
-import { ClaudeIcon, FilesIcon, GitBranchIcon, HelpIcon, LightbulbIcon, SettingsIcon, TerminalIcon } from '@/ui/icons';
+import { ClaudeIcon, FilesIcon, GitBranchIcon, GitGraphIcon, HelpIcon, LightbulbIcon, SettingsIcon, TerminalIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 
 interface RailItem {
@@ -14,6 +14,7 @@ const ITEMS: RailItem[] = [
   { id: 'vision', label: 'Vision', Icon: LightbulbIcon },
   { id: 'project', label: 'Project', Icon: FilesIcon },
   { id: 'vcs', label: 'Version Control', Icon: GitBranchIcon },
+  { id: 'git', label: 'Git Log & Worktrees', Icon: GitGraphIcon },
   { id: 'claude', label: 'Claude', Icon: ClaudeIcon },
   { id: 'terminal', label: 'Terminal', Icon: TerminalIcon },
 ];
