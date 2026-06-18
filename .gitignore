@@ -8,3 +8,7 @@ dist/
 *.shot.mjs
 .shots.mjs
 .shot.mjs
+
+# go backend build artifacts
+/devlabd
+backend/devlabd
