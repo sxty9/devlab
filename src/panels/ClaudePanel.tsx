@@ -24,7 +24,7 @@ function Message({ msg }: { msg: ClaudeMsg }) {
   }
   return (
     <div className="flex gap-2">
-      <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gpu/15 text-gpu">
+      <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gpu/15 text-gpu shadow-elev-1">
         <ClaudeIcon className="h-3.5 w-3.5" />
       </span>
       <div className="max-w-[85%] rounded-md rounded-tl-sm bg-fill/[0.07] px-3 py-2 text-footnote leading-relaxed text-text-primary">
@@ -36,11 +36,18 @@ function Message({ msg }: { msg: ClaudeMsg }) {
 
 export function ClaudePanel() {
   const { data, activeRepo } = useWorkspace();
-  const [msgs, setMsgs] = useState<ClaudeMsg[]>(data.claude);
+  // One transcript per repo, kept in state so switching repos preserves history.
+  const [sessions, setSessions] = useState<Record<string, ClaudeMsg[]>>(() => ({ [activeRepo.id]: data.claude }));
   const [draft, setDraft] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => setMsgs(data.claude), [data.claude]);
+  const msgs = sessions[activeRepo.id] ?? data.claude;
+
+  // Seed a repo's transcript from its mock the first time it's opened.
+  useEffect(() => {
+    setSessions((s) => (s[activeRepo.id] ? s : { ...s, [activeRepo.id]: data.claude }));
+  }, [activeRepo.id, data.claude]);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [msgs]);
@@ -49,16 +56,22 @@ export function ClaudePanel() {
     const text = draft.trim();
     if (!text) return;
     setDraft('');
-    setMsgs((m) => [
-      ...m,
-      { id: `u-${m.length}`, role: 'user', text, ts: 'now' },
-      {
-        id: `a-${m.length + 1}`,
-        role: 'assistant',
-        text: `(preview) I'd work on “${text}” in ${activeRepo.name} — but the Claude backend isn't wired yet. This panel is a mock of the session view.`,
-        ts: 'now',
-      },
-    ]);
+    setSessions((s) => {
+      const cur = s[activeRepo.id] ?? data.claude;
+      return {
+        ...s,
+        [activeRepo.id]: [
+          ...cur,
+          { id: `u-${cur.length}`, role: 'user', text, ts: 'now' },
+          {
+            id: `a-${cur.length + 1}`,
+            role: 'assistant',
+            text: `(preview) I'd work on “${text}” in ${activeRepo.name} — but the Claude backend isn't wired yet. This panel is a mock of the session view.`,
+            ts: 'now',
+          },
+        ],
+      };
+    });
   };
 
   return (
@@ -90,16 +103,17 @@ export function ClaudePanel() {
               }
             }}
             rows={1}
-            placeholder={`Ask Claude about ${activeRepo.name}…`}
+            placeholder={`Ask Claude about ${activeRepo.name}…  (Shift+Enter for newline)`}
+            aria-label={`Message Claude about ${activeRepo.name}`}
             className="dl-scroll max-h-28 min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1 text-footnote text-text-primary placeholder:text-text-tertiary focus:outline-none"
           />
           <button
             type="button"
             onClick={send}
             disabled={!draft.trim()}
-            aria-label="Send"
+            aria-label="Send message"
             className={cn(
-              'flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition',
+              'flex h-7 w-7 shrink-0 items-center justify-center rounded-md transition duration-fast ease-out',
               draft.trim() ? 'bg-accent text-accent-fg hover:bg-accent-hover' : 'bg-fill/10 text-text-tertiary',
             )}
           >

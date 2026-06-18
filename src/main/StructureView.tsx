@@ -1,7 +1,8 @@
 import { useWorkspace } from '@/state/workspace';
 import { FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
 import { Button } from '@/ui/Button';
-import { tintBg, tintText } from '@/ui/tint';
+import { tintSoftBg, tintText } from '@/ui/tint';
+import { PREVIEW_URL } from '@/lib/constants';
 import { cn } from '@/lib/cn';
 
 /** The repo "skeleton" overview — a landing surface summarising structure & delivery state. */
@@ -13,8 +14,13 @@ export function StructureView() {
       <div className="mx-auto max-w-3xl px-8 py-10">
         {/* Header */}
         <div className="flex items-start gap-4">
-          <span className={cn('mt-1 flex h-12 w-12 items-center justify-center rounded-card text-bg-base shadow-elev-2', tintBg[activeRepo.tint])}>
-            <FolderIcon className="h-6 w-6" />
+          <span
+            className={cn(
+              'mt-1 flex h-12 w-12 items-center justify-center rounded-card shadow-elev-1 ring-1 ring-separator',
+              tintSoftBg[activeRepo.tint],
+            )}
+          >
+            <FolderIcon className={cn('h-6 w-6', tintText[activeRepo.tint])} />
           </span>
           <div className="min-w-0">
             <h1 className="text-title1 font-semibold tracking-tight text-text-primary">{activeRepo.name}</h1>
@@ -28,9 +34,15 @@ export function StructureView() {
               </span>
             </div>
           </div>
-          <Button variant="primary" size="sm" className="ml-auto mt-1 shrink-0">
+          <Button
+            variant="primary"
+            size="sm"
+            className="ml-auto mt-1 shrink-0"
+            onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')}
+            title="Open the live sxgate preview"
+          >
             <RocketIcon className="h-3.5 w-3.5" />
-            Deploy preview
+            Open preview
           </Button>
         </div>
 

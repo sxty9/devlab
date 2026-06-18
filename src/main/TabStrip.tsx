@@ -27,6 +27,7 @@ function TabButton({ tab, active }: { tab: Tab; active: boolean }) {
       }}
       className={cn(
         'group/tab relative flex h-9 max-w-[15rem] shrink-0 cursor-pointer items-center gap-2 border-r border-separator pl-3 pr-2 text-footnote',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/50',
         active ? 'bg-surface-raised text-text-primary' : 'text-text-tertiary hover:bg-fill/5 hover:text-text-secondary',
       )}
     >

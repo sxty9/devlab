@@ -4,7 +4,10 @@ import { MoonIcon, SunIcon } from '@/ui/icons';
 
 type Theme = 'dark' | 'light';
 
-/** Flips :root[data-theme]; DevLab defaults to dark (set in index.html). */
+const STORAGE_KEY = 'dl.theme';
+
+/** Flips :root[data-theme] and persists the choice. DevLab defaults to dark; index.html
+ *  restores a saved theme before first paint to avoid a flash. */
 export function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>(
     () => (document.documentElement.getAttribute('data-theme') as Theme) || 'dark',
@@ -13,6 +16,11 @@ export function ThemeToggle() {
   const toggle = () => {
     const next: Theme = theme === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      /* ignore storage errors */
+    }
     setTheme(next);
   };
 

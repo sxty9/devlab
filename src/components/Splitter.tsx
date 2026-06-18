@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 /**
  * A vertical drag handle between two columns. Emits horizontal deltas (px) as the user drags;
@@ -7,6 +7,10 @@ import { useRef, useState } from 'react';
 export function Splitter({ onResize, ariaLabel = 'Resize panel' }: { onResize: (deltaX: number) => void; ariaLabel?: string }) {
   const [dragging, setDragging] = useState(false);
   const lastX = useRef(0);
+  // Holds the teardown for an in-flight drag so we can clean up on unmount mid-drag.
+  const cleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => () => cleanupRef.current?.(), []);
 
   const onPointerDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -20,15 +24,17 @@ export function Splitter({ onResize, ariaLabel = 'Resize panel' }: { onResize: (
       lastX.current = ev.clientX;
       if (dx !== 0) onResize(dx);
     };
-    const up = () => {
+    const teardown = () => {
       setDragging(false);
       document.body.classList.remove('dl-no-select');
       document.body.style.cursor = '';
       window.removeEventListener('pointermove', move);
-      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointerup', teardown);
+      cleanupRef.current = null;
     };
+    cleanupRef.current = teardown;
     window.addEventListener('pointermove', move);
-    window.addEventListener('pointerup', up);
+    window.addEventListener('pointerup', teardown);
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -45,12 +51,12 @@ export function Splitter({ onResize, ariaLabel = 'Resize panel' }: { onResize: (
     <div
       role="separator"
       aria-orientation="vertical"
-      aria-label={ariaLabel}
+      aria-label={`${ariaLabel} (use arrow keys)`}
       tabIndex={0}
       data-dragging={dragging}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}
-      className="dl-splitter focus-visible:outline-none"
+      className="dl-splitter"
     />
   );
 }

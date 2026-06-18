@@ -13,7 +13,7 @@ const variants: Record<Variant, string> = {
   primary: 'bg-accent text-accent-fg shadow-elev-1 hover:bg-accent-hover active:scale-[0.98]',
   secondary: 'bg-fill/10 text-text-primary hover:bg-fill/15 active:scale-[0.98]',
   ghost: 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
-  danger: 'bg-danger text-white shadow-elev-1 hover:opacity-90 active:scale-[0.98]',
+  danger: 'bg-danger text-accent-fg shadow-elev-1 hover:opacity-90 active:scale-[0.98]',
 };
 
 const sizes: Record<Size, string> = {

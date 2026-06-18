@@ -33,10 +33,10 @@ export function ProjectPanel() {
         title="Project"
         actions={
           <>
-            <IconButton label="New file">
+            <IconButton label="New file" title="New file — wired up with the backend (phase 2)">
               <PlusIcon className="h-4 w-4" />
             </IconButton>
-            <IconButton label="Refresh">
+            <IconButton label="Refresh" title="Refresh — wired up with the backend (phase 2)">
               <RefreshIcon className="h-4 w-4" />
             </IconButton>
           </>

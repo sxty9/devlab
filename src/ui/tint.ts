@@ -20,3 +20,14 @@ export const tintText: Record<Repo['tint'], string> = {
   ssd: 'text-ssd',
   ram: 'text-ram',
 };
+
+/** Soft tinted background (channel-based colors support the /opacity modifier). */
+export const tintSoftBg: Record<Repo['tint'], string> = {
+  accent: 'bg-accent/15',
+  success: 'bg-success/15',
+  warning: 'bg-warning/15',
+  gpu: 'bg-gpu/15',
+  net: 'bg-net/15',
+  ssd: 'bg-ssd/15',
+  ram: 'bg-ram/15',
+};

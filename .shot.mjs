@@ -1,0 +1,10 @@
+import { chromium } from 'playwright';
+const url = process.argv[2] || 'https://preview-devlab.henrysoase.org';
+const out = process.argv[3] || '/tmp/devlab-shot.png';
+const b = await chromium.launch();
+const p = await b.newPage({ viewport: { width: 1440, height: 900, deviceScaleFactor: 1 } });
+await p.goto(url, { waitUntil: 'networkidle', timeout: 45000 });
+await p.waitForTimeout(2800);
+await p.screenshot({ path: out });
+console.log('shot ->', out);
+await b.close();

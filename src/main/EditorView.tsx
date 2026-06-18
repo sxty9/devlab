@@ -5,8 +5,15 @@ import { ChevronRightIcon } from '@/ui/icons';
 /** Monaco editor surface with a path breadcrumb. Editable (per phase-1 decision); contents are
  *  mock until the backend lands. A custom dark theme matches the Holistic surface tokens.
  *  `repoId` namespaces the Monaco model so identical paths across repos don't collide. */
+let themeDefined = false;
+
 export function EditorView({ repoId, path, lang, code }: { repoId: string; path: string; lang: string; code: string }) {
   const onMount = useCallback<OnMount>((_editor, monaco) => {
+    if (themeDefined) {
+      monaco.editor.setTheme('devlab-dark');
+      return;
+    }
+    themeDefined = true;
     monaco.editor.defineTheme('devlab-dark', {
       base: 'vs-dark',
       inherit: true,

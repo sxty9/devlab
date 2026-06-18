@@ -13,18 +13,33 @@ interface DropdownProps {
   menuClassName?: string;
 }
 
-/** A click-to-open popover menu with outside-click + Escape dismissal. */
+/** A click-to-open popover menu with outside-click + Escape dismissal, roving keyboard focus
+ *  across menu items, and focus return to the trigger on close. */
 export function Dropdown({ trigger, ariaLabel, align = 'start', children, triggerClassName, menuClassName }: DropdownProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const items = () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
+
+  // Close and (optionally) return focus to the trigger — used for select/Escape, not outside-click.
+  const close = (returnFocus = true) => {
+    setOpen(false);
+    if (returnFocus) triggerRef.current?.focus();
+  };
 
   useEffect(() => {
     if (!open) return;
+    items()[0]?.focus(); // move focus into the menu on open
     const onDown = (e: MouseEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+      }
     };
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -32,11 +47,32 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
     };
+    // eslint not configured; close/items are stable enough for this lightweight menu.
   }, [open]);
+
+  const onMenuKeyDown = (e: React.KeyboardEvent) => {
+    const list = items();
+    if (!list.length) return;
+    const idx = list.indexOf(document.activeElement as HTMLElement);
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      list[(idx + 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      list[(idx - 1 + list.length) % list.length]?.focus();
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      list[0]?.focus();
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      list[list.length - 1]?.focus();
+    }
+  };
 
   return (
     <div ref={rootRef} className="relative">
       <button
+        ref={triggerRef}
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -54,7 +90,10 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
       </button>
       {open && (
         <div
+          ref={menuRef}
           role="menu"
+          aria-label={ariaLabel}
+          onKeyDown={onMenuKeyDown}
           className={cn(
             'absolute z-50 mt-1.5 min-w-[15rem] origin-top overflow-hidden rounded-md border border-separator',
             'bg-material-thick p-1 shadow-elev-3 [backdrop-filter:var(--material-blur)] animate-pop-in',
@@ -62,7 +101,7 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
             menuClassName,
           )}
         >
-          {children(() => setOpen(false))}
+          {children(() => close())}
         </div>
       )}
     </div>
@@ -90,7 +129,7 @@ export function DropdownItem({
       type="button"
       role="menuitem"
       onClick={onClick}
-      className="flex w-full items-center gap-2.5 rounded-sm px-2 py-1.5 text-left transition-colors duration-fast hover:bg-fill/10"
+      className="flex w-full items-center gap-2.5 rounded-sm px-2 py-1.5 text-left transition-colors duration-fast hover:bg-fill/10 focus:bg-fill/15 focus:outline-none"
     >
       {leading != null && <span className="flex h-5 w-5 shrink-0 items-center justify-center">{leading}</span>}
       <span className="min-w-0 flex-1">

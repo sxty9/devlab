@@ -39,7 +39,7 @@ export function IconRail() {
               className={cn(
                 'relative flex h-10 w-10 items-center justify-center rounded-md transition duration-fast ease-out',
                 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50',
-                active ? 'text-text-primary' : 'text-text-tertiary hover:bg-fill/10 hover:text-text-secondary',
+                active ? 'bg-fill/[0.07] text-text-primary' : 'text-text-tertiary hover:bg-fill/10 hover:text-text-secondary',
               )}
             >
               <span

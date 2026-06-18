@@ -15,30 +15,39 @@ const lineCls: Record<TermLine['kind'], string> = {
 
 export function TerminalPanel() {
   const { data, activeRepo, activeBranch } = useWorkspace();
-  const [lines, setLines] = useState<TermLine[]>(data.terminal);
+  // One scrollback per repo, kept in state so switching repos preserves the session.
+  const [sessions, setSessions] = useState<Record<string, TermLine[]>>(() => ({ [activeRepo.id]: data.terminal }));
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => setLines(data.terminal), [data.terminal]);
+  const lines = sessions[activeRepo.id] ?? data.terminal;
+
+  useEffect(() => {
+    setSessions((s) => (s[activeRepo.id] ? s : { ...s, [activeRepo.id]: data.terminal }));
+  }, [activeRepo.id, data.terminal]);
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [lines]);
 
   const prompt = `~/${activeRepo.name} ${activeBranch.name} $`;
 
+  const setLines = (updater: (cur: TermLine[]) => TermLine[]) =>
+    setSessions((s) => ({ ...s, [activeRepo.id]: updater(s[activeRepo.id] ?? data.terminal) }));
+
   const run = () => {
     const cmd = input.trim();
     if (!cmd) return;
     setInput('');
-    const reply: TermLine =
-      cmd === 'clear'
-        ? { id: `c-${lines.length}`, kind: 'system', text: '' }
-        : { id: `o-${lines.length + 1}`, kind: 'stdout', text: `${cmd.split(' ')[0]}: (preview) terminal backend not wired yet` };
     if (cmd === 'clear') {
-      setLines([]);
+      setLines(() => []);
       return;
     }
-    setLines((l) => [...l, { id: `c-${l.length}`, kind: 'cmd', text: cmd }, reply]);
+    setLines((cur) => [
+      ...cur,
+      { id: `c-${cur.length}`, kind: 'cmd', text: cmd },
+      { id: `o-${cur.length + 1}`, kind: 'stdout', text: `${cmd.split(' ')[0]}: (preview) terminal backend not wired yet` },
+    ]);
   };
 
   return (
@@ -50,7 +59,7 @@ export function TerminalPanel() {
             <IconButton label="New terminal">
               <PlusIcon className="h-4 w-4" />
             </IconButton>
-            <IconButton label="Clear" onClick={() => setLines([])}>
+            <IconButton label="Clear terminal" onClick={() => setLines(() => [])}>
               <XIcon className="h-4 w-4" />
             </IconButton>
           </>
@@ -61,7 +70,6 @@ export function TerminalPanel() {
         ref={scrollRef}
         className="dl-scroll min-h-0 flex-1 overflow-y-auto px-3 py-2 font-mono text-[12.5px] leading-relaxed"
         onClick={(e) => {
-          // focus the input when clicking anywhere in the scrollback
           (e.currentTarget.parentElement?.querySelector('input') as HTMLInputElement | null)?.focus();
         }}
       >

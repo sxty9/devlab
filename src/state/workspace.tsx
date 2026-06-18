@@ -1,6 +1,15 @@
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
 import type { Branch, FileContent, FileNode, PanelId, Repo, RepoData, Tab } from '@/types';
 import { DEFAULT_REPO_ID, REPOS, REPO_DATA } from '@/mock/workspace';
+
+/** Last-resort branch so an empty `branches` array (future backend) never crashes the shell. */
+const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
+
+const defaultBranchName = (d: RepoData) => d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? FALLBACK_BRANCH.name;
+
+/** Pick the activeTabId for a repo, guarding against a default that isn't actually in its tabs. */
+const initialTabId = (d: RepoData) =>
+  d.defaultTabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : (d.defaultTabs[0]?.id ?? null);
 
 interface WorkspaceContextValue {
   repos: Repo[];
@@ -49,25 +58,34 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const [activeRepoId, setActiveRepoId] = useState(DEFAULT_REPO_ID);
   const data = REPO_DATA[activeRepoId];
 
-  const [activeBranchName, setActiveBranchName] = useState(
-    () => data.branches.find((b) => b.isDefault)?.name ?? data.branches[0].name,
-  );
+  const [activeBranchName, setActiveBranchName] = useState(() => defaultBranchName(data));
   const [activePanel, setActivePanel] = useState<PanelId | null>('project');
   const [openTabs, setOpenTabs] = useState<Tab[]>(() => data.defaultTabs);
-  const [activeTabId, setActiveTabId] = useState<string | null>(() => data.activeTabId);
+  const [activeTabId, setActiveTabId] = useState<string | null>(() => initialTabId(data));
 
   const fileIndex = useMemo(() => indexTree(data.tree), [data.tree]);
 
+  // Remember the last-used branch per repo so switching away and back doesn't snap to default.
+  const branchMemory = useRef<Record<string, string>>({ [DEFAULT_REPO_ID]: activeBranchName });
+
   const setRepo = useCallback((id: string) => {
-    if (!REPO_DATA[id]) return;
     const next = REPO_DATA[id];
+    if (!next) return;
+    const remembered = branchMemory.current[id];
+    const branch = remembered && next.branches.some((b) => b.name === remembered) ? remembered : defaultBranchName(next);
     setActiveRepoId(id);
-    setActiveBranchName(next.branches.find((b) => b.isDefault)?.name ?? next.branches[0].name);
+    setActiveBranchName(branch);
     setOpenTabs(next.defaultTabs);
-    setActiveTabId(next.activeTabId);
+    setActiveTabId(initialTabId(next));
   }, []);
 
-  const setBranch = useCallback((name: string) => setActiveBranchName(name), []);
+  const setBranch = useCallback(
+    (name: string) => {
+      branchMemory.current[activeRepoId] = name;
+      setActiveBranchName(name);
+    },
+    [activeRepoId],
+  );
 
   const togglePanel = useCallback((id: PanelId) => setActivePanel((cur) => (cur === id ? null : id)), []);
   const setPanel = useCallback((id: PanelId) => setActivePanel(id), []);
@@ -122,7 +140,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     data,
     setRepo,
     branches: data.branches,
-    activeBranch: data.branches.find((b) => b.name === activeBranchName) ?? data.branches[0],
+    activeBranch: data.branches.find((b) => b.name === activeBranchName) ?? data.branches[0] ?? FALLBACK_BRANCH,
     setBranch,
     activePanel,
     togglePanel,

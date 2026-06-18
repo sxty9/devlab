@@ -62,7 +62,11 @@ body,
   transition: background var(--anim-fast, 120ms) var(--ease-out);
 }
 .dl-splitter:hover::after,
+.dl-splitter:focus-visible::after,
 .dl-splitter[data-dragging='true']::after {
   background: rgb(var(--accent) / 0.9);
   width: 2px;
+}
+.dl-splitter:focus-visible {
+  outline: none;
 }
