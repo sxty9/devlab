@@ -53,15 +53,11 @@ func Repos(base string) []model.Repo {
 }
 
 func query(base string) []model.Repo {
-	cmd := exec.Command("gh", "search", "repos", "--owner", owner(), "--topic", "holistic",
-		"--limit", "100", "--json", "name,description,language")
-	out, err := cmd.Output()
-	if err != nil {
-		return []model.Repo{}
-	}
-	var ghs []ghRepo
-	if json.Unmarshal(out, &ghs) != nil {
-		return []model.Repo{}
+	ghs := ghSearch()
+	if len(ghs) == 0 {
+		// gh unavailable (e.g. no keyring in the sandboxed preview) → fall back to an explicit
+		// allowlist of repo names. Keeps the holistic set visible without a live gh round-trip.
+		ghs = allowlist()
 	}
 	var repos []model.Repo
 	for _, g := range ghs {
@@ -89,6 +85,36 @@ func query(base string) []model.Repo {
 		repos = []model.Repo{}
 	}
 	return repos
+}
+
+func ghSearch() []ghRepo {
+	cmd := exec.Command("gh", "search", "repos", "--owner", owner(), "--topic", "holistic",
+		"--limit", "100", "--json", "name,description,language")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var ghs []ghRepo
+	if json.Unmarshal(out, &ghs) != nil {
+		return nil
+	}
+	return ghs
+}
+
+// allowlist reads DEVLAB_REPOS_ALLOWLIST (comma-separated repo names) as a gh-free fallback.
+func allowlist() []ghRepo {
+	raw := os.Getenv("DEVLAB_REPOS_ALLOWLIST")
+	if raw == "" {
+		return nil
+	}
+	var out []ghRepo
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out = append(out, ghRepo{Name: name})
+		}
+	}
+	return out
 }
 
 // Path resolves a repo id to its local working-copy path (validated, must contain .git).
