@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { cn } from '@/lib/cn';
 import { CheckIcon, ChevronDownIcon } from './icons';
 
@@ -13,27 +14,46 @@ interface DropdownProps {
   menuClassName?: string;
 }
 
-/** A click-to-open popover menu with outside-click + Escape dismissal, roving keyboard focus
- *  across menu items, and focus return to the trigger on close. */
+/**
+ * A click-to-open popover menu. The menu is rendered in a PORTAL to document.body — this
+ * escapes the top bar's `backdrop-filter` ancestor (which otherwise makes descendant popovers
+ * appear to "bleed through" their opaque background on some browsers). Includes outside-click +
+ * Escape dismissal, roving keyboard focus, and focus return to the trigger.
+ */
 export function Dropdown({ trigger, ariaLabel, align = 'start', children, triggerClassName, menuClassName }: DropdownProps) {
   const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; left?: number; right?: number; minWidth: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   const items = () => Array.from(menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? []);
 
-  // Close and (optionally) return focus to the trigger — used for select/Escape, not outside-click.
+  const place = () => {
+    const r = triggerRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setPos({
+      top: r.bottom + 6,
+      ...(align === 'end' ? { right: window.innerWidth - r.right } : { left: r.left }),
+      minWidth: r.width,
+    });
+  };
+
   const close = (returnFocus = true) => {
     setOpen(false);
     if (returnFocus) triggerRef.current?.focus();
   };
 
+  useLayoutEffect(() => {
+    if (open) place();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
-    items()[0]?.focus(); // move focus into the menu on open
+    items()[0]?.focus();
     const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -41,13 +61,18 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
         close();
       }
     };
+    const onReflow = () => place();
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onReflow);
+    window.addEventListener('scroll', onReflow, true);
     return () => {
       document.removeEventListener('mousedown', onDown);
       document.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onReflow);
+      window.removeEventListener('scroll', onReflow, true);
     };
-    // eslint not configured; close/items are stable enough for this lightweight menu.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   const onMenuKeyDown = (e: React.KeyboardEvent) => {
@@ -70,7 +95,7 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
   };
 
   return (
-    <div ref={rootRef} className="relative">
+    <div className="contents">
       <button
         ref={triggerRef}
         type="button"
@@ -88,22 +113,25 @@ export function Dropdown({ trigger, ariaLabel, align = 'start', children, trigge
         {trigger}
         <ChevronDownIcon className={cn('h-3.5 w-3.5 shrink-0 text-text-tertiary transition-transform', open && 'rotate-180')} />
       </button>
-      {open && (
-        <div
-          ref={menuRef}
-          role="menu"
-          aria-label={ariaLabel}
-          onKeyDown={onMenuKeyDown}
-          className={cn(
-            'absolute z-50 mt-1.5 min-w-[15rem] origin-top overflow-hidden rounded-md border border-separator',
-            'bg-surface-raised p-1 shadow-elev-3 ring-1 ring-black/5 animate-pop-in',
-            align === 'end' ? 'right-0' : 'left-0',
-            menuClassName,
-          )}
-        >
-          {children(() => close())}
-        </div>
-      )}
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            aria-label={ariaLabel}
+            onKeyDown={onMenuKeyDown}
+            style={{ position: 'fixed', top: pos.top, left: pos.left, right: pos.right, minWidth: pos.minWidth }}
+            className={cn(
+              'z-[200] max-h-[70vh] origin-top overflow-y-auto rounded-md border border-separator',
+              'bg-surface-raised p-1 shadow-elev-3 ring-1 ring-black/20 animate-pop-in dl-scroll',
+              menuClassName,
+            )}
+          >
+            {children(() => close())}
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
