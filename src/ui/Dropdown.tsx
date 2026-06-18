@@ -128,8 +128,12 @@ export function DropdownItem({
     <button
       type="button"
       role="menuitem"
+      aria-current={selected}
       onClick={onClick}
-      className="flex w-full items-center gap-2.5 rounded-sm px-2 py-1.5 text-left transition-colors duration-fast hover:bg-fill/10 focus:bg-fill/15 focus:outline-none"
+      className={cn(
+        'flex w-full items-center gap-2.5 rounded-sm px-2 py-1.5 text-left transition-colors duration-fast hover:bg-fill/10 focus:bg-fill/15 focus:outline-none',
+        selected && 'bg-accent/10',
+      )}
     >
       {leading != null && <span className="flex h-5 w-5 shrink-0 items-center justify-center">{leading}</span>}
       <span className="min-w-0 flex-1">

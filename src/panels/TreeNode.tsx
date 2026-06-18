@@ -41,7 +41,16 @@ export function TreeNode({
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className={cn(ROW, 'text-text-secondary hover:bg-fill/10')}
+          onKeyDown={(e) => {
+            if (e.key === 'ArrowRight' && !open) {
+              e.preventDefault();
+              setOpen(true);
+            } else if (e.key === 'ArrowLeft' && open) {
+              e.preventDefault();
+              setOpen(false);
+            }
+          }}
+          className={cn(ROW, 'text-text-secondary hover:bg-fill/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/40')}
           style={pad}
           aria-expanded={open}
         >
@@ -73,12 +82,15 @@ export function TreeNode({
       <button
         type="button"
         onClick={() => onOpen(node)}
+        aria-current={active}
         className={cn(
           ROW,
+          'relative focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/40',
           active ? 'bg-accent/15 text-text-primary' : 'text-text-secondary hover:bg-fill/10',
         )}
         style={pad}
       >
+        {active && <span className="absolute inset-y-1 left-0 w-0.5 rounded-r bg-accent" />}
         <span className="w-3.5 shrink-0" />
         <FileTextIcon className={cn('h-4 w-4 shrink-0', active ? 'text-accent' : iconTint, 'opacity-90')} />
         <span className={cn('truncate', status && status.cls)}>{node.name}</span>

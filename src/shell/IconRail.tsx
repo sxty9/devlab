@@ -1,7 +1,7 @@
 import { useWorkspace } from '@/state/workspace';
 import type { PanelId } from '@/types';
 import { Tooltip } from '@/ui/Tooltip';
-import { ClaudeIcon, FilesIcon, GitBranchIcon, SettingsIcon, TerminalIcon } from '@/ui/icons';
+import { ClaudeIcon, FilesIcon, GitBranchIcon, HelpIcon, LightbulbIcon, SettingsIcon, TerminalIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 
 interface RailItem {
@@ -11,6 +11,7 @@ interface RailItem {
 }
 
 const ITEMS: RailItem[] = [
+  { id: 'vision', label: 'Vision', Icon: LightbulbIcon },
   { id: 'project', label: 'Project', Icon: FilesIcon },
   { id: 'vcs', label: 'Version Control', Icon: GitBranchIcon },
   { id: 'claude', label: 'Claude', Icon: ClaudeIcon },
@@ -19,7 +20,7 @@ const ITEMS: RailItem[] = [
 
 /** The 56px left rail of tool toggles. Click an active tool to collapse its panel. */
 export function IconRail() {
-  const { activePanel, togglePanel, data } = useWorkspace();
+  const { activePanel, togglePanel, data, setOverlay } = useWorkspace();
   const changeCount = data.changes.length;
 
   return (
@@ -59,11 +60,22 @@ export function IconRail() {
         );
       })}
 
-      <div className="mt-auto">
+      <div className="mt-auto flex flex-col items-center gap-1">
+        <Tooltip label="Keyboard shortcuts  (?)" side="right">
+          <button
+            type="button"
+            aria-label="Keyboard shortcuts"
+            onClick={() => setOverlay('help')}
+            className="flex h-10 w-10 items-center justify-center rounded-md text-text-tertiary transition duration-fast ease-out hover:bg-fill/10 hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+          >
+            <HelpIcon className="h-5 w-5" />
+          </button>
+        </Tooltip>
         <Tooltip label="Settings" side="right">
           <button
             type="button"
             aria-label="Settings"
+            onClick={() => setOverlay('settings')}
             className="flex h-10 w-10 items-center justify-center rounded-md text-text-tertiary transition duration-fast ease-out hover:bg-fill/10 hover:text-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
           >
             <SettingsIcon className="h-5 w-5" />

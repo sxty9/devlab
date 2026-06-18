@@ -2,8 +2,17 @@
 // deliberately close to what a real backend (git + sxgate + Claude) would return, so wiring
 // the backend later is a swap of the data source, not a rewrite of the UI.
 
-/** The four tools in the left icon rail. */
-export type PanelId = 'project' | 'vcs' | 'claude' | 'terminal';
+/** The tools in the left icon rail. */
+export type PanelId = 'vision' | 'project' | 'vcs' | 'claude' | 'terminal';
+
+/** User-tunable editor settings (Settings modal → Monaco). */
+export interface EditorSettings {
+  fontSize: number;
+  tabSize: number;
+}
+
+/** A full-screen overlay (modal) that's currently open, if any. */
+export type Overlay = 'settings' | 'help' | null;
 
 export type RepoKind = 'service' | 'repo' | 'library';
 
@@ -98,12 +107,26 @@ export interface Stage {
   hint: string;
 }
 
+export type VisionKind = 'spec' | 'mindmap' | 'jet' | 'note';
+
+/** A "Vision Deposit" artifact — the front of the pipeline (specs, mindmaps, jets, notes). */
+export interface VisionDoc {
+  id: string;
+  title: string;
+  kind: VisionKind;
+  summary: string;
+  /** Pipeline state this idea has reached. */
+  state: StageState;
+  updated: string;
+}
+
 /** Everything the workspace knows about one repo (mock in phase 1). */
 export interface RepoData {
   branches: Branch[];
   tree: FileNode[];
   files: Record<string, FileContent>;
   changes: Change[];
+  vision: VisionDoc[];
   claude: ClaudeMsg[];
   terminal: TermLine[];
   stages: Stage[];

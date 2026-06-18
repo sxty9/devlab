@@ -1,5 +1,5 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
-import type { Branch, FileContent, FileNode, PanelId, Repo, RepoData, Tab } from '@/types';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab } from '@/types';
 import { DEFAULT_REPO_ID, REPOS, REPO_DATA } from '@/mock/workspace';
 
 /** Last-resort branch so an empty `branches` array (future backend) never crashes the shell. */
@@ -10,6 +10,18 @@ const defaultBranchName = (d: RepoData) => d.branches.find((b) => b.isDefault)?.
 /** Pick the activeTabId for a repo, guarding against a default that isn't actually in its tabs. */
 const initialTabId = (d: RepoData) =>
   d.defaultTabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : (d.defaultTabs[0]?.id ?? null);
+
+const DEFAULT_SETTINGS: EditorSettings = { fontSize: 13, tabSize: 2 };
+
+function readSettings(): EditorSettings {
+  try {
+    const raw = localStorage.getItem('dl.settings');
+    if (raw) return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<EditorSettings>) };
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_SETTINGS;
+}
 
 interface WorkspaceContextValue {
   repos: Repo[];
@@ -25,6 +37,8 @@ interface WorkspaceContextValue {
   activePanel: PanelId | null;
   togglePanel: (id: PanelId) => void;
   setPanel: (id: PanelId) => void;
+  /** Collapse/expand the panel column, remembering the last tool (⌘/Ctrl+B). */
+  toggleColumn: () => void;
 
   openTabs: Tab[];
   activeTabId: string | null;
@@ -34,6 +48,12 @@ interface WorkspaceContextValue {
   closeTab: (id: string) => void;
 
   fileContent: (path: string) => FileContent;
+
+  settings: EditorSettings;
+  updateSettings: (patch: Partial<EditorSettings>) => void;
+
+  overlay: Overlay;
+  setOverlay: (o: Overlay) => void;
 }
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
@@ -87,8 +107,54 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [activeRepoId],
   );
 
-  const togglePanel = useCallback((id: PanelId) => setActivePanel((cur) => (cur === id ? null : id)), []);
-  const setPanel = useCallback((id: PanelId) => setActivePanel(id), []);
+  const lastPanelRef = useRef<PanelId>('project');
+  const togglePanel = useCallback(
+    (id: PanelId) =>
+      setActivePanel((cur) => {
+        if (cur === id) return null;
+        lastPanelRef.current = id;
+        return id;
+      }),
+    [],
+  );
+  const setPanel = useCallback((id: PanelId) => {
+    lastPanelRef.current = id;
+    setActivePanel(id);
+  }, []);
+  const toggleColumn = useCallback(() => setActivePanel((cur) => (cur ? null : lastPanelRef.current)), []);
+
+  const [settings, setSettings] = useState<EditorSettings>(readSettings);
+  const updateSettings = useCallback((patch: Partial<EditorSettings>) => {
+    setSettings((s) => {
+      const next = { ...s, ...patch };
+      try {
+        localStorage.setItem('dl.settings', JSON.stringify(next));
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
+
+  const [overlay, setOverlay] = useState<Overlay>(null);
+
+  // Global shortcuts: ⌘/Ctrl+B toggles the panel column; ? opens the shortcuts help.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && (e.key === 'b' || e.key === 'B')) {
+        e.preventDefault();
+        toggleColumn();
+      } else if (e.key === '?') {
+        const t = e.target as HTMLElement | null;
+        if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+        e.preventDefault();
+        setOverlay('help');
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [toggleColumn]);
 
   const openFile = useCallback<WorkspaceContextValue['openFile']>((node) => {
     setOpenTabs((tabs) => {
@@ -145,6 +211,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     activePanel,
     togglePanel,
     setPanel,
+    toggleColumn,
     openTabs,
     activeTabId,
     openFile,
@@ -152,6 +219,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     setActiveTab,
     closeTab,
     fileContent,
+    settings,
+    updateSettings,
+    overlay,
+    setOverlay,
   };
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

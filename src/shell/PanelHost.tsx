@@ -1,6 +1,7 @@
 import { useCallback, useState } from 'react';
 import { useWorkspace } from '@/state/workspace';
 import { Splitter } from '@/components/Splitter';
+import { VisionPanel } from '@/panels/VisionPanel';
 import { ProjectPanel } from '@/panels/ProjectPanel';
 import { VersionControlPanel } from '@/panels/VersionControlPanel';
 import { ClaudePanel } from '@/panels/ClaudePanel';
@@ -44,6 +45,7 @@ export function PanelHost() {
         style={{ width }}
         className="flex min-h-0 shrink-0 flex-col overflow-hidden border-r border-separator bg-surface-sidebar"
       >
+        {activePanel === 'vision' && <VisionPanel />}
         {activePanel === 'project' && <ProjectPanel />}
         {activePanel === 'vcs' && <VersionControlPanel />}
         {activePanel === 'claude' && <ClaudePanel />}

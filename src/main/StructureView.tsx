@@ -1,13 +1,35 @@
 import { useWorkspace } from '@/state/workspace';
-import { FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
+import { useToast } from '@/ui/Toast';
+import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
 import { Button } from '@/ui/Button';
 import { tintSoftBg, tintText } from '@/ui/tint';
 import { PREVIEW_URL } from '@/lib/constants';
+import { basename, guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
+import type { StructureSection } from '@/types';
 
-/** The repo "skeleton" overview — a landing surface summarising structure & delivery state. */
+const QUICK_LINKS = ['README.md', 'package.json'];
+
+/** The repo "skeleton" overview — a navigable landing surface for structure & delivery. */
 export function StructureView() {
-  const { data, activeRepo, activeBranch } = useWorkspace();
+  const { data, activeRepo, activeBranch, openFile, setPanel } = useWorkspace();
+  const { toast } = useToast();
+
+  const openPath = (path: string) => openFile({ id: path, name: basename(path), lang: guessLang(path) });
+
+  const onEntry = (e: StructureSection['entries'][number]) => {
+    const looksLikePath = !/[ ()]/.test(e.name);
+    if (e.kind === 'file' && looksLikePath) openPath(e.name);
+    else setPanel('project');
+  };
+
+  const deploy = () => {
+    toast({ title: 'Building preview…', description: `${activeRepo.name} · sxgate · MODE=static` });
+    window.setTimeout(
+      () => toast({ title: 'Preview is live', description: `preview-${activeRepo.name}.henrysoase.org`, variant: 'success' }),
+      1500,
+    );
+  };
 
   return (
     <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
@@ -34,16 +56,15 @@ export function StructureView() {
               </span>
             </div>
           </div>
-          <Button
-            variant="primary"
-            size="sm"
-            className="ml-auto mt-1 shrink-0"
-            onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')}
-            title="Open the live sxgate preview"
-          >
-            <RocketIcon className="h-3.5 w-3.5" />
-            Open preview
-          </Button>
+          <div className="ml-auto mt-1 flex shrink-0 items-center gap-1.5">
+            <Button variant="primary" size="sm" onClick={deploy} title="Simulate a sxgate preview deploy">
+              <RocketIcon className="h-3.5 w-3.5" />
+              Deploy preview
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')} title="Open the live preview">
+              Open ↗
+            </Button>
+          </div>
         </div>
 
         {/* Pipeline */}
@@ -55,7 +76,7 @@ export function StructureView() {
                 <div
                   className={cn(
                     'flex items-center gap-2 rounded-md px-2.5 py-1.5',
-                    s.state === 'active' && 'bg-accent/15',
+                    s.state === 'active' && 'bg-accent/15 ring-1 ring-accent/30',
                     s.state === 'done' && 'bg-success/10',
                     s.state === 'pending' && 'bg-fill/[0.06]',
                   )}
@@ -69,12 +90,7 @@ export function StructureView() {
                       s.state === 'pending' && 'bg-fill/30',
                     )}
                   />
-                  <span
-                    className={cn(
-                      'text-footnote font-medium',
-                      s.state === 'pending' ? 'text-text-tertiary' : 'text-text-primary',
-                    )}
-                  >
+                  <span className={cn('text-footnote font-medium', s.state === 'pending' ? 'text-text-tertiary' : 'text-text-primary')}>
                     {s.label}
                   </span>
                 </div>
@@ -84,24 +100,46 @@ export function StructureView() {
           </div>
         </div>
 
+        {/* Quick links */}
+        <div className="mt-6 flex flex-wrap gap-2">
+          {QUICK_LINKS.map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => openPath(p)}
+              className="flex items-center gap-1.5 rounded-md border border-separator bg-surface px-2.5 py-1.5 text-caption text-text-secondary shadow-elev-1 transition hover:border-accent/40 hover:text-text-primary"
+            >
+              <FileTextIcon className="h-3.5 w-3.5 text-text-tertiary" />
+              {p}
+            </button>
+          ))}
+        </div>
+
         {/* Structure sections */}
         <div className="mt-6 space-y-4">
           {data.structure.map((section) => (
-            <section key={section.title} className="rounded-card border border-separator bg-surface shadow-elev-1">
+            <section key={section.title} className="overflow-hidden rounded-card border border-separator bg-surface shadow-elev-1">
               <div className="border-b border-separator px-4 py-3">
                 <h3 className="text-subhead font-semibold text-text-primary">{section.title}</h3>
                 <p className="mt-0.5 text-caption text-text-tertiary">{section.hint}</p>
               </div>
               <ul className="divide-y divide-separator">
                 {section.entries.map((e) => (
-                  <li key={e.name} className="flex items-center gap-3 px-4 py-2.5">
-                    {e.kind === 'dir' ? (
-                      <FolderIcon className="h-4 w-4 shrink-0 text-text-tertiary" />
-                    ) : (
-                      <FileTextIcon className="h-4 w-4 shrink-0 text-text-tertiary" />
-                    )}
-                    <span className="shrink-0 font-mono text-footnote text-text-primary">{e.name}</span>
-                    <span className="truncate text-caption text-text-secondary">{e.note}</span>
+                  <li key={e.name}>
+                    <button
+                      type="button"
+                      onClick={() => onEntry(e)}
+                      className="group flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-fill/[0.06] focus-visible:outline-none focus-visible:bg-fill/[0.06]"
+                    >
+                      {e.kind === 'dir' ? (
+                        <FolderIcon className="h-4 w-4 shrink-0 text-text-tertiary" />
+                      ) : (
+                        <FileTextIcon className="h-4 w-4 shrink-0 text-text-tertiary" />
+                      )}
+                      <span className="shrink-0 font-mono text-footnote text-text-primary">{e.name}</span>
+                      <span className="truncate text-caption text-text-secondary">{e.note}</span>
+                      <ChevronRightIcon className="ml-auto h-4 w-4 shrink-0 text-text-tertiary opacity-0 transition group-hover:opacity-100" />
+                    </button>
                   </li>
                 ))}
               </ul>

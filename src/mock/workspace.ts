@@ -186,6 +186,13 @@ const devlabData: RepoData = {
     { path: '.sxgate/preview.conf', status: 'added', additions: 6, deletions: 0, staged: false },
     { path: 'src/shell/TopBar.tsx', status: 'modified', additions: 7, deletions: 2, staged: false },
   ],
+  vision: [
+    { id: 'v1', title: 'DevLab vision & sketches', kind: 'spec', summary: 'IntelliJ/VS-Code-style in-browser IDE: repo dropdown, left tools, editor, delivery pipeline.', state: 'done', updated: '2h ago' },
+    { id: 'v2', title: 'Pipeline: Vision → Code → Preview → Delivery → main', kind: 'mindmap', summary: 'How a service flows from idea to prod through sxgate previews.', state: 'active', updated: '1h ago' },
+    { id: 'v3', title: 'Repo dropdown like IntelliJ', kind: 'jet', summary: 'One-click switch of the active repo/service from the top bar.', state: 'done', updated: '3h ago' },
+    { id: 'v4', title: 'Claude + terminal as first-class tools', kind: 'jet', summary: 'Drive each repo with a Claude session and a real shell, side by side.', state: 'active', updated: '40m ago' },
+    { id: 'v5', title: 'Multi-developer sessions on a branch', kind: 'note', summary: 'Later: collaborate on the same branch/session in real time.', state: 'pending', updated: 'yesterday' },
+  ],
   claude: [
     { id: 'c1', role: 'user', text: 'Scaffold the IDE shell and vendor the Holistic dark tokens.', ts: '10:24' },
     { id: 'c2', role: 'assistant', text: 'On it. I vendored tokens.css + the Tailwind preset into src/theme and wired a VS-Code-style layout: top bar with repo/branch pickers, a 56px icon rail, a resizable panel column and a Monaco editor.', ts: '10:24' },
@@ -299,6 +306,11 @@ HEALTHCHECK="/api/health"
     { path: 'services/dashboard/main.py', status: 'modified', additions: 24, deletions: 6, staged: false },
     { path: 'frontend/packages/ui/src/tokens.css', status: 'modified', additions: 3, deletions: 1, staged: false },
   ],
+  vision: [
+    { id: 'v1', title: 'Profile & settings page', kind: 'spec', summary: 'Self-serve profile, avatar, and notification settings in the dashboard.', state: 'active', updated: '1h ago' },
+    { id: 'v2', title: 'Auth & service map', kind: 'mindmap', summary: 'How dashboard, samba and manifest services share one auth surface.', state: 'done', updated: 'yesterday' },
+    { id: 'v3', title: 'Per-service health badges', kind: 'jet', summary: 'Surface /api/health for each mounted service on the home screen.', state: 'pending', updated: '2d ago' },
+  ],
   claude: [
     { id: 'c1', role: 'user', text: 'Add a /api/me endpoint gated by current_user.', ts: '09:02' },
     { id: 'c2', role: 'assistant', text: 'Added it to services/dashboard/main.py with a Depends(current_user) guard and a matching health check. Tests pass.', ts: '09:03' },
@@ -381,6 +393,11 @@ preview_up() {
     { path: 'sxgate', status: 'modified', additions: 12, deletions: 3, staged: false },
     { path: 'lib/preview.sh', status: 'modified', additions: 31, deletions: 8, staged: true },
   ],
+  vision: [
+    { id: 'v1', title: 'static preview mode (no backend)', kind: 'spec', summary: 'Serve a pure dist/ SPA with SPA fallback — what DevLab uses.', state: 'active', updated: '30m ago' },
+    { id: 'v2', title: 'Wildcard ingress → dispatcher', kind: 'mindmap', summary: 'One *.<zone> ingress to a local Caddy that fans out per-branch.', state: 'done', updated: '3d ago' },
+    { id: 'v3', title: 'Per-branch teardown safety', kind: 'note', summary: 'down removes worktree + route + instance atomically.', state: 'done', updated: '3d ago' },
+  ],
   claude: [
     { id: 'c1', role: 'user', text: 'Make sure MODE="static" works without a backend instance.', ts: '14:11' },
     { id: 'c2', role: 'assistant', text: 'Added a serve_static path that skips the systemd backend unit entirely and just points the dispatcher vhost at dist/ with SPA fallback. DevLab can use it as-is.', ts: '14:12' },
@@ -446,9 +463,15 @@ function minimalRepo(opts: {
     tree: opts.tree,
     files: opts.files,
     changes: opts.changes,
+    vision: [
+      { id: 'v1', title: opts.claudeAsk.replace(/\.$/, ''), kind: 'spec', summary: opts.claudeReply, state: 'active', updated: '1h ago' },
+      { id: 'v2', title: `${opts.feature.split('/').pop()} plan`, kind: 'note', summary: 'Scoped from the feature branch; details captured here.', state: 'pending', updated: 'yesterday' },
+    ],
     claude: [
       { id: 'c1', role: 'user', text: opts.claudeAsk, ts: '11:40' },
       { id: 'c2', role: 'assistant', text: opts.claudeReply, ts: '11:41' },
+      { id: 'c3', role: 'tool', tool: 'Edit', text: opts.activePath, ts: '11:41' },
+      { id: 'c4', role: 'assistant', text: 'Done — build is green. Want me to open a branch preview?', ts: '11:42' },
     ],
     terminal: opts.term,
     stages,

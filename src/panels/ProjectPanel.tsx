@@ -86,7 +86,9 @@ export function ProjectPanel() {
               })}
             </ul>
           ) : (
-            <p className="px-3 py-4 text-footnote text-text-tertiary">No files match “{query}”.</p>
+            <p role="status" className="px-3 py-4 text-footnote text-text-tertiary">
+              No files match “{query}”.
+            </p>
           )
         ) : (
           <ul>
