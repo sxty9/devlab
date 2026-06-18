@@ -1,26 +1,24 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab } from '@/types';
-import { DEFAULT_REPO_ID, REPOS, REPO_DATA } from '@/mock/workspace';
+import { getDataSource, type DiffPayload } from '@/data';
 import { guessLang } from '@/lib/lang';
+import { CodeIcon } from '@/ui/icons';
+import { LoginGate } from '@/shell/LoginGate';
 
-/** Fabricate a believable "before" for a modified file with no explicit diff content. */
-function synthBefore(after: string): string {
-  const lines = after.split('\n');
-  if (lines.length <= 5) return lines.slice(0, Math.max(1, lines.length - 1)).join('\n');
-  const out = lines.slice();
-  const mid = Math.floor(out.length / 2);
-  out.splice(mid, 2); // these two lines read as additions in the "after"
-  const tweak = Math.min(3, out.length - 1);
-  out[tweak] = `${out[tweak]}  // (previous)`; // one modified line
-  return out.join('\n');
-}
-
-/** Last-resort branch so an empty `branches` array (future backend) never crashes the shell. */
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
+const FALLBACK_REPO: Repo = { id: '', name: '…', kind: 'repo', description: '', language: '', tint: 'accent' };
 
 const defaultBranchName = (d: RepoData) => d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? FALLBACK_BRANCH.name;
 
-/** Pick the activeTabId for a repo, guarding against a default that isn't actually in its tabs. */
 const initialTabId = (d: RepoData) =>
   d.defaultTabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : (d.defaultTabs[0]?.id ?? null);
 
@@ -46,25 +44,21 @@ interface WorkspaceContextValue {
   activeBranch: Branch;
   setBranch: (name: string) => void;
 
-  /** null = the panel column is collapsed. */
   activePanel: PanelId | null;
   togglePanel: (id: PanelId) => void;
   setPanel: (id: PanelId) => void;
-  /** Collapse/expand the panel column, remembering the last tool (⌘/Ctrl+B). */
   toggleColumn: () => void;
 
   openTabs: Tab[];
   activeTabId: string | null;
   openFile: (node: Pick<FileNode, 'id' | 'name' | 'lang'>) => void;
   openStructure: () => void;
-  /** Open a side-by-side diff for a changed file. */
   openDiff: (path: string) => void;
   setActiveTab: (id: string) => void;
   closeTab: (id: string) => void;
 
   fileContent: (path: string) => FileContent;
-  /** Before/after content + language for a changed file's diff view. */
-  fileDiff: (path: string) => { before: string; after: string; lang: string };
+  fileDiff: (path: string) => DiffPayload;
 
   settings: EditorSettings;
   updateSettings: (patch: Partial<EditorSettings>) => void;
@@ -75,7 +69,6 @@ interface WorkspaceContextValue {
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
-/** Flatten a file tree into a path→node map for quick lookups. */
 function indexTree(nodes: FileNode[], acc: Record<string, FileNode> = {}): Record<string, FileNode> {
   for (const n of nodes) {
     acc[n.id] = n;
@@ -84,47 +77,107 @@ function indexTree(nodes: FileNode[], acc: Record<string, FileNode> = {}): Recor
   return acc;
 }
 
-/** A believable placeholder for tree files that have no explicit mock contents. */
-function stubContent(path: string, lang: string): FileContent {
-  const name = path.split('/').pop() ?? path;
-  const code = `// ${path}\n// (preview) — open in DevLab.\n//\n// Phase 1 ships the IDE shell with mock data; file contents arrive with the backend.\n// "${name}" is a ${lang || 'text'} file in this repo's working tree.\n`;
-  return { path, lang: lang || 'plaintext', code };
-}
+const loadingFile = (path: string): FileContent => ({ path, lang: guessLang(path), code: '// loading…\n' });
+const loadingDiff = (path: string): DiffPayload => ({ before: '', after: '// loading…\n', lang: guessLang(path) });
+
+type Phase = 'boot' | 'login' | 'ready';
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const [activeRepoId, setActiveRepoId] = useState(DEFAULT_REPO_ID);
-  const data = REPO_DATA[activeRepoId];
+  const source = useMemo(() => getDataSource(), []);
 
-  const [activeBranchName, setActiveBranchName] = useState(() => defaultBranchName(data));
+  const [phase, setPhase] = useState<Phase>('boot');
+  const [repos, setRepos] = useState<Repo[]>([]);
+  const [activeRepoId, setActiveRepoId] = useState('');
+  const [data, setData] = useState<RepoData | null>(null);
+  const [activeBranchName, setActiveBranchName] = useState('');
+
   const [activePanel, setActivePanel] = useState<PanelId | null>('project');
-  const [openTabs, setOpenTabs] = useState<Tab[]>(() => data.defaultTabs);
-  const [activeTabId, setActiveTabId] = useState<string | null>(() => initialTabId(data));
+  const [openTabs, setOpenTabs] = useState<Tab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [fileCache, setFileCache] = useState<Record<string, FileContent>>({});
+  const [diffCache, setDiffCache] = useState<Record<string, DiffPayload>>({});
 
-  const fileIndex = useMemo(() => indexTree(data.tree), [data.tree]);
+  const branchMemory = useRef<Record<string, string>>({});
+  const lastPanelRef = useRef<PanelId>('project');
 
-  // Remember the last-used branch per repo so switching away and back doesn't snap to default.
-  const branchMemory = useRef<Record<string, string>>({ [DEFAULT_REPO_ID]: activeBranchName });
+  const fileIndex = useMemo(() => (data ? indexTree(data.tree) : {}), [data]);
 
-  const setRepo = useCallback((id: string) => {
-    const next = REPO_DATA[id];
-    if (!next) return;
+  // Apply a freshly-loaded RepoData: set state + reset the editor tabs.
+  const applyData = useCallback((id: string, d: RepoData, keepTabs = false) => {
+    setData(d);
     const remembered = branchMemory.current[id];
-    const branch = remembered && next.branches.some((b) => b.name === remembered) ? remembered : defaultBranchName(next);
-    setActiveRepoId(id);
-    setActiveBranchName(branch);
-    setOpenTabs(next.defaultTabs);
-    setActiveTabId(initialTabId(next));
+    setActiveBranchName(remembered && d.branches.some((b) => b.name === remembered) ? remembered : defaultBranchName(d));
+    if (!keepTabs) {
+      setOpenTabs(d.defaultTabs);
+      setActiveTabId(initialTabId(d));
+    }
   }, []);
+
+  // ── boot: detect api/mock + auth, then load the first repo ──────────────────
+  const bootstrap = useCallback(async () => {
+    const rs = await source.repos();
+    setRepos(rs);
+    const first = rs[0]?.id ?? '';
+    setActiveRepoId(first);
+    if (first) {
+      const d = await source.repoData(first);
+      applyData(first, d);
+    }
+    setPhase('ready');
+  }, [source, applyData]);
+
+  useEffect(() => {
+    let cancelled = false;
+    source
+      .init()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.gated && !res.authed) {
+          setPhase('login');
+          return;
+        }
+        return bootstrap();
+      })
+      .catch(() => setPhase('login'));
+    return () => {
+      cancelled = true;
+    };
+  }, [source, bootstrap]);
+
+  const login = useCallback(
+    async (password: string) => {
+      const ok = await source.login(password);
+      if (ok) {
+        setPhase('boot');
+        await bootstrap();
+      }
+      return ok;
+    },
+    [source, bootstrap],
+  );
+
+  // ── repo switching ──────────────────────────────────────────────────────────
+  const setRepo = useCallback(
+    (id: string) => {
+      if (id === activeRepoId || !repos.some((r) => r.id === id)) return;
+      setActiveRepoId(id);
+      setOpenTabs([]); // optimistic; applyData sets the real defaults
+      setActiveTabId(null);
+      source.repoData(id, branchMemory.current[id]).then((d) => applyData(id, d));
+    },
+    [activeRepoId, repos, source, applyData],
+  );
 
   const setBranch = useCallback(
     (name: string) => {
       branchMemory.current[activeRepoId] = name;
       setActiveBranchName(name);
+      source.repoData(activeRepoId, name).then((d) => applyData(activeRepoId, d, true));
     },
-    [activeRepoId],
+    [activeRepoId, source, applyData],
   );
 
-  const lastPanelRef = useRef<PanelId>('project');
+  // ── panels ──────────────────────────────────────────────────────────────────
   const togglePanel = useCallback(
     (id: PanelId) =>
       setActivePanel((cur) => {
@@ -140,6 +193,77 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   }, []);
   const toggleColumn = useCallback(() => setActivePanel((cur) => (cur ? null : lastPanelRef.current)), []);
 
+  // ── tabs + lazy file/diff fetching ──────────────────────────────────────────
+  const fetchFile = useCallback(
+    (path: string) => {
+      const key = `${activeRepoId}:${path}`;
+      if (fileCache[key] || data?.files[path]) return;
+      source.fileContent(activeRepoId, path).then((fc) => setFileCache((c) => ({ ...c, [key]: fc })));
+    },
+    [activeRepoId, fileCache, data, source],
+  );
+
+  const fetchDiff = useCallback(
+    (path: string) => {
+      const key = `${activeRepoId}:${path}`;
+      if (diffCache[key]) return;
+      source.fileDiff(activeRepoId, path).then((d) => setDiffCache((c) => ({ ...c, [key]: d })));
+    },
+    [activeRepoId, diffCache, source],
+  );
+
+  const openFile = useCallback<WorkspaceContextValue['openFile']>(
+    (node) => {
+      setOpenTabs((tabs) =>
+        tabs.some((t) => t.id === node.id)
+          ? tabs
+          : [...tabs, { id: node.id, title: node.name, kind: 'code', path: node.id, lang: node.lang ?? guessLang(node.id) }],
+      );
+      setActiveTabId(node.id);
+      fetchFile(node.id);
+    },
+    [fetchFile],
+  );
+
+  const openStructure = useCallback(() => {
+    const id = `structure:${activeRepoId}`;
+    setOpenTabs((tabs) => (tabs.some((t) => t.id === id) ? tabs : [...tabs, { id, title: `${activeRepoId} — structure`, kind: 'structure' }]));
+    setActiveTabId(id);
+  }, [activeRepoId]);
+
+  const openDiff = useCallback(
+    (path: string) => {
+      const id = `diff:${path}`;
+      const name = path.split('/').pop() ?? path;
+      setOpenTabs((tabs) => (tabs.some((t) => t.id === id) ? tabs : [...tabs, { id, title: name, kind: 'diff', path, lang: fileIndex[path]?.lang ?? guessLang(path) }]));
+      setActiveTabId(id);
+      fetchDiff(path);
+    },
+    [fileIndex, fetchDiff],
+  );
+
+  const setActiveTab = useCallback((id: string) => setActiveTabId(id), []);
+
+  const closeTab = useCallback((id: string) => {
+    setOpenTabs((tabs) => {
+      const idx = tabs.findIndex((t) => t.id === id);
+      if (idx === -1) return tabs;
+      const next = tabs.filter((t) => t.id !== id);
+      setActiveTabId((cur) => (cur !== id ? cur : next.length === 0 ? null : next[Math.min(idx, next.length - 1)].id));
+      return next;
+    });
+  }, []);
+
+  const fileContent = useCallback(
+    (path: string): FileContent => fileCache[`${activeRepoId}:${path}`] ?? data?.files[path] ?? loadingFile(path),
+    [fileCache, activeRepoId, data],
+  );
+  const fileDiff = useCallback(
+    (path: string): DiffPayload => diffCache[`${activeRepoId}:${path}`] ?? loadingDiff(path),
+    [diffCache, activeRepoId],
+  );
+
+  // ── settings + overlay + shortcuts ──────────────────────────────────────────
   const [settings, setSettings] = useState<EditorSettings>(readSettings);
   const updateSettings = useCallback((patch: Partial<EditorSettings>) => {
     setSettings((s) => {
@@ -155,7 +279,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
   const [overlay, setOverlay] = useState<Overlay>(null);
 
-  // Global shortcuts: ⌘/Ctrl+B toggles the panel column; ? opens the shortcuts help.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -173,80 +296,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [toggleColumn]);
 
-  const openFile = useCallback<WorkspaceContextValue['openFile']>((node) => {
-    setOpenTabs((tabs) => {
-      if (tabs.some((t) => t.id === node.id)) return tabs;
-      const newTab: Tab = { id: node.id, title: node.name, kind: 'code', path: node.id, lang: node.lang ?? 'plaintext' };
-      return [...tabs, newTab];
-    });
-    setActiveTabId(node.id);
-  }, []);
-
-  const openStructure = useCallback(() => {
-    const id = `structure:${activeRepoId}`;
-    setOpenTabs((tabs) => {
-      if (tabs.some((t) => t.id === id)) return tabs;
-      return [...tabs, { id, title: `${activeRepoId} — structure`, kind: 'structure' }];
-    });
-    setActiveTabId(id);
-  }, [activeRepoId]);
-
-  const openDiff = useCallback(
-    (path: string) => {
-      const id = `diff:${path}`;
-      const name = path.split('/').pop() ?? path;
-      setOpenTabs((tabs) =>
-        tabs.some((t) => t.id === id)
-          ? tabs
-          : [...tabs, { id, title: name, kind: 'diff', path, lang: fileIndex[path]?.lang ?? guessLang(path) }],
-      );
-      setActiveTabId(id);
-    },
-    [fileIndex],
-  );
-
-  const setActiveTab = useCallback((id: string) => setActiveTabId(id), []);
-
-  const closeTab = useCallback((id: string) => {
-    setOpenTabs((tabs) => {
-      const idx = tabs.findIndex((t) => t.id === id);
-      if (idx === -1) return tabs;
-      const next = tabs.filter((t) => t.id !== id);
-      setActiveTabId((cur) => {
-        if (cur !== id) return cur;
-        if (next.length === 0) return null;
-        return next[Math.min(idx, next.length - 1)].id;
-      });
-      return next;
-    });
-  }, []);
-
-  const fileContent = useCallback(
-    (path: string): FileContent => {
-      const explicit = data.files[path];
-      if (explicit) return explicit;
-      const node = fileIndex[path];
-      return stubContent(path, node?.lang ?? 'plaintext');
-    },
-    [data.files, fileIndex],
-  );
-
-  const fileDiff = useCallback(
-    (path: string) => {
-      const after = fileContent(path);
-      const change = data.changes.find((c) => c.path === path);
-      const status = change?.status;
-      if (status === 'added' || status === 'untracked') return { before: '', after: after.code, lang: after.lang };
-      if (status === 'deleted') return { before: after.code, after: '', lang: after.lang };
-      const before = data.diffBefore?.[path] ?? synthBefore(after.code);
-      return { before, after: after.code, lang: after.lang };
-    },
-    [data.changes, data.diffBefore, fileContent],
-  );
+  if (phase === 'login') return <LoginGate onSubmit={login} />;
+  if (phase === 'boot' || !data) return <Splash />;
 
   const value: WorkspaceContextValue = {
-    repos: REPOS,
-    activeRepo: REPOS.find((r) => r.id === activeRepoId)!,
+    repos,
+    activeRepo: repos.find((r) => r.id === activeRepoId) ?? FALLBACK_REPO,
     data,
     setRepo,
     branches: data.branches,
@@ -272,6 +327,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   };
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
+}
+
+function Splash() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-4 bg-bg-base text-text-primary">
+      <span className="flex h-12 w-12 animate-pulse items-center justify-center rounded-2xl bg-surface-raised shadow-elev-2 ring-1 ring-separator">
+        <CodeIcon className="h-6 w-6 text-accent" />
+      </span>
+      <p className="text-footnote text-text-tertiary">Loading workspace…</p>
+    </div>
+  );
 }
 
 export function useWorkspace(): WorkspaceContextValue {

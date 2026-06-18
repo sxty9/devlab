@@ -13,5 +13,12 @@ export default defineConfig({
     alias: [{ find: '@', replacement: r('./src') }],
     dedupe: ['react', 'react-dom'],
   },
+  server: {
+    port: 5173,
+    // Reach the local devlabd backend during `vite dev`; /api/ws/* upgrades for terminal/Claude.
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:8780', changeOrigin: false, ws: true },
+    },
+  },
   build: { outDir: 'dist', emptyOutDir: true },
 });
