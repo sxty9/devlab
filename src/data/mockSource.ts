@@ -24,10 +24,10 @@ const data = (id: string): RepoData => REPO_DATA[id] ?? REPO_DATA[DEFAULT_REPO_I
 /** The bundled mock data source — the permanent offline/dev fallback. */
 export const mockSource: DataSource = {
   async init() {
-    return { mode: 'mock', gated: false, authed: true };
+    return { mode: 'mock', signedIn: true, canUseDevlab: true };
   },
-  async login() {
-    return true;
+  async getUser() {
+    return { username: 'dev', displayName: 'Developer', isAdmin: true, canUseDevlab: true };
   },
   async repos() {
     return REPOS;

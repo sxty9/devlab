@@ -3,10 +3,8 @@
 package api
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"os"
 
@@ -31,23 +29,34 @@ func New(v *auth.Verifier) *Server {
 	return &Server{v: v, reposBase: base}
 }
 
+// ctxKey namespaces the resolved user stashed in the request context by the guards.
+type ctxKey int
+
+const userCtxKey ctxKey = 0
+
+// userFrom returns the authenticated user a guard placed on the request (nil if none).
+func userFrom(r *http.Request) *auth.User {
+	u, _ := r.Context().Value(userCtxKey).(*auth.User)
+	return u
+}
+
 // Handler returns the routed handler (Go 1.22 method+path patterns).
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/health", s.health)
-	mux.HandleFunc("POST /api/session", s.session)
+	mux.HandleFunc("GET /api/user", s.guardAuthed(s.user))
 
-	// Read tier (preview password OR full).
-	mux.HandleFunc("GET /api/repos", s.guard(false, false, s.repos))
-	mux.HandleFunc("GET /api/repos/{id}", s.guard(false, false, s.repoData))
-	mux.HandleFunc("GET /api/repos/{id}/branches", s.guard(false, false, s.branches))
-	mux.HandleFunc("GET /api/repos/{id}/tree", s.guard(false, false, s.tree))
-	mux.HandleFunc("GET /api/repos/{id}/file", s.guard(false, false, s.file))
-	mux.HandleFunc("GET /api/repos/{id}/changes", s.guard(false, false, s.changes))
-	mux.HandleFunc("GET /api/repos/{id}/diff", s.guard(false, false, s.diff))
-	mux.HandleFunc("GET /api/repos/{id}/commits", s.guard(false, false, s.commits))
-	mux.HandleFunc("GET /api/repos/{id}/worktrees", s.guard(false, false, s.worktrees))
+	// Read tier — a valid Holistic session that holds hp_devlab_access.
+	mux.HandleFunc("GET /api/repos", s.guard(s.repos))
+	mux.HandleFunc("GET /api/repos/{id}", s.guard(s.repoData))
+	mux.HandleFunc("GET /api/repos/{id}/branches", s.guard(s.branches))
+	mux.HandleFunc("GET /api/repos/{id}/tree", s.guard(s.tree))
+	mux.HandleFunc("GET /api/repos/{id}/file", s.guard(s.file))
+	mux.HandleFunc("GET /api/repos/{id}/changes", s.guard(s.changes))
+	mux.HandleFunc("GET /api/repos/{id}/diff", s.guard(s.diff))
+	mux.HandleFunc("GET /api/repos/{id}/commits", s.guard(s.commits))
+	mux.HandleFunc("GET /api/repos/{id}/worktrees", s.guard(s.worktrees))
 
 	// Anything else under /api 404s as JSON; non-/api is served by Caddy (static_proxy).
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -57,71 +66,44 @@ func (s *Server) Handler() http.Handler {
 	return secureHeaders(mux)
 }
 
-type handler func(w http.ResponseWriter, r *http.Request)
-
-// guard enforces the access tier: any auth for reads; Full for power ops; optional CSRF.
-func (s *Server) guard(power, csrf bool, h handler) http.HandlerFunc {
+// guardAuthed requires a valid Holistic session and stashes the resolved user on the request.
+// It does NOT enforce the DevLab right — used by /api/user so the SPA can tell "signed in but
+// no access" from "not signed in".
+func (s *Server) guardAuthed(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		lvl := s.v.Level(r)
-		if lvl == auth.None {
+		u, err := s.v.User(r)
+		if err != nil {
 			writeErr(w, http.StatusUnauthorized, "Not authenticated")
 			return
 		}
-		if power && lvl != auth.Full {
-			writeErr(w, http.StatusForbidden, "This action is disabled on the public preview")
-			return
-		}
-		if csrf && !s.v.CheckCSRF(r) {
-			writeErr(w, http.StatusForbidden, "CSRF check failed")
+		h(w, r.WithContext(context.WithValue(r.Context(), userCtxKey, u)))
+	}
+}
+
+// guard additionally enforces the single DevLab right (hp_devlab_access; admin implicit).
+func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
+	return s.guardAuthed(func(w http.ResponseWriter, r *http.Request) {
+		if u := userFrom(r); u == nil || !u.CanUseDevlab() {
+			writeErr(w, http.StatusForbidden, "DevLab requires the hp_devlab_access right")
 			return
 		}
 		h(w, r)
-	}
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "devlab", "version": version, "previewGated": s.v.PreviewGated()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "devlab", "version": version})
 }
 
-// session exchanges the shared preview password for the dl_preview + dl_csrf cookies.
-func (s *Server) session(w http.ResponseWriter, r *http.Request) {
-	if !s.v.PreviewGated() {
-		// Not a password-gated deployment (dev/JWT): nothing to do.
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "gated": false})
-		return
-	}
-	var body struct {
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil && err != io.EOF {
-		writeErr(w, http.StatusBadRequest, "Invalid request body")
-		return
-	}
-	if !s.v.CheckPassword(body.Password) {
-		writeErr(w, http.StatusUnauthorized, "Wrong password")
-		return
-	}
-	secure := os.Getenv("DEVLAB_COOKIE_SECURE") == "1"
-	http.SetCookie(w, &http.Cookie{
-		Name: previewCookieName, Value: s.v.PreviewCookieValue(), Path: "/",
-		HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode, MaxAge: 60 * 60 * 12,
+// user returns the caller's identity + whether they may use DevLab (the SPA's bootstrap probe).
+func (s *Server) user(w http.ResponseWriter, r *http.Request) {
+	u := userFrom(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"username":     u.Username,
+		"displayName":  auth.DisplayName(u.Username),
+		"isAdmin":      u.IsAdmin,
+		"canUseDevlab": u.CanUseDevlab(),
 	})
-	http.SetCookie(w, &http.Cookie{
-		Name: csrfCookieName, Value: randomToken(), Path: "/",
-		HttpOnly: false, Secure: secure, SameSite: http.SameSiteLaxMode, MaxAge: 60 * 60 * 12,
-	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "gated": true})
-}
-
-const (
-	previewCookieName = "dl_preview"
-	csrfCookieName    = "dl_csrf"
-)
-
-func randomToken() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // repoPath resolves {id} to a local working copy, writing 404 if unknown.

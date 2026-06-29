@@ -1,4 +1,4 @@
-import type { FileContent, Repo, RepoData } from '@/types';
+import type { FileContent, Repo, RepoData, User } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -9,17 +9,17 @@ export interface DiffPayload {
 export interface InitResult {
   /** 'api' when the Go backend is reachable; 'mock' when offline (dev fallback). */
   mode: 'api' | 'mock';
-  /** true when a shared preview password is required. */
-  gated: boolean;
-  /** true when the current request is already authorized. */
-  authed: boolean;
+  /** true when a valid Holistic session is present on this origin (the SSO cookie). */
+  signedIn: boolean;
+  /** true when the signed-in user holds hp_devlab_access (or is admin). */
+  canUseDevlab: boolean;
 }
 
 /** The single seam between the UI and its data. mockSource serves bundled mock data;
  *  httpSource talks to the devlabd /api. The UI components are agnostic to which is active. */
 export interface DataSource {
   init(): Promise<InitResult>;
-  login(password: string): Promise<boolean>;
+  getUser(): Promise<User>;
   repos(): Promise<Repo[]>;
   repoData(id: string, branch?: string): Promise<RepoData>;
   fileContent(id: string, path: string): Promise<FileContent>;

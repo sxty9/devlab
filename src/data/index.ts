@@ -19,7 +19,7 @@ export const dataSource: DataSource = {
     impl = res.mode === 'mock' && forced !== 'api' ? mockSource : httpSource;
     return res;
   },
-  login: (pw) => impl.login(pw),
+  getUser: () => impl.getUser(),
   repos: () => impl.repos(),
   repoData: (id, b) => impl.repoData(id, b),
   fileContent: (id, p) => impl.fileContent(id, p),

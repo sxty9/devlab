@@ -1,9 +1,10 @@
 import { AuthRequiredError, type DataSource, type DiffPayload, type InitResult } from './source';
+import type { User } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
 function csrfToken(): string {
-  const m = document.cookie.match(/(?:^|;\s*)dl_csrf=([^;]+)/);
+  const m = document.cookie.match(/(?:^|;\s*)h_csrf=([^;]+)/);
   return m ? decodeURIComponent(m[1]) : '';
 }
 
@@ -23,30 +24,27 @@ async function json<T>(res: Response): Promise<T> {
 
 const enc = encodeURIComponent;
 
-/** Talks to the devlabd backend over /api (same-origin, cookie auth). */
+/** Talks to the devlabd backend over /api (same-origin, Holistic SSO cookie auth). */
 export const httpSource: DataSource = {
   async init(): Promise<InitResult> {
     try {
       const h = await fetch('/api/health', opts);
-      if (!h.ok) return { mode: 'mock', gated: false, authed: true };
-      const hd = (await h.json()) as { previewGated?: boolean };
-      // A cheap authorization probe.
-      const probe = await fetch('/api/repos', opts);
-      return { mode: 'api', gated: !!hd.previewGated, authed: probe.status !== 401 };
+      if (!h.ok) return { mode: 'mock', signedIn: true, canUseDevlab: true };
+      // /api/user requires only a session (not the right), so we can tell
+      // "signed in but no access" from "not signed in".
+      const u = await fetch('/api/user', opts);
+      if (u.status === 401) return { mode: 'api', signedIn: false, canUseDevlab: false };
+      if (!u.ok) return { mode: 'api', signedIn: true, canUseDevlab: false };
+      const body = (await u.json()) as { canUseDevlab?: boolean };
+      return { mode: 'api', signedIn: true, canUseDevlab: !!body.canUseDevlab };
     } catch {
       // Backend unreachable (offline dev) → caller falls back to mock.
-      return { mode: 'mock', gated: false, authed: true };
+      return { mode: 'mock', signedIn: true, canUseDevlab: true };
     }
   },
 
-  async login(password) {
-    const res = await fetch('/api/session', {
-      ...opts,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-    return res.ok;
+  async getUser(): Promise<User> {
+    return json(await fetch('/api/user', opts));
   },
 
   async repos() {

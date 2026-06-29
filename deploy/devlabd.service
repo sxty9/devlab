@@ -1,0 +1,65 @@
+# DevLab backend (devlabd) — production systemd unit.
+#
+# Slice 0 reads the operator's local working copies under /home/nanu and discovers repos via the
+# operator's `gh` auth, so the daemon runs as `nanu` (the owner of both). It only needs read
+# access; nothing under /home is written. Slice 3 re-architects storage to per-user clones under
+# /var/lib/devlab with per-user GitHub tokens, at which point this should move to a dedicated
+# unprivileged `devlab` system user (no /home access, no shared gh PAT).
+#
+# Install (run once, as root):
+#   # 1. binary + unit
+#   sudo install -m0755 devlabd /usr/local/bin/devlabd
+#   sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
+#   # 2. rights manifest → privleg discovers it; create the backing group (mirrors the
+#   #    holistic-service-template install_permissions step)
+#   sudo install -m0644 permissions/devlab.json /etc/holistic/permissions.d/devlab.json
+#   sudo groupadd -f hp_devlab_access
+#   # 3. let nanu read the shared Holistic session secret (validates the h_access SSO cookie)
+#   sudo usermod -aG holistic nanu        # log out/in or restart the unit for it to take effect
+#   # 4. start
+#   sudo systemctl daemon-reload && sudo systemctl enable --now devlabd
+#
+# Grant a non-admin developer access (admins are implicitly allowed):
+#   privleg-grant <user> hp_devlab_access on     # or via the privleg UI
+#
+# Register the production route (Cloudflare tunnel via sxgate):
+#   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8780
+#   sudo /home/nanu/sxgate/sxgate route add devlab.henrysoase.org devlab
+#   (+ a proxied CNAME `devlab` in the Cloudflare DNS for henrysoase.org)
+
+[Unit]
+Description=DevLab backend (devlabd)
+After=network.target
+
+[Service]
+Type=simple
+User=nanu
+SupplementaryGroups=holistic
+ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8780
+Restart=on-failure
+RestartSec=3
+
+# Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable secret
+# makes devlabd refuse to start in SSO mode (fail closed) rather than accept forged tokens.
+Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
+# Cookies issued by devlabd (CSRF refresh, Slice 1) are domain-wide + secure in production.
+Environment=DEVLAB_COOKIE_SECURE=1
+Environment=DEVLAB_COOKIE_DOMAIN=.henrysoase.org
+# Slice 0 reads local working copies; Slice 2/3 add per-user GitHub + workspaces:
+Environment=DEVLAB_REPOS_PATH=/home/nanu
+# Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json   # Slice 1: honor logout at refresh
+# Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
+# Environment=DEVLAB_LINKS=/var/lib/devlab/links
+# Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
+# Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
+
+# Hardening.
+StateDirectory=devlab
+ReadWritePaths=/var/lib/devlab
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

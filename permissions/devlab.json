@@ -1,0 +1,20 @@
+{
+  "service": "devlab",
+  "version": 1,
+  "categories": [
+    {
+      "id": "access",
+      "label": "DevLab",
+      "description": "Zugang zur DevLab-Entwicklungsumgebung. Welche Repositories sichtbar sind und was darin erlaubt ist (lesen, committen, pushen), bestimmt ausschließlich das verknüpfte GitHub-Konto des Benutzers.",
+      "permissions": [
+        {
+          "id": "access",
+          "label": "DevLab nutzen",
+          "description": "Erlaubt die Nutzung der DevLab-Entwicklungsumgebung. Ohne dieses Recht ist DevLab nicht zugänglich. Alle weiteren Rechte (Repo-Sichtbarkeit, Schreib- und Push-Rechte) werden über GitHub verwaltet.",
+          "group": "hp_devlab_access",
+          "default": false
+        }
+      ]
+    }
+  ]
+}

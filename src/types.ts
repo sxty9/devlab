@@ -5,6 +5,15 @@
 /** The tools in the left icon rail. */
 export type PanelId = 'vision' | 'project' | 'vcs' | 'git' | 'claude' | 'terminal';
 
+/** The signed-in DevLab user. Identity comes from the Holistic session (a Linux account);
+ *  `canUseDevlab` reflects the single Holistic right (hp_devlab_access, admin implicit). */
+export interface User {
+  username: string;
+  displayName: string;
+  isAdmin: boolean;
+  canUseDevlab: boolean;
+}
+
 /** User-tunable editor settings (Settings modal → Monaco). */
 export interface EditorSettings {
   fontSize: number;

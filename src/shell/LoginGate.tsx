@@ -1,26 +1,20 @@
-import { useState } from 'react';
 import { CodeIcon } from '@/ui/icons';
 import { Button } from '@/ui/Button';
+import type { User } from '@/types';
 
-/** Full-screen password gate for the public sxgate preview (read-only, shared password). */
-export function LoginGate({ onSubmit }: { onSubmit: (password: string) => Promise<boolean> }) {
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
+/** Resolve the Holistic dashboard origin from DevLab's own host: devlab.<zone> → holistic.<zone>.
+ *  Falls back to a bare path in dev/unknown hosts. */
+function holisticOrigin(): string {
+  if (typeof window === 'undefined') return '/';
+  const { protocol, hostname, host } = window.location;
+  const parts = hostname.split('.');
+  if (parts.length >= 2) {
+    return `${protocol}//holistic.${parts.slice(1).join('.')}`;
+  }
+  return `${protocol}//${host}`;
+}
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!password.trim() || busy) return;
-    setBusy(true);
-    setError('');
-    const ok = await onSubmit(password).catch(() => false);
-    setBusy(false);
-    if (!ok) {
-      setError('Wrong password.');
-      setPassword('');
-    }
-  };
-
+function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-full flex-col items-center justify-center bg-bg-base px-6 text-center text-text-primary">
       <div className="relative">
@@ -30,27 +24,58 @@ export function LoginGate({ onSubmit }: { onSubmit: (password: string) => Promis
         </span>
       </div>
       <h1 className="mt-5 text-title2 font-semibold tracking-tight">DevLab</h1>
-      <p className="mt-1 max-w-xs text-footnote text-text-secondary">
-        This preview is read-only and password-protected. Enter the shared preview password.
-      </p>
-
-      <form onSubmit={submit} className="mt-6 flex w-full max-w-xs flex-col gap-2">
-        <input
-          type="password"
-          autoFocus
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Preview password"
-          aria-label="Preview password"
-          className="w-full rounded-md border border-separator bg-fill/10 px-3 py-2.5 text-center text-footnote text-text-primary placeholder:text-text-tertiary focus:border-accent/50 focus:outline-none focus:ring-2 focus:ring-accent/40"
-        />
-        {error && <p className="text-caption text-danger">{error}</p>}
-        <Button type="submit" variant="primary" size="md" disabled={busy || !password.trim()} className="w-full">
-          {busy ? 'Checking…' : 'Enter'}
-        </Button>
-      </form>
-
-      <p className="mt-6 text-caption text-text-tertiary">Holistic DevLab · preview via sxgate</p>
+      {children}
+      <p className="mt-6 text-caption text-text-tertiary">Holistic DevLab</p>
     </div>
+  );
+}
+
+/** Shown when there is no Holistic session on this origin. Sign in via the Holistic dashboard;
+ *  the shared session cookie then carries to DevLab. */
+export function SignInGate() {
+  return (
+    <Shell>
+      <p className="mt-1 max-w-xs text-footnote text-text-secondary">
+        Bitte über Holistic anmelden. Deine Sitzung gilt dann auch hier.
+      </p>
+      <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
+        <Button
+          variant="primary"
+          size="md"
+          className="w-full"
+          onClick={() => {
+            window.location.href = holisticOrigin();
+          }}
+        >
+          Bei Holistic anmelden
+        </Button>
+        <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
+          Erneut prüfen
+        </Button>
+      </div>
+    </Shell>
+  );
+}
+
+/** Shown when the user IS signed in but lacks the hp_devlab_access right. */
+export function AccessDenied({ user }: { user: User }) {
+  return (
+    <Shell>
+      <p className="mt-1 max-w-sm text-footnote text-text-secondary">
+        {user.displayName || user.username ? (
+          <>
+            Angemeldet als <span className="font-medium text-text-primary">{user.displayName || user.username}</span>.{' '}
+          </>
+        ) : null}
+        Für DevLab fehlt dir die Berechtigung. Ein Administrator kann dir das Recht{' '}
+        <code className="rounded bg-fill/10 px-1 py-0.5 text-caption text-text-primary">hp_devlab_access</code>{' '}
+        über privleg erteilen.
+      </p>
+      <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
+        <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
+          Erneut prüfen
+        </Button>
+      </div>
+    </Shell>
   );
 }

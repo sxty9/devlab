@@ -24,10 +24,14 @@ func main() {
 	flag.Parse()
 
 	v := auth.New()
-	if v.PreviewGated() {
-		log.Print("devlabd: preview mode (shared-password read-only)")
+	if v.DevBypass() {
+		log.Print("devlabd: dev-bypass mode (full access, no auth)")
+	} else if !v.HasSecret() {
+		// Refuse to serve without a real secret: an empty HMAC key would validate forged
+		// tokens (fail-open). Set HOLISTIC_SECRET_FILE or run with DEVLAB_DEV_BYPASS_AUTH=1.
+		log.Fatal("devlabd: no JWT secret (set HOLISTIC_SECRET_FILE) — refusing to start in SSO mode")
 	} else {
-		log.Print("devlabd: full-access mode (dev-bypass or holistic JWT)")
+		log.Print("devlabd: holistic SSO mode (hp_devlab_access required)")
 	}
 
 	srv := &http.Server{

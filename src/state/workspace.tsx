@@ -8,11 +8,11 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab } from '@/types';
+import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab, User } from '@/types';
 import { getDataSource, type DiffPayload } from '@/data';
 import { guessLang } from '@/lib/lang';
 import { CodeIcon } from '@/ui/icons';
-import { LoginGate } from '@/shell/LoginGate';
+import { SignInGate, AccessDenied } from '@/shell/LoginGate';
 
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
 const FALLBACK_REPO: Repo = { id: '', name: '…', kind: 'repo', description: '', language: '', tint: 'accent' };
@@ -35,6 +35,7 @@ function readSettings(): EditorSettings {
 }
 
 interface WorkspaceContextValue {
+  user: User;
   repos: Repo[];
   activeRepo: Repo;
   data: RepoData;
@@ -80,12 +81,15 @@ function indexTree(nodes: FileNode[], acc: Record<string, FileNode> = {}): Recor
 const loadingFile = (path: string): FileContent => ({ path, lang: guessLang(path), code: '// loading…\n' });
 const loadingDiff = (path: string): DiffPayload => ({ before: '', after: '// loading…\n', lang: guessLang(path) });
 
-type Phase = 'boot' | 'login' | 'ready';
+type Phase = 'boot' | 'login' | 'denied' | 'ready';
+
+const FALLBACK_USER: User = { username: '', displayName: '', isAdmin: false, canUseDevlab: false };
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const source = useMemo(() => getDataSource(), []);
 
   const [phase, setPhase] = useState<Phase>('boot');
+  const [user, setUser] = useState<User>(FALLBACK_USER);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [activeRepoId, setActiveRepoId] = useState('');
   const [data, setData] = useState<RepoData | null>(null);
@@ -113,9 +117,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // ── boot: detect api/mock + auth, then load the first repo ──────────────────
+  // ── boot: detect api/mock + auth, then load identity + the first repo ───────
   const bootstrap = useCallback(async () => {
-    const rs = await source.repos();
+    const [u, rs] = await Promise.all([source.getUser(), source.repos()]);
+    setUser(u);
     setRepos(rs);
     const first = rs[0]?.id ?? '';
     setActiveRepoId(first);
@@ -132,8 +137,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       .init()
       .then((res) => {
         if (cancelled) return;
-        if (res.gated && !res.authed) {
+        if (!res.signedIn) {
           setPhase('login');
+          return;
+        }
+        if (!res.canUseDevlab) {
+          // Name the user on the access-denied screen, best-effort.
+          source.getUser().then((u) => !cancelled && setUser(u)).catch(() => {});
+          setPhase('denied');
           return;
         }
         return bootstrap();
@@ -143,18 +154,6 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       cancelled = true;
     };
   }, [source, bootstrap]);
-
-  const login = useCallback(
-    async (password: string) => {
-      const ok = await source.login(password);
-      if (ok) {
-        setPhase('boot');
-        await bootstrap();
-      }
-      return ok;
-    },
-    [source, bootstrap],
-  );
 
   // ── repo switching ──────────────────────────────────────────────────────────
   const setRepo = useCallback(
@@ -296,10 +295,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [toggleColumn]);
 
-  if (phase === 'login') return <LoginGate onSubmit={login} />;
+  if (phase === 'login') return <SignInGate />;
+  if (phase === 'denied') return <AccessDenied user={user} />;
   if (phase === 'boot' || !data) return <Splash />;
 
   const value: WorkspaceContextValue = {
+    user,
     repos,
     activeRepo: repos.find((r) => r.id === activeRepoId) ?? FALLBACK_REPO,
     data,
