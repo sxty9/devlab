@@ -47,6 +47,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/user", s.guardAuthed(s.user))
 
+	// Local mint-only refresh: re-mints a fresh h_access from the shared h_refresh cookie so a
+	// 15-minute access expiry doesn't bounce the SPA to Holistic. No CSRF gate (SameSite=Lax on
+	// h_refresh blocks cross-site POSTs; the call only refreshes the caller's own session).
+	mux.HandleFunc("POST /api/auth/refresh", s.refresh)
+
 	// Read tier — a valid Holistic session that holds hp_devlab_access.
 	mux.HandleFunc("GET /api/repos", s.guard(s.repos))
 	mux.HandleFunc("GET /api/repos/{id}", s.guard(s.repoData))
@@ -93,6 +98,17 @@ func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "devlab", "version": version})
+}
+
+// refresh re-mints the access + CSRF cookies from a valid h_refresh, or 401s.
+func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
+	access, csrf, err := s.v.RefreshAccess(r)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "Session expired")
+		return
+	}
+	setSessionCookies(w, access, csrf)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // user returns the caller's identity + whether they may use DevLab (the SPA's bootstrap probe).

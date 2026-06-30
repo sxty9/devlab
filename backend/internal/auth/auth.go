@@ -10,23 +10,32 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
-	accessCookie = "h_access"
-	csrfCookie   = "h_csrf"
-	csrfHeader   = "X-CSRF-Token"
+	accessCookie  = "h_access"
+	refreshCookie = "h_refresh"
+	csrfCookie    = "h_csrf"
+	csrfHeader    = "X-CSRF-Token"
 
 	// devlabGroup is the sole DevLab right: the distributable "developer" Linux group.
 	devlabGroup = "hp_devlab_access"
+
+	// AccessTTL is the minted access-token lifetime, matching holistic's 15 minutes. The cookie
+	// max-age is set to match so browser and token expire together.
+	AccessTTL = 15 * time.Minute
 )
 
 // ErrNoSession means the request carried no valid, unexpired access token.
@@ -151,6 +160,105 @@ func (v *Verifier) devUser() *User {
 	}
 	groups, _ := resolveGroups(name)
 	return &User{Username: name, Groups: groups, IsAdmin: true}
+}
+
+// RefreshAccess implements DevLab's mint-only local refresh. It reads the shared h_refresh
+// cookie, validates it (HS256, type=="refresh", unexpired, backing account still exists),
+// consults the holistic revocation set READ-ONLY, and mints a fresh h_access + h_csrf.
+//
+// It deliberately does NOT rotate h_refresh and does NOT write any holistic state (no new sid,
+// no revocation). Holistic remains the single writer of session state (Single Source of Truth);
+// DevLab only re-mints short-lived access locally so the SPA survives a 15-minute expiry without
+// a redirect (preserving unsaved editor state) and without CORS-coupling to the holistic origin.
+func (v *Verifier) RefreshAccess(r *http.Request) (access, csrf string, err error) {
+	if len(v.secret) == 0 {
+		return "", "", ErrNoSession
+	}
+	c, err := r.Cookie(refreshCookie)
+	if err != nil || c.Value == "" {
+		return "", "", ErrNoSession
+	}
+	tok, err := jwt.Parse(c.Value, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("unexpected signing method")
+		}
+		return v.secret, nil
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithExpirationRequired())
+	if err != nil || !tok.Valid {
+		return "", "", ErrNoSession
+	}
+	claims, ok := tok.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", "", ErrNoSession
+	}
+	if t, _ := claims["type"].(string); t != "refresh" {
+		return "", "", ErrNoSession
+	}
+	sub, _ := claims["sub"].(string)
+	if sub == "" {
+		return "", "", ErrNoSession
+	}
+	// Honor a holistic logout/rotation if we can read the revocation set; if it's unreadable we
+	// fall back to the refresh-token TTL (documented degradation), never failing open louder.
+	if sid, _ := claims["sid"].(string); sid != "" && isRevoked(sid) {
+		return "", "", ErrNoSession
+	}
+	if _, exists := resolveGroups(sub); !exists {
+		return "", "", ErrNoSession
+	}
+	access, err = v.mintAccess(sub)
+	if err != nil {
+		return "", "", err
+	}
+	return access, newCSRF(), nil
+}
+
+// mintAccess signs a holistic-compatible access token {sub, type:"access", exp}.
+func (v *Verifier) mintAccess(sub string) (string, error) {
+	claims := jwt.MapClaims{
+		"sub":  sub,
+		"type": "access",
+		"exp":  time.Now().Add(AccessTTL).Unix(),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(v.secret)
+}
+
+// newCSRF generates a fresh double-submit token (32 hex chars), matching holistic's format.
+func newCSRF() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is catastrophic; an empty token simply fails the next CSRF check.
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+// revokedPath resolves the holistic revocation set (read-only for DevLab).
+func revokedPath() string {
+	if p := os.Getenv("HOLISTIC_REVOKED"); p != "" {
+		return p
+	}
+	return "/var/lib/holistic/revoked.json"
+}
+
+// isRevoked reports whether a session id appears in the holistic revocation set. An unreadable
+// or malformed set is treated as "not revoked" (fail-soft: logout honoring then degrades to the
+// refresh-token TTL, the documented fallback).
+func isRevoked(sid string) bool {
+	b, err := os.ReadFile(revokedPath())
+	if err != nil {
+		return false
+	}
+	var sids []string
+	if json.Unmarshal(b, &sids) != nil {
+		return false
+	}
+	for _, s := range sids {
+		if s == sid {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckCSRF enforces the double-submit guard: header X-CSRF-Token must equal the readable
