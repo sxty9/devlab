@@ -24,6 +24,8 @@ export const dataSource: DataSource = {
   repoData: (id, b) => impl.repoData(id, b),
   fileContent: (id, p) => impl.fileContent(id, p),
   fileDiff: (id, p) => impl.fileDiff(id, p),
+  githubAuthorizeUrl: () => impl.githubAuthorizeUrl(),
+  unlinkGitHub: () => impl.unlinkGitHub(),
 };
 
 export function getDataSource(): DataSource {

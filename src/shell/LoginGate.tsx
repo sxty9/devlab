@@ -14,7 +14,8 @@ function holisticOrigin(): string {
   return `${protocol}//${host}`;
 }
 
-function Shell({ children }: { children: React.ReactNode }) {
+/** The centered brand-mark frame shared by the sign-in, access-denied and GitHub-link gates. */
+export function GateShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-full flex-col items-center justify-center bg-bg-base px-6 text-center text-text-primary">
       <div className="relative">
@@ -34,7 +35,7 @@ function Shell({ children }: { children: React.ReactNode }) {
  *  the shared session cookie then carries to DevLab. */
 export function SignInGate() {
   return (
-    <Shell>
+    <GateShell>
       <p className="mt-1 max-w-xs text-footnote text-text-secondary">
         Bitte über Holistic anmelden. Deine Sitzung gilt dann auch hier.
       </p>
@@ -53,14 +54,14 @@ export function SignInGate() {
           Erneut prüfen
         </Button>
       </div>
-    </Shell>
+    </GateShell>
   );
 }
 
 /** Shown when the user IS signed in but lacks the hp_devlab_access right. */
 export function AccessDenied({ user }: { user: User }) {
   return (
-    <Shell>
+    <GateShell>
       <p className="mt-1 max-w-sm text-footnote text-text-secondary">
         {user.displayName || user.username ? (
           <>
@@ -76,6 +77,6 @@ export function AccessDenied({ user }: { user: User }) {
           Erneut prüfen
         </Button>
       </div>
-    </Shell>
+    </GateShell>
   );
 }

@@ -73,18 +73,18 @@ export const httpSource: DataSource = {
   async init(): Promise<InitResult> {
     try {
       const h = await fetch('/api/health', opts);
-      if (!h.ok) return { mode: 'mock', signedIn: true, canUseDevlab: true };
+      if (!h.ok) return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
       // /api/user requires only a session (not the right), so we can tell "signed in but no
       // access" from "not signed in". request() refreshes once on 401 so an expired access
       // token (with a still-valid refresh) does not bounce the user to the login gate.
       const u = await request('/api/user');
-      if (u.status === 401) return { mode: 'api', signedIn: false, canUseDevlab: false };
-      if (!u.ok) return { mode: 'api', signedIn: true, canUseDevlab: false };
-      const body = (await u.json()) as { canUseDevlab?: boolean };
-      return { mode: 'api', signedIn: true, canUseDevlab: !!body.canUseDevlab };
+      if (u.status === 401) return { mode: 'api', signedIn: false, canUseDevlab: false, githubLinked: false };
+      if (!u.ok) return { mode: 'api', signedIn: true, canUseDevlab: false, githubLinked: false };
+      const body = (await u.json()) as { canUseDevlab?: boolean; githubLinked?: boolean };
+      return { mode: 'api', signedIn: true, canUseDevlab: !!body.canUseDevlab, githubLinked: !!body.githubLinked };
     } catch {
       // Backend unreachable (offline dev) → caller falls back to mock.
-      return { mode: 'mock', signedIn: true, canUseDevlab: true };
+      return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
     }
   },
 
@@ -107,6 +107,15 @@ export const httpSource: DataSource = {
 
   async fileDiff(id, path): Promise<DiffPayload> {
     return json(await request(`/api/repos/${enc(id)}/diff?path=${enc(path)}`));
+  },
+
+  githubAuthorizeUrl() {
+    return '/api/github/authorize';
+  },
+
+  async unlinkGitHub() {
+    const res = await request('/api/github/unlink', withCsrf({ method: 'POST' }));
+    await json<void>(res);
   },
 };
 

@@ -10,8 +10,25 @@ import (
 	"devlab/backend/internal/model"
 )
 
-func (s *Server) repos(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, discover.Repos(s.reposBase))
+func (s *Server) repos(w http.ResponseWriter, r *http.Request) {
+	// Dev-bypass/preview sandbox: no per-user token → the local working-copy set.
+	if s.v.DevBypass() {
+		writeJSON(w, http.StatusOK, discover.Repos(s.reposBase))
+		return
+	}
+	u := userFrom(r)
+	token, err := s.userToken(u)
+	if err != nil {
+		// Not linked (the link gate should have prevented this) → an empty set, not an error.
+		writeJSON(w, http.StatusOK, []model.Repo{})
+		return
+	}
+	repos, err := discover.ReposForUser(r.Context(), u.Username, token)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "Could not reach GitHub")
+		return
+	}
+	writeJSON(w, http.StatusOK, repos)
 }
 
 func (s *Server) branches(w http.ResponseWriter, r *http.Request) {

@@ -13,9 +13,10 @@ import { getDataSource, type DiffPayload } from '@/data';
 import { guessLang } from '@/lib/lang';
 import { CodeIcon } from '@/ui/icons';
 import { SignInGate, AccessDenied } from '@/shell/LoginGate';
+import { GitHubLinkGate } from '@/shell/GitHubLinkGate';
 
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
-const FALLBACK_REPO: Repo = { id: '', name: '…', kind: 'repo', description: '', language: '', tint: 'accent' };
+const FALLBACK_REPO: Repo = { id: '', name: '…', fullName: '', kind: 'repo', description: '', language: '', tint: 'accent', permission: 'pull' };
 
 const defaultBranchName = (d: RepoData) => d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? FALLBACK_BRANCH.name;
 
@@ -81,9 +82,9 @@ function indexTree(nodes: FileNode[], acc: Record<string, FileNode> = {}): Recor
 const loadingFile = (path: string): FileContent => ({ path, lang: guessLang(path), code: '// loading…\n' });
 const loadingDiff = (path: string): DiffPayload => ({ before: '', after: '// loading…\n', lang: guessLang(path) });
 
-type Phase = 'boot' | 'login' | 'denied' | 'ready';
+type Phase = 'boot' | 'login' | 'denied' | 'github-link' | 'ready';
 
-const FALLBACK_USER: User = { username: '', displayName: '', isAdmin: false, canUseDevlab: false };
+const FALLBACK_USER: User = { username: '', displayName: '', isAdmin: false, canUseDevlab: false, githubLinked: false };
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const source = useMemo(() => getDataSource(), []);
@@ -145,6 +146,12 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           // Name the user on the access-denied screen, best-effort.
           source.getUser().then((u) => !cancelled && setUser(u)).catch(() => {});
           setPhase('denied');
+          return;
+        }
+        if (!res.githubLinked) {
+          // Mandatory GitHub link before the workspace loads; name the user best-effort.
+          source.getUser().then((u) => !cancelled && setUser(u)).catch(() => {});
+          setPhase('github-link');
           return;
         }
         return bootstrap();
@@ -297,6 +304,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
   if (phase === 'login') return <SignInGate />;
   if (phase === 'denied') return <AccessDenied user={user} />;
+  if (phase === 'github-link') return <GitHubLinkGate user={user} />;
   if (phase === 'boot' || !data) return <Splash />;
 
   const value: WorkspaceContextValue = {

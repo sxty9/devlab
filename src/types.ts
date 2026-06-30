@@ -6,12 +6,16 @@
 export type PanelId = 'vision' | 'project' | 'vcs' | 'git' | 'claude' | 'terminal';
 
 /** The signed-in DevLab user. Identity comes from the Holistic session (a Linux account);
- *  `canUseDevlab` reflects the single Holistic right (hp_devlab_access, admin implicit). */
+ *  `canUseDevlab` reflects the single Holistic right (hp_devlab_access, admin implicit).
+ *  `githubLinked` gates the workspace — repo visibility/authorization derive from GitHub. */
 export interface User {
   username: string;
   displayName: string;
   isAdmin: boolean;
   canUseDevlab: boolean;
+  githubLinked: boolean;
+  /** The linked GitHub login, when linked. */
+  githubLogin?: string;
 }
 
 /** User-tunable editor settings (Settings modal → Monaco). */
@@ -25,16 +29,23 @@ export type Overlay = 'settings' | 'help' | null;
 
 export type RepoKind = 'service' | 'repo' | 'library';
 
+/** The viewer's effective GitHub permission on a repo (the single source of truth for write). */
+export type RepoPermission = 'pull' | 'push' | 'admin';
+
 /** A selectable repository/service in the top-bar dropdown. */
 export interface Repo {
   id: string;
   name: string;
+  /** GitHub canonical "owner/repo". */
+  fullName: string;
   kind: RepoKind;
   description: string;
   /** Primary language label, e.g. "TypeScript", "Go", "Shell". */
   language: string;
   /** A design-token color name used as the repo's accent dot (accent | success | warning | gpu | net | ssd | ram). */
   tint: 'accent' | 'success' | 'warning' | 'gpu' | 'net' | 'ssd' | 'ram';
+  /** The viewer's effective right from GitHub; 'pull' repos are read-only in the UI. */
+  permission: RepoPermission;
 }
 
 /** A git branch / working session for the active repo. */

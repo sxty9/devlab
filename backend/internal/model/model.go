@@ -2,14 +2,17 @@
 // the TypeScript types in frontend src/types.ts exactly, so the UI consumes them unchanged.
 package model
 
-// Repo is a selectable repository/service (discovered from GitHub topic "holistic").
+// Repo is a selectable repository/service. The set is resolved per-user from GitHub (the single
+// source of truth for visibility and authorization), filtered to the holistic set.
 type Repo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
-	Kind        string `json:"kind"` // service | repo | library
+	FullName    string `json:"fullName"`   // owner/repo (GitHub canonical)
+	Kind        string `json:"kind"`       // service | repo | library
 	Description string `json:"description"`
 	Language    string `json:"language"`
-	Tint        string `json:"tint"` // accent | success | warning | gpu | net | ssd | ram
+	Tint        string `json:"tint"`       // accent | success | warning | gpu | net | ssd | ram
+	Permission  string `json:"permission"` // pull | push | admin (the viewer's effective right)
 }
 
 // Branch is a git branch with tracking info.
@@ -163,4 +166,32 @@ type Preview struct {
 	Service string `json:"service"`
 	URL     string `json:"url"`
 	State   string `json:"state"`
+}
+
+// CommitResult is returned after a successful commit.
+type CommitResult struct {
+	Hash    string   `json:"hash"`
+	Branch  string   `json:"branch"`
+	Changes []Change `json:"changes"`
+}
+
+// PushResult is returned after push/pull, carrying refreshed tracking + the raw git message.
+type PushResult struct {
+	Branch   string   `json:"branch"`
+	Ahead    int      `json:"ahead"`
+	Behind   int      `json:"behind"`
+	Message  string   `json:"message"`
+	Branches []Branch `json:"branches"`
+}
+
+// WriteResult is returned after a working-tree mutation (write/stage/unstage) with refreshed
+// change rows so the UI re-renders the VCS panel without a second round-trip.
+type WriteResult struct {
+	Changes []Change `json:"changes"`
+}
+
+// BranchResult is returned after creating/checking out a branch.
+type BranchResult struct {
+	Branch   string   `json:"branch"`
+	Branches []Branch `json:"branches"`
 }

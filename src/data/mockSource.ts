@@ -24,10 +24,10 @@ const data = (id: string): RepoData => REPO_DATA[id] ?? REPO_DATA[DEFAULT_REPO_I
 /** The bundled mock data source — the permanent offline/dev fallback. */
 export const mockSource: DataSource = {
   async init() {
-    return { mode: 'mock', signedIn: true, canUseDevlab: true };
+    return { mode: 'mock' as const, signedIn: true, canUseDevlab: true, githubLinked: true };
   },
   async getUser() {
-    return { username: 'dev', displayName: 'Developer', isAdmin: true, canUseDevlab: true };
+    return { username: 'dev', displayName: 'Developer', isAdmin: true, canUseDevlab: true, githubLinked: true, githubLogin: 'dev' };
   },
   async repos() {
     return REPOS;
@@ -46,5 +46,11 @@ export const mockSource: DataSource = {
     if (change?.status === 'added' || change?.status === 'untracked') return { before: '', after, lang };
     if (change?.status === 'deleted') return { before: after, after: '', lang };
     return { before: d.diffBefore?.[path] ?? synthBefore(after), after, lang };
+  },
+  githubAuthorizeUrl() {
+    return '#';
+  },
+  async unlinkGitHub() {
+    /* mock: no-op */
   },
 };

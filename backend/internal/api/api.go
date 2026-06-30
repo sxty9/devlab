@@ -5,28 +5,39 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"os"
 
 	"devlab/backend/internal/auth"
 	"devlab/backend/internal/discover"
+	"devlab/backend/internal/links"
 )
 
 const version = "0.1.0"
 
-// Server wires the verifier + repo base into HTTP handlers.
+// Server wires the verifier + repo base + per-user GitHub link store into HTTP handlers.
 type Server struct {
 	v         *auth.Verifier
 	reposBase string
+	links     *links.Store // nil when no encryption key is configured (dev/preview sandbox)
 }
 
-// New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies.
+// New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies. The link
+// store needs DEVLAB_LINK_ENC_KEY_FILE; when absent (dev-bypass/preview), GitHub linking is
+// disabled and discovery falls back to the local sandbox set.
 func New(v *auth.Verifier) *Server {
 	base := os.Getenv("DEVLAB_REPOS_PATH")
 	if base == "" {
 		base = "/home/nanu"
 	}
-	return &Server{v: v, reposBase: base}
+	store, err := links.NewStore()
+	if err != nil {
+		log.Printf("devlabd: GitHub link store disabled: %v", err)
+		store = nil
+	}
+	return &Server{v: v, reposBase: base, links: store}
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -51,6 +62,12 @@ func (s *Server) Handler() http.Handler {
 	// 15-minute access expiry doesn't bounce the SPA to Holistic. No CSRF gate (SameSite=Lax on
 	// h_refresh blocks cross-site POSTs; the call only refreshes the caller's own session).
 	mux.HandleFunc("POST /api/auth/refresh", s.refresh)
+
+	// GitHub linking (mandatory before the workspace loads). authorize/callback identify the
+	// user via the session; unlink mutates so it additionally checks CSRF.
+	mux.HandleFunc("GET /api/github/authorize", s.guard(s.githubAuthorize))
+	mux.HandleFunc("GET /api/github/callback", s.guard(s.githubCallback))
+	mux.HandleFunc("POST /api/github/unlink", s.guardWrite(s.githubUnlink))
 
 	// Read tier — a valid Holistic session that holds hp_devlab_access.
 	mux.HandleFunc("GET /api/repos", s.guard(s.repos))
@@ -96,6 +113,44 @@ func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
+// guardWrite gates mutating requests: a DevLab session (guard) + CSRF double-submit + a linked
+// GitHub account. Per-repo GitHub push permission is enforced inside the write handlers (Slice 3),
+// which know the target repo. Under dev-bypass the GitHub-link requirement is waived (sandbox).
+func (s *Server) guardWrite(h http.HandlerFunc) http.HandlerFunc {
+	return s.guard(func(w http.ResponseWriter, r *http.Request) {
+		if !s.v.CheckCSRF(r) {
+			writeErr(w, http.StatusForbidden, "Invalid CSRF token")
+			return
+		}
+		u := userFrom(r)
+		if !s.githubLinked(u) {
+			writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+			return
+		}
+		h(w, r)
+	})
+}
+
+// githubLinked reports whether the user has a usable GitHub link. Dev-bypass is treated as linked
+// (the sandbox operates on local clones with no per-user token).
+func (s *Server) githubLinked(u *auth.User) bool {
+	if s.v.DevBypass() {
+		return true
+	}
+	return s.links != nil && u != nil && s.links.Linked(u.Username)
+}
+
+// userToken returns the user's decrypted GitHub OAuth token (for server-side GitHub calls only —
+// never returned to the client). Errors when no link store or no link exists.
+func (s *Server) userToken(u *auth.User) (string, error) {
+	if s.links == nil || u == nil {
+		return "", errNoLink
+	}
+	return s.links.Token(u.Username)
+}
+
+var errNoLink = errors.New("no github link")
+
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "devlab", "version": version})
 }
@@ -111,14 +166,23 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// user returns the caller's identity + whether they may use DevLab (the SPA's bootstrap probe).
+// user returns the caller's identity, DevLab access, and GitHub-link status — the SPA's bootstrap
+// probe that drives the login / access-denied / github-link / ready gates.
 func (s *Server) user(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
+	ghLogin := ""
+	if s.links != nil {
+		if l, err := s.links.Get(u.Username); err == nil && l != nil {
+			ghLogin = l.GHLogin
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"username":     u.Username,
 		"displayName":  auth.DisplayName(u.Username),
 		"isAdmin":      u.IsAdmin,
 		"canUseDevlab": u.CanUseDevlab(),
+		"githubLinked": s.githubLinked(u),
+		"githubLogin":  ghLogin,
 	})
 }
 

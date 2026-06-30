@@ -22,6 +22,18 @@
 # Grant a non-admin developer access (admins are implicitly allowed):
 #   privleg-grant <user> hp_devlab_access on     # or via the privleg UI
 #
+# GitHub linking (Slice 2) — one-time operator setup:
+#   # a) Register a GitHub OAuth App (Settings → Developer settings → OAuth Apps):
+#   #      Homepage:      https://devlab.henrysoase.org
+#   #      Callback URL:  https://devlab.henrysoase.org/api/github/callback
+#   #    then drop its credentials (root:devlab 0640) where devlabd can read them:
+#   sudo install -d -m0750 -o root -g devlab /etc/devlab
+#   printf '{"client_id":"...","client_secret":"...","redirect_uri":"https://devlab.henrysoase.org/api/github/callback"}' \
+#     | sudo install -m0640 -o root -g devlab /dev/stdin /etc/devlab/github-oauth.json
+#   # b) 32-byte AES key that encrypts each user's GitHub token at rest:
+#   sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/devlab/link-key' && sudo chgrp devlab /etc/devlab/link-key && sudo chmod 0640 /etc/devlab/link-key
+#   # /var/lib/devlab/{links,workspaces} are created by StateDirectory + the daemon (0700).
+#
 # Register the production route (Cloudflare tunnel via sxgate):
 #   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8780
 #   sudo /home/nanu/sxgate/sxgate route add devlab.henrysoase.org devlab
@@ -42,16 +54,21 @@ RestartSec=3
 # Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable secret
 # makes devlabd refuse to start in SSO mode (fail closed) rather than accept forged tokens.
 Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
-# Cookies issued by devlabd (CSRF refresh, Slice 1) are domain-wide + secure in production.
+# Cookies re-minted by devlabd (local refresh) are domain-wide + secure in production, so they
+# overwrite the shared Holistic variants rather than shadowing them.
 Environment=DEVLAB_COOKIE_SECURE=1
 Environment=DEVLAB_COOKIE_DOMAIN=.henrysoase.org
-# Slice 0 reads local working copies; Slice 2/3 add per-user GitHub + workspaces:
+# Slice 0/2 reads local working copies in the sandbox; production discovery is per-user GitHub:
 Environment=DEVLAB_REPOS_PATH=/home/nanu
-# Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json   # Slice 1: honor logout at refresh
-# Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
-# Environment=DEVLAB_LINKS=/var/lib/devlab/links
-# Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
-# Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
+# Slice 1: honor a Holistic logout/rotation at refresh time (read-only). Falls back to the
+# refresh-token TTL if unreadable.
+Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json
+# Slice 2: per-user GitHub link store (AES-256-GCM token at rest) + OAuth app config.
+Environment=DEVLAB_LINKS=/var/lib/devlab/links
+Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
+Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
+# Slice 3: per-user git workspaces.
+Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
 
 # Hardening.
 StateDirectory=devlab
