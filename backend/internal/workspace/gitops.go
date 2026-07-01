@@ -76,7 +76,10 @@ func assertNoLeak(wt, token string) error {
 }
 
 func clone(ctx context.Context, wt, url, token string) error {
-	if _, err := runGit(gitCmd(ctx, "", token, "clone", "--", url, wt)); err != nil {
+	// core.symlinks=false makes git materialize any committed symlink as a plain text file (its
+	// target path) instead of a real symlink, neutralizing symlink-escape reads/writes for the
+	// whole life of this clone (persisted in .git/config, so branch switches honor it too).
+	if _, err := runGit(gitCmd(ctx, "", token, "-c", "core.symlinks=false", "clone", "--", url, wt)); err != nil {
 		return fmt.Errorf("clone failed: %w", err)
 	}
 	if err := assertNoLeak(wt, token); err != nil {

@@ -12,8 +12,9 @@ import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, R
 import { getDataSource, type CommitResult, type DiffPayload, type PushResult } from '@/data';
 import { guessLang } from '@/lib/lang';
 import { CodeIcon } from '@/ui/icons';
-import { SignInGate, AccessDenied } from '@/shell/LoginGate';
+import { SignInGate, AccessDenied, GateShell } from '@/shell/LoginGate';
 import { GitHubLinkGate } from '@/shell/GitHubLinkGate';
+import { Button } from '@/ui/Button';
 
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
 const FALLBACK_REPO: Repo = { id: '', name: '…', fullName: '', kind: 'repo', description: '', language: '', tint: 'accent', permission: 'pull' };
@@ -99,6 +100,13 @@ function indexTree(nodes: FileNode[], acc: Record<string, FileNode> = {}): Recor
 
 const loadingFile = (path: string): FileContent => ({ path, lang: guessLang(path), code: '// loading…\n' });
 const loadingDiff = (path: string): DiffPayload => ({ before: '', after: '// loading…\n', lang: guessLang(path) });
+
+/** Drop every entry whose key starts with prefix (used to evict one repo's buffers). */
+function stripPrefix<T>(obj: Record<string, T>, prefix: string): Record<string, T> {
+  const out: Record<string, T> = {};
+  for (const k in obj) if (!k.startsWith(prefix)) out[k] = obj[k];
+  return out;
+}
 
 type Phase = 'boot' | 'login' | 'denied' | 'github-link' | 'ready';
 
@@ -193,23 +201,44 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [activeRepoId, repos, source, applyData],
   );
 
+  // Evict a repo's cached file/diff/draft buffers (keyed by repo:path, branch-agnostic). Called on
+  // branch switch so an open file cannot keep the previous branch's content — otherwise a save
+  // would write the old branch's bytes onto the new branch. Also clears tab dirty flags.
+  const clearRepoBuffers = useCallback((repoId: string) => {
+    const prefix = `${repoId}:`;
+    setFileCache((c) => stripPrefix(c, prefix));
+    setDiffCache((c) => stripPrefix(c, prefix));
+    setDrafts((d) => stripPrefix(d, prefix));
+    setOpenTabs((tabs) => tabs.map((t) => (t.dirty ? { ...t, dirty: false } : t)));
+  }, []);
+
   const setBranch = useCallback(
     (name: string) => {
+      if (name === activeBranchName) return;
+      // In-browser drafts are built on the current branch's content and are never written to disk
+      // before a checkout (so the backend can't refuse). Confirm before discarding them.
+      const prefix = `${activeRepoId}:`;
+      if (Object.keys(drafts).some((k) => k.startsWith(prefix)) && !window.confirm('Discard unsaved changes and switch branch?')) {
+        return;
+      }
       const prev = activeBranchName;
       branchMemory.current[activeRepoId] = name;
       setActiveBranchName(name);
-      // Real checkout in the workspace, then load that branch's view. On refusal (e.g. a dirty
-      // tree) revert the selection so the UI matches the checked-out branch.
+      // Real checkout in the workspace, then load that branch's view, evicting the previous
+      // branch's cached content. On refusal (e.g. a dirty tree) revert the selection.
       source
         .checkout(activeRepoId, name)
         .then(() => source.repoData(activeRepoId, name))
-        .then((d) => applyData(activeRepoId, d, true))
+        .then((d) => {
+          clearRepoBuffers(activeRepoId);
+          applyData(activeRepoId, d, true);
+        })
         .catch(() => {
           branchMemory.current[activeRepoId] = prev;
           setActiveBranchName(prev);
         });
     },
-    [activeRepoId, activeBranchName, source, applyData],
+    [activeRepoId, activeBranchName, drafts, source, applyData, clearRepoBuffers],
   );
 
   // ── panels ──────────────────────────────────────────────────────────────────
@@ -309,6 +338,17 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     (path: string): DiffPayload => diffCache[`${activeRepoId}:${path}`] ?? loadingDiff(path),
     [diffCache, activeRepoId],
   );
+
+  // Keep the active tab's content loaded for the current branch. After a branch switch (which
+  // evicts the repo's file+diff caches) this refetches the open file/diff from the newly
+  // checked-out branch, so a code editor or diff view never shows another branch's content or
+  // gets stuck on the loading placeholder. fetchFile/fetchDiff short-circuit when cached.
+  useEffect(() => {
+    const tab = openTabs.find((t) => t.id === activeTabId);
+    if (!tab || !tab.path) return;
+    if (tab.kind === 'code') fetchFile(tab.path);
+    else if (tab.kind === 'diff') fetchDiff(tab.path);
+  }, [activeTabId, activeBranchName, openTabs, fetchFile, fetchDiff]);
 
   // ── editing + write loop ─────────────────────────────────────────────────────
   const diskContent = useCallback(
@@ -457,7 +497,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   if (phase === 'login') return <SignInGate />;
   if (phase === 'denied') return <AccessDenied user={user} />;
   if (phase === 'github-link') return <GitHubLinkGate user={user} />;
-  if (phase === 'boot' || !data) return <Splash />;
+  if (phase === 'boot') return <Splash />;
+  // Ready with no accessible repos: show an empty state rather than blocking on `!data` forever.
+  if (repos.length === 0) return <NoRepos />;
+  if (!data) return <Splash />;
 
   const activeRepo = repos.find((r) => r.id === activeRepoId) ?? FALLBACK_REPO;
   const canWrite = activeRepo.permission === 'push' || activeRepo.permission === 'admin';
@@ -513,6 +556,25 @@ function Splash() {
       </span>
       <p className="text-footnote text-text-tertiary">Loading workspace…</p>
     </div>
+  );
+}
+
+/** Shown when the user is authorized and GitHub-linked but has no repositories in the holistic
+ *  set visible to their GitHub account (so there is nothing to open). */
+function NoRepos() {
+  return (
+    <GateShell>
+      <p className="mt-1 max-w-sm text-footnote text-text-secondary">
+        Keine Repositories sichtbar. DevLab zeigt die Holistic-Repos, auf die dein verknüpftes
+        GitHub-Konto Zugriff hat — aktuell sind das keine. Sobald dir Zugriff gewährt wird,
+        erscheinen sie hier.
+      </p>
+      <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
+        <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
+          Erneut prüfen
+        </Button>
+      </div>
+    </GateShell>
   );
 }
 

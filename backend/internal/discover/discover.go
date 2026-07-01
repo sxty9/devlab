@@ -164,7 +164,10 @@ func lookup(user, id string) (full, perm string, ok bool) {
 	userMu.Lock()
 	defer userMu.Unlock()
 	e, present := userCache[user]
-	if !present {
+	// Treat an entry older than userTTL as absent so the caller repopulates via ReposForUser,
+	// which re-checks GitHub and drops repos the user can no longer see. Without this, a cache
+	// hit would let revoked GitHub access survive on the read hot path indefinitely.
+	if !present || time.Since(e.at) >= userTTL {
 		return "", "", false
 	}
 	for _, r := range e.repos {

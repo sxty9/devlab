@@ -16,9 +16,12 @@ import (
 
 const maxFileBytes = 2 << 20 // 2 MiB editor cap
 
-// run executes `git -C repo args…` and returns trimmed stdout.
+// run executes `git --no-optional-locks -C repo args…` and returns trimmed stdout.
+// --no-optional-locks keeps read commands (status/ls-files) from opportunistically taking
+// .git/index.lock, so a concurrent write op (git add/commit, holding the workspace mutex) in
+// another browser tab does not fail with "index.lock: File exists".
 func run(repo string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	cmd := exec.Command("git", append([]string{"--no-optional-locks", "-C", repo}, args...)...)
 	out, err := cmd.Output()
 	return strings.TrimRight(string(out), "\n"), err
 }
@@ -204,6 +207,12 @@ func FileAt(repo, rel string) model.FileContent {
 	if !strings.HasPrefix(abs, filepath.Clean(repo)+string(os.PathSeparator)) {
 		return model.FileContent{Path: rel, Lang: lang, Code: "// (refused: path escapes repository)\n"}
 	}
+	// A committed symlink can point outside the repo; os.ReadFile would follow it. Resolve links
+	// and confirm the target stays inside the (symlink-resolved) repo, mirroring the write path's
+	// guard, so a malicious repo cannot exfiltrate arbitrary server-side files.
+	if escapesViaSymlink(repo, abs) {
+		return model.FileContent{Path: rel, Lang: lang, Code: "// (refused: path escapes repository)\n"}
+	}
 	info, err := os.Stat(abs)
 	if err != nil {
 		return model.FileContent{Path: rel, Lang: lang, Code: "// (file not found)\n"}
@@ -219,6 +228,27 @@ func FileAt(repo, rel string) model.FileContent {
 		return model.FileContent{Path: rel, Lang: "plaintext", Code: "// (binary file)\n"}
 	}
 	return model.FileContent{Path: rel, Lang: lang, Code: string(b)}
+}
+
+// escapesViaSymlink reports whether abs resolves (through symlinks) to a location outside repo.
+// It resolves the deepest existing ancestor of abs so a symlinked directory anywhere on the path
+// is caught. Any resolution error on the repo root is treated as an escape (fail closed).
+func escapesViaSymlink(repo, abs string) bool {
+	root, err := filepath.EvalSymlinks(filepath.Clean(repo))
+	if err != nil {
+		return true
+	}
+	p := abs
+	for {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return real != root && !strings.HasPrefix(real, root+string(os.PathSeparator))
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false // no existing ancestor (path simply doesn't exist yet) — os.Stat handles it
+		}
+		p = parent
+	}
 }
 
 // showAt returns committed content of a path at a ref (empty if absent).
