@@ -1,9 +1,10 @@
+import { useState } from 'react';
 import { useWorkspace } from '@/state/workspace';
 import { PanelHeader } from './PanelHeader';
 import { CommitGraph } from './CommitGraph';
-import { IconButton } from '@/ui/Button';
+import { Button, IconButton } from '@/ui/Button';
 import { useToast } from '@/ui/Toast';
-import { CheckIcon, GitBranchIcon, GitGraphIcon, RefreshIcon } from '@/ui/icons';
+import { CheckIcon, GitBranchIcon, GitGraphIcon, PlusIcon, RefreshIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
@@ -14,21 +15,68 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** IntelliJ-style Git tool window: worktrees, branches (checkout), and the commit log graph. */
+/** IntelliJ-style Git tool window: pull/push, worktrees, branches (checkout), and the log graph. */
 export function GitPanel() {
-  const { data, activeBranch, setBranch } = useWorkspace();
+  const { data, activeBranch, setBranch, push, pull, createBranch, canWrite } = useWorkspace();
   const { toast } = useToast();
+  const [busy, setBusy] = useState(false);
+
+  const run = async (fn: () => Promise<unknown>, fail: string) => {
+    setBusy(true);
+    try {
+      await fn();
+    } catch (e) {
+      toast({ title: fail, description: String((e as Error)?.message ?? e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doPull = () =>
+    run(async () => {
+      const res = await pull();
+      toast({ title: 'Pulled', description: res.message || `On ${res.branch}`, variant: 'success' });
+    }, 'Pull failed');
+
+  const doPush = () =>
+    run(async () => {
+      const res = await push();
+      toast({ title: 'Pushed', description: res.message || `${res.branch} up to date`, variant: 'success' });
+    }, 'Push failed');
+
+  const doNewBranch = () => {
+    const name = window.prompt(`New branch from ${activeBranch.name}:`)?.trim();
+    if (!name) return;
+    void run(async () => {
+      await createBranch(name, activeBranch.name);
+      toast({ title: 'Branch created', description: name, variant: 'success' });
+    }, 'Create branch failed');
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <PanelHeader
         title="Git"
         actions={
-          <IconButton label="Fetch" title="Fetch — wired up with the backend (phase 2)" onClick={() => toast({ title: 'Fetch', description: 'Live git arrives with the backend.' })}>
+          <IconButton label="Pull" title="Pull (fast-forward)" onClick={doPull} disabled={busy}>
             <RefreshIcon className="h-4 w-4" />
           </IconButton>
         }
       />
+
+      <div className="flex items-center gap-1.5 px-2 pb-2">
+        <Button variant="secondary" size="sm" className="flex-1" onClick={doPull} disabled={busy}>
+          Pull
+          {activeBranch.behind > 0 && <span className="ml-1 font-mono text-warning">↓{activeBranch.behind}</span>}
+        </Button>
+        <Button variant="primary" size="sm" className="flex-1" onClick={doPush} disabled={busy || !canWrite} title={canWrite ? 'Push current branch' : 'Read-only repository'}>
+          Push
+          {activeBranch.ahead > 0 && <span className="ml-1 font-mono">↑{activeBranch.ahead}</span>}
+        </Button>
+        <IconButton label="New branch" title="New branch" onClick={doNewBranch} disabled={busy || !canWrite}>
+          <PlusIcon className="h-4 w-4" />
+        </IconButton>
+      </div>
 
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto pb-3">
         {/* Worktrees */}

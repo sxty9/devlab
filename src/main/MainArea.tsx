@@ -22,7 +22,6 @@ export function MainArea() {
           repoId={activeRepo.id}
           path={activeTab.path}
           lang={fileContent(activeTab.path).lang}
-          code={fileContent(activeTab.path).code}
         />
       )}
     </main>

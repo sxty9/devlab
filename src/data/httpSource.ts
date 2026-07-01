@@ -1,4 +1,13 @@
-import { AuthRequiredError, type DataSource, type DiffPayload, type InitResult } from './source';
+import {
+  AuthRequiredError,
+  type BranchResult,
+  type CommitResult,
+  type DataSource,
+  type DiffPayload,
+  type InitResult,
+  type PushResult,
+  type WriteResult,
+} from './source';
 import type { User } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
@@ -114,10 +123,47 @@ export const httpSource: DataSource = {
   },
 
   async unlinkGitHub() {
-    const res = await request('/api/github/unlink', withCsrf({ method: 'POST' }));
-    await json<void>(res);
+    await json<void>(await request('/api/github/unlink', withCsrf({ method: 'POST' })));
+  },
+
+  async ensureRepo(id) {
+    await json<void>(await post(`/api/repos/${enc(id)}/ensure`));
+  },
+  async saveFile(id, path, content): Promise<WriteResult> {
+    return json(await post(`/api/repos/${enc(id)}/file`, { path, content }));
+  },
+  async stage(id, path): Promise<WriteResult> {
+    return json(await post(`/api/repos/${enc(id)}/stage`, { path }));
+  },
+  async unstage(id, path): Promise<WriteResult> {
+    return json(await post(`/api/repos/${enc(id)}/unstage`, { path }));
+  },
+  async commit(id, message): Promise<CommitResult> {
+    return json(await post(`/api/repos/${enc(id)}/commit`, { message }));
+  },
+  async push(id): Promise<PushResult> {
+    return json(await post(`/api/repos/${enc(id)}/push`));
+  },
+  async pull(id): Promise<PushResult> {
+    return json(await post(`/api/repos/${enc(id)}/pull`));
+  },
+  async createBranch(id, name, from): Promise<BranchResult> {
+    return json(await post(`/api/repos/${enc(id)}/branch`, { name, from }));
+  },
+  async checkout(id, name): Promise<BranchResult> {
+    return json(await post(`/api/repos/${enc(id)}/checkout`, { name }));
   },
 };
+
+/** POST helper: JSON body (optional), CSRF header, refresh-aware. */
+function post(path: string, body?: unknown): Promise<Response> {
+  const init: RequestInit = withCsrf({ method: 'POST' });
+  if (body !== undefined) {
+    init.headers = { ...(init.headers as Record<string, string>), 'Content-Type': 'application/json' };
+    init.body = JSON.stringify(body);
+  }
+  return request(path, init);
+}
 
 /** Builds a power-op request init with the CSRF header (for mutating calls). */
 export function withCsrf(init: RequestInit = {}): RequestInit {

@@ -13,20 +13,23 @@ import (
 	"devlab/backend/internal/auth"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/workspace"
 )
 
 const version = "0.1.0"
 
-// Server wires the verifier + repo base + per-user GitHub link store into HTTP handlers.
+// Server wires the verifier + repo base + per-user GitHub link store + workspace manager into
+// HTTP handlers.
 type Server struct {
-	v         *auth.Verifier
-	reposBase string
-	links     *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	v          *auth.Verifier
+	reposBase  string
+	links      *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	workspaces *workspace.Manager
 }
 
-// New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies. The link
-// store needs DEVLAB_LINK_ENC_KEY_FILE; when absent (dev-bypass/preview), GitHub linking is
-// disabled and discovery falls back to the local sandbox set.
+// New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
+// The link store needs DEVLAB_LINK_ENC_KEY_FILE; when absent (dev-bypass/preview), GitHub linking
+// is disabled and discovery/paths fall back to the local sandbox set.
 func New(v *auth.Verifier) *Server {
 	base := os.Getenv("DEVLAB_REPOS_PATH")
 	if base == "" {
@@ -37,7 +40,7 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: GitHub link store disabled: %v", err)
 		store = nil
 	}
-	return &Server{v: v, reposBase: base, links: store}
+	return &Server{v: v, reposBase: base, links: store, workspaces: workspace.NewManager()}
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -79,6 +82,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/repos/{id}/diff", s.guard(s.diff))
 	mux.HandleFunc("GET /api/repos/{id}/commits", s.guard(s.commits))
 	mux.HandleFunc("GET /api/repos/{id}/worktrees", s.guard(s.worktrees))
+
+	// Write tier — guardWrite: session + hp_devlab_access + CSRF + GitHub link; the handlers
+	// additionally enforce the per-repo GitHub permission (push for mutations, pull for fetch).
+	mux.HandleFunc("POST /api/repos/{id}/ensure", s.guardWrite(s.gitEnsure))
+	mux.HandleFunc("POST /api/repos/{id}/file", s.guardWrite(s.gitWriteFile))
+	mux.HandleFunc("POST /api/repos/{id}/stage", s.guardWrite(s.gitStage))
+	mux.HandleFunc("POST /api/repos/{id}/unstage", s.guardWrite(s.gitUnstage))
+	mux.HandleFunc("POST /api/repos/{id}/commit", s.guardWrite(s.gitCommit))
+	mux.HandleFunc("POST /api/repos/{id}/push", s.guardWrite(s.gitPush))
+	mux.HandleFunc("POST /api/repos/{id}/pull", s.guardWrite(s.gitPull))
+	mux.HandleFunc("POST /api/repos/{id}/branch", s.guardWrite(s.gitBranch))
+	mux.HandleFunc("POST /api/repos/{id}/checkout", s.guardWrite(s.gitCheckout))
 
 	// Anything else under /api 404s as JSON; non-/api is served by Caddy (static_proxy).
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -186,15 +201,55 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// repoPath resolves {id} to a local working copy, writing 404 if unknown.
+// repoPath resolves {id} to the working tree the caller operates on. Under dev-bypass that is the
+// local sandbox clone; in production it is the caller's per-user workspace, cloned on first access
+// from GitHub with their own token. Writes 404/403/502 and returns false on failure.
 func (s *Server) repoPath(w http.ResponseWriter, r *http.Request) (string, bool) {
 	id := r.PathValue("id")
-	p, ok := discover.Path(s.reposBase, id)
+	if s.v.DevBypass() {
+		p, ok := discover.Path(s.reposBase, id)
+		if !ok {
+			writeErr(w, http.StatusNotFound, "Repository not found")
+			return "", false
+		}
+		return p, true
+	}
+	u := userFrom(r)
+	full, ok := s.resolveFullName(r.Context(), u, id)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "Repository not found")
 		return "", false
 	}
+	token, err := s.userToken(u)
+	if err != nil {
+		writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+		return "", false
+	}
+	p, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "Could not prepare the workspace")
+		return "", false
+	}
 	return p, true
+}
+
+// resolveFullName maps a repo id to its GitHub owner/repo from the user's visible set, refreshing
+// the per-user cache once on a miss so a cold cache (or a direct deep-link) still resolves.
+func (s *Server) resolveFullName(ctx context.Context, u *auth.User, id string) (string, bool) {
+	if u == nil {
+		return "", false
+	}
+	if full, ok := discover.FullName(u.Username, id); ok {
+		return full, true
+	}
+	token, err := s.userToken(u)
+	if err != nil {
+		return "", false
+	}
+	if _, err := discover.ReposForUser(ctx, u.Username, token); err != nil {
+		return "", false
+	}
+	return discover.FullName(u.Username, id)
 }
 
 func secureHeaders(next http.Handler) http.Handler {

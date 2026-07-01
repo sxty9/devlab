@@ -1,9 +1,36 @@
-import type { FileContent, Repo, RepoData, User } from '@/types';
+import type { Branch, Change, FileContent, Repo, RepoData, User } from '@/types';
 
 export interface DiffPayload {
   before: string;
   after: string;
   lang: string;
+}
+
+/** Refreshed change set returned by working-tree mutations (write/stage/unstage). */
+export interface WriteResult {
+  changes: Change[];
+}
+
+/** Returned by a successful commit. */
+export interface CommitResult {
+  hash: string;
+  branch: string;
+  changes: Change[];
+}
+
+/** Returned by push/pull — refreshed tracking + the raw git message. */
+export interface PushResult {
+  branch: string;
+  ahead: number;
+  behind: number;
+  message: string;
+  branches: Branch[];
+}
+
+/** Returned after creating/switching a branch. */
+export interface BranchResult {
+  branch: string;
+  branches: Branch[];
 }
 
 export interface InitResult {
@@ -31,6 +58,18 @@ export interface DataSource {
   githubAuthorizeUrl(): string;
   /** Remove the GitHub link (POST, CSRF-guarded). */
   unlinkGitHub(): Promise<void>;
+
+  // ── write loop (all CSRF-guarded; require GitHub push on the repo) ──────────
+  /** Clone the repo into the caller's workspace if needed (idempotent). */
+  ensureRepo(id: string): Promise<void>;
+  saveFile(id: string, path: string, content: string): Promise<WriteResult>;
+  stage(id: string, path: string): Promise<WriteResult>;
+  unstage(id: string, path: string): Promise<WriteResult>;
+  commit(id: string, message: string): Promise<CommitResult>;
+  push(id: string): Promise<PushResult>;
+  pull(id: string): Promise<PushResult>;
+  createBranch(id: string, name: string, from?: string): Promise<BranchResult>;
+  checkout(id: string, name: string): Promise<BranchResult>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

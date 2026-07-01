@@ -1,7 +1,7 @@
-import type { FileContent, RepoData } from '@/types';
+import type { Change, FileContent, RepoData } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { guessLang } from '@/lib/lang';
-import type { DataSource, DiffPayload } from './source';
+import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
 
 function stub(path: string): FileContent {
   return { path, lang: guessLang(path), code: `// ${path}\n// (mock) file contents arrive with the backend.\n` };
@@ -53,4 +53,69 @@ export const mockSource: DataSource = {
   async unlinkGitHub() {
     /* mock: no-op */
   },
+
+  // ── write loop: mutate the in-memory REPO_DATA so the offline loop is exercisable ──
+  async ensureRepo() {
+    /* mock: already "cloned" */
+  },
+  async saveFile(id, path, content): Promise<WriteResult> {
+    const d = data(id);
+    d.files[path] = { path, lang: guessLang(path), code: content };
+    upsertChange(d, path, 'modified', false);
+    return { changes: d.changes };
+  },
+  async stage(id, path): Promise<WriteResult> {
+    setStaged(data(id), path, true);
+    return { changes: data(id).changes };
+  },
+  async unstage(id, path): Promise<WriteResult> {
+    setStaged(data(id), path, false);
+    return { changes: data(id).changes };
+  },
+  async commit(id, message): Promise<CommitResult> {
+    const d = data(id);
+    d.changes = d.changes.filter((c) => !c.staged);
+    void message;
+    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    const b = d.branches.find((x) => x.name === branch);
+    if (b) b.ahead += 1;
+    return { hash: mockHash(), branch, changes: d.changes };
+  },
+  async push(id): Promise<PushResult> {
+    const d = data(id);
+    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    const b = d.branches.find((x) => x.name === branch);
+    if (b) b.ahead = 0;
+    return { branch, ahead: 0, behind: 0, message: 'Everything up-to-date (mock)', branches: d.branches };
+  },
+  async pull(id): Promise<PushResult> {
+    const d = data(id);
+    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    return { branch, ahead: 0, behind: 0, message: 'Already up to date (mock)', branches: d.branches };
+  },
+  async createBranch(id, name, from): Promise<BranchResult> {
+    const d = data(id);
+    void from;
+    if (!d.branches.some((b) => b.name === name)) {
+      d.branches.push({ name, isDefault: false, ahead: 0, behind: 0, updated: 'just now' });
+    }
+    return { branch: name, branches: d.branches };
+  },
+  async checkout(id, name): Promise<BranchResult> {
+    return { branch: name, branches: data(id).branches };
+  },
 };
+
+function upsertChange(d: RepoData, path: string, status: Change['status'], staged: boolean) {
+  if (!d.changes.some((c) => c.path === path)) {
+    d.changes = [...d.changes, { path, status, additions: 1, deletions: 0, staged }];
+  }
+}
+
+function setStaged(d: RepoData, path: string, staged: boolean) {
+  d.changes = d.changes.map((c) => (c.path === path ? { ...c, staged } : c));
+}
+
+function mockHash(): string {
+  return Array.from({ length: 7 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+}

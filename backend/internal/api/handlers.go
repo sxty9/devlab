@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/git"
@@ -112,10 +113,18 @@ func (s *Server) repoData(w http.ResponseWriter, r *http.Request) {
 
 	tree := git.Tree(p)
 	changes := git.Changes(p)
+	branches := git.Branches(p)
 	structureID := "structure:" + id
 
+	ahead := 0
+	for _, b := range branches {
+		if b.Name == branch {
+			ahead = b.Ahead
+		}
+	}
+
 	data := model.RepoData{
-		Branches:    git.Branches(p),
+		Branches:    branches,
 		Tree:        tree,
 		Files:       map[string]model.FileContent{},
 		Changes:     changes,
@@ -124,7 +133,7 @@ func (s *Server) repoData(w http.ResponseWriter, r *http.Request) {
 		Vision:      []model.VisionDoc{},
 		Claude:      []model.ClaudeMsg{},
 		Terminal:    []model.TermLine{},
-		Stages:      stages(len(changes) > 0),
+		Stages:      stages(len(changes) > 0, ahead),
 		DefaultTabs: []model.Tab{{ID: structureID, Title: id + " — structure", Kind: "structure"}},
 		ActiveTabID: structureID,
 		Structure:   structure(p, tree),
@@ -132,20 +141,38 @@ func (s *Server) repoData(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, data)
 }
 
-// stages derives the delivery pipeline state (Code active while there are changes).
-func stages(hasChanges bool) []model.Stage {
-	code := "done"
+// stages derives the delivery pipeline from real git state: Code is active while the working tree
+// is dirty (else committed/clean), and Delivery is active while the branch has unpushed commits.
+func stages(hasChanges bool, ahead int) []model.Stage {
+	code, codeHint := "done", "Committed"
 	if hasChanges {
-		code = "active"
+		code, codeHint = "active", "Uncommitted changes"
+	}
+	delivery, deliveryHint := "pending", "Push to deliver"
+	if ahead > 0 {
+		delivery = "active"
+		deliveryHint = plural(ahead, "commit") + " to push"
+	} else if !hasChanges {
+		deliveryHint = "Up to date"
 	}
 	return []model.Stage{
 		{ID: "vision", Label: "Vision", State: "done", Hint: "Captured"},
-		{ID: "code", Label: "Code", State: code, Hint: "Working tree"},
+		{ID: "code", Label: "Code", State: code, Hint: codeHint},
 		{ID: "preview", Label: "Preview", State: "pending", Hint: "sxgate"},
-		{ID: "delivery", Label: "Delivery", State: "pending", Hint: "Prod test"},
+		{ID: "delivery", Label: "Delivery", State: delivery, Hint: deliveryHint},
 		{ID: "merge", Label: "main", State: "pending", Hint: "Awaiting merge"},
 	}
 }
+
+func plural(n int, noun string) string {
+	s := noun
+	if n != 1 {
+		s += "s"
+	}
+	return itoa(n) + " " + s
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 // structure derives the repo skeleton overview from the top of the file tree.
 func structure(repoPath string, tree []model.FileNode) []model.StructureSection {
