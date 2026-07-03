@@ -57,6 +57,7 @@ interface WorkspaceContextValue {
   openFile: (node: Pick<FileNode, 'id' | 'name' | 'lang'>) => void;
   openStructure: () => void;
   openDiff: (path: string) => void;
+  openVision: (path: string) => void;
   setActiveTab: (id: string) => void;
   closeTab: (id: string) => void;
 
@@ -306,6 +307,13 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     [fileIndex, fetchDiff],
   );
 
+  const openVision = useCallback((path: string) => {
+    const id = `vision:${path}`;
+    const name = path.split('/').pop() ?? path;
+    setOpenTabs((tabs) => (tabs.some((t) => t.id === id) ? tabs : [...tabs, { id, title: name, kind: 'vision', path }]));
+    setActiveTabId(id);
+  }, []);
+
   const setActiveTab = useCallback((id: string) => setActiveTabId(id), []);
 
   const closeTab = useCallback(
@@ -523,6 +531,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     openFile,
     openStructure,
     openDiff,
+    openVision,
     setActiveTab,
     closeTab,
     fileContent,

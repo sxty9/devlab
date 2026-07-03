@@ -1,4 +1,4 @@
-import type { Branch, Change, FileContent, Repo, RepoData, User } from '@/types';
+import type { Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -70,6 +70,15 @@ export interface DataSource {
   pull(id: string): Promise<PushResult>;
   createBranch(id: string, name: string, from?: string): Promise<BranchResult>;
   checkout(id: string, name: string): Promise<BranchResult>;
+
+  // ── Vision Catalog + threaded comments ─────────────────────────────────────
+  vision(id: string): Promise<VisionFile[]>;
+  /** Direct URL for an <img>/<iframe> to a raw vision file (bytes, correct MIME). */
+  rawUrl(id: string, path: string): string;
+  uploadVision(id: string, path: string, contentB64: string): Promise<VisionFile[]>;
+  listComments(id: string, path: string): Promise<Comment[]>;
+  addComment(id: string, path: string, body: string, parentId?: string): Promise<Comment>;
+  deleteComment(id: string, commentId: string): Promise<void>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

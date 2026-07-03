@@ -1,9 +1,9 @@
 import { useWorkspace } from '@/state/workspace';
 import type { Tab } from '@/types';
-import { DiffIcon, SitemapIcon, FileTextIcon, XIcon } from '@/ui/icons';
+import { DiffIcon, SitemapIcon, FileTextIcon, LightbulbIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 
-const tabIcon = { structure: SitemapIcon, diff: DiffIcon, code: FileTextIcon } as const;
+const tabIcon = { structure: SitemapIcon, diff: DiffIcon, code: FileTextIcon, vision: LightbulbIcon } as const;
 
 function TabButton({ tab, active }: { tab: Tab; active: boolean }) {
   const { setActiveTab, closeTab } = useWorkspace();

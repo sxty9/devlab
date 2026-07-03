@@ -43,6 +43,12 @@ export const dataSource: DataSource = {
   pull: (id) => impl.pull(id),
   createBranch: (id, n, f) => impl.createBranch(id, n, f),
   checkout: (id, n) => impl.checkout(id, n),
+  vision: (id) => impl.vision(id),
+  rawUrl: (id, p) => impl.rawUrl(id, p),
+  uploadVision: (id, p, c) => impl.uploadVision(id, p, c),
+  listComments: (id, p) => impl.listComments(id, p),
+  addComment: (id, p, b, parent) => impl.addComment(id, p, b, parent),
+  deleteComment: (id, cid) => impl.deleteComment(id, cid),
 };
 
 export function getDataSource(): DataSource {

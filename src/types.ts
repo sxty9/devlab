@@ -110,11 +110,37 @@ export interface TermLine {
 export interface Tab {
   id: string;
   title: string;
-  kind: 'code' | 'structure' | 'diff';
-  /** Present for kind: 'code' | 'diff'. */
+  kind: 'code' | 'structure' | 'diff' | 'vision';
+  /** Present for kind: 'code' | 'diff' | 'vision'. */
   path?: string;
   lang?: string;
   dirty?: boolean;
+}
+
+/** How a Vision-Catalog file is rendered. */
+export type VisionFileKind = 'image' | 'pdf' | 'markdown' | 'text' | 'other';
+
+/** One artifact in a repo's /vision folder (the Vision Catalog). */
+export interface VisionFile {
+  path: string;
+  name: string;
+  kind: VisionFileKind;
+  size: number;
+  /** git status decoration, if any. */
+  status?: string;
+}
+
+/** One message in a per-file threaded discussion (nested via parentId). */
+export interface Comment {
+  id: string;
+  path: string;
+  /** '' for a top-level comment, else the parent comment's id. */
+  parentId: string;
+  author: string;
+  authorName: string;
+  body: string;
+  createdAt: string;
+  editedAt?: string;
 }
 
 /** One drawn segment in a commit-graph row (a lane line from the row's top to its bottom). */

@@ -195,3 +195,24 @@ type BranchResult struct {
 	Branch   string   `json:"branch"`
 	Branches []Branch `json:"branches"`
 }
+
+// VisionFile is one tracked artifact in the repo's /vision folder (the Vision Catalog).
+type VisionFile struct {
+	Path   string `json:"path"`   // repo-relative, e.g. "vision/sketch.png"
+	Name   string `json:"name"`   // basename
+	Kind   string `json:"kind"`   // image | pdf | markdown | text | other
+	Size   int64  `json:"size"`   // bytes
+	Status string `json:"status"` // git status decoration (modified|added|untracked|…), if any
+}
+
+// Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
+type Comment struct {
+	ID        string `json:"id"`
+	Path      string `json:"path"`             // the vision file it's attached to
+	ParentID  string `json:"parentId"`         // "" for a top-level comment, else the parent's id
+	Author    string `json:"author"`           // Linux username (stable authorship key)
+	AuthorName string `json:"authorName"`      // display name at post time
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`        // RFC3339
+	EditedAt  string `json:"editedAt,omitempty"`
+}

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
 	"devlab/backend/internal/workspace"
@@ -28,7 +29,8 @@ type Server struct {
 	reposBase  string
 	links      *links.Store // nil when no encryption key is configured (dev/preview sandbox)
 	workspaces *workspace.Manager
-	staticDir  string // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
+	comments   *comments.Store // nil if the comments dir can't be created
+	staticDir  string          // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
@@ -45,11 +47,17 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: GitHub link store disabled: %v", err)
 		store = nil
 	}
+	cstore, err := comments.NewStore()
+	if err != nil {
+		log.Printf("devlabd: comments store disabled: %v", err)
+		cstore = nil
+	}
 	return &Server{
 		v:          v,
 		reposBase:  base,
 		links:      store,
 		workspaces: workspace.NewManager(),
+		comments:   cstore,
 		staticDir:  os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
@@ -105,6 +113,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/pull", s.guardWrite(s.gitPull))
 	mux.HandleFunc("POST /api/repos/{id}/branch", s.guardWrite(s.gitBranch))
 	mux.HandleFunc("POST /api/repos/{id}/checkout", s.guardWrite(s.gitCheckout))
+
+	// Vision Catalog — the repo's /vision folder. Reads under guard; raw bytes for the viewer;
+	// upload writes into vision/ (needs push). Threaded comments live in a DevLab-side store.
+	mux.HandleFunc("GET /api/repos/{id}/vision", s.guard(s.visionList))
+	mux.HandleFunc("GET /api/repos/{id}/raw", s.guard(s.visionRaw))
+	mux.HandleFunc("POST /api/repos/{id}/vision/upload", s.guardWrite(s.visionUpload))
+	mux.HandleFunc("GET /api/repos/{id}/comments", s.guard(s.commentsList))
+	mux.HandleFunc("POST /api/repos/{id}/comments", s.guardWrite(s.commentAdd))
+	mux.HandleFunc("DELETE /api/repos/{id}/comments/{cid}", s.guardWrite(s.commentDelete))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.

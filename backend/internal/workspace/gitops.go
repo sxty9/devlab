@@ -115,6 +115,10 @@ func safePath(wt, rel string) (string, error) {
 	return abs, nil
 }
 
+// SafePath resolves a repo-relative path against the worktree with the traversal/.git/symlink
+// guards and returns the absolute path. Exported for the Vision raw-byte file server.
+func SafePath(wt, rel string) (string, error) { return safePath(wt, rel) }
+
 // assertNoSymlinkEscape resolves the deepest existing ancestor of abs and verifies it stays inside
 // the symlink-resolved worktree, so a pre-existing symlinked directory can't redirect a write out.
 func assertNoSymlinkEscape(wt, abs string) error {
@@ -155,7 +159,21 @@ func relFor(wt, rel string) (string, error) {
 // WriteFile writes content to a repo-relative path (creating parent dirs), refusing traversal,
 // .git, oversize, and symlink escapes.
 func WriteFile(wt, rel string, content []byte) error {
-	if len(content) > maxFileBytes {
+	return writeBytes(wt, rel, content, maxFileBytes)
+}
+
+// maxVisionBytes is the upload cap for Vision-Catalog assets (images/PDFs) — larger than the
+// editor's text cap since binary artifacts are legitimately bigger.
+const maxVisionBytes = 25 << 20 // 25 MiB
+
+// WriteFileBytes writes arbitrary bytes (e.g. an uploaded image/PDF) with the vision cap and the
+// same traversal/.git/symlink guards as WriteFile.
+func WriteFileBytes(wt, rel string, content []byte) error {
+	return writeBytes(wt, rel, content, maxVisionBytes)
+}
+
+func writeBytes(wt, rel string, content []byte, limit int) error {
+	if len(content) > limit {
 		return errTooLarge
 	}
 	abs, err := safePath(wt, rel)

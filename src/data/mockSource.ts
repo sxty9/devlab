@@ -1,4 +1,4 @@
-import type { Change, FileContent, RepoData } from '@/types';
+import type { Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { guessLang } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -104,7 +104,70 @@ export const mockSource: DataSource = {
   async checkout(id, name): Promise<BranchResult> {
     return { branch: name, branches: data(id).branches };
   },
+
+  // ── Vision Catalog + comments (in-memory so the offline loop is exercisable) ──
+  async vision(id): Promise<VisionFile[]> {
+    return mockVision(id);
+  },
+  rawUrl(_id, path): string {
+    const label = path.split('/').pop() ?? 'file';
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300"><rect width="100%" height="100%" fill="#1e2230"/><text x="50%" y="50%" fill="#8b93a7" font-family="sans-serif" font-size="15" text-anchor="middle">${label} (mock)</text></svg>`;
+    return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+  },
+  async uploadVision(id, path, _contentB64): Promise<VisionFile[]> {
+    const name = path.split('/').pop() ?? path;
+    const list = mockVision(id);
+    if (!list.some((f) => f.path === path)) list.push({ path, name, kind: mockKind(name), size: 1024, status: 'untracked' });
+    return list;
+  },
+  async listComments(id, path): Promise<Comment[]> {
+    return (commentStore[id] ?? []).filter((c) => c.path === path);
+  },
+  async addComment(id, path, body, parentId): Promise<Comment> {
+    const c: Comment = {
+      id: mockHash(),
+      path,
+      parentId: parentId ?? '',
+      author: 'dev',
+      authorName: 'Developer',
+      body,
+      createdAt: new Date().toISOString(),
+    };
+    (commentStore[id] ??= []).push(c);
+    return c;
+  },
+  async deleteComment(id, commentId): Promise<void> {
+    const list = commentStore[id] ?? [];
+    const remove = new Set([commentId]);
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const c of list) if (!remove.has(c.id) && c.parentId && remove.has(c.parentId)) { remove.add(c.id); changed = true; }
+    }
+    commentStore[id] = list.filter((c) => !remove.has(c.id));
+  },
 };
+
+const visionStore: Record<string, VisionFile[]> = {};
+const commentStore: Record<string, Comment[]> = {};
+
+function mockKind(name: string): VisionFile['kind'] {
+  const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) return 'image';
+  if (ext === 'pdf') return 'pdf';
+  if (ext === 'md' || ext === 'markdown') return 'markdown';
+  if (['txt', 'json', 'yaml', 'yml'].includes(ext)) return 'text';
+  return 'other';
+}
+
+function mockVision(id: string): VisionFile[] {
+  if (!visionStore[id]) {
+    visionStore[id] = [
+      { path: 'vision/overview.md', name: 'overview.md', kind: 'markdown', size: 240 },
+      { path: 'vision/sketch.png', name: 'sketch.png', kind: 'image', size: 10240 },
+    ];
+  }
+  return visionStore[id];
+}
 
 function upsertChange(d: RepoData, path: string, status: Change['status'], staged: boolean) {
   if (!d.changes.some((c) => c.path === path)) {

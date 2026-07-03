@@ -8,7 +8,7 @@ import {
   type PushResult,
   type WriteResult,
 } from './source';
-import type { User } from '@/types';
+import type { Comment, User, VisionFile } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -152,6 +152,25 @@ export const httpSource: DataSource = {
   },
   async checkout(id, name): Promise<BranchResult> {
     return json(await post(`/api/repos/${enc(id)}/checkout`, { name }));
+  },
+
+  async vision(id): Promise<VisionFile[]> {
+    return json(await request(`/api/repos/${enc(id)}/vision`));
+  },
+  rawUrl(id, path) {
+    return `/api/repos/${enc(id)}/raw?path=${enc(path)}`;
+  },
+  async uploadVision(id, path, contentB64): Promise<VisionFile[]> {
+    return json(await post(`/api/repos/${enc(id)}/vision/upload`, { path, contentB64 }));
+  },
+  async listComments(id, path): Promise<Comment[]> {
+    return json(await request(`/api/repos/${enc(id)}/comments?path=${enc(path)}`));
+  },
+  async addComment(id, path, body, parentId): Promise<Comment> {
+    return json(await post(`/api/repos/${enc(id)}/comments`, { path, body, parentId: parentId ?? '' }));
+  },
+  async deleteComment(id, commentId): Promise<void> {
+    await json<void>(await request(`/api/repos/${enc(id)}/comments/${enc(commentId)}`, withCsrf({ method: 'DELETE' })));
   },
 };
 

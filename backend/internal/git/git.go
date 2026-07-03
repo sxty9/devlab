@@ -271,6 +271,65 @@ func DiffFor(repo, rel string) model.Diff {
 	return model.Diff{Before: before, After: after, Lang: Lang(rel)}
 }
 
+// visionKind classifies a vision file by extension for the catalog renderer.
+func visionKind(name string) string {
+	ext := ""
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		ext = strings.ToLower(name[i+1:])
+	}
+	switch ext {
+	case "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico":
+		return "image"
+	case "pdf":
+		return "pdf"
+	case "md", "markdown":
+		return "markdown"
+	case "txt", "json", "yaml", "yml", "toml", "csv", "ts", "tsx", "js", "go", "py", "sh", "html", "css":
+		return "text"
+	default:
+		return "other"
+	}
+}
+
+// VisionFiles lists the tracked+untracked (gitignore-respected) files under the repo's vision/
+// folder, classified for the Vision Catalog, with sizes and git-status decorations. Hidden files
+// (e.g. the vision/.gitignore itself) are omitted.
+func VisionFiles(repo string) []model.VisionFile {
+	out, err := run(repo, "ls-files", "--cached", "--others", "--exclude-standard", "--", "vision")
+	if err != nil {
+		return []model.VisionFile{}
+	}
+	statusByPath := map[string]string{}
+	for _, c := range Changes(repo) {
+		statusByPath[c.Path] = c.Status
+	}
+	seen := map[string]bool{}
+	var files []model.VisionFile
+	for _, p := range strings.Split(out, "\n") {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		name := p
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			name = p[i+1:]
+		}
+		if strings.HasPrefix(name, ".") {
+			continue // hide .gitignore / dotfiles from the catalog
+		}
+		var size int64
+		if fi, err := os.Stat(filepath.Join(repo, p)); err == nil {
+			size = fi.Size()
+		}
+		files = append(files, model.VisionFile{Path: p, Name: name, Kind: visionKind(name), Size: size, Status: statusByPath[p]})
+	}
+	sort.Slice(files, func(i, j int) bool { return strings.ToLower(files[i].Path) < strings.ToLower(files[j].Path) })
+	if files == nil {
+		files = []model.VisionFile{}
+	}
+	return files
+}
+
 func mapStatus(code byte) string {
 	switch code {
 	case 'M':
