@@ -9,6 +9,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
+	"strings"
 
 	"devlab/backend/internal/auth"
 	"devlab/backend/internal/discover"
@@ -25,11 +28,13 @@ type Server struct {
 	reposBase  string
 	links      *links.Store // nil when no encryption key is configured (dev/preview sandbox)
 	workspaces *workspace.Manager
+	staticDir  string // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
 // The link store needs DEVLAB_LINK_ENC_KEY_FILE; when absent (dev-bypass/preview), GitHub linking
-// is disabled and discovery/paths fall back to the local sandbox set.
+// is disabled and discovery/paths fall back to the local sandbox set. DEVLAB_STATIC_DIR, when set,
+// makes devlabd serve the built SPA (dist/) itself so one process serves both UI and API.
 func New(v *auth.Verifier) *Server {
 	base := os.Getenv("DEVLAB_REPOS_PATH")
 	if base == "" {
@@ -40,7 +45,13 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: GitHub link store disabled: %v", err)
 		store = nil
 	}
-	return &Server{v: v, reposBase: base, links: store, workspaces: workspace.NewManager()}
+	return &Server{
+		v:          v,
+		reposBase:  base,
+		links:      store,
+		workspaces: workspace.NewManager(),
+		staticDir:  os.Getenv("DEVLAB_STATIC_DIR"),
+	}
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -95,12 +106,41 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/branch", s.guardWrite(s.gitBranch))
 	mux.HandleFunc("POST /api/repos/{id}/checkout", s.guardWrite(s.gitCheckout))
 
-	// Anything else under /api 404s as JSON; non-/api is served by Caddy (static_proxy).
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeErr(w, http.StatusNotFound, "Not found")
-	})
+	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
+	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
+	mux.HandleFunc("/", s.root)
 
 	return secureHeaders(mux)
+}
+
+// root serves the SPA for non-API routes; unknown /api paths 404 as JSON.
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") || s.staticDir == "" {
+		writeErr(w, http.StatusNotFound, "Not found")
+		return
+	}
+	s.serveSPA(w, r)
+}
+
+// serveSPA serves a file from staticDir, falling back to index.html for client-side routes. The
+// path is cleaned and confined to staticDir; index.html is never long-cached so new deploys show.
+func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
+	root := filepath.Clean(s.staticDir)
+	upath := path.Clean("/" + r.URL.Path)
+	full := filepath.Join(root, filepath.FromSlash(upath))
+	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
+		writeErr(w, http.StatusNotFound, "Not found")
+		return
+	}
+	if upath != "/" {
+		if fi, err := os.Stat(full); err == nil && !fi.IsDir() {
+			http.ServeFile(w, r, full)
+			return
+		}
+	}
+	// SPA entrypoint: revalidate so a redeploy is picked up promptly.
+	w.Header().Set("Cache-Control", "no-cache")
+	http.ServeFile(w, r, filepath.Join(root, "index.html"))
 }
 
 // guardAuthed requires a valid Holistic session and stashes the resolved user on the request.

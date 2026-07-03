@@ -35,7 +35,7 @@
 #   # /var/lib/devlab/{links,workspaces} are created by StateDirectory + the daemon (0700).
 #
 # Register the production route (Cloudflare tunnel via sxgate):
-#   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8780
+#   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8781
 #   sudo /home/nanu/sxgate/sxgate route add devlab.henrysoase.org devlab
 #   (+ a proxied CNAME `devlab` in the Cloudflare DNS for henrysoase.org)
 
@@ -47,7 +47,7 @@ After=network.target
 Type=simple
 User=nanu
 SupplementaryGroups=holistic
-ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8780
+ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8781
 Restart=on-failure
 RestartSec=3
 
@@ -69,6 +69,9 @@ Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
 Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
 # Slice 3: per-user git workspaces.
 Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
+# Serve the built SPA (dist/) directly so one process serves both UI and API (sxgate routes
+# devlab.henrysoase.org straight here). Deploy dist/ to this path on each release.
+Environment=DEVLAB_STATIC_DIR=/var/lib/devlab/www
 
 # Hardening.
 StateDirectory=devlab
