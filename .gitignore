@@ -12,3 +12,4 @@ dist/
 # go backend build artifacts
 /devlabd
 backend/devlabd
+deploy/devlabd
