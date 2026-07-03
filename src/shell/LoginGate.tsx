@@ -14,6 +14,14 @@ function holisticOrigin(): string {
   return `${protocol}//${host}`;
 }
 
+/** The Holistic sign-in URL carrying a `return` param, so Holistic sends the user straight back to
+ *  where they were in DevLab after signing in (Holistic validates it stays on the same zone). */
+function holisticLoginUrl(): string {
+  const origin = holisticOrigin();
+  if (typeof window === 'undefined') return origin;
+  return `${origin}/?return=${encodeURIComponent(window.location.href)}`;
+}
+
 /** The centered brand-mark frame shared by the sign-in, access-denied and GitHub-link gates. */
 export function GateShell({ children }: { children: React.ReactNode }) {
   return (
@@ -45,7 +53,7 @@ export function SignInGate() {
           size="md"
           className="w-full"
           onClick={() => {
-            window.location.href = holisticOrigin();
+            window.location.href = holisticLoginUrl();
           }}
         >
           Bei Holistic anmelden
