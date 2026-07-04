@@ -117,6 +117,29 @@ export interface Tab {
   dirty?: boolean;
 }
 
+/** One turn in the repo-scoped AI assistant transcript. */
+export interface AiMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  ts: string;
+}
+
+/** What the AI assistant returns after a run (proxied from aigentic). */
+export interface AssistantReply {
+  output: string;
+  engine: string;
+  model: string;
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number; truncated: boolean };
+}
+
+/** The payload for one AI turn. */
+export interface AssistantAsk {
+  prompt: string;
+  contextPaths: string[];
+  history: AiMessage[];
+  effort?: string;
+}
+
 /** How a Vision-Catalog file is rendered. */
 export type VisionFileKind = 'image' | 'pdf' | 'markdown' | 'text' | 'other';
 

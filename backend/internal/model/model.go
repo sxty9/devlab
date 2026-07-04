@@ -205,6 +205,26 @@ type VisionFile struct {
 	Status string `json:"status"` // git status decoration (modified|added|untracked|…), if any
 }
 
+// AiMessage is one turn in the repo-scoped AI assistant transcript (persisted per user+repo).
+type AiMessage struct {
+	Role    string `json:"role"` // user | assistant
+	Content string `json:"content"`
+	Ts      string `json:"ts"`
+}
+
+// AssistantReply is what DevLab returns to the SPA after proxying an aigentic run.
+type AssistantReply struct {
+	Output string `json:"output"`
+	Engine string `json:"engine"`
+	Model  string `json:"model"`
+	Usage  struct {
+		InputTokens  int  `json:"inputTokens"`
+		OutputTokens int  `json:"outputTokens"`
+		TotalTokens  int  `json:"totalTokens"`
+		Truncated    bool `json:"truncated"`
+	} `json:"usage"`
+}
+
 // Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
 type Comment struct {
 	ID        string `json:"id"`

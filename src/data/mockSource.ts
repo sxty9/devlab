@@ -1,4 +1,4 @@
-import type { Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
+import type { AiMessage, AssistantReply, Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { guessLang } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -145,10 +145,26 @@ export const mockSource: DataSource = {
     }
     commentStore[id] = list.filter((c) => !remove.has(c.id));
   },
+  async askAssistant(_id, ask): Promise<AssistantReply> {
+    const last = ask.prompt.slice(0, 80);
+    return {
+      output: `**(mock AI)** I'd help with “${last}” using this repo as context — the aigentic backend answers here in production.\n\n\`\`\`\n// example\n\`\`\``,
+      engine: 'mock',
+      model: 'mock',
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, truncated: false },
+    };
+  },
+  async getAssistantHistory(id): Promise<AiMessage[]> {
+    return aiStore[id] ?? [];
+  },
+  async saveAssistantHistory(id, messages): Promise<void> {
+    aiStore[id] = messages;
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};
+const aiStore: Record<string, AiMessage[]> = {};
 
 function mockKind(name: string): VisionFile['kind'] {
   const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';

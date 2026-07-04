@@ -49,6 +49,9 @@ export const dataSource: DataSource = {
   listComments: (id, p) => impl.listComments(id, p),
   addComment: (id, p, b, parent) => impl.addComment(id, p, b, parent),
   deleteComment: (id, cid) => impl.deleteComment(id, cid),
+  askAssistant: (id, ask) => impl.askAssistant(id, ask),
+  getAssistantHistory: (id) => impl.getAssistantHistory(id),
+  saveAssistantHistory: (id, msgs) => impl.saveAssistantHistory(id, msgs),
 };
 
 export function getDataSource(): DataSource {

@@ -8,7 +8,7 @@ import {
   type PushResult,
   type WriteResult,
 } from './source';
-import type { Comment, User, VisionFile } from '@/types';
+import type { AiMessage, AssistantReply, Comment, User, VisionFile } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -172,11 +172,21 @@ export const httpSource: DataSource = {
   async deleteComment(id, commentId): Promise<void> {
     await json<void>(await request(`/api/repos/${enc(id)}/comments/${enc(commentId)}`, withCsrf({ method: 'DELETE' })));
   },
+
+  async askAssistant(id, ask): Promise<AssistantReply> {
+    return json(await post(`/api/repos/${enc(id)}/assistant`, ask));
+  },
+  async getAssistantHistory(id): Promise<AiMessage[]> {
+    return json(await request(`/api/repos/${enc(id)}/assistant/history`));
+  },
+  async saveAssistantHistory(id, messages): Promise<void> {
+    await json<void>(await post(`/api/repos/${enc(id)}/assistant/history`, { messages }, 'PUT'));
+  },
 };
 
-/** POST helper: JSON body (optional), CSRF header, refresh-aware. */
-function post(path: string, body?: unknown): Promise<Response> {
-  const init: RequestInit = withCsrf({ method: 'POST' });
+/** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */
+function post(path: string, body?: unknown, method = 'POST'): Promise<Response> {
+  const init: RequestInit = withCsrf({ method });
   if (body !== undefined) {
     init.headers = { ...(init.headers as Record<string, string>), 'Content-Type': 'application/json' };
     init.body = JSON.stringify(body);

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
@@ -30,6 +31,7 @@ type Server struct {
 	links      *links.Store // nil when no encryption key is configured (dev/preview sandbox)
 	workspaces *workspace.Manager
 	comments   *comments.Store // nil if the comments dir can't be created
+	chats      *chats.Store    // nil if the chats dir can't be created — AI transcript persistence
 	staticDir  string          // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -52,12 +54,18 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: comments store disabled: %v", err)
 		cstore = nil
 	}
+	chatStore, err := chats.NewStore()
+	if err != nil {
+		log.Printf("devlabd: chat store disabled: %v", err)
+		chatStore = nil
+	}
 	return &Server{
 		v:          v,
 		reposBase:  base,
 		links:      store,
 		workspaces: workspace.NewManager(),
 		comments:   cstore,
+		chats:      chatStore,
 		staticDir:  os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
@@ -122,6 +130,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/repos/{id}/comments", s.guard(s.commentsList))
 	mux.HandleFunc("POST /api/repos/{id}/comments", s.guardWrite(s.commentAdd))
 	mux.HandleFunc("DELETE /api/repos/{id}/comments/{cid}", s.guardWrite(s.commentDelete))
+
+	// AI assistant — proxied to the aigentic service with the open repo as context, plus a
+	// per-user-per-repo transcript so a conversation survives a reload.
+	mux.HandleFunc("POST /api/repos/{id}/assistant", s.guardWrite(s.assistant))
+	mux.HandleFunc("GET /api/repos/{id}/assistant/history", s.guard(s.getHistory))
+	mux.HandleFunc("PUT /api/repos/{id}/assistant/history", s.guardWrite(s.putHistory))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
