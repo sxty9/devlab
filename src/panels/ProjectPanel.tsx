@@ -1,11 +1,14 @@
 import { useMemo, useState } from 'react';
 import { useWorkspace } from '@/state/workspace';
+import { getDataSource } from '@/data';
 import type { FileNode } from '@/types';
 import { PanelHeader } from './PanelHeader';
 import { TreeNode } from './TreeNode';
 import { IconButton } from '@/ui/Button';
+import { useToast } from '@/ui/Toast';
 import { FileTextIcon, PlusIcon, RefreshIcon, SearchIcon } from '@/ui/icons';
 import { gitStatusMeta } from '@/ui/git';
+import { guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 
 /** Flatten every file (not dir) for the search view. */
@@ -18,7 +21,9 @@ function flattenFiles(nodes: FileNode[], acc: FileNode[] = []): FileNode[] {
 }
 
 export function ProjectPanel() {
-  const { data, activeRepo, activeTabId, openFile } = useWorkspace();
+  const { data, activeRepo, activeTabId, openFile, reloadRepo, canWrite } = useWorkspace();
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
   const [query, setQuery] = useState('');
   const q = query.trim().toLowerCase();
 
@@ -27,16 +32,29 @@ export function ProjectPanel() {
     return flattenFiles(data.tree).filter((n) => n.id.toLowerCase().includes(q));
   }, [q, data.tree]);
 
+  const newFile = async () => {
+    const path = window.prompt('New file — repo-relative path:')?.trim();
+    if (!path) return;
+    try {
+      await source.saveFile(activeRepo.id, path, '');
+      await reloadRepo();
+      openFile({ id: path, name: path.split('/').pop() ?? path, lang: guessLang(path) });
+      toast({ title: 'File created', description: path, variant: 'success' });
+    } catch (e) {
+      toast({ title: 'Create failed', description: String((e as Error)?.message ?? e), variant: 'danger' });
+    }
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <PanelHeader
         title="Project"
         actions={
           <>
-            <IconButton label="New file" title="New file — wired up with the backend (phase 2)">
+            <IconButton label="New file" title={canWrite ? 'New file' : 'Read-only repository'} disabled={!canWrite} onClick={() => void newFile()}>
               <PlusIcon className="h-4 w-4" />
             </IconButton>
-            <IconButton label="Refresh" title="Refresh — wired up with the backend (phase 2)">
+            <IconButton label="Refresh" title="Refresh file tree" onClick={() => void reloadRepo()}>
               <RefreshIcon className="h-4 w-4" />
             </IconButton>
           </>
