@@ -300,6 +300,7 @@ func (s *Server) repoPath(w http.ResponseWriter, r *http.Request) (string, bool)
 	}
 	p, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token, !s.v.DevBypass())
 	if err != nil {
+		log.Printf("devlabd: prepare workspace %s/%s: %v", u.Username, id, err)
 		writeErr(w, http.StatusBadGateway, "Could not prepare the workspace")
 		return "", false
 	}

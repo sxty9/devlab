@@ -12,7 +12,9 @@
 #   rm    <file>                remove <file>
 # The GitHub token, when needed, is passed via the DEVLAB_GH_TOKEN env (sudoers env_keep), never argv.
 set -euo pipefail
-umask 0077
+# 0027: files 0640 / dirs 0750 — the workspace's setgid group is `devlab`, so the read-only devlab
+# service can read what the user creates here; other users (not in the group) cannot.
+umask 0027
 
 SELF="$(id -un)"
 ROOT="/var/lib/devlab/workspaces/$SELF"
@@ -43,7 +45,9 @@ case "$verb" in
     require_under_root "$dir"
     cd -- "$dir"
     export GIT_TERMINAL_PROMPT=0
-    exec git "$@"
+    # safe.directory='*': the workspace is confined + owned by this same user, but sudo's env
+    # (HOME/uid handling) can otherwise trip git's dubious-ownership guard. Safe here by construction.
+    exec git -c "safe.directory=*" "$@"
     ;;
   claude)
     dir="${1:-}"; shift || true

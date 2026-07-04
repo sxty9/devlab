@@ -13,3 +13,4 @@ dist/
 /devlabd
 backend/devlabd
 deploy/devlabd
+backend/deploy/
