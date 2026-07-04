@@ -6,7 +6,14 @@ import { IconButton } from '@/ui/Button';
 import { ClaudeIcon, PlusIcon, SendIcon } from '@/ui/icons';
 import { renderMarkdown } from '@/lib/markdown';
 import { cn } from '@/lib/cn';
-import type { AiMessage } from '@/types';
+import type { AiMessage, AiModelCatalog } from '@/types';
+
+const ENGINES = [
+  { id: 'choose', label: 'Auto (Router)' },
+  { id: 'claude-cli', label: 'Claude Code' },
+  { id: 'claude-api', label: 'Claude API' },
+  { id: 'ollama', label: 'Ollama (lokal)' },
+];
 
 /** Resolve the Holistic dashboard origin so we can deep-link to the aigentic settings. */
 function aigenticUrl(): string {
@@ -45,7 +52,29 @@ export function ClaudePanel() {
   const [error, setError] = useState<string | null>(null);
   const [includeFile, setIncludeFile] = useState(true);
   const [effort, setEffort] = useState('medium');
+  const [engine, setEngine] = useState('choose');
+  const [model, setModel] = useState('');
+  const [catalog, setCatalog] = useState<AiModelCatalog | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    source
+      .assistantModels()
+      .then((c) => !cancelled && setCatalog(c))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+
+  // Model options depend on the chosen engine; Auto/router leaves the model to aigentic.
+  const models = useMemo<{ id: string; label: string }[]>(() => {
+    if (!catalog) return [];
+    if (engine === 'ollama') return catalog.ollama.map((m) => ({ id: m, label: m }));
+    if (engine === 'claude-cli' || engine === 'claude-api') return catalog.claude;
+    return [];
+  }, [catalog, engine]);
 
   const activeFile = useMemo(() => {
     const t = openTabs.find((x) => x.id === activeTabId);
@@ -78,7 +107,7 @@ export function ClaudePanel() {
     setBusy(true);
     try {
       const contextPaths = includeFile && activeFile ? [activeFile] : [];
-      const reply = await source.askAssistant(activeRepo.id, { prompt: text, contextPaths, history, effort });
+      const reply = await source.askAssistant(activeRepo.id, { prompt: text, contextPaths, history, kind: engine, model, effort });
       const withReply: AiMessage[] = [...next, { role: 'assistant', content: reply.output, ts: new Date().toISOString() }];
       setMessages(withReply);
       source.saveAssistantHistory(activeRepo.id, withReply).catch(() => {});
@@ -107,29 +136,59 @@ export function ClaudePanel() {
         }
       />
 
-      {/* Context controls */}
-      <div className="dl-no-select flex flex-wrap items-center gap-1.5 border-b border-separator px-3 py-1.5 text-caption text-text-tertiary">
-        <span>Kontext: <span className="text-text-secondary">{activeRepo.name}</span></span>
-        {activeFile && (
-          <button
-            type="button"
-            onClick={() => setIncludeFile((v) => !v)}
-            className={cn('truncate rounded-sm px-1.5 py-0.5 font-mono text-[11px] transition', includeFile ? 'bg-accent/15 text-accent' : 'bg-fill/10 text-text-tertiary line-through')}
-            title={includeFile ? 'Open file included as context' : 'Open file excluded'}
+      {/* Context + engine controls */}
+      <div className="dl-no-select flex flex-col gap-1.5 border-b border-separator px-3 py-1.5 text-caption text-text-tertiary">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span>Kontext: <span className="text-text-secondary">{activeRepo.name}</span> (ganzes Repo)</span>
+          {activeFile && (
+            <button
+              type="button"
+              onClick={() => setIncludeFile((v) => !v)}
+              className={cn('truncate rounded-sm px-1.5 py-0.5 font-mono text-[11px] transition', includeFile ? 'bg-accent/15 text-accent' : 'bg-fill/10 text-text-tertiary line-through')}
+              title={includeFile ? 'Offene Datei priorisiert' : 'Offene Datei nicht priorisiert'}
+            >
+              +{activeFile.split('/').pop()}
+            </button>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <select
+            value={engine}
+            onChange={(e) => {
+              setEngine(e.target.value);
+              setModel('');
+            }}
+            className="rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
+            title="Engine"
           >
-            {activeFile.split('/').pop()}
-          </button>
-        )}
-        <select
-          value={effort}
-          onChange={(e) => setEffort(e.target.value)}
-          className="ml-auto rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
-          title="Reasoning effort"
-        >
-          {['low', 'medium', 'high', 'xhigh', 'max'].map((x) => (
-            <option key={x} value={x}>{x}</option>
-          ))}
-        </select>
+            {ENGINES.map((x) => (
+              <option key={x.id} value={x.id}>{x.label}</option>
+            ))}
+          </select>
+          {models.length > 0 && (
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="max-w-[10rem] rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
+              title="Modell"
+            >
+              <option value="">Modell: Auto</option>
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          )}
+          <select
+            value={effort}
+            onChange={(e) => setEffort(e.target.value)}
+            className="ml-auto rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
+            title="Reasoning effort"
+          >
+            {['low', 'medium', 'high', 'xhigh', 'max'].map((x) => (
+              <option key={x} value={x}>{x}</option>
+            ))}
+          </select>
+        </div>
       </div>
 
       <div ref={scrollRef} className="dl-scroll min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-2">

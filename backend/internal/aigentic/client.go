@@ -45,7 +45,31 @@ type Request struct {
 	Prompt       string       `json:"prompt"`
 	Inline       []InlineFile `json:"inline,omitempty"`
 	OutputFormat string       `json:"outputFormat,omitempty"`
+	Model        string       `json:"model,omitempty"`
 	Claude       *ClaudeOpts  `json:"claude,omitempty"`
+}
+
+// Get proxies an authenticated GET to an aigentic sub-path (e.g. "models") forwarding the caller's
+// cookie, and returns the raw JSON body.
+func Get(ctx context.Context, cookieHeader, subpath string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL()+"/"+strings.TrimPrefix(subpath, "/"), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
+	}
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, res.StatusCode, fmt.Errorf("aigentic: %s", res.Status)
+	}
+	return raw, res.StatusCode, nil
 }
 
 // Usage is the token accounting aigentic returns.

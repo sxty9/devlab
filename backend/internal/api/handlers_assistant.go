@@ -7,16 +7,21 @@ import (
 	"unicode/utf8"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/git"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/workspace"
 )
 
 const (
-	ctxPerFile = 16 << 10 // 16 KiB per context file
-	ctxBudget  = 48 << 10 // 48 KiB total (under aigentic's ~64 KiB context budget)
+	ctxPerFile   = 24 << 10  // 24 KiB per context file
+	ctxRepoBudget = 256 << 10 // 256 KiB repo snapshot (aigentic's claude-cli materializes these to a
+	// temp workdir the CLI reads via Read/Glob/Grep; other engines trim to their own budget)
 )
 
-var effortAllowed = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+var (
+	effortAllowed = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
+	kindAllowed   = map[string]bool{"choose": true, "claude-cli": true, "claude-api": true, "ollama": true}
+)
 
 // assistant proxies one AI turn to aigentic with the open repo as context. It forwards the
 // caller's session cookie so aigentic bills the user's own key and enforces its own rights.
@@ -29,6 +34,8 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 		Prompt       string            `json:"prompt"`
 		ContextPaths []string          `json:"contextPaths"`
 		History      []model.AiMessage `json:"history"`
+		Kind         string            `json:"kind"`
+		Model        string            `json:"model"`
 		Effort       string            `json:"effort"`
 	}
 	if !decodeJSON(w, r, &body) {
@@ -38,10 +45,14 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Empty prompt")
 		return
 	}
+	kind := body.Kind
+	if !kindAllowed[kind] {
+		kind = "choose"
+	}
 
 	repo := r.PathValue("id")
 	prompt := buildPrompt(repo, body.History, body.Prompt)
-	inline := collectContext(wt, body.ContextPaths)
+	inline := collectRepoContext(wt, body.ContextPaths)
 
 	var claude *aigentic.ClaudeOpts
 	if effortAllowed[body.Effort] {
@@ -52,8 +63,8 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(csrfCookie); err == nil {
 		csrf = c.Value
 	}
-	req := aigentic.Request{Prompt: prompt, Inline: inline, OutputFormat: "markdown", Claude: claude}
-	result, status, err := aigentic.Run(r.Context(), r.Header.Get("Cookie"), csrf, "choose", req)
+	req := aigentic.Request{Prompt: prompt, Inline: inline, OutputFormat: "markdown", Model: body.Model, Claude: claude}
+	result, status, err := aigentic.Run(r.Context(), r.Header.Get("Cookie"), csrf, kind, req)
 	if err != nil {
 		if status == http.StatusForbidden {
 			writeErr(w, http.StatusForbidden, "AI not enabled: grant hp_aigentic_run and link your Claude key/subscription in aigentic")
@@ -80,7 +91,10 @@ func buildPrompt(repo string, history []model.AiMessage, prompt string) string {
 	var b strings.Builder
 	b.WriteString("You are an AI assistant embedded in DevLab, an in-browser IDE, helping with the GitHub repository \"")
 	b.WriteString(repo)
-	b.WriteString("\". Answer concisely in GitHub-flavoured Markdown. Use the attached repository files as context when relevant.\n\n")
+	b.WriteString("\". The repository's files are attached as context (REPO_FILES.txt lists every path; ")
+	b.WriteString("text files are attached by content). Reason about THIS repository from the attached ")
+	b.WriteString("context — do not assume access to any other filesystem. Answer concisely in ")
+	b.WriteString("GitHub-flavoured Markdown.\n\n")
 	for _, m := range history {
 		label := "User"
 		if m.Role == "assistant" {
@@ -97,33 +111,66 @@ func buildPrompt(repo string, history []model.AiMessage, prompt string) string {
 	return b.String()
 }
 
-// collectContext reads the requested repo files (text only), trimmed to the aigentic budget, and
-// packs them as inline context. Paths are workspace-confined and symlink-guarded via SafePath.
-func collectContext(wt string, paths []string) []aigentic.InlineFile {
-	var out []aigentic.InlineFile
+// collectRepoContext packs the open repo as context: a REPO_FILES.txt listing every path, then the
+// priority paths (the open file) followed by the rest of the repo's text files, up to the budget.
+// For aigentic's claude-cli engine these are materialized to a temp workdir the CLI reads via its
+// tools; for other engines aigentic trims them to its own budget. All paths are SafePath-confined.
+func collectRepoContext(wt string, priority []string) []aigentic.InlineFile {
+	files := git.ListFiles(wt)
+	out := []aigentic.InlineFile{{Path: "REPO_FILES.txt", Content: strings.Join(files, "\n"), MediaType: "text/plain"}}
 	used := 0
-	for _, rel := range paths {
-		if used >= ctxBudget {
-			break
+	seen := map[string]bool{}
+	add := func(rel string) {
+		if rel == "" || seen[rel] || used >= ctxRepoBudget {
+			return
 		}
 		abs, err := workspace.SafePath(wt, rel)
 		if err != nil {
-			continue
+			return
+		}
+		info, err := os.Stat(abs)
+		if err != nil || info.IsDir() {
+			return
 		}
 		b, err := os.ReadFile(abs)
 		if err != nil || !utf8.Valid(b) {
-			continue // text context only
+			return // text context only
 		}
 		if len(b) > ctxPerFile {
 			b = b[:ctxPerFile]
 		}
-		if used+len(b) > ctxBudget {
-			b = b[:ctxBudget-used]
+		if used+len(b) > ctxRepoBudget {
+			return
 		}
 		used += len(b)
+		seen[rel] = true
 		out = append(out, aigentic.InlineFile{Path: rel, Content: string(b), MediaType: "text/plain"})
 	}
+	for _, p := range priority {
+		add(p)
+	}
+	for _, p := range files {
+		add(p)
+	}
 	return out
+}
+
+// assistantModels proxies aigentic's model catalog (per engine) with the caller's session, so the
+// KI tab can offer the same engine/model choices as aigentic itself.
+func (s *Server) assistantModels(w http.ResponseWriter, r *http.Request) {
+	raw, status, err := aigentic.Get(r.Context(), r.Header.Get("Cookie"), "models")
+	if err != nil {
+		if status == http.StatusForbidden {
+			writeErr(w, http.StatusForbidden, "AI not enabled")
+			return
+		}
+		writeErr(w, http.StatusBadGateway, "Could not load models")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(raw)
 }
 
 // getHistory / putHistory persist the repo-scoped transcript per user.

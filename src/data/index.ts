@@ -53,6 +53,7 @@ export const dataSource: DataSource = {
   askAssistant: (id, ask) => impl.askAssistant(id, ask),
   getAssistantHistory: (id) => impl.getAssistantHistory(id),
   saveAssistantHistory: (id, msgs) => impl.saveAssistantHistory(id, msgs),
+  assistantModels: () => impl.assistantModels(),
 };
 
 export function getDataSource(): DataSource {

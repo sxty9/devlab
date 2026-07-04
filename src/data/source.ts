@@ -1,4 +1,4 @@
-import type { AiMessage, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -85,6 +85,7 @@ export interface DataSource {
   askAssistant(id: string, ask: AssistantAsk): Promise<AssistantReply>;
   getAssistantHistory(id: string): Promise<AiMessage[]>;
   saveAssistantHistory(id: string, messages: AiMessage[]): Promise<void>;
+  assistantModels(): Promise<AiModelCatalog>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

@@ -137,6 +137,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/assistant", s.guardWrite(s.assistant))
 	mux.HandleFunc("GET /api/repos/{id}/assistant/history", s.guard(s.getHistory))
 	mux.HandleFunc("PUT /api/repos/{id}/assistant/history", s.guardWrite(s.putHistory))
+	mux.HandleFunc("GET /api/assistant/models", s.guard(s.assistantModels))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.

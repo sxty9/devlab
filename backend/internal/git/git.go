@@ -291,6 +291,15 @@ func visionKind(name string) string {
 	}
 }
 
+// ListFiles returns the repo's tracked+untracked (gitignore-respected) file paths, flat.
+func ListFiles(repo string) []string {
+	out, err := run(repo, "ls-files", "--cached", "--others", "--exclude-standard")
+	if err != nil || out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
 // VisionFiles lists the tracked+untracked (gitignore-respected) files under the repo's vision/
 // folder, classified for the Vision Catalog, with sizes and git-status decorations. Hidden files
 // (e.g. the vision/.gitignore itself) are omitted.

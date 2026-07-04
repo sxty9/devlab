@@ -8,7 +8,7 @@ import {
   type PushResult,
   type WriteResult,
 } from './source';
-import type { AiMessage, AssistantReply, Comment, User, VisionFile } from '@/types';
+import type { AiMessage, AiModelCatalog, AssistantReply, Comment, User, VisionFile } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -184,6 +184,9 @@ export const httpSource: DataSource = {
   },
   async saveAssistantHistory(id, messages): Promise<void> {
     await json<void>(await post(`/api/repos/${enc(id)}/assistant/history`, { messages }, 'PUT'));
+  },
+  async assistantModels(): Promise<AiModelCatalog> {
+    return json(await request('/api/assistant/models'));
   },
 };
 

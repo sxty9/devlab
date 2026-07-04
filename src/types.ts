@@ -137,7 +137,17 @@ export interface AssistantAsk {
   prompt: string;
   contextPaths: string[];
   history: AiMessage[];
+  /** aigentic engine: 'choose' (router) | 'claude-cli' | 'claude-api' | 'ollama'. */
+  kind?: string;
+  /** model id override (from the catalog); '' = the engine's default. */
+  model?: string;
   effort?: string;
+}
+
+/** aigentic's model catalog (GET /api/assistant/models). */
+export interface AiModelCatalog {
+  claude: { id: string; label: string }[];
+  ollama: string[];
 }
 
 /** How a Vision-Catalog file is rendered. */

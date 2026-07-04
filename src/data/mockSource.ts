@@ -164,6 +164,16 @@ export const mockSource: DataSource = {
   async saveAssistantHistory(id, messages): Promise<void> {
     aiStore[id] = messages;
   },
+  async assistantModels() {
+    return {
+      claude: [
+        { id: 'claude-opus-4-8', label: 'Opus' },
+        { id: 'claude-sonnet-4-6', label: 'Sonnet' },
+        { id: 'claude-haiku-4-5-20251001', label: 'Haiku' },
+      ],
+      ollama: ['llama3.1', 'qwen2.5-coder'],
+    };
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};
