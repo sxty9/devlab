@@ -8,7 +8,7 @@ import {
   type PushResult,
   type WriteResult,
 } from './source';
-import type { AiMessage, AiModelCatalog, AssistantReply, Comment, User, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AiModelCatalog, AssistantReply, Comment, User, VisionFile } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -178,6 +178,9 @@ export const httpSource: DataSource = {
 
   async askAssistant(id, ask): Promise<AssistantReply> {
     return json(await post(`/api/repos/${enc(id)}/assistant`, ask));
+  },
+  async askAgent(id, ask): Promise<AgentReply> {
+    return json(await post(`/api/repos/${enc(id)}/agent`, ask));
   },
   async getAssistantHistory(id): Promise<AiMessage[]> {
     return json(await request(`/api/repos/${enc(id)}/assistant/history`));

@@ -1,4 +1,4 @@
-import type { AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -83,6 +83,8 @@ export interface DataSource {
 
   // ── AI assistant (proxied to aigentic, repo as context) ────────────────────
   askAssistant(id: string, ask: AssistantAsk): Promise<AssistantReply>;
+  /** Run the FULL claude CLI agentically in the repo workspace, as the user (can edit the tree). */
+  askAgent(id: string, ask: AgentAsk): Promise<AgentReply>;
   getAssistantHistory(id: string): Promise<AiMessage[]>;
   saveAssistantHistory(id: string, messages: AiMessage[]): Promise<void>;
   assistantModels(): Promise<AiModelCatalog>;

@@ -53,6 +53,10 @@ case "$verb" in
     dir="${1:-}"; shift || true
     require_under_root "$dir"
     cd -- "$dir"
+    # claude reads the invoking user's ~/.claude (config + auth). sudo may not reset HOME, so set
+    # it (and USER) from the passwd entry of whoever we are running as, so the RIGHT config loads.
+    HOME="$(getent passwd "$SELF" | cut -d: -f6)"; export HOME
+    export USER="$SELF" LOGNAME="$SELF"
     command -v claude >/dev/null 2>&1 || die "claude CLI not installed for $SELF"
     exec claude "$@"
     ;;

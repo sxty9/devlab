@@ -10,9 +10,17 @@ import type { AiMessage, AiModelCatalog } from '@/types';
 
 const ENGINES = [
   { id: 'choose', label: 'Auto (Router)' },
+  { id: 'claude-agent', label: 'Claude Agent (Repo)' },
   { id: 'claude-cli', label: 'Claude Code' },
   { id: 'claude-api', label: 'Claude API' },
   { id: 'ollama', label: 'Ollama (lokal)' },
+];
+
+// The agentic engine runs the FULL claude CLI in the workspace, as the user — it can edit files.
+const AGENT_MODES = [
+  { id: 'plan', label: 'Plan (nur lesen)' },
+  { id: 'auto', label: 'Auto (bearbeiten)' },
+  { id: 'full', label: 'Full (autonom)' },
 ];
 
 /** Resolve the Holistic dashboard origin so we can deep-link to the aigentic settings. */
@@ -44,7 +52,7 @@ function Bubble({ msg }: { msg: AiMessage }) {
 
 /** The AI assistant panel: a general chat whose context is the open repo, powered by aigentic. */
 export function ClaudePanel() {
-  const { activeRepo, openTabs, activeTabId } = useWorkspace();
+  const { activeRepo, openTabs, activeTabId, reloadRepo } = useWorkspace();
   const source = useMemo(() => getDataSource(), []);
   const [messages, setMessages] = useState<AiMessage[]>([]);
   const [draft, setDraft] = useState('');
@@ -54,8 +62,11 @@ export function ClaudePanel() {
   const [effort, setEffort] = useState('medium');
   const [engine, setEngine] = useState('choose');
   const [model, setModel] = useState('');
+  const [mode, setMode] = useState('auto'); // agent permission mode (plan | auto | full)
+  const [sessionId, setSessionId] = useState(''); // agent session, for multi-turn --resume
   const [catalog, setCatalog] = useState<AiModelCatalog | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const isAgent = engine === 'claude-agent';
 
   useEffect(() => {
     let cancelled = false;
@@ -72,7 +83,7 @@ export function ClaudePanel() {
   const models = useMemo<{ id: string; label: string }[]>(() => {
     if (!catalog) return [];
     if (engine === 'ollama') return catalog.ollama.map((m) => ({ id: m, label: m }));
-    if (engine === 'claude-cli' || engine === 'claude-api') return catalog.claude;
+    if (engine === 'claude-cli' || engine === 'claude-api' || engine === 'claude-agent') return catalog.claude;
     return [];
   }, [catalog, engine]);
 
@@ -83,6 +94,7 @@ export function ClaudePanel() {
 
   useEffect(() => {
     let cancelled = false;
+    setSessionId(''); // a new repo starts a fresh agent session
     source
       .getAssistantHistory(activeRepo.id)
       .then((h) => !cancelled && setMessages(h))
@@ -106,9 +118,20 @@ export function ClaudePanel() {
     setMessages(next);
     setBusy(true);
     try {
-      const contextPaths = includeFile && activeFile ? [activeFile] : [];
-      const reply = await source.askAssistant(activeRepo.id, { prompt: text, contextPaths, history, kind: engine, model, effort });
-      const withReply: AiMessage[] = [...next, { role: 'assistant', content: reply.output, ts: new Date().toISOString() }];
+      let output: string;
+      if (isAgent) {
+        // Full agentic run: claude CLI in the workspace, as the user — it can edit the tree.
+        const reply = await source.askAgent(activeRepo.id, { prompt: text, model, effort, mode, resume: sessionId });
+        if (reply.sessionId) setSessionId(reply.sessionId);
+        const n = reply.changes.length;
+        output = reply.output + (n ? `\n\n_(${n} ${n === 1 ? 'file' : 'files'} changed — open Source Control to review)_` : '');
+        if (n) void reloadRepo(); // surface the edits in the tree + VCS panel
+      } else {
+        const contextPaths = includeFile && activeFile ? [activeFile] : [];
+        const reply = await source.askAssistant(activeRepo.id, { prompt: text, contextPaths, history, kind: engine, model, effort });
+        output = reply.output;
+      }
+      const withReply: AiMessage[] = [...next, { role: 'assistant', content: output, ts: new Date().toISOString() }];
       setMessages(withReply);
       source.saveAssistantHistory(activeRepo.id, withReply).catch(() => {});
     } catch (e) {
@@ -122,6 +145,7 @@ export function ClaudePanel() {
   const clear = () => {
     setMessages([]);
     setError(null);
+    setSessionId(''); // drop the agent session so the next turn starts fresh
     source.saveAssistantHistory(activeRepo.id, []).catch(() => {});
   };
 
@@ -139,8 +163,12 @@ export function ClaudePanel() {
       {/* Context + engine controls */}
       <div className="dl-no-select flex flex-col gap-1.5 border-b border-separator px-3 py-1.5 text-caption text-text-tertiary">
         <div className="flex flex-wrap items-center gap-1.5">
-          <span>Kontext: <span className="text-text-secondary">{activeRepo.name}</span> (ganzes Repo)</span>
-          {activeFile && (
+          {isAgent ? (
+            <span>Agent im Workspace <span className="text-text-secondary">{activeRepo.name}</span> — läuft als du, kann Dateien ändern</span>
+          ) : (
+            <span>Kontext: <span className="text-text-secondary">{activeRepo.name}</span> (ganzes Repo)</span>
+          )}
+          {!isAgent && activeFile && (
             <button
               type="button"
               onClick={() => setIncludeFile((v) => !v)}
@@ -175,6 +203,18 @@ export function ClaudePanel() {
               <option value="">Modell: Auto</option>
               {models.map((m) => (
                 <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          )}
+          {isAgent && (
+            <select
+              value={mode}
+              onChange={(e) => setMode(e.target.value)}
+              className="rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
+              title="Agent-Modus"
+            >
+              {AGENT_MODES.map((x) => (
+                <option key={x.id} value={x.id}>{x.label}</option>
               ))}
             </select>
           )}

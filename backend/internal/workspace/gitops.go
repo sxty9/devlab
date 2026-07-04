@@ -136,6 +136,39 @@ func (e Executor) clone(ctx context.Context, wt, url, token string) error {
 	return assertNoLeak(wt, token)
 }
 
+// Agent runs the claude CLI as the user inside the workspace via the pinned devlab-exec `claude`
+// verb, returning its stdout (the CLI's JSON result). This is the FULL agentic AI: claude reads
+// and edits the real workspace with the user's OWN ~/.claude config, rights and subscription —
+// no key is injected. Per-user: `sudo -n -u <user> devlab-exec claude wt …` (the wrapper cd's to
+// wt as the user and sets their HOME). Under dev-bypass it runs claude directly in wt (sandbox).
+// The prompt and flags are passed as argv (exec, not a shell) so there is no injection surface.
+// Long-running; the caller owns the context deadline. stderr is folded into the error on failure.
+func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte, error) {
+	var cmd *exec.Cmd
+	if e.PerUser {
+		full := append([]string{"-n", "-u", e.User, execWrapper, "claude", wt}, args...)
+		cmd = exec.CommandContext(ctx, "sudo", full...)
+	} else {
+		cmd = exec.CommandContext(ctx, "claude", args...)
+		cmd.Dir = wt
+	}
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		s := strings.TrimSpace(stderr.String())
+		if s == "" {
+			s = strings.TrimSpace(stdout.String())
+		}
+		if s == "" {
+			s = err.Error()
+		}
+		return stdout.Bytes(), errors.New(s)
+	}
+	return stdout.Bytes(), nil
+}
+
 // provisionWorkspace creates the user's workspace root (owned by the user) via the root helper.
 func provisionWorkspace(user string) error {
 	cmd := exec.Command("sudo", "-n", mkWorkspaceWrapper, user)

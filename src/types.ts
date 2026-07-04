@@ -144,6 +144,28 @@ export interface AssistantAsk {
   effort?: string;
 }
 
+/** The payload for one agentic run — the full claude CLI, in the repo workspace, as the user. */
+export interface AgentAsk {
+  prompt: string;
+  /** model id (from the catalog); '' = the CLI default. */
+  model?: string;
+  effort?: string;
+  /** 'plan' (read-only) | 'auto' (accept edits) | 'full' (autonomous, incl. shell). */
+  mode?: string;
+  /** prior session id to continue the conversation (--resume). */
+  resume?: string;
+}
+
+/** What an agentic run returns: the summary + the refreshed change set (edits it made). */
+export interface AgentReply {
+  output: string;
+  sessionId: string;
+  costUsd: number;
+  numTurns: number;
+  isError: boolean;
+  changes: Change[];
+}
+
 /** aigentic's model catalog (GET /api/assistant/models). */
 export interface AiModelCatalog {
   claude: { id: string; label: string }[];

@@ -139,6 +139,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/repos/{id}/assistant/history", s.guardWrite(s.putHistory))
 	mux.HandleFunc("GET /api/assistant/models", s.guard(s.assistantModels))
 
+	// Agentic AI — the FULL claude CLI run AS the user inside their repo workspace (Edit/Write/Bash,
+	// Plan/Auto/Full modes, their own ~/.claude config). Can modify the tree, so it's a write op.
+	mux.HandleFunc("POST /api/repos/{id}/agent", s.guardWrite(s.agent))
+
 	// Terminal — a real shell in the caller's repo workspace, proxied over loopback to the
 	// remshel provider (which owns the pty + recording + run-as-user escalation). WebSocket:
 	// authenticated by guard, upgraded inside the handler.

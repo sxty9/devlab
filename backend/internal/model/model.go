@@ -225,6 +225,18 @@ type AssistantReply struct {
 	} `json:"usage"`
 }
 
+// AgentReply is what DevLab returns after a FULL agentic claude run in the user's workspace.
+// Unlike AssistantReply (a read-only aigentic proxy), the agent can edit the tree, so it carries
+// the refreshed change set. SessionID lets the SPA continue the conversation (--resume).
+type AgentReply struct {
+	Output    string   `json:"output"`
+	SessionID string   `json:"sessionId"`
+	CostUSD   float64  `json:"costUsd"`
+	NumTurns  int      `json:"numTurns"`
+	IsError   bool     `json:"isError"`
+	Changes   []Change `json:"changes"`
+}
+
 // Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
 type Comment struct {
 	ID        string `json:"id"`

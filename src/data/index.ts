@@ -51,6 +51,7 @@ export const dataSource: DataSource = {
   addComment: (id, p, b, parent) => impl.addComment(id, p, b, parent),
   deleteComment: (id, cid) => impl.deleteComment(id, cid),
   askAssistant: (id, ask) => impl.askAssistant(id, ask),
+  askAgent: (id, ask) => impl.askAgent(id, ask),
   getAssistantHistory: (id) => impl.getAssistantHistory(id),
   saveAssistantHistory: (id, msgs) => impl.saveAssistantHistory(id, msgs),
   assistantModels: () => impl.assistantModels(),

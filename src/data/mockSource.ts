@@ -1,4 +1,4 @@
-import type { AiMessage, AssistantReply, Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { guessLang } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -156,6 +156,16 @@ export const mockSource: DataSource = {
       engine: 'mock',
       model: 'mock',
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, truncated: false },
+    };
+  },
+  async askAgent(_id, ask): Promise<AgentReply> {
+    return {
+      output: `**(mock agent)** In production I'd run the full Claude CLI in this workspace (mode: ${ask.mode ?? 'auto'}) and edit files directly.`,
+      sessionId: 'mock-session',
+      costUsd: 0,
+      numTurns: 0,
+      isError: false,
+      changes: [],
     };
   },
   async getAssistantHistory(id): Promise<AiMessage[]> {
