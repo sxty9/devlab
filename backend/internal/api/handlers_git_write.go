@@ -19,9 +19,10 @@ const maxBodyBytes = 8 << 20 // 8 MiB request cap (file content ≤2 MiB + slack
 type writeCtx struct {
 	wt      string // working-tree path
 	user    string
-	token   string // "" under dev-bypass (ambient git credentials)
+	token   string            // "" under dev-bypass (ambient git credentials)
 	ghLogin string
 	ghID    int64
+	exec    workspace.Executor // runs mutations as the user (per-user) or directly (dev-bypass)
 }
 
 // mutateCtx resolves the working tree and enforces per-repo write authorization (GitHub is the
@@ -38,7 +39,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 			writeErr(w, http.StatusNotFound, "Repository not found")
 			return nil, nil, false
 		}
-		return &writeCtx{wt: p, user: u.Username}, func() {}, true
+		return &writeCtx{wt: p, user: u.Username, exec: workspace.Executor{User: u.Username, PerUser: false}}, func() {}, true
 	}
 
 	full, ok := s.resolveFullName(r.Context(), u, id)
@@ -55,7 +56,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 		writeErr(w, http.StatusForbidden, "Link your GitHub account first")
 		return nil, nil, false
 	}
-	if _, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token); err != nil {
+	if _, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token, true); err != nil {
 		writeErr(w, http.StatusBadGateway, "Could not prepare the workspace")
 		return nil, nil, false
 	}
@@ -65,7 +66,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 		return nil, nil, false
 	}
 	wt, _ := s.workspaces.Path(u.Username, id)
-	wc := &writeCtx{wt: wt, user: u.Username, token: token}
+	wc := &writeCtx{wt: wt, user: u.Username, token: token, exec: workspace.Executor{User: u.Username, PerUser: true}}
 	if s.links != nil {
 		if l, e := s.links.Get(u.Username); e == nil && l != nil {
 			wc.ghLogin, wc.ghID = l.GHLogin, l.GHID
@@ -129,7 +130,7 @@ func (s *Server) gitWriteFile(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Missing path")
 		return
 	}
-	if err := workspace.WriteFile(wc.wt, body.Path, []byte(body.Content)); err != nil {
+	if err := wc.exec.WriteFile(wc.wt, body.Path, []byte(body.Content)); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -157,9 +158,9 @@ func (s *Server) stageOp(w http.ResponseWriter, r *http.Request, stage bool) {
 	}
 	var err error
 	if stage {
-		err = workspace.Stage(r.Context(), wc.wt, body.Path)
+		err = wc.exec.Stage(r.Context(), wc.wt, body.Path)
 	} else {
-		err = workspace.Unstage(r.Context(), wc.wt, body.Path)
+		err = wc.exec.Unstage(r.Context(), wc.wt, body.Path)
 	}
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -181,7 +182,7 @@ func (s *Server) gitCommit(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	hash, branch, err := workspace.Commit(r.Context(), wc.wt, body.Message, wc.ghLogin, wc.ghID)
+	hash, branch, err := wc.exec.Commit(r.Context(), wc.wt, body.Message, wc.ghLogin, wc.ghID)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -196,7 +197,7 @@ func (s *Server) gitPush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer unlock()
-	msg, err := workspace.Push(r.Context(), wc.wt, wc.token)
+	msg, err := wc.exec.Push(r.Context(), wc.wt, wc.token)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -210,7 +211,7 @@ func (s *Server) gitPull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer unlock()
-	msg, err := workspace.Pull(r.Context(), wc.wt, wc.token)
+	msg, err := wc.exec.Pull(r.Context(), wc.wt, wc.token)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -219,7 +220,7 @@ func (s *Server) gitPull(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) writePushResult(w http.ResponseWriter, r *http.Request, wc *writeCtx, msg string) {
-	branch := workspace.CurrentBranch(r.Context(), wc.wt)
+	branch := wc.exec.CurrentBranch(r.Context(), wc.wt)
 	branches := workspace.Branches(wc.wt)
 	ahead, behind := 0, 0
 	for _, b := range branches {
@@ -244,11 +245,11 @@ func (s *Server) gitBranch(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if err := workspace.CreateBranch(r.Context(), wc.wt, body.Name, body.From); err != nil {
+	if err := wc.exec.CreateBranch(r.Context(), wc.wt, body.Name, body.From); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, model.BranchResult{Branch: workspace.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
+	writeJSON(w, http.StatusOK, model.BranchResult{Branch: wc.exec.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
 }
 
 func (s *Server) gitCheckout(w http.ResponseWriter, r *http.Request) {
@@ -263,9 +264,9 @@ func (s *Server) gitCheckout(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if err := workspace.Checkout(r.Context(), wc.wt, body.Name); err != nil {
+	if err := wc.exec.Checkout(r.Context(), wc.wt, body.Name); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, model.BranchResult{Branch: workspace.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
+	writeJSON(w, http.StatusOK, model.BranchResult{Branch: wc.exec.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
 }

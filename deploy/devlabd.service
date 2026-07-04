@@ -45,7 +45,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=nanu
+# Phase C: dedicated unprivileged service user. Per-user git/file ops (and the terminal/AI) run AS
+# the logged-in Linux user via the pinned devlab-exec sudo wrapper; the service itself only reads.
+User=devlab
 SupplementaryGroups=holistic
 ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8781
 Restart=on-failure
@@ -73,13 +75,15 @@ Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
 # devlab.henrysoase.org straight here). Deploy dist/ to this path on each release.
 Environment=DEVLAB_STATIC_DIR=/var/lib/devlab/www
 
-# Hardening.
+# Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo wrappers to
+# run ops as the end user); ProtectHome false so per-user git/claude configs (~/.gitconfig, ~/.claude)
+# resolve. Isolation is at the sudo/OS-user layer (devlab-exec), not the mount namespace.
 StateDirectory=devlab
 ReadWritePaths=/var/lib/devlab
-NoNewPrivileges=true
+NoNewPrivileges=false
 ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
+ProtectHome=false
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target

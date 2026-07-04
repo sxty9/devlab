@@ -298,7 +298,7 @@ func (s *Server) repoPath(w http.ResponseWriter, r *http.Request) (string, bool)
 		writeErr(w, http.StatusForbidden, "Link your GitHub account first")
 		return "", false
 	}
-	p, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token)
+	p, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token, !s.v.DevBypass())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "Could not prepare the workspace")
 		return "", false

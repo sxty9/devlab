@@ -81,7 +81,9 @@ func (m *Manager) Exists(user, repo string) bool {
 
 // Ensure returns the working-tree path, cloning on first access (no network if already present).
 // fullName is "owner/repo"; token authorizes the clone of private repos and is never persisted.
-func (m *Manager) Ensure(ctx context.Context, user, repo, fullName, token string) (string, error) {
+// perUser=true provisions the user's workspace root (owned by the user) and clones AS the user via
+// the wrapper; false (dev-bypass) clones directly as the service user.
+func (m *Manager) Ensure(ctx context.Context, user, repo, fullName, token string, perUser bool) (string, error) {
 	wt, err := m.Path(user, repo)
 	if err != nil {
 		return "", err
@@ -95,12 +97,18 @@ func (m *Manager) Ensure(ctx context.Context, user, repo, fullName, token string
 	if isGitDir(wt) {
 		return wt, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(wt), 0o700); err != nil {
+	if perUser {
+		if err := provisionWorkspace(user); err != nil { // root helper: create + chown the user's root
+			return "", err
+		}
+	} else if err := os.MkdirAll(filepath.Dir(wt), 0o700); err != nil {
 		return "", fmt.Errorf("workspace: mkdir: %w", err)
 	}
-	if err := clone(ctx, wt, "https://github.com/"+fullName+".git", token); err != nil {
-		// Leave no half-clone behind to confuse the next Ensure.
-		_ = os.RemoveAll(wt)
+	e := Executor{User: user, PerUser: perUser}
+	if err := e.clone(ctx, wt, "https://github.com/"+fullName+".git", token); err != nil {
+		if !perUser {
+			_ = os.RemoveAll(wt) // leave no half-clone (git clone self-cleans in the per-user path)
+		}
 		return "", err
 	}
 	return wt, nil

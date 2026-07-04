@@ -80,7 +80,7 @@ func (s *Server) visionUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Invalid base64 content")
 		return
 	}
-	if err := workspace.WriteFileBytes(wc.wt, rel, data); err != nil {
+	if err := wc.exec.WriteFileBytes(wc.wt, rel, data); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -106,7 +106,7 @@ func (s *Server) visionDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Only vision/ files can be deleted here")
 		return
 	}
-	if err := workspace.DeleteFile(wc.wt, rel); err != nil {
+	if err := wc.exec.DeleteFile(wc.wt, rel); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}

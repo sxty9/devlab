@@ -16,12 +16,14 @@ import (
 
 const maxFileBytes = 2 << 20 // 2 MiB editor cap
 
-// run executes `git --no-optional-locks -C repo args…` and returns trimmed stdout.
-// --no-optional-locks keeps read commands (status/ls-files) from opportunistically taking
-// .git/index.lock, so a concurrent write op (git add/commit, holding the workspace mutex) in
-// another browser tab does not fail with "index.lock: File exists".
+// run executes a read-only `git … -C repo args…` and returns trimmed stdout. Runs as the devlab
+// service user directly (reads are fast, no sudo). --no-optional-locks keeps status/ls-files from
+// taking .git/index.lock (so a concurrent user-run write doesn't collide). safe.directory=* lets the
+// service read repos OWNED by a different user (the per-user workspace model), where git would
+// otherwise refuse with "dubious ownership".
 func run(repo string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"--no-optional-locks", "-C", repo}, args...)...)
+	full := append([]string{"--no-optional-locks", "-c", "safe.directory=*", "-C", repo}, args...)
+	cmd := exec.Command("git", full...)
 	out, err := cmd.Output()
 	return strings.TrimRight(string(out), "\n"), err
 }
