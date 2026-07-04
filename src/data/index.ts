@@ -46,6 +46,7 @@ export const dataSource: DataSource = {
   vision: (id) => impl.vision(id),
   rawUrl: (id, p) => impl.rawUrl(id, p),
   uploadVision: (id, p, c) => impl.uploadVision(id, p, c),
+  deleteVision: (id, p) => impl.deleteVision(id, p),
   listComments: (id, p) => impl.listComments(id, p),
   addComment: (id, p, b, parent) => impl.addComment(id, p, b, parent),
   deleteComment: (id, cid) => impl.deleteComment(id, cid),

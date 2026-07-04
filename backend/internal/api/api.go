@@ -127,6 +127,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/repos/{id}/vision", s.guard(s.visionList))
 	mux.HandleFunc("GET /api/repos/{id}/raw", s.guard(s.visionRaw))
 	mux.HandleFunc("POST /api/repos/{id}/vision/upload", s.guardWrite(s.visionUpload))
+	mux.HandleFunc("POST /api/repos/{id}/vision/delete", s.guardWrite(s.visionDelete))
 	mux.HandleFunc("GET /api/repos/{id}/comments", s.guard(s.commentsList))
 	mux.HandleFunc("POST /api/repos/{id}/comments", s.guardWrite(s.commentAdd))
 	mux.HandleFunc("DELETE /api/repos/{id}/comments/{cid}", s.guardWrite(s.commentDelete))

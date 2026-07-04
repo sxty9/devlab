@@ -87,6 +87,32 @@ func (s *Server) visionUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, git.VisionFiles(wc.wt))
 }
 
+// visionDelete removes a vision file from the working tree and returns the refreshed listing.
+// The removal is shared via the normal stage→commit→push loop (symmetric with upload).
+func (s *Server) visionDelete(w http.ResponseWriter, r *http.Request) {
+	wc, unlock, ok := s.mutateCtx(w, r, true)
+	if !ok {
+		return
+	}
+	defer unlock()
+	var body struct {
+		Path string `json:"path"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	rel := cleanRel(body.Path)
+	if !strings.HasPrefix(rel, visionPrefix) || rel == visionPrefix {
+		writeErr(w, http.StatusBadRequest, "Only vision/ files can be deleted here")
+		return
+	}
+	if err := workspace.DeleteFile(wc.wt, rel); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, git.VisionFiles(wc.wt))
+}
+
 // ─── Comments (DevLab-side threaded store, per repo) ────────────────────────
 
 // commentsList returns the thread for a vision file (or the whole repo when path is empty).

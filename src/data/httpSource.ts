@@ -163,6 +163,9 @@ export const httpSource: DataSource = {
   async uploadVision(id, path, contentB64): Promise<VisionFile[]> {
     return json(await post(`/api/repos/${enc(id)}/vision/upload`, { path, contentB64 }));
   },
+  async deleteVision(id, path): Promise<VisionFile[]> {
+    return json(await post(`/api/repos/${enc(id)}/vision/delete`, { path }));
+  },
   async listComments(id, path): Promise<Comment[]> {
     return json(await request(`/api/repos/${enc(id)}/comments?path=${enc(path)}`));
   },

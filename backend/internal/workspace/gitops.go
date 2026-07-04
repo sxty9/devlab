@@ -186,6 +186,19 @@ func writeBytes(wt, rel string, content []byte, limit int) error {
 	return os.WriteFile(abs, content, 0o644)
 }
 
+// DeleteFile removes a working-tree file (traversal/.git/symlink guarded). Idempotent when the
+// file is already gone. A tracked file then shows as a deletion for the caller to commit+push.
+func DeleteFile(wt, rel string) error {
+	abs, err := safePath(wt, rel)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // Stage adds a path to the index.
 func Stage(ctx context.Context, wt, rel string) error {
 	p, err := relFor(wt, rel)

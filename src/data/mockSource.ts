@@ -120,6 +120,10 @@ export const mockSource: DataSource = {
     if (!list.some((f) => f.path === path)) list.push({ path, name, kind: mockKind(name), size: 1024, status: 'untracked' });
     return list;
   },
+  async deleteVision(id, path): Promise<VisionFile[]> {
+    visionStore[id] = mockVision(id).filter((f) => f.path !== path);
+    return visionStore[id];
+  },
   async listComments(id, path): Promise<Comment[]> {
     return (commentStore[id] ?? []).filter((c) => c.path === path);
   },

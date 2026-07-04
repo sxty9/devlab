@@ -4,7 +4,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
-import { FileIcon, FileTextIcon, PlusIcon, RefreshIcon } from '@/ui/icons';
+import { FileIcon, FileTextIcon, PlusIcon, RefreshIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 import type { VisionFile } from '@/types';
 
@@ -52,6 +52,20 @@ export function VisionPanel() {
     reload();
   }, [reload]);
 
+  const removeFile = async (f: VisionFile) => {
+    if (!window.confirm(`Delete ${f.name}? Commit & push to share the removal.`)) return;
+    setBusy(true);
+    try {
+      const updated = await source.deleteVision(activeRepo.id, f.path);
+      setFiles(updated);
+      toast({ title: 'Deleted', description: `${f.name} — commit & push to share the removal`, variant: 'success' });
+    } catch (err) {
+      toast({ title: 'Delete failed', description: String((err as Error)?.message ?? err), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = ''; // allow re-picking the same file
@@ -97,29 +111,38 @@ export function VisionPanel() {
           </p>
         )}
         {files.map((f) => (
-          <button
-            key={f.path}
-            type="button"
-            onClick={() => openVision(f.path)}
-            className="group mb-1.5 flex w-full items-center gap-2.5 rounded-md p-2 text-left transition-colors hover:bg-fill/10"
-          >
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md bg-fill/10 ring-1 ring-separator">
-              {f.kind === 'image' ? (
-                <img src={source.rawUrl(activeRepo.id, f.path)} alt="" className="h-full w-full object-cover" />
-              ) : f.kind === 'markdown' || f.kind === 'text' ? (
-                <FileTextIcon className="h-4 w-4 text-text-tertiary" />
-              ) : (
-                <FileIcon className="h-4 w-4 text-text-tertiary" />
-              )}
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-footnote text-text-primary">{f.name}</span>
-              <span className="block truncate text-caption text-text-tertiary">
-                {f.kind} · {humanSize(f.size)}
-                {f.status && <span className={cn('ml-1', f.status === 'untracked' || f.status === 'added' ? 'text-success' : 'text-warning')}>· {f.status}</span>}
+          <div key={f.path} className="group mb-1.5 flex items-center gap-2.5 rounded-md p-2 transition-colors hover:bg-fill/10">
+            <button type="button" onClick={() => openVision(f.path)} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-md bg-fill/10 ring-1 ring-separator">
+                {f.kind === 'image' ? (
+                  <img src={source.rawUrl(activeRepo.id, f.path)} alt="" className="h-full w-full object-cover" />
+                ) : f.kind === 'markdown' || f.kind === 'text' ? (
+                  <FileTextIcon className="h-4 w-4 text-text-tertiary" />
+                ) : (
+                  <FileIcon className="h-4 w-4 text-text-tertiary" />
+                )}
               </span>
-            </span>
-          </button>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-footnote text-text-primary">{f.name}</span>
+                <span className="block truncate text-caption text-text-tertiary">
+                  {f.kind} · {humanSize(f.size)}
+                  {f.status && <span className={cn('ml-1', f.status === 'untracked' || f.status === 'added' ? 'text-success' : 'text-warning')}>· {f.status}</span>}
+                </span>
+              </span>
+            </button>
+            {canWrite && (
+              <button
+                type="button"
+                onClick={() => void removeFile(f)}
+                disabled={busy}
+                aria-label={`Delete ${f.name}`}
+                title="Delete vision file"
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-text-tertiary opacity-0 transition hover:bg-fill/15 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-30"
+              >
+                <XIcon className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
         ))}
       </div>
     </div>

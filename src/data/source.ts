@@ -76,6 +76,7 @@ export interface DataSource {
   /** Direct URL for an <img>/<iframe> to a raw vision file (bytes, correct MIME). */
   rawUrl(id: string, path: string): string;
   uploadVision(id: string, path: string, contentB64: string): Promise<VisionFile[]>;
+  deleteVision(id: string, path: string): Promise<VisionFile[]>;
   listComments(id: string, path: string): Promise<Comment[]>;
   addComment(id: string, path: string, body: string, parentId?: string): Promise<Comment>;
   deleteComment(id: string, commentId: string): Promise<void>;
