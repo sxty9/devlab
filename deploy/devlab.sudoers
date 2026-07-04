@@ -1,0 +1,14 @@
+# /etc/sudoers.d/devlab — the ONLY privilege the devlab service holds.
+# Install: sudo install -m0440 -o root -g root deploy/devlab.sudoers /etc/sudoers.d/devlab
+# then: sudo visudo -cf /etc/sudoers.d/devlab   (validate before trusting)
+#
+# 1) Run per-user ops (git/claude/file) as any DevLab-eligible user, pinned to devlab-exec.
+#    Runas is restricted to the hp_devlab_access group (developers) so the service can never
+#    become root or an unrelated account. The GitHub token is passed via DEVLAB_GH_TOKEN (never
+#    argv) — env_keep lets it (and GIT_TERMINAL_PROMPT) survive sudo's env reset.
+Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT"
+devlab ALL=(%hp_devlab_access) NOPASSWD: /usr/local/sbin/devlab-exec
+
+# 2) Provision a user's workspace root (create + chown to the user) — needs root, pinned to the
+#    mkworkspace helper which itself validates the target is a real, DevLab-eligible account.
+devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-mkworkspace

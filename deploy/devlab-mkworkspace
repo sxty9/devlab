@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# devlab-mkworkspace — root helper that provisions a user's workspace root owned by that user.
+# Invoked ONLY by the devlab service via: sudo -n /usr/local/sbin/devlab-mkworkspace <username>
+# (chowning to another user needs root; the devlab service is unprivileged.) Must be root-owned +
+# non-writable. The dir is 2750 <user>:devlab (setgid) so files inherit the devlab group and the
+# read-only devlab service can read them, while other users (700 on the parent's entries) cannot.
+set -euo pipefail
+u="${1:-}"
+[[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "devlab-mkworkspace: bad username" >&2; exit 64; }
+id -u "$u" >/dev/null 2>&1 || { echo "devlab-mkworkspace: no such user" >&2; exit 64; }
+# Only provision for DevLab-eligible accounts: members of hp_devlab_access, or admins (sudo).
+if ! id -nG "$u" | tr ' ' '\n' | grep -qxE 'hp_devlab_access|sudo'; then
+  echo "devlab-mkworkspace: $u is not devlab-eligible" >&2; exit 77
+fi
+getent group devlab >/dev/null 2>&1 || { echo "devlab-mkworkspace: devlab group missing" >&2; exit 71; }
+base=/var/lib/devlab/workspaces
+install -d -m 0711 -o devlab -g devlab "$base"
+dir="$base/$u"
+if [ ! -d "$dir" ]; then
+  install -d -o "$u" -g devlab -m 2750 "$dir"
+fi
+printf '%s\n' "$dir"

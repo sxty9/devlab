@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# devlab-exec — pinned per-user executor for DevLab. Invoked ONLY by the devlab service via:
+#     sudo -n -u <targetuser> /usr/local/sbin/devlab-exec <verb> <args...>
+# It runs AS the target user (sudo -u) and CONFINES every path to that user's workspace root
+# (/var/lib/devlab/workspaces/<self>), so a compromised devlab service cannot reach another user's
+# files, /home, or the token store. Must be root-owned and non-writable (see devlab.sudoers).
+#
+# Verbs:
+#   git   <dir> <git-args...>   run git in <dir>  (clone: <dir> = the workspace root)
+#   claude<dir> <cli-args...>   run the claude CLI (agentic AI) in <dir>
+#   write <file>                write stdin to <file> (parents created)
+#   rm    <file>                remove <file>
+# The GitHub token, when needed, is passed via the DEVLAB_GH_TOKEN env (sudoers env_keep), never argv.
+set -euo pipefail
+umask 0077
+
+SELF="$(id -un)"
+ROOT="/var/lib/devlab/workspaces/$SELF"
+
+die() { echo "devlab-exec: $*" >&2; exit 64; }
+
+# require_under_root <path> — resolve the deepest existing ancestor (defeating symlink escapes) and
+# require the result stays within $ROOT.
+require_under_root() {
+  local p="$1" parent real
+  [ -n "$p" ] || die "empty path"
+  case "$p" in /*) : ;; *) die "path must be absolute: $p" ;; esac
+  parent="$p"
+  while [ ! -e "$parent" ] && [ "$parent" != "/" ]; do parent="$(dirname "$parent")"; done
+  real="$(realpath -e -- "$parent")" || die "cannot resolve: $p"
+  local rootreal
+  rootreal="$(realpath -e -- "$ROOT")" || die "no workspace root for $SELF"
+  case "$real/" in
+    "$rootreal"/*) : ;;
+    *) die "path escapes workspace root: $p" ;;
+  esac
+}
+
+verb="${1:-}"; shift || true
+case "$verb" in
+  git)
+    dir="${1:-}"; shift || true
+    require_under_root "$dir"
+    cd -- "$dir"
+    export GIT_TERMINAL_PROMPT=0
+    exec git "$@"
+    ;;
+  claude)
+    dir="${1:-}"; shift || true
+    require_under_root "$dir"
+    cd -- "$dir"
+    command -v claude >/dev/null 2>&1 || die "claude CLI not installed for $SELF"
+    exec claude "$@"
+    ;;
+  write)
+    file="${1:-}"; shift || true
+    require_under_root "$file"
+    mkdir -p -- "$(dirname -- "$file")"
+    cat > "$file"
+    ;;
+  rm)
+    file="${1:-}"; shift || true
+    require_under_root "$file"
+    rm -f -- "$file"
+    ;;
+  *)
+    die "unknown verb: ${verb:-<none>}"
+    ;;
+esac
