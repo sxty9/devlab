@@ -139,6 +139,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/repos/{id}/assistant/history", s.guardWrite(s.putHistory))
 	mux.HandleFunc("GET /api/assistant/models", s.guard(s.assistantModels))
 
+	// Terminal — a real shell in the caller's repo workspace, proxied over loopback to the
+	// remshel provider (which owns the pty + recording + run-as-user escalation). WebSocket:
+	// authenticated by guard, upgraded inside the handler.
+	mux.HandleFunc("GET /api/repos/{id}/pty", s.guard(s.pty))
+
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
 	mux.HandleFunc("/", s.root)

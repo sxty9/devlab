@@ -174,6 +174,9 @@ export const mockSource: DataSource = {
       ollama: ['llama3.1', 'qwen2.5-coder'],
     };
   },
+  terminalUrl() {
+    return null; // no live shell offline — the panel shows a mock notice
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};

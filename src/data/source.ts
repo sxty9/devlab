@@ -86,6 +86,10 @@ export interface DataSource {
   getAssistantHistory(id: string): Promise<AiMessage[]>;
   saveAssistantHistory(id: string, messages: AiMessage[]): Promise<void>;
   assistantModels(): Promise<AiModelCatalog>;
+
+  // ── Terminal (WebSocket to the remshel-backed shell in the repo workspace) ──
+  /** WebSocket URL for a shell in the repo workspace, or null when no live provider (mock/offline). */
+  terminalUrl(id: string): string | null;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

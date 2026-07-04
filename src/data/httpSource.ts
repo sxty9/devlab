@@ -188,6 +188,11 @@ export const httpSource: DataSource = {
   async assistantModels(): Promise<AiModelCatalog> {
     return json(await request('/api/assistant/models'));
   },
+
+  terminalUrl(id) {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${proto}://${location.host}/api/repos/${enc(id)}/pty`;
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */
