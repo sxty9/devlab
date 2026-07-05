@@ -6,9 +6,17 @@
 #    Runas is restricted to the hp_devlab_access group (developers) so the service can never
 #    become root or an unrelated account. The GitHub token is passed via DEVLAB_GH_TOKEN (never
 #    argv) — env_keep lets it (and GIT_TERMINAL_PROMPT) survive sudo's env reset.
-Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT"
+#    DEVLAB_PV_CMD carries a preview build/seed command (already placeholder-expanded by root) to
+#    the pv-build verb via env, so it too must survive the reset; DEVLAB_PV_TIMEOUT bounds it.
+Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT DEVLAB_PV_CMD DEVLAB_PV_TIMEOUT"
 devlab ALL=(%hp_devlab_access) NOPASSWD: /usr/local/sbin/devlab-exec
 
 # 2) Provision a user's workspace root (create + chown to the user) — needs root, pinned to the
 #    mkworkspace helper which itself validates the target is a real, DevLab-eligible account.
 devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-mkworkspace
+
+# 3) Drive per-user branch previews. Root, pinned to the branch-code-FREE devlab-preview wrapper,
+#    which validates the identity, then runs sxgate's preview engine with every untrusted step
+#    dropped to the target user via devlab-exec. The runas-root exposure is confined to this
+#    audited wrapper (it never sources or executes manifest-derived code).
+devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-preview

@@ -71,6 +71,60 @@ case "$verb" in
     require_under_root "$file"
     rm -f -- "$file"
     ;;
+
+  # ── preview verbs (per-user branch previews, driven by the root devlab-preview wrapper) ──
+  # These run AS this user, path-confined to the workspace root, so sxgate's preview engine can
+  # execute EVERY untrusted step (manifest read, checkout, build, seed) as the user, never root.
+  pv-manifest)
+    # Source .sxgate/preview.conf AS the user with its OWN output muted, then emit only the known
+    # keys as NUL-delimited KEY=VALUE via slash-pathed /usr/bin/printf (immune to function
+    # shadowing). The root caller parses this as pure DATA — no eval — so a hostile manifest can
+    # neither run code at root nor inject keys.
+    mf="${1:-}"; require_under_root "$mf"
+    [ -f "$mf" ] || die "no such manifest: $mf"
+    (
+      SERVICE='' BUILD='' MODE='' ROOT='' API_PREFIX='' RUN='' RUN_CWD='' RUN_ENV='' SEED='' HEALTHCHECK='' HOOK=''
+      # shellcheck disable=SC1090
+      . "$mf" >/dev/null 2>&1 || true
+      for k in SERVICE BUILD MODE ROOT API_PREFIX RUN RUN_CWD RUN_ENV SEED HEALTHCHECK HOOK; do
+        /usr/bin/printf '%s=%s\0' "$k" "${!k}"
+      done
+    )
+    ;;
+  pv-worktree-add)
+    # Detached checkout of a committed SHA. Runs as the user against the user's own repo, so git's
+    # dubious-ownership guard never fires and root never touches the user's .git.
+    src="${1:-}"; wt="${2:-}"; ref="${3:-}"
+    require_under_root "$src"; require_under_root "$wt"
+    sha="$(git -C "$src" -c safe.directory='*' rev-parse --verify "${ref}^{commit}" 2>/dev/null)" \
+      || die "no such commit for ref: $ref"
+    mkdir -p -- "$(dirname -- "$wt")"
+    exec git -C "$src" -c safe.directory='*' worktree add --detach "$wt" "$sha"
+    ;;
+  pv-mkdir)
+    d="${1:-}"; require_under_root "$d"
+    exec mkdir -p -- "$d"
+    ;;
+  pv-build)
+    # Run the (root-expanded, placeholder-substituted) build/seed command as the user, in the
+    # worktree. Trust-equivalent to the `claude` verb (arbitrary user code, as the user). The
+    # command travels via DEVLAB_PV_CMD env (sudoers env_keep), never argv. timeout bounds a
+    # hostile build so it cannot pin sxgate's lock indefinitely.
+    wt="${1:-}"; require_under_root "$wt"
+    [ -d "$wt" ] || die "no such worktree: $wt"
+    cd -- "$wt"
+    exec timeout "${DEVLAB_PV_TIMEOUT:-600}" bash -c "${DEVLAB_PV_CMD:?missing DEVLAB_PV_CMD}"
+    ;;
+  pv-worktree-remove)
+    src="${1:-}"; wt="${2:-}"
+    require_under_root "$src"; require_under_root "$wt"
+    exec git -C "$src" -c safe.directory='*' worktree remove --force "$wt"
+    ;;
+  pv-rm)
+    d="${1:-}"; require_under_root "$d"
+    exec rm -rf -- "$d"
+    ;;
+
   *)
     die "unknown verb: ${verb:-<none>}"
     ;;

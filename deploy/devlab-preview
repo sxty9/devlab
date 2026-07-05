@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# devlab-preview — root-side, BRANCH-CODE-FREE driver for DevLab per-user previews. Invoked ONLY
+# by the devlab service via:  sudo -n /usr/local/sbin/devlab-preview <verb> <user> [args...]
+#
+# It runs ZERO manifest-derived code. It validates the identity + names, then drives sxgate's
+# preview engine (which detects it is already root and skips its own sudo re-exec) with
+# PREVIEW_RUNAS set — so every UNTRUSTED step (manifest read, checkout, build, seed, and the
+# long-lived RUN) drops to <user> via the pinned devlab-exec. The runas-root exposure is confined
+# to exactly this audited wrapper. Must be root-owned and non-writable (see devlab.sudoers).
+set -euo pipefail
+
+SXGATE=/home/nanu/sxgate/sxgate
+EXEC=/usr/local/sbin/devlab-exec
+WSROOT=/var/lib/devlab/workspaces
+
+die() { echo "devlab-preview: $*" >&2; exit 64; }
+
+verb="${1:-}"; user="${2:-}"
+shift 2 2>/dev/null || true
+
+# ── identity: strict, and refuse privileged-group users (fix #2) ────────────────
+[[ "$user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid user"
+id -u "$user" >/dev/null 2>&1 || die "no such user: $user"
+groups="$(id -nG "$user" 2>/dev/null | tr ' ' '\n')"
+printf '%s\n' "$groups" | grep -qxE 'hp_devlab_access|sudo' || die "$user not preview-eligible"
+printf '%s\n' "$groups" | grep -qxE 'devlab|holistic' && die "$user in a privileged group — refusing"
+
+base="$WSROOT/$user/.previews"
+# The engine drops untrusted steps to <user>; force the mandatory passphrase gate; group 'devlab'
+# may read the plaintext .pw so devlabd can show it. SXGATE_YES skips the interactive confirm.
+export PREVIEW_RUNAS="$user" PREVIEW_EXEC="$EXEC" PREVIEW_BASE="$base" \
+       PREVIEW_PASSWORD=1 PREVIEW_PW_GROUP=devlab SXGATE_YES=1
+
+case "$verb" in
+  up)
+    repo_id="${1:-}"; branch="${2:-}"
+    [[ "$repo_id" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "invalid repo id"
+    case "$repo_id" in .*|*..*) die "invalid repo id" ;; esac
+    [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$ ]] || die "invalid branch"
+    case "$branch" in *..*) die "invalid branch" ;; esac
+    src="$WSROOT/$user/$repo_id"
+    { [ -d "$src/.git" ] || [ -f "$src/.git" ]; } || die "no workspace repo: $repo_id"
+    exec "$SXGATE" preview up --as-user "$user" --exec "$EXEC" --base "$base" --repo "$src" "$branch"
+    ;;
+  down)
+    slug="${1:-}"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,61}$ ]] || die "invalid slug"
+    case "$slug" in "$user"-*) : ;; *) die "not your preview" ;; esac
+    exec "$SXGATE" preview down --as-user "$user" --exec "$EXEC" --base "$base" --yes "$slug"
+    ;;
+  pw)
+    slug="${1:-}"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,61}$ ]] || die "invalid slug"
+    case "$slug" in "$user"-*) : ;; *) die "not your preview" ;; esac
+    exec "$SXGATE" preview pw "$slug"
+    ;;
+  *)
+    die "unknown verb: ${verb:-<none>}"
+    ;;
+esac
