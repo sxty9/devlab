@@ -63,11 +63,17 @@ ensured + branch committed locally + `.sxgate/preview.conf` present) → `sudo -
 …/previews` (list from devlabd's own state, not sxgate's — which already drifts). User comes from
 the **session**, never the body.
 
-## ⚠️ Product decision required before exposing (cannot be fixed inside isolation)
-Preview URLs are edge-terminated through the shared `*.henrysoase.org` cloudflared wildcard with
-**no per-preview auth**; devlab's own preview even runs `DEVLAB_DEV_BYPASS_AUTH=1` (fully open).
-Options: (a) Holistic-SSO check at the dispatcher before proxying [recommended]; (b) per-preview
-password/token in the URL; (c) accept open (trusted users only). **Pick one before enabling.**
+## Exposure gating — DECIDED: per-preview passphrase (✅ Stage 1 built)
+Product decision (user): **every preview is gated by a simple 3-word passphrase** (`apple-tiger-moon`),
+so external testers need no Holistic account. Implemented in sxgate as **Caddy `basic_auth`** (bcrypt)
+rendered by root into the dispatcher vhost — branch code can't read/bypass it. Committed on sxgate
+branch `feat/devlab-preview-password` (`9af3e3f`), activated by `PREVIEW_PASSWORD=1` (legacy path
+byte-identical when unset). Login user `preview`; passphrase printed on `up`, re-shown by
+`sxgate preview pw <slug>`, stored `0640 root:$PREVIEW_PW_GROUP` (DevLab sets group `devlab` to read+show).
+Verified offline: generator + bcrypt + `caddy validate` of gated vhosts (proxy + static_proxy).
+DevLab per-user path (below) will always set `PREVIEW_PASSWORD=1` ⇒ every DevLab preview protected.
+NOTE: `basic_auth` is a browser user+pass popup (user `preview`). If a pure password-only form is
+wanted later, add a small `forward_auth` cookie service — deferred.
 
 ## Operator prerequisites (once, by hand)
 `sxgate preview setup` done (✅ live); wildcard DNS `*.henrysoase.org` CNAME confirmed; each
