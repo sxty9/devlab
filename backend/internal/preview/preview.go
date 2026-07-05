@@ -18,7 +18,8 @@ import (
 const (
 	wrapper      = "/usr/local/sbin/devlab-preview"
 	instancesDir = "/etc/sxgate/preview/instances"
-	buildTimeout = "600" // seconds; bounds a hostile build (fix #5)
+	buildTimeout = "300" // seconds; hard-bounds a hostile build (review #1/#5)
+	maxPerUser   = 5      // review #4: cap previews per user (shared port pool / host resources)
 )
 
 var (
@@ -38,6 +39,9 @@ type Preview struct {
 // Up creates (or fails cleanly) a preview of the user's branch and returns its URL + passphrase,
 // parsed from the wrapper output. The user is the authenticated session user (never client input).
 func Up(ctx context.Context, user, repoID, branch string) (Preview, error) {
+	if countUser(user) >= maxPerUser {
+		return Preview{}, errors.New("preview limit reached — remove one of your previews first")
+	}
 	cmd := exec.CommandContext(ctx, "sudo", "-n", wrapper, "up", user, repoID, branch)
 	cmd.Env = append(os.Environ(), "DEVLAB_PV_TIMEOUT="+buildTimeout)
 	out, err := cmd.CombinedOutput()
@@ -84,6 +88,18 @@ func List(user, repoID string) []Preview {
 		out = append(out, p)
 	}
 	return out
+}
+
+// countUser counts a user's live previews across all repos (for the per-user cap).
+func countUser(user string) int {
+	metas, _ := filepath.Glob(instancesDir + "/*.meta")
+	n := 0
+	for _, mf := range metas {
+		if readKV(mf)["OWNER"] == user {
+			n++
+		}
+	}
+	return n
 }
 
 // readKV parses a KEY=VALUE file (sxgate meta) into a map. Non-executing.

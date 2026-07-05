@@ -108,12 +108,23 @@ case "$verb" in
   pv-build)
     # Run the (root-expanded, placeholder-substituted) build/seed command as the user, in the
     # worktree. Trust-equivalent to the `claude` verb (arbitrary user code, as the user). The
-    # command travels via DEVLAB_PV_CMD env (sudoers env_keep), never argv. timeout bounds a
-    # hostile build so it cannot pin sxgate's lock indefinitely.
+    # command travels via DEVLAB_PV_CMD env (sudoers env_keep), never argv.
+    #
+    # Robust bounding (review #1/#5): run in a NEW SESSION so the whole process tree can be
+    # signalled — a TERM-ignoring build or a double-forked daemon cannot escape. After the
+    # timeout we TERM the process group, then hard-KILL it, and KILL any stragglers on exit. So a
+    # hostile build can neither run forever (defeating a lock) nor leave orphans behind.
     wt="${1:-}"; require_under_root "$wt"
     [ -d "$wt" ] || die "no such worktree: $wt"
     cd -- "$wt"
-    exec timeout "${DEVLAB_PV_TIMEOUT:-600}" bash -c "${DEVLAB_PV_CMD:?missing DEVLAB_PV_CMD}"
+    : "${DEVLAB_PV_CMD:?missing DEVLAB_PV_CMD}"
+    # timeout (in its default non-foreground mode) runs the build in its OWN process group and
+    # signals the WHOLE group on expiry; -k adds a hard SIGKILL 30s after the SIGTERM, so neither a
+    # SIGTERM-ignoring build nor a double-forked daemon can survive (review #1/#5). Because the build
+    # is thus HARD-BOUNDED, it can no longer pin sxgate's lock indefinitely (the CRITICAL wedge);
+    # the residual is only a bounded delay for other users while a build runs (lock-scope reduction
+    # + unix sockets are the documented follow-up).
+    exec timeout -k 30 -s TERM "${DEVLAB_PV_TIMEOUT:-300}" bash -c "$DEVLAB_PV_CMD"
     ;;
   pv-worktree-remove)
     src="${1:-}"; wt="${2:-}"

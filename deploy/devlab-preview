@@ -52,7 +52,9 @@ case "$verb" in
     slug="${1:-}"
     [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,61}$ ]] || die "invalid slug"
     case "$slug" in "$user"-*) : ;; *) die "not your preview" ;; esac
-    exec "$SXGATE" preview pw "$slug"
+    # Pass --as-user so the engine re-asserts ownership via the root-written OWNER meta (review #8:
+    # the slug-prefix check alone is ambiguous when usernames contain '-').
+    exec "$SXGATE" preview pw --as-user "$user" "$slug"
     ;;
   *)
     die "unknown verb: ${verb:-<none>}"
