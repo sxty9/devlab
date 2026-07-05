@@ -149,6 +149,12 @@ func (s *Server) Handler() http.Handler {
 	// authenticated by guard, upgraded inside the handler.
 	mux.HandleFunc("GET /api/repos/{id}/pty", s.guard(s.pty))
 
+	// Preview — per-user, passphrase-gated branch previews via sxgate (branch code runs as the
+	// user, never root). Create/delete mutate (guardWrite); listing is read-only.
+	mux.HandleFunc("GET /api/repos/{id}/previews", s.guard(s.previewList))
+	mux.HandleFunc("POST /api/repos/{id}/previews", s.guardWrite(s.previewCreate))
+	mux.HandleFunc("DELETE /api/repos/{id}/previews/{slug}", s.guardWrite(s.previewDelete))
+
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
 	mux.HandleFunc("/", s.root)
