@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, Repo, RepoData, Tab, User } from '@/types';
+import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, PullRequestResult, Repo, RepoData, Tab, User } from '@/types';
 import { getDataSource, type CommitResult, type DiffPayload, type PushResult } from '@/data';
 import { guessLang } from '@/lib/lang';
 import { CodeIcon } from '@/ui/icons';
@@ -79,6 +79,8 @@ interface WorkspaceContextValue {
   commitStaged: (message: string) => Promise<CommitResult>;
   push: () => Promise<PushResult>;
   pull: () => Promise<PushResult>;
+  /** Push the current branch and open (or focus) a GitHub PR into the default branch. */
+  openPR: () => Promise<PullRequestResult>;
   createBranch: (name: string, from?: string) => Promise<void>;
   reloadRepo: () => Promise<void>;
 
@@ -448,6 +450,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     await reloadRepo();
     return res;
   }, [source, activeRepoId, reloadRepo]);
+  const openPR = useCallback(async () => {
+    const res = await source.openPR(activeRepoId);
+    await reloadRepo(); // the push may change ahead/behind
+    return res;
+  }, [source, activeRepoId, reloadRepo]);
   const createBranch = useCallback(
     async (name: string, from?: string) => {
       await source.createBranch(activeRepoId, name, from);
@@ -546,6 +553,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     commitStaged,
     push,
     pull,
+    openPR,
     createBranch,
     reloadRepo,
     settings,

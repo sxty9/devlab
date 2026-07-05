@@ -166,6 +166,18 @@ export interface AgentReply {
   changes: Change[];
 }
 
+/** Result of opening (or focusing) a GitHub pull request for the current branch. */
+export interface PullRequestResult {
+  number: number;
+  url: string;
+  state: string;
+  title: string;
+  branch: string;
+  base: string;
+  /** true when an already-open PR was focused rather than a new one created. */
+  existed: boolean;
+}
+
 /** aigentic's model catalog (GET /api/assistant/models). */
 export interface AiModelCatalog {
   claude: { id: string; label: string }[];

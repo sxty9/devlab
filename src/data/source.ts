@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -70,6 +70,8 @@ export interface DataSource {
   pull(id: string): Promise<PushResult>;
   createBranch(id: string, name: string, from?: string): Promise<BranchResult>;
   checkout(id: string, name: string): Promise<BranchResult>;
+  /** Push the current branch and open (or focus) a GitHub PR into the default branch. */
+  openPR(id: string, title?: string, body?: string): Promise<PullRequestResult>;
 
   // ── Vision Catalog + threaded comments ─────────────────────────────────────
   vision(id: string): Promise<VisionFile[]>;

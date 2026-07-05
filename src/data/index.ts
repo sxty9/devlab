@@ -43,6 +43,7 @@ export const dataSource: DataSource = {
   pull: (id) => impl.pull(id),
   createBranch: (id, n, f) => impl.createBranch(id, n, f),
   checkout: (id, n) => impl.checkout(id, n),
+  openPR: (id, title, body) => impl.openPR(id, title, body),
   vision: (id) => impl.vision(id),
   rawUrl: (id, p) => impl.rawUrl(id, p),
   uploadVision: (id, p, c) => impl.uploadVision(id, p, c),

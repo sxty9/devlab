@@ -121,6 +121,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/pull", s.guardWrite(s.gitPull))
 	mux.HandleFunc("POST /api/repos/{id}/branch", s.guardWrite(s.gitBranch))
 	mux.HandleFunc("POST /api/repos/{id}/checkout", s.guardWrite(s.gitCheckout))
+	mux.HandleFunc("POST /api/repos/{id}/pr", s.guardWrite(s.openPR))
 
 	// Vision Catalog — the repo's /vision folder. Reads under guard; raw bytes for the viewer;
 	// upload writes into vision/ (needs push). Threaded comments live in a DevLab-side store.

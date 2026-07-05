@@ -8,7 +8,7 @@ import {
   type PushResult,
   type WriteResult,
 } from './source';
-import type { AgentReply, AiMessage, AiModelCatalog, AssistantReply, Comment, User, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AiModelCatalog, AssistantReply, Comment, PullRequestResult, User, VisionFile } from '@/types';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -152,6 +152,9 @@ export const httpSource: DataSource = {
   },
   async checkout(id, name): Promise<BranchResult> {
     return json(await post(`/api/repos/${enc(id)}/checkout`, { name }));
+  },
+  async openPR(id, title, body): Promise<PullRequestResult> {
+    return json(await post(`/api/repos/${enc(id)}/pr`, { title: title ?? '', body: body ?? '' }));
   },
 
   async vision(id): Promise<VisionFile[]> {

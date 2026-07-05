@@ -17,9 +17,10 @@ function SectionLabel({ children }: { children: React.ReactNode }) {
 
 /** IntelliJ-style Git tool window: pull/push, worktrees, branches (checkout), and the log graph. */
 export function GitPanel() {
-  const { data, activeBranch, setBranch, push, pull, createBranch, canWrite } = useWorkspace();
+  const { data, activeBranch, setBranch, push, pull, openPR, createBranch, canWrite } = useWorkspace();
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
+  const onDefaultBranch = activeBranch.isDefault;
 
   const run = async (fn: () => Promise<unknown>, fail: string) => {
     setBusy(true);
@@ -43,6 +44,17 @@ export function GitPanel() {
       const res = await push();
       toast({ title: 'Pushed', description: res.message || `${res.branch} up to date`, variant: 'success' });
     }, 'Push failed');
+
+  const doPR = () =>
+    run(async () => {
+      const pr = await openPR();
+      toast({
+        title: pr.existed ? `PR #${pr.number} already open` : `Opened PR #${pr.number}`,
+        description: `${pr.branch} → ${pr.base}`,
+        variant: 'success',
+      });
+      window.open(pr.url, '_blank', 'noopener');
+    }, 'Open PR failed');
 
   const doNewBranch = () => {
     const name = window.prompt(`New branch from ${activeBranch.name}:`)?.trim();
@@ -77,6 +89,23 @@ export function GitPanel() {
           <PlusIcon className="h-4 w-4" />
         </IconButton>
       </div>
+
+      {/* Open a GitHub PR for the current feature branch (pushes it first). Hidden on the default branch. */}
+      {!onDefaultBranch && (
+        <div className="px-2 pb-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            className="w-full gap-1.5"
+            onClick={doPR}
+            disabled={busy || !canWrite}
+            title={canWrite ? `Push ${activeBranch.name} and open a pull request` : 'Read-only repository'}
+          >
+            <GitBranchIcon className="h-3.5 w-3.5" />
+            Open Pull Request
+          </Button>
+        </div>
+      )}
 
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto pb-3">
         {/* Worktrees */}

@@ -104,6 +104,10 @@ export const mockSource: DataSource = {
   async checkout(id, name): Promise<BranchResult> {
     return { branch: name, branches: data(id).branches };
   },
+  async openPR(id) {
+    const branch = data(id).branches.find((b) => !b.isDefault)?.name ?? 'feature';
+    return { number: 42, url: 'https://github.com/example/repo/pull/42', state: 'open', title: branch, branch, base: 'main', existed: false };
+  },
 
   // ── Vision Catalog + comments (in-memory so the offline loop is exercisable) ──
   async vision(id): Promise<VisionFile[]> {

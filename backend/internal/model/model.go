@@ -237,6 +237,17 @@ type AgentReply struct {
 	Changes   []Change `json:"changes"`
 }
 
+// PullRequestResult is what DevLab returns after opening (or focusing) a GitHub PR for a branch.
+type PullRequestResult struct {
+	Number  int    `json:"number"`
+	URL     string `json:"url"`
+	State   string `json:"state"`
+	Title   string `json:"title"`
+	Branch  string `json:"branch"`
+	Base    string `json:"base"`
+	Existed bool   `json:"existed"` // true when we focused an already-open PR rather than creating one
+}
+
 // Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
 type Comment struct {
 	ID        string `json:"id"`
