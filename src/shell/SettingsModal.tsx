@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useWorkspace } from '@/state/workspace';
+import { useSession } from '@/state/session';
 import { Modal } from '@/ui/Modal';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
@@ -47,7 +47,7 @@ function Row({ label, hint, children }: { label: string; hint?: string; children
 }
 
 export function SettingsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { settings, updateSettings } = useWorkspace();
+  const { settings, updateSettings } = useSession();
   const [theme, setTheme] = useState<Theme>(
     () => (document.documentElement.getAttribute('data-theme') as Theme) || 'dark',
   );

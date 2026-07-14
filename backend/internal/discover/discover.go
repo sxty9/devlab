@@ -114,13 +114,15 @@ func projectRepos(ghs []github.Repo) []model.Repo {
 		if perm == "" {
 			perm = "pull"
 		}
+		k := kind(g.Name)
 		repos = append(repos, model.Repo{
 			ID:          g.Name,
 			Name:        g.Name,
 			FullName:    g.FullName,
-			Kind:        kind(g.Name),
+			Kind:        k,
 			Description: desc,
 			Language:    languageLabel(g.Language),
+			Icon:        icon(g.Language, k),
 			Tint:        tint(g.Language),
 			Permission:  perm,
 		})
@@ -222,13 +224,15 @@ func query(base string) []model.Repo {
 		if desc == "" {
 			desc = "Holistic service"
 		}
+		k := kind(g.Name)
 		repos = append(repos, model.Repo{
 			ID:          g.Name,
 			Name:        g.Name,
 			FullName:    owner() + "/" + g.Name,
-			Kind:        kind(g.Name),
+			Kind:        k,
 			Description: desc,
 			Language:    languageLabel(g.Language),
+			Icon:        icon(g.Language, k),
 			Tint:        tint(g.Language),
 			Permission:  "admin", // sandbox operator has full local control
 		})
@@ -305,6 +309,31 @@ func languageLabel(l string) string {
 		return "—"
 	}
 	return l
+}
+
+// icon derives the repo's card glyph from its primary language, falling back to its kind when the
+// language has no mark of its own (a docs-only repo reports no language at all). The frontend maps
+// the name to an SVG in src/ui/repoIcon.ts; an unknown name there renders the service mark.
+func icon(language, kind string) string {
+	switch strings.ToLower(language) {
+	case "go":
+		return "go"
+	case "typescript", "javascript":
+		return "ts"
+	case "rust":
+		return "rust"
+	case "python":
+		return "python"
+	case "shell":
+		return "shell"
+	}
+	switch kind {
+	case "library":
+		return "library"
+	case "repo":
+		return "repo"
+	}
+	return "service"
 }
 
 func tint(language string) string {

@@ -7,12 +7,12 @@ import type { Branch, Change, Commit, FileContent, FileNode, Repo, RepoData, Sta
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const REPOS: Repo[] = [
-  { id: 'devlab', name: 'devlab', fullName: 'sxty9/devlab', kind: 'service', description: 'Developer collaboration & in-browser IDE', language: 'TypeScript', tint: 'gpu', permission: 'admin' },
-  { id: 'holistic', name: 'holistic', fullName: 'sxty9/holistic', kind: 'service', description: 'Self-hosting control plane & dashboard', language: 'TS · Python', tint: 'accent', permission: 'push' },
-  { id: 'sxgate', name: 'sxgate', fullName: 'sxty9/sxgate', kind: 'repo', description: 'Cloudflare-tunnel subdomain & preview router', language: 'Shell', tint: 'net', permission: 'push' },
-  { id: 'holistic-service-template', name: 'holistic-service-template', fullName: 'sxty9/holistic-service-template', kind: 'library', description: 'Scaffold for new Holistic services', language: 'Go · TSX', tint: 'ssd', permission: 'pull' },
-  { id: 'bwl-manager', name: 'bwl-manager', fullName: 'sxty9/bwl-manager', kind: 'service', description: 'Business-admin & invoicing workspace', language: 'TypeScript', tint: 'success', permission: 'push' },
-  { id: 'hostek', name: 'hostek', fullName: 'sxty9/hostek', kind: 'service', description: 'Host metrics & hardware telemetry', language: 'Go', tint: 'ram', permission: 'pull' },
+  { id: 'devlab', name: 'devlab', fullName: 'sxty9/devlab', kind: 'service', description: 'Developer collaboration & in-browser IDE', language: 'TypeScript', icon: 'ts', tint: 'gpu', permission: 'admin' },
+  { id: 'holistic', name: 'holistic', fullName: 'sxty9/holistic', kind: 'service', description: 'Self-hosting control plane & dashboard', language: 'TS · Python', icon: 'ts', tint: 'accent', permission: 'push' },
+  { id: 'sxgate', name: 'sxgate', fullName: 'sxty9/sxgate', kind: 'repo', description: 'Cloudflare-tunnel subdomain & preview router', language: 'Shell', icon: 'shell', tint: 'net', permission: 'push' },
+  { id: 'holistic-service-template', name: 'holistic-service-template', fullName: 'sxty9/holistic-service-template', kind: 'library', description: 'Scaffold for new Holistic services', language: 'Go · TSX', icon: 'go', tint: 'ssd', permission: 'pull' },
+  { id: 'bwl-manager', name: 'bwl-manager', fullName: 'sxty9/bwl-manager', kind: 'service', description: 'Business-admin & invoicing workspace', language: 'TypeScript', icon: 'ts', tint: 'success', permission: 'push' },
+  { id: 'hostek', name: 'hostek', fullName: 'sxty9/hostek', kind: 'service', description: 'Host metrics & hardware telemetry', language: 'Go', icon: 'go', tint: 'ram', permission: 'pull' },
 ];
 
 // ── tiny tree/file builders ──────────────────────────────────────────────────

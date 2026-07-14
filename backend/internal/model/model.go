@@ -11,6 +11,7 @@ type Repo struct {
 	Kind        string `json:"kind"`       // service | repo | library
 	Description string `json:"description"`
 	Language    string `json:"language"`
+	Icon        string `json:"icon"`       // go | ts | rust | python | shell | service | repo | library
 	Tint        string `json:"tint"`       // accent | success | warning | gpu | net | ssd | ram
 	Permission  string `json:"permission"` // pull | push | admin (the viewer's effective right)
 }
