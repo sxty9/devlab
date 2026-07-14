@@ -166,6 +166,9 @@ func (s *Server) Handler() http.Handler {
 	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
 	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
 	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
+	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
+	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
+	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
