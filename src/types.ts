@@ -5,6 +5,19 @@
 /** The tools in the left icon rail. */
 export type PanelId = 'vision' | 'project' | 'vcs' | 'git' | 'claude' | 'terminal';
 
+/** The signed-in DevLab user. Identity comes from the Holistic session (a Linux account);
+ *  `canUseDevlab` reflects the single Holistic right (hp_devlab_access, admin implicit).
+ *  `githubLinked` gates the workspace — repo visibility/authorization derive from GitHub. */
+export interface User {
+  username: string;
+  displayName: string;
+  isAdmin: boolean;
+  canUseDevlab: boolean;
+  githubLinked: boolean;
+  /** The linked GitHub login, when linked. */
+  githubLogin?: string;
+}
+
 /** User-tunable editor settings (Settings modal → Monaco). */
 export interface EditorSettings {
   fontSize: number;
@@ -16,16 +29,29 @@ export type Overlay = 'settings' | 'help' | null;
 
 export type RepoKind = 'service' | 'repo' | 'library';
 
+/** The viewer's effective GitHub permission on a repo (the single source of truth for write). */
+export type RepoPermission = 'pull' | 'push' | 'admin';
+
+/** The repo's card glyph, derived server-side from its language and kind (discover.icon()).
+ *  src/ui/repoIcon.ts maps each name to an SVG. */
+export type RepoIcon = 'go' | 'ts' | 'rust' | 'python' | 'shell' | 'service' | 'repo' | 'library';
+
 /** A selectable repository/service in the top-bar dropdown. */
 export interface Repo {
   id: string;
   name: string;
+  /** GitHub canonical "owner/repo". */
+  fullName: string;
   kind: RepoKind;
   description: string;
   /** Primary language label, e.g. "TypeScript", "Go", "Shell". */
   language: string;
+  /** The card glyph name; derived from language, falling back to kind. */
+  icon: RepoIcon;
   /** A design-token color name used as the repo's accent dot (accent | success | warning | gpu | net | ssd | ram). */
   tint: 'accent' | 'success' | 'warning' | 'gpu' | 'net' | 'ssd' | 'ram';
+  /** The viewer's effective right from GitHub; 'pull' repos are read-only in the UI. */
+  permission: RepoPermission;
 }
 
 /** A git branch / working session for the active repo. */
@@ -90,11 +116,104 @@ export interface TermLine {
 export interface Tab {
   id: string;
   title: string;
-  kind: 'code' | 'structure' | 'diff';
-  /** Present for kind: 'code' | 'diff'. */
+  kind: 'code' | 'structure' | 'diff' | 'vision';
+  /** Present for kind: 'code' | 'diff' | 'vision'. */
   path?: string;
   lang?: string;
   dirty?: boolean;
+}
+
+/** One turn in the repo-scoped AI assistant transcript. */
+export interface AiMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  ts: string;
+}
+
+/** What the AI assistant returns after a run (proxied from aigentic). */
+export interface AssistantReply {
+  output: string;
+  engine: string;
+  model: string;
+  usage: { inputTokens: number; outputTokens: number; totalTokens: number; truncated: boolean };
+}
+
+/** The payload for one AI turn. */
+export interface AssistantAsk {
+  prompt: string;
+  contextPaths: string[];
+  history: AiMessage[];
+  /** aigentic engine: 'choose' (router) | 'claude-cli' | 'claude-api' | 'ollama'. */
+  kind?: string;
+  /** model id override (from the catalog); '' = the engine's default. */
+  model?: string;
+  effort?: string;
+}
+
+/** The payload for one agentic run — the full claude CLI, in the repo workspace, as the user. */
+export interface AgentAsk {
+  prompt: string;
+  /** model id (from the catalog); '' = the CLI default. */
+  model?: string;
+  effort?: string;
+  /** 'plan' (read-only) | 'auto' (accept edits) | 'full' (autonomous, incl. shell). */
+  mode?: string;
+  /** prior session id to continue the conversation (--resume). */
+  resume?: string;
+}
+
+/** What an agentic run returns: the summary + the refreshed change set (edits it made). */
+export interface AgentReply {
+  output: string;
+  sessionId: string;
+  costUsd: number;
+  numTurns: number;
+  isError: boolean;
+  changes: Change[];
+}
+
+/** Result of opening (or focusing) a GitHub pull request for the current branch. */
+export interface PullRequestResult {
+  number: number;
+  url: string;
+  state: string;
+  title: string;
+  branch: string;
+  base: string;
+  /** true when an already-open PR was focused rather than a new one created. */
+  existed: boolean;
+}
+
+/** aigentic's model catalog (GET /api/assistant/models). */
+export interface AiModelCatalog {
+  claude: { id: string; label: string }[];
+  ollama: string[];
+}
+
+/** How a Vision-Catalog file is rendered. */
+export type VisionFileKind = 'image' | 'pdf' | 'markdown' | 'text' | 'other';
+
+/** One artifact in a repo's /vision folder (the Vision Catalog). */
+export interface VisionFile {
+  path: string;
+  name: string;
+  kind: VisionFileKind;
+  size: number;
+  /** git status decoration, if any. */
+  status?: string;
+}
+
+/** One message in a per-file threaded discussion (nested via parentId). */
+export interface Comment {
+  id: string;
+  path: string;
+  /** '' for a top-level comment, else the parent comment's id. */
+  parentId: string;
+  author: string;
+  authorName: string;
+  body: string;
+  createdAt: string;
+  editedAt?: string;
 }
 
 /** One drawn segment in a commit-graph row (a lane line from the row's top to its bottom). */
@@ -171,6 +290,34 @@ export interface RepoData {
   activeTabId: string;
   /** A short overview shown in StructureView / the repo skeleton. */
   structure: StructureSection[];
+}
+
+// ── Atlas — the deployed Holistic landscape ──────────────────────────────────
+
+/** A deployed Holistic service, derived from its rights manifest and its Caddy route. */
+export interface AtlasNode {
+  id: string;
+  /** The port it answers on; 0 when it has no route. */
+  port: number;
+  /** The hp_* groups it declares. */
+  rights: string[];
+  hasManifest: boolean;
+  hasRoute: boolean;
+  /** The repo it is built from, when the viewer can see one — '' otherwise. */
+  repo: string;
+}
+
+/** An inconsistency between what is deployed and what is declared. */
+export interface AtlasFinding {
+  severity: 'warn' | 'error';
+  message: string;
+  nodes: string[];
+}
+
+export interface AtlasGraph {
+  nodes: AtlasNode[];
+  findings: AtlasFinding[];
+  scannedAt: string;
 }
 
 /** A section of the repo "skeleton" overview rendered by StructureView. */

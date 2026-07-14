@@ -263,3 +263,67 @@ export const DiffIcon = (p: IconProps) => (
     <path d="M6 8.2V14a3 3 0 0 0 3 3h6M14 14l3 3-3 3M18 15.8V10a3 3 0 0 0-3-3H9M10 10 7 7l3-3" />
   </Svg>
 );
+
+// ── Repo card marks (discover.icon(): language first, kind as the fallback) ───────────────────
+// Shell → TerminalIcon, service → SitemapIcon and repo → FolderIcon are reused above; these are
+// the marks the set was missing. src/ui/repoIcon.ts binds each name to its glyph.
+
+// Go — a forward double-chevron.
+export const GoIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M4.5 7.5 9 12l-4.5 4.5M12.5 7.5 17 12l-4.5 4.5" />
+  </Svg>
+);
+
+// TypeScript / JavaScript — braces.
+export const BracesIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M9 4c-1.7 0-2.5.9-2.5 2.6v2.6c0 1.5-.8 2.4-2.2 2.8 1.4.4 2.2 1.3 2.2 2.8v2.6C6.5 19.1 7.3 20 9 20" />
+    <path d="M15 4c1.7 0 2.5.9 2.5 2.6v2.6c0 1.5.8 2.4 2.2 2.8-1.4.4-2.2 1.3-2.2 2.8v2.6c0 1.7-.8 2.6-2.5 2.6" />
+  </Svg>
+);
+
+// Rust — a cog.
+export const CogIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="3.2" />
+    <path d="M12 2.8v2.6M12 18.6v2.6M21.2 12h-2.6M5.4 12H2.8M18.5 5.5l-1.8 1.8M7.3 16.7l-1.8 1.8M18.5 18.5l-1.8-1.8M7.3 7.3 5.5 5.5" />
+  </Svg>
+);
+
+// Python — two interlocking curves.
+export const PythonIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M12 3.5c-3 0-4.5.9-4.5 2.8V9h9v1H5.8C4 10 3 11.4 3 14s1 4 2.8 4h1.7v-2.8c0-1.9 1.5-2.8 4.5-2.8" />
+    <path d="M12 20.5c3 0 4.5-.9 4.5-2.8V15h-9v-1h10.7c1.8 0 2.8-1.4 2.8-4s-1-4-2.8-4h-1.7v2.8c0 1.9-1.5 2.8-4.5 2.8" />
+  </Svg>
+);
+
+// Library / template — a stack of layers.
+export const LayersIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m12 3 8.5 4.5L12 12 3.5 7.5z" />
+    <path d="m3.5 12 8.5 4.5 8.5-4.5M3.5 16.5 12 21l8.5-4.5" />
+  </Svg>
+);
+
+// ── Capability marks ─────────────────────────────────────────────────────────────────────────
+
+// Mercury — the alchemical mercury sign (☿): horns, orb, cross. The axiom centre.
+export const MercuryIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="M8.5 2.8a4.5 4.5 0 0 0 7 0" />
+    <circle cx="12" cy="10.5" r="3.7" />
+    <path d="M12 14.2V21M9 18h6" />
+  </Svg>
+);
+
+// Atlas — an interaction graph: nodes joined by edges.
+export const AtlasIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <circle cx="12" cy="4.8" r="2.2" />
+    <circle cx="4.8" cy="17.5" r="2.2" />
+    <circle cx="19.2" cy="17.5" r="2.2" />
+    <path d="m10.9 6.7-4.8 8.6M13.1 6.7l4.8 8.6M7 17.5h10" />
+  </Svg>
+);

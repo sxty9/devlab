@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# devlab-exec — pinned per-user executor for DevLab. Invoked ONLY by the devlab service via:
+#     sudo -n -u <targetuser> /usr/local/sbin/devlab-exec <verb> <args...>
+# It runs AS the target user (sudo -u) and CONFINES every path to that user's workspace root
+# (/var/lib/devlab/workspaces/<self>), so a compromised devlab service cannot reach another user's
+# files, /home, or the token store. Must be root-owned and non-writable (see devlab.sudoers).
+#
+# Verbs:
+#   git   <dir> <git-args...>   run git in <dir>  (clone: <dir> = the workspace root)
+#   claude<dir> <cli-args...>   run the claude CLI (agentic AI) in <dir>
+#   write <file>                write stdin to <file> (parents created)
+#   rm    <file>                remove <file>
+# The GitHub token, when needed, is passed via the DEVLAB_GH_TOKEN env (sudoers env_keep), never argv.
+set -euo pipefail
+# 0027: files 0640 / dirs 0750 — the workspace's setgid group is `devlab`, so the read-only devlab
+# service can read what the user creates here; other users (not in the group) cannot.
+umask 0027
+
+SELF="$(id -un)"
+ROOT="/var/lib/devlab/workspaces/$SELF"
+
+die() { echo "devlab-exec: $*" >&2; exit 64; }
+
+# require_under_root <path> — resolve the deepest existing ancestor (defeating symlink escapes) and
+# require the result stays within $ROOT.
+require_under_root() {
+  local p="$1" parent real
+  [ -n "$p" ] || die "empty path"
+  case "$p" in /*) : ;; *) die "path must be absolute: $p" ;; esac
+  parent="$p"
+  while [ ! -e "$parent" ] && [ "$parent" != "/" ]; do parent="$(dirname "$parent")"; done
+  real="$(realpath -e -- "$parent")" || die "cannot resolve: $p"
+  local rootreal
+  rootreal="$(realpath -e -- "$ROOT")" || die "no workspace root for $SELF"
+  case "$real/" in
+    "$rootreal"/*) : ;;
+    *) die "path escapes workspace root: $p" ;;
+  esac
+}
+
+verb="${1:-}"; shift || true
+case "$verb" in
+  git)
+    dir="${1:-}"; shift || true
+    require_under_root "$dir"
+    cd -- "$dir"
+    export GIT_TERMINAL_PROMPT=0
+    # safe.directory='*': the workspace is confined + owned by this same user, but sudo's env
+    # (HOME/uid handling) can otherwise trip git's dubious-ownership guard. Safe here by construction.
+    exec git -c "safe.directory=*" "$@"
+    ;;
+  claude)
+    dir="${1:-}"; shift || true
+    require_under_root "$dir"
+    cd -- "$dir"
+    # claude reads the invoking user's ~/.claude (config + auth). sudo may not reset HOME, so set
+    # it (and USER) from the passwd entry of whoever we are running as, so the RIGHT config loads.
+    HOME="$(getent passwd "$SELF" | cut -d: -f6)"; export HOME
+    export USER="$SELF" LOGNAME="$SELF"
+    command -v claude >/dev/null 2>&1 || die "claude CLI not installed for $SELF"
+    exec claude "$@"
+    ;;
+  write)
+    file="${1:-}"; shift || true
+    require_under_root "$file"
+    mkdir -p -- "$(dirname -- "$file")"
+    cat > "$file"
+    ;;
+  rm)
+    file="${1:-}"; shift || true
+    require_under_root "$file"
+    rm -f -- "$file"
+    ;;
+
+  # ── preview verbs (per-user branch previews, driven by the root devlab-preview wrapper) ──
+  # These run AS this user, path-confined to the workspace root, so sxgate's preview engine can
+  # execute EVERY untrusted step (manifest read, checkout, build, seed) as the user, never root.
+  pv-manifest)
+    # Source .sxgate/preview.conf AS the user with its OWN output muted, then emit only the known
+    # keys as NUL-delimited KEY=VALUE via slash-pathed /usr/bin/printf (immune to function
+    # shadowing). The root caller parses this as pure DATA — no eval — so a hostile manifest can
+    # neither run code at root nor inject keys.
+    mf="${1:-}"; require_under_root "$mf"
+    [ -f "$mf" ] || die "no such manifest: $mf"
+    (
+      SERVICE='' BUILD='' MODE='' ROOT='' API_PREFIX='' RUN='' RUN_CWD='' RUN_ENV='' SEED='' HEALTHCHECK='' HOOK=''
+      # shellcheck disable=SC1090
+      . "$mf" >/dev/null 2>&1 || true
+      for k in SERVICE BUILD MODE ROOT API_PREFIX RUN RUN_CWD RUN_ENV SEED HEALTHCHECK HOOK; do
+        /usr/bin/printf '%s=%s\0' "$k" "${!k}"
+      done
+    )
+    ;;
+  pv-worktree-add)
+    # Detached checkout of a committed SHA. Runs as the user against the user's own repo, so git's
+    # dubious-ownership guard never fires and root never touches the user's .git.
+    src="${1:-}"; wt="${2:-}"; ref="${3:-}"
+    require_under_root "$src"; require_under_root "$wt"
+    sha="$(git -C "$src" -c safe.directory='*' rev-parse --verify "${ref}^{commit}" 2>/dev/null)" \
+      || die "no such commit for ref: $ref"
+    mkdir -p -- "$(dirname -- "$wt")"
+    exec git -C "$src" -c safe.directory='*' worktree add --detach "$wt" "$sha"
+    ;;
+  pv-mkdir)
+    d="${1:-}"; require_under_root "$d"
+    exec mkdir -p -- "$d"
+    ;;
+  pv-build)
+    # Run the (root-expanded, placeholder-substituted) build/seed command as the user, in the
+    # worktree. Trust-equivalent to the `claude` verb (arbitrary user code, as the user). The
+    # command travels via DEVLAB_PV_CMD env (sudoers env_keep), never argv.
+    #
+    # Robust bounding (review #1/#5): run in a NEW SESSION so the whole process tree can be
+    # signalled — a TERM-ignoring build or a double-forked daemon cannot escape. After the
+    # timeout we TERM the process group, then hard-KILL it, and KILL any stragglers on exit. So a
+    # hostile build can neither run forever (defeating a lock) nor leave orphans behind.
+    wt="${1:-}"; require_under_root "$wt"
+    [ -d "$wt" ] || die "no such worktree: $wt"
+    cd -- "$wt"
+    : "${DEVLAB_PV_CMD:?missing DEVLAB_PV_CMD}"
+    # timeout (in its default non-foreground mode) runs the build in its OWN process group and
+    # signals the WHOLE group on expiry; -k adds a hard SIGKILL 30s after the SIGTERM, so neither a
+    # SIGTERM-ignoring build nor a double-forked daemon can survive (review #1/#5). Because the build
+    # is thus HARD-BOUNDED, it can no longer pin sxgate's lock indefinitely (the CRITICAL wedge);
+    # the residual is only a bounded delay for other users while a build runs (lock-scope reduction
+    # + unix sockets are the documented follow-up).
+    exec timeout -k 30 -s TERM "${DEVLAB_PV_TIMEOUT:-300}" bash -c "$DEVLAB_PV_CMD"
+    ;;
+  pv-worktree-remove)
+    src="${1:-}"; wt="${2:-}"
+    require_under_root "$src"; require_under_root "$wt"
+    exec git -C "$src" -c safe.directory='*' worktree remove --force "$wt"
+    ;;
+  pv-rm)
+    d="${1:-}"; require_under_root "$d"
+    exec rm -rf -- "$d"
+    ;;
+
+  *)
+    die "unknown verb: ${verb:-<none>}"
+    ;;
+esac

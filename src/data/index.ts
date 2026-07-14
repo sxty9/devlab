@@ -2,7 +2,15 @@ import type { DataSource } from './source';
 import { mockSource } from './mockSource';
 import { httpSource } from './httpSource';
 
-export type { DataSource, DiffPayload, InitResult } from './source';
+export type {
+  DataSource,
+  DiffPayload,
+  InitResult,
+  WriteResult,
+  CommitResult,
+  PushResult,
+  BranchResult,
+} from './source';
 export { AuthRequiredError } from './source';
 
 // VITE_DATA_SOURCE=mock forces offline mock; =api forces the backend; unset = try the backend
@@ -19,11 +27,37 @@ export const dataSource: DataSource = {
     impl = res.mode === 'mock' && forced !== 'api' ? mockSource : httpSource;
     return res;
   },
-  login: (pw) => impl.login(pw),
+  getUser: () => impl.getUser(),
   repos: () => impl.repos(),
   repoData: (id, b) => impl.repoData(id, b),
   fileContent: (id, p) => impl.fileContent(id, p),
   fileDiff: (id, p) => impl.fileDiff(id, p),
+  githubAuthorizeUrl: () => impl.githubAuthorizeUrl(),
+  unlinkGitHub: () => impl.unlinkGitHub(),
+  ensureRepo: (id) => impl.ensureRepo(id),
+  saveFile: (id, p, c) => impl.saveFile(id, p, c),
+  stage: (id, p) => impl.stage(id, p),
+  unstage: (id, p) => impl.unstage(id, p),
+  commit: (id, m) => impl.commit(id, m),
+  push: (id) => impl.push(id),
+  pull: (id) => impl.pull(id),
+  createBranch: (id, n, f) => impl.createBranch(id, n, f),
+  checkout: (id, n) => impl.checkout(id, n),
+  openPR: (id, title, body) => impl.openPR(id, title, body),
+  vision: (id) => impl.vision(id),
+  rawUrl: (id, p) => impl.rawUrl(id, p),
+  uploadVision: (id, p, c) => impl.uploadVision(id, p, c),
+  deleteVision: (id, p) => impl.deleteVision(id, p),
+  listComments: (id, p) => impl.listComments(id, p),
+  addComment: (id, p, b, parent) => impl.addComment(id, p, b, parent),
+  deleteComment: (id, cid) => impl.deleteComment(id, cid),
+  askAssistant: (id, ask) => impl.askAssistant(id, ask),
+  askAgent: (id, ask) => impl.askAgent(id, ask),
+  getAssistantHistory: (id) => impl.getAssistantHistory(id),
+  saveAssistantHistory: (id, msgs) => impl.saveAssistantHistory(id, msgs),
+  assistantModels: () => impl.assistantModels(),
+  terminalUrl: (id) => impl.terminalUrl(id),
+  atlas: () => impl.atlas(),
 };
 
 export function getDataSource(): DataSource {

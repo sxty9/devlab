@@ -3,6 +3,7 @@ import { TabStrip } from './TabStrip';
 import { EditorView } from './EditorView';
 import { DiffView } from './DiffView';
 import { StructureView } from './StructureView';
+import { VisionView } from './VisionView';
 import { WelcomeView } from './WelcomeView';
 
 /** The editor region: tab strip + the active tab's body (code / structure / welcome). */
@@ -16,13 +17,13 @@ export function MainArea() {
       {!activeTab && <WelcomeView />}
       {activeTab?.kind === 'structure' && <StructureView />}
       {activeTab?.kind === 'diff' && activeTab.path && <DiffView key={`${activeRepo.id}/diff/${activeTab.path}`} path={activeTab.path} />}
+      {activeTab?.kind === 'vision' && activeTab.path && <VisionView key={`${activeRepo.id}/vision/${activeTab.path}`} path={activeTab.path} />}
       {activeTab?.kind === 'code' && activeTab.path && (
         <EditorView
           key={`${activeRepo.id}/${activeTab.path}`}
           repoId={activeRepo.id}
           path={activeTab.path}
           lang={fileContent(activeTab.path).lang}
-          code={fileContent(activeTab.path).code}
         />
       )}
     </main>

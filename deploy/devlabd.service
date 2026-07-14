@@ -1,0 +1,89 @@
+# DevLab backend (devlabd) — production systemd unit.
+#
+# Slice 0 reads the operator's local working copies under /home/nanu and discovers repos via the
+# operator's `gh` auth, so the daemon runs as `nanu` (the owner of both). It only needs read
+# access; nothing under /home is written. Slice 3 re-architects storage to per-user clones under
+# /var/lib/devlab with per-user GitHub tokens, at which point this should move to a dedicated
+# unprivileged `devlab` system user (no /home access, no shared gh PAT).
+#
+# Install (run once, as root):
+#   # 1. binary + unit
+#   sudo install -m0755 devlabd /usr/local/bin/devlabd
+#   sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
+#   # 2. rights manifest → privleg discovers it; create the backing group (mirrors the
+#   #    holistic-service-template install_permissions step)
+#   sudo install -m0644 permissions/devlab.json /etc/holistic/permissions.d/devlab.json
+#   sudo groupadd -f hp_devlab_access
+#   # 3. let nanu read the shared Holistic session secret (validates the h_access SSO cookie)
+#   sudo usermod -aG holistic nanu        # log out/in or restart the unit for it to take effect
+#   # 4. start
+#   sudo systemctl daemon-reload && sudo systemctl enable --now devlabd
+#
+# Grant a non-admin developer access (admins are implicitly allowed):
+#   privleg-grant <user> hp_devlab_access on     # or via the privleg UI
+#
+# GitHub linking (Slice 2) — one-time operator setup:
+#   # a) Register a GitHub OAuth App (Settings → Developer settings → OAuth Apps):
+#   #      Homepage:      https://devlab.henrysoase.org
+#   #      Callback URL:  https://devlab.henrysoase.org/api/github/callback
+#   #    then drop its credentials (root:devlab 0640) where devlabd can read them:
+#   sudo install -d -m0750 -o root -g devlab /etc/devlab
+#   printf '{"client_id":"...","client_secret":"...","redirect_uri":"https://devlab.henrysoase.org/api/github/callback"}' \
+#     | sudo install -m0640 -o root -g devlab /dev/stdin /etc/devlab/github-oauth.json
+#   # b) 32-byte AES key that encrypts each user's GitHub token at rest:
+#   sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/devlab/link-key' && sudo chgrp devlab /etc/devlab/link-key && sudo chmod 0640 /etc/devlab/link-key
+#   # /var/lib/devlab/{links,workspaces} are created by StateDirectory + the daemon (0700).
+#
+# Register the production route (Cloudflare tunnel via sxgate):
+#   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8781
+#   sudo /home/nanu/sxgate/sxgate route add devlab.henrysoase.org devlab
+#   (+ a proxied CNAME `devlab` in the Cloudflare DNS for henrysoase.org)
+
+[Unit]
+Description=DevLab backend (devlabd)
+After=network.target
+
+[Service]
+Type=simple
+# Phase C: dedicated unprivileged service user. Per-user git/file ops (and the terminal/AI) run AS
+# the logged-in Linux user via the pinned devlab-exec sudo wrapper; the service itself only reads.
+User=devlab
+SupplementaryGroups=holistic
+ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8781
+Restart=on-failure
+RestartSec=3
+
+# Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable secret
+# makes devlabd refuse to start in SSO mode (fail closed) rather than accept forged tokens.
+Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
+# Cookies re-minted by devlabd (local refresh) are domain-wide + secure in production, so they
+# overwrite the shared Holistic variants rather than shadowing them.
+Environment=DEVLAB_COOKIE_SECURE=1
+Environment=DEVLAB_COOKIE_DOMAIN=.henrysoase.org
+# Slice 0/2 reads local working copies in the sandbox; production discovery is per-user GitHub:
+Environment=DEVLAB_REPOS_PATH=/home/nanu
+# Slice 1: honor a Holistic logout/rotation at refresh time (read-only). Falls back to the
+# refresh-token TTL if unreadable.
+Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json
+# Slice 2: per-user GitHub link store (AES-256-GCM token at rest) + OAuth app config.
+Environment=DEVLAB_LINKS=/var/lib/devlab/links
+Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
+Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
+# Slice 3: per-user git workspaces.
+Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
+# Serve the built SPA (dist/) directly so one process serves both UI and API (sxgate routes
+# devlab.henrysoase.org straight here). Deploy dist/ to this path on each release.
+Environment=DEVLAB_STATIC_DIR=/var/lib/devlab/www
+
+# Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo wrappers to
+# run ops as the end user); ProtectHome false so per-user git/claude configs (~/.gitconfig, ~/.claude)
+# resolve. Isolation is at the sudo/OS-user layer (devlab-exec), not the mount namespace.
+StateDirectory=devlab
+ReadWritePaths=/var/lib/devlab
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=false
+PrivateTmp=false
+
+[Install]
+WantedBy=multi-user.target

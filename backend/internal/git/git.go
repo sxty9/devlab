@@ -16,9 +16,14 @@ import (
 
 const maxFileBytes = 2 << 20 // 2 MiB editor cap
 
-// run executes `git -C repo args…` and returns trimmed stdout.
+// run executes a read-only `git … -C repo args…` and returns trimmed stdout. Runs as the devlab
+// service user directly (reads are fast, no sudo). --no-optional-locks keeps status/ls-files from
+// taking .git/index.lock (so a concurrent user-run write doesn't collide). safe.directory=* lets the
+// service read repos OWNED by a different user (the per-user workspace model), where git would
+// otherwise refuse with "dubious ownership".
 func run(repo string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+	full := append([]string{"--no-optional-locks", "-c", "safe.directory=*", "-C", repo}, args...)
+	cmd := exec.Command("git", full...)
 	out, err := cmd.Output()
 	return strings.TrimRight(string(out), "\n"), err
 }
@@ -204,6 +209,12 @@ func FileAt(repo, rel string) model.FileContent {
 	if !strings.HasPrefix(abs, filepath.Clean(repo)+string(os.PathSeparator)) {
 		return model.FileContent{Path: rel, Lang: lang, Code: "// (refused: path escapes repository)\n"}
 	}
+	// A committed symlink can point outside the repo; os.ReadFile would follow it. Resolve links
+	// and confirm the target stays inside the (symlink-resolved) repo, mirroring the write path's
+	// guard, so a malicious repo cannot exfiltrate arbitrary server-side files.
+	if escapesViaSymlink(repo, abs) {
+		return model.FileContent{Path: rel, Lang: lang, Code: "// (refused: path escapes repository)\n"}
+	}
 	info, err := os.Stat(abs)
 	if err != nil {
 		return model.FileContent{Path: rel, Lang: lang, Code: "// (file not found)\n"}
@@ -219,6 +230,27 @@ func FileAt(repo, rel string) model.FileContent {
 		return model.FileContent{Path: rel, Lang: "plaintext", Code: "// (binary file)\n"}
 	}
 	return model.FileContent{Path: rel, Lang: lang, Code: string(b)}
+}
+
+// escapesViaSymlink reports whether abs resolves (through symlinks) to a location outside repo.
+// It resolves the deepest existing ancestor of abs so a symlinked directory anywhere on the path
+// is caught. Any resolution error on the repo root is treated as an escape (fail closed).
+func escapesViaSymlink(repo, abs string) bool {
+	root, err := filepath.EvalSymlinks(filepath.Clean(repo))
+	if err != nil {
+		return true
+	}
+	p := abs
+	for {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return real != root && !strings.HasPrefix(real, root+string(os.PathSeparator))
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return false // no existing ancestor (path simply doesn't exist yet) — os.Stat handles it
+		}
+		p = parent
+	}
 }
 
 // showAt returns committed content of a path at a ref (empty if absent).
@@ -239,6 +271,74 @@ func DiffFor(repo, rel string) model.Diff {
 		after = ""
 	}
 	return model.Diff{Before: before, After: after, Lang: Lang(rel)}
+}
+
+// visionKind classifies a vision file by extension for the catalog renderer.
+func visionKind(name string) string {
+	ext := ""
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		ext = strings.ToLower(name[i+1:])
+	}
+	switch ext {
+	case "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif", "ico":
+		return "image"
+	case "pdf":
+		return "pdf"
+	case "md", "markdown":
+		return "markdown"
+	case "txt", "json", "yaml", "yml", "toml", "csv", "ts", "tsx", "js", "go", "py", "sh", "html", "css":
+		return "text"
+	default:
+		return "other"
+	}
+}
+
+// ListFiles returns the repo's tracked+untracked (gitignore-respected) file paths, flat.
+func ListFiles(repo string) []string {
+	out, err := run(repo, "ls-files", "--cached", "--others", "--exclude-standard")
+	if err != nil || out == "" {
+		return nil
+	}
+	return strings.Split(out, "\n")
+}
+
+// VisionFiles lists the tracked+untracked (gitignore-respected) files under the repo's vision/
+// folder, classified for the Vision Catalog, with sizes and git-status decorations. Hidden files
+// (e.g. the vision/.gitignore itself) are omitted.
+func VisionFiles(repo string) []model.VisionFile {
+	out, err := run(repo, "ls-files", "--cached", "--others", "--exclude-standard", "--", "vision")
+	if err != nil {
+		return []model.VisionFile{}
+	}
+	statusByPath := map[string]string{}
+	for _, c := range Changes(repo) {
+		statusByPath[c.Path] = c.Status
+	}
+	seen := map[string]bool{}
+	var files []model.VisionFile
+	for _, p := range strings.Split(out, "\n") {
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		name := p
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			name = p[i+1:]
+		}
+		if strings.HasPrefix(name, ".") {
+			continue // hide .gitignore / dotfiles from the catalog
+		}
+		var size int64
+		if fi, err := os.Stat(filepath.Join(repo, p)); err == nil {
+			size = fi.Size()
+		}
+		files = append(files, model.VisionFile{Path: p, Name: name, Kind: visionKind(name), Size: size, Status: statusByPath[p]})
+	}
+	sort.Slice(files, func(i, j int) bool { return strings.ToLower(files[i].Path) < strings.ToLower(files[j].Path) })
+	if files == nil {
+		files = []model.VisionFile{}
+	}
+	return files
 }
 
 func mapStatus(code byte) string {

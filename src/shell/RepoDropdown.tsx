@@ -36,6 +36,14 @@ export function RepoDropdown() {
                 <span className="flex items-center gap-2">
                   <span className="truncate">{r.name}</span>
                   <span className="shrink-0 text-caption text-text-tertiary">{r.language}</span>
+                  {r.permission === 'pull' && (
+                    <span
+                      className="shrink-0 rounded-sm bg-fill/10 px-1.5 text-[10px] font-semibold uppercase tracking-wide text-text-tertiary"
+                      title="Read-only access on GitHub"
+                    >
+                      read-only
+                    </span>
+                  )}
                 </span>
               }
               hint={r.description}

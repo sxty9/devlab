@@ -15,7 +15,7 @@ const ITEMS: RailItem[] = [
   { id: 'project', label: 'Project', Icon: FilesIcon },
   { id: 'vcs', label: 'Version Control', Icon: GitBranchIcon },
   { id: 'git', label: 'Git Log & Worktrees', Icon: GitGraphIcon },
-  { id: 'claude', label: 'Claude', Icon: ClaudeIcon },
+  { id: 'claude', label: 'KI', Icon: ClaudeIcon },
   { id: 'terminal', label: 'Terminal', Icon: TerminalIcon },
 ];
 
