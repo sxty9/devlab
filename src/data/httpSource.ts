@@ -203,6 +203,14 @@ export const httpSource: DataSource = {
   async atlas() {
     return json(await request('/api/atlas'));
   },
+
+  async mercuryTree() {
+    return json(await request('/api/mercury/tree'));
+  },
+  async mercuryItem(path) {
+    const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
+    return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

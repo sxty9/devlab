@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Branch, Change, Comment, FileContent, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, FileContent, MercuryTree, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -97,6 +97,10 @@ export interface DataSource {
 
   // ── Atlas (the deployed Holistic landscape, derived from the host's own config) ──
   atlas(): Promise<AtlasGraph>;
+
+  // ── Mercury (the axiom model over aigentic's scheme graveyard) ──────────────
+  mercuryTree(): Promise<MercuryTree>;
+  mercuryItem(path: string): Promise<Axiom>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

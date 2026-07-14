@@ -292,6 +292,32 @@ export interface RepoData {
   structure: StructureSection[];
 }
 
+// ── Mercury — the axiom-management model (scheme-backed, via aigentic) ────────
+
+/** One node of a namespace tree: a category (folder) or an axiom (leaf). Categories nest to any
+ *  depth; `path` is the node's stable scheme address. */
+export interface MercuryNode {
+  name: string;
+  path: string;
+  isAxiom: boolean;
+  children?: MercuryNode[];
+}
+
+/** The whole model, grouped by namespace. */
+export interface MercuryTree {
+  axiome: MercuryNode[];
+  regeln: MercuryNode[];
+  laeufe: MercuryNode[];
+}
+
+/** A parsed axiom record: front-matter fields + the body markdown. */
+export interface Axiom {
+  id: string;
+  titel: string;
+  quelle?: string;
+  body: string;
+}
+
 // ── Atlas — the deployed Holistic landscape ──────────────────────────────────
 
 /** A deployed Holistic service, derived from its rights manifest and its Caddy route. */

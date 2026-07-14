@@ -58,6 +58,8 @@ export const dataSource: DataSource = {
   assistantModels: () => impl.assistantModels(),
   terminalUrl: (id) => impl.terminalUrl(id),
   atlas: () => impl.atlas(),
+  mercuryTree: () => impl.mercuryTree(),
+  mercuryItem: (path) => impl.mercuryItem(path),
 };
 
 export function getDataSource(): DataSource {

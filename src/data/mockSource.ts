@@ -214,6 +214,49 @@ export const mockSource: DataSource = {
       scannedAt: '2026-07-14T09:00:00Z',
     };
   },
+
+  async mercuryTree() {
+    const leaf = (name: string, path: string) => ({ name, path, isAxiom: true });
+    return {
+      axiome: [
+        {
+          name: 'architektur',
+          path: 'axiome/architektur',
+          isAxiom: false,
+          children: [
+            {
+              name: 'ssot',
+              path: 'axiome/architektur/ssot',
+              isAxiom: false,
+              children: [
+                leaf('atomare-zugriffe', 'axiome/architektur/ssot/atomare-zugriffe.md'),
+                leaf('kein-paralleler-datenpfad', 'axiome/architektur/ssot/kein-paralleler-datenpfad.md'),
+              ],
+            },
+            leaf('passive-pools', 'axiome/architektur/passive-pools.md'),
+          ],
+        },
+        {
+          name: 'minimalismus',
+          path: 'axiome/minimalismus',
+          isAxiom: false,
+          children: [leaf('keine-tooltips', 'axiome/minimalismus/keine-tooltips.md')],
+        },
+      ],
+      regeln: [
+        { name: 'go', path: 'regeln/go', isAxiom: false, children: [leaf('fehler-wrappen', 'regeln/go/fehler-wrappen.md')] },
+      ],
+      laeufe: [],
+    };
+  },
+  async mercuryItem(path: string) {
+    return {
+      id: 'ax_mock01',
+      titel: path.split('/').pop()?.replace('.md', '') ?? 'Axiom',
+      quelle: 'axioms/CLAUDE.MD.md#holistic_architecture_maxims/Single Source of Truth',
+      body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
+    };
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};

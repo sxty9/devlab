@@ -159,6 +159,11 @@ func (s *Server) Handler() http.Handler {
 	// rights manifests + their Caddy routes). Read-only, host-scoped, no workspace access.
 	mux.HandleFunc("GET /api/atlas", s.guard(s.atlasGraph))
 
+	// Mercury — the axiom-management model over aigentic's scheme-backed graveyard. Read tier for
+	// now (the tree and a record); the caller's session is forwarded to aigentic.
+	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
+	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
 	mux.HandleFunc("/", s.root)
