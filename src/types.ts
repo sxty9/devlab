@@ -300,7 +300,7 @@ export interface AtlasNode {
   /** The port it answers on; 0 when it has no route. */
   port: number;
   /** The hp_* groups it declares. */
-  rights: string[] | null;
+  rights: string[];
   hasManifest: boolean;
   hasRoute: boolean;
   /** The repo it is built from, when the viewer can see one — '' otherwise. */

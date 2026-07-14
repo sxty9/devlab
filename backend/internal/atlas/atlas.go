@@ -181,7 +181,7 @@ func stem(name, suffix string) (string, bool) {
 
 // findings compares what is deployed against what is declared. The store stays passive: the graph
 // holds facts, and every judgement about them is made here, outside it.
-func findings(nodes []Node) []Finding {
+func findings(nodes []Node, catalogKnown bool) []Finding {
 	var out []Finding
 
 	byPort := map[int][]string{}
@@ -203,10 +203,14 @@ func findings(nodes []Node) []Finding {
 				Nodes:    []string{n.ID},
 			})
 		}
-		if n.Repo == "" {
+		// Only meaningful when the repo catalog actually resolved. On a GitHub outage every node
+		// would otherwise look uncatalogued, and Atlas would indict the whole landscape. The wording
+		// stays neutral about the cause: it may be an untagged repo, or simply one this caller has
+		// no GitHub access to.
+		if catalogKnown && n.Repo == "" {
 			out = append(out, Finding{
 				Severity: "warn",
-				Message:  n.ID + " ist deployed, liegt aber außerhalb des DevLab-Repo-Katalogs.",
+				Message:  n.ID + " ist deployed, aber als Repository nicht sichtbar.",
 				Nodes:    []string{n.ID},
 			})
 		}
@@ -256,23 +260,21 @@ func snapshot() map[string]*Node {
 	out := make(map[string]*Node, len(cached))
 	for id, n := range cached {
 		c := *n
-		c.Rights = append([]string(nil), n.Rights...)
+		// append() to a nil slice yields nil when there is nothing to copy, and a nil slice
+		// marshals to JSON `null` rather than `[]`. Every list this API returns is a list.
+		c.Rights = make([]string, len(n.Rights))
+		copy(c.Rights, n.Rights)
 		out[id] = &c
 	}
 	return out
 }
 
-// Invalidate drops the cached host snapshot.
-func Invalidate() {
-	mu.Lock()
-	cached = nil
-	mu.Unlock()
-}
-
 // GraphFor builds the landscape as this caller can see it. repoIDs are the repos DevLab resolved for
 // them from GitHub — used only to link a deployed service back to its repo, never to filter the host
-// nodes, so a service the caller cannot see on GitHub is still shown as deployed.
-func GraphFor(repoIDs []string) Graph {
+// nodes, so a service the caller cannot see on GitHub is still shown as deployed. catalogKnown says
+// whether that resolution actually succeeded; when it did not, findings that reason about the repo
+// catalog are suppressed rather than reported against every node.
+func GraphFor(repoIDs []string, catalogKnown bool) Graph {
 	known := make(map[string]bool, len(repoIDs))
 	for _, id := range repoIDs {
 		known[id] = true
@@ -290,7 +292,7 @@ func GraphFor(repoIDs []string) Graph {
 
 	return Graph{
 		Nodes:     nodes,
-		Findings:  findings(nodes),
+		Findings:  findings(nodes, catalogKnown),
 		ScannedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 }

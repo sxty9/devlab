@@ -12,11 +12,23 @@ export type View =
   | { kind: 'mercury' }
   | { kind: 'atlas' };
 
+/** decodeURIComponent throws on a malformed escape ("%", "a%zz"). The hash is user-typeable, and
+ *  this runs inside a useState initializer, so an exception here would blank the whole app. A repo
+ *  id cannot contain an escape anyway: hand back the raw segment and let the caller fail to match
+ *  it, which lands them on the dashboard. */
+function decodeSegment(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /** Parse a location hash into a View. Anything unrecognised lands on the dashboard. */
 export function parseHash(hash: string): View {
   const segments = hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   const [head, ...rest] = segments;
-  if (head === 'ide' && rest[0]) return { kind: 'ide', repo: decodeURIComponent(rest[0]) };
+  if (head === 'ide' && rest[0]) return { kind: 'ide', repo: decodeSegment(rest[0]) };
   if (head === 'mercury') return { kind: 'mercury' };
   if (head === 'atlas') return { kind: 'atlas' };
   return { kind: 'dashboard' };

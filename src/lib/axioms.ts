@@ -41,7 +41,18 @@ export function parseAxioms(md: string): AxiomSection[] {
 
   let section: AxiomSection | null = null;
   let sectionIntroStart = 0;
+  // Whether the section's leading prose run has been closed off. A plain `!section.intro` check
+  // cannot tell "no prose yet" from "no prose at all", and a section that opens straight with a
+  // block has an empty intro — which would then swallow the section's whole body.
+  let introTaken = false;
   let block: { tag: string; name: string; start: number } | null = null;
+
+  /** Close off the section's leading prose at `upto`. Only the run before its first block counts. */
+  const takeIntro = (upto: number) => {
+    if (!section || introTaken) return;
+    section.intro = md.slice(sectionIntroStart, upto).trim();
+    introTaken = true;
+  };
 
   let offset = 0;
   for (const line of md.split('\n')) {
@@ -59,6 +70,7 @@ export function parseAxioms(md: string): AxiomSection[] {
       if (bare) {
         section = { tag: bare[1], intro: '', entries: [] };
         sectionIntroStart = lineEnd;
+        introTaken = false;
       }
       continue;
     }
@@ -79,21 +91,20 @@ export function parseAxioms(md: string): AxiomSection[] {
     }
 
     if (close && close[1].toLowerCase() === section.tag.toLowerCase()) {
-      if (!section.intro) section.intro = md.slice(sectionIntroStart, lineStart).trim();
+      takeIntro(lineStart); // a section with no blocks at all carries everything in its prose
       sections.push(section);
       section = null;
       continue;
     }
 
     if (named) {
-      // The prose seen so far is the section's intro (only the run before its first block counts).
-      if (!section.entries.length && !section.intro) section.intro = md.slice(sectionIntroStart, lineStart).trim();
+      takeIntro(lineStart);
       block = { tag: named[1], name: named[2], start: lineEnd };
       continue;
     }
 
     if (bare) {
-      if (!section.entries.length && !section.intro) section.intro = md.slice(sectionIntroStart, lineStart).trim();
+      takeIntro(lineStart);
       block = { tag: bare[1], name: bare[1], start: lineEnd };
     }
   }

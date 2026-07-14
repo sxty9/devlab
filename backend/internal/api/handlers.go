@@ -11,21 +11,30 @@ import (
 	"devlab/backend/internal/model"
 )
 
-func (s *Server) repos(w http.ResponseWriter, r *http.Request) {
+// userRepos resolves the caller's holistic repo set. ok is false only when GitHub could not be
+// reached — an unlinked account is an empty set, not a failure. Callers decide what a failure means:
+// /api/repos turns it into a 502, Atlas degrades around it.
+func (s *Server) userRepos(r *http.Request) (repos []model.Repo, ok bool) {
 	// Dev-bypass/preview sandbox: no per-user token → the local working-copy set.
 	if s.v.DevBypass() {
-		writeJSON(w, http.StatusOK, discover.Repos(s.reposBase))
-		return
+		return discover.Repos(s.reposBase), true
 	}
 	u := userFrom(r)
 	token, err := s.userToken(u)
 	if err != nil {
 		// Not linked (the link gate should have prevented this) → an empty set, not an error.
-		writeJSON(w, http.StatusOK, []model.Repo{})
-		return
+		return []model.Repo{}, true
 	}
-	repos, err := discover.ReposForUser(r.Context(), u.Username, token)
+	repos, err = discover.ReposForUser(r.Context(), u.Username, token)
 	if err != nil {
+		return nil, false
+	}
+	return repos, true
+}
+
+func (s *Server) repos(w http.ResponseWriter, r *http.Request) {
+	repos, ok := s.userRepos(r)
+	if !ok {
 		writeErr(w, http.StatusBadGateway, "Could not reach GitHub")
 		return
 	}
