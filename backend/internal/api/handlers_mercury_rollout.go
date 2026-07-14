@@ -75,11 +75,17 @@ func (s *Server) mercuryRollout(w http.ResponseWriter, r *http.Request) {
 			changed++
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"applied": apply,
 		"changed": changed,
 		"repos":   results,
-	})
+	}
+	// On a dry-run, return the exact block that would be injected, so the owner reviews the content
+	// before pushing it into 18 constitutions.
+	if !apply {
+		out["block"] = block
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // rolloutOne clones/updates a repo and syncs its CLAUDE.md. Never fatal: any failure becomes a
