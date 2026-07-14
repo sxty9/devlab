@@ -101,6 +101,8 @@ export interface DataSource {
   // ── Mercury (the axiom model over aigentic's scheme graveyard) ──────────────
   mercuryTree(): Promise<MercuryTree>;
   mercuryItem(path: string): Promise<Axiom>;
+  /** Add an axiom; aigentic classifies it into the tree. Returns where it landed. */
+  mercuryAddAxiom(titel: string, body: string): Promise<{ path: string; id: string; classified: boolean }>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

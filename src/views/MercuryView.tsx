@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
 import { renderMarkdown } from '@/lib/markdown';
+import { useToast } from '@/ui/Toast';
+import { Button } from '@/ui/Button';
 import { Splash } from '@/shell/Splash';
 import { cn } from '@/lib/cn';
-import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon } from '@/ui/icons';
+import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon } from '@/ui/icons';
 import type { Axiom, MercuryNode, MercuryTree } from '@/types';
 
 type SectionId = 'axiome' | 'regeln' | 'laeufe';
@@ -25,17 +27,22 @@ export function MercuryView() {
   const [failed, setFailed] = useState<string | null>(null);
   const [section, setSection] = useState<SectionId>('axiome');
   const [selected, setSelected] = useState<MercuryNode | null>(null);
+  const [adding, setAdding] = useState(false);
+
+  const reload = useCallback(() => {
+    return source
+      .mercuryTree()
+      .then((t) => setTree(t))
+      .catch((e: unknown) => setFailed(String((e as Error)?.message ?? e)));
+  }, [source]);
 
   useEffect(() => {
     let cancelled = false;
-    source
-      .mercuryTree()
-      .then((t) => !cancelled && setTree(t))
-      .catch((e: unknown) => !cancelled && setFailed(String((e as Error)?.message ?? e)));
+    void reload().finally(() => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [source]);
+  }, [reload]);
 
   if (failed) {
     return (
@@ -74,6 +81,29 @@ export function MercuryView() {
           })}
         </nav>
 
+        {section === 'axiome' && (
+          <div className="border-b border-separator px-2 py-1.5">
+            {adding ? (
+              <AddAxiomForm
+                onClose={() => setAdding(false)}
+                onAdded={async () => {
+                  setAdding(false);
+                  await reload();
+                }}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => setAdding(true)}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
+              >
+                <PlusIcon className="h-4 w-4 text-accent" />
+                Axiom hinzufügen
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="flex-1 p-1.5">
           {roots.length === 0 ? (
             <p className="px-2.5 py-3 text-caption text-text-tertiary">{SECTIONS.find((s) => s.id === section)!.empty}</p>
@@ -86,6 +116,61 @@ export function MercuryView() {
       <main className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
         {selected ? <AxiomPane node={selected} /> : <Placeholder section={section} />}
       </main>
+    </div>
+  );
+}
+
+/** Add an axiom: the user gives a title and text; aigentic classifies it into the tree. Mercury
+ *  never asks the user to choose a category — that is the whole point. */
+function AddAxiomForm({ onClose, onAdded }: { onClose: () => void; onAdded: (path: string) => void }) {
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [titel, setTitel] = useState('');
+  const [body, setBody] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!titel.trim() || !body.trim() || busy) return;
+    setBusy(true);
+    try {
+      const res = await source.mercuryAddAxiom(titel.trim(), body.trim());
+      toast({
+        title: res.classified ? 'Axiom einsortiert' : 'Axiom abgelegt (unsortiert)',
+        description: res.path,
+        variant: res.classified ? 'success' : 'default',
+      });
+      onAdded(res.path);
+    } catch (e) {
+      toast({ title: 'Axiom konnte nicht angelegt werden', description: String((e as Error)?.message ?? e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2 p-1">
+      <input
+        autoFocus
+        value={titel}
+        onChange={(e) => setTitel(e.target.value)}
+        placeholder="Titel"
+        className="rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
+      />
+      <textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="Das Axiom, atomar und knapp formuliert."
+        rows={4}
+        className="dl-scroll resize-none rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
+      />
+      <div className="flex items-center gap-2">
+        <Button variant="primary" size="sm" disabled={busy || !titel.trim() || !body.trim()} onClick={submit}>
+          {busy ? 'Sortiere ein…' : 'Einsortieren'}
+        </Button>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={onClose}>
+          Abbrechen
+        </Button>
+      </div>
     </div>
   );
 }

@@ -20,9 +20,9 @@ const (
 // Node is one node of a namespace's tree: a category (folder) or an axiom (a .md leaf). Categories
 // nest to any depth. Path is the node's scheme path — for a leaf it is the record's stable address.
 type Node struct {
-	Name     string  `json:"name"`     // the path segment (category label or leaf slug, ".md" trimmed)
-	Path     string  `json:"path"`     // full scheme path
-	IsAxiom  bool    `json:"isAxiom"`  // true for a .md leaf, false for a category
+	Name     string  `json:"name"`    // the path segment (category label or leaf slug, ".md" trimmed)
+	Path     string  `json:"path"`    // full scheme path
+	IsAxiom  bool    `json:"isAxiom"` // true for a .md leaf, false for a category
 	Children []*Node `json:"children,omitempty"`
 }
 

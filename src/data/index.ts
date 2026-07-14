@@ -60,6 +60,7 @@ export const dataSource: DataSource = {
   atlas: () => impl.atlas(),
   mercuryTree: () => impl.mercuryTree(),
   mercuryItem: (path) => impl.mercuryItem(path),
+  mercuryAddAxiom: (titel, body) => impl.mercuryAddAxiom(titel, body),
 };
 
 export function getDataSource(): DataSource {

@@ -163,6 +163,9 @@ func (s *Server) Handler() http.Handler {
 	// now (the tree and a record); the caller's session is forwarded to aigentic.
 	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
 	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
+	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
+	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
@@ -238,6 +241,19 @@ func (s *Server) guardWrite(h http.HandlerFunc) http.HandlerFunc {
 		u := userFrom(r)
 		if !s.githubLinked(u) {
 			writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+			return
+		}
+		h(w, r)
+	})
+}
+
+// guardCSRF gates a mutating request that does NOT touch a GitHub repo: a DevLab session (guard) +
+// CSRF, without the GitHub-link requirement. Used by Mercury's axiom writes, whose authority is
+// aigentic's hp_aigentic_run on the forwarded session, not GitHub.
+func (s *Server) guardCSRF(h http.HandlerFunc) http.HandlerFunc {
+	return s.guard(func(w http.ResponseWriter, r *http.Request) {
+		if !s.v.CheckCSRF(r) {
+			writeErr(w, http.StatusForbidden, "Invalid CSRF token")
 			return
 		}
 		h(w, r)

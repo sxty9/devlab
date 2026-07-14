@@ -211,6 +211,10 @@ export const httpSource: DataSource = {
     const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
     return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
   },
+  async mercuryAddAxiom(titel, body) {
+    const r = await post('/api/mercury/axiom', { titel, body });
+    return json(r);
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

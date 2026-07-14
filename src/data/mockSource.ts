@@ -257,6 +257,9 @@ export const mockSource: DataSource = {
       body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
     };
   },
+  async mercuryAddAxiom(titel: string, _body: string) {
+    return { path: `axiome/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`, id: 'ax_mocknew', classified: false };
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};
