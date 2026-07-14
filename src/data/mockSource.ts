@@ -191,6 +191,29 @@ export const mockSource: DataSource = {
   terminalUrl() {
     return null; // no live shell offline — the panel shows a mock notice
   },
+
+  async atlas() {
+    // A stand-in for the host's own config, so `vite dev` renders Atlas offline.
+    return {
+      nodes: [
+        { id: 'aigentic', port: 8780, rights: ['hp_aigentic_api', 'hp_aigentic_run'], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'contax', port: 8777, rights: [], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'devlab', port: 0, rights: ['hp_devlab_access'], hasManifest: true, hasRoute: false, repo: 'devlab' },
+        { id: 'hostek', port: 8771, rights: ['hp_hostek_proc', 'hp_hostek_disks'], hasManifest: true, hasRoute: true, repo: 'hostek' },
+        { id: 'icaly', port: 8776, rights: ['hp_icaly_view', 'hp_icaly_edit'], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'mail', port: 8775, rights: ['hp_mail_read', 'hp_mail_send'], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'notify', port: 8778, rights: ['hp_notify_broadcast'], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'privleg', port: 8772, rights: ['hp_privleg_admin'], hasManifest: true, hasRoute: true, repo: '' },
+        { id: 'remshel', port: 8774, rights: [], hasManifest: true, hasRoute: true, repo: 'sxgate' },
+      ],
+      findings: [
+        { severity: 'warn', message: 'devlab liefert ein Rechte-Manifest, ist aber nicht geroutet.', nodes: ['devlab'] },
+        { severity: 'warn', message: 'aigentic ist deployed, liegt aber außerhalb des DevLab-Repo-Katalogs.', nodes: ['aigentic'] },
+        { severity: 'warn', message: 'mail ist deployed, liegt aber außerhalb des DevLab-Repo-Katalogs.', nodes: ['mail'] },
+      ],
+      scannedAt: '2026-07-14T09:00:00Z',
+    };
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};

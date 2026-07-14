@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, Branch, Change, Comment, FileContent, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Branch, Change, Comment, FileContent, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -94,6 +94,9 @@ export interface DataSource {
   // ── Terminal (WebSocket to the remshel-backed shell in the repo workspace) ──
   /** WebSocket URL for a shell in the repo workspace, or null when no live provider (mock/offline). */
   terminalUrl(id: string): string | null;
+
+  // ── Atlas (the deployed Holistic landscape, derived from the host's own config) ──
+  atlas(): Promise<AtlasGraph>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

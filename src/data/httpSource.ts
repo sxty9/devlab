@@ -199,6 +199,10 @@ export const httpSource: DataSource = {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     return `${proto}://${location.host}/api/repos/${enc(id)}/pty`;
   },
+
+  async atlas() {
+    return json(await request('/api/atlas'));
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

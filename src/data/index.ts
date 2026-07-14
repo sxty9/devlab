@@ -57,6 +57,7 @@ export const dataSource: DataSource = {
   saveAssistantHistory: (id, msgs) => impl.saveAssistantHistory(id, msgs),
   assistantModels: () => impl.assistantModels(),
   terminalUrl: (id) => impl.terminalUrl(id),
+  atlas: () => impl.atlas(),
 };
 
 export function getDataSource(): DataSource {

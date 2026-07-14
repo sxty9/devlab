@@ -292,6 +292,34 @@ export interface RepoData {
   structure: StructureSection[];
 }
 
+// ── Atlas — the deployed Holistic landscape ──────────────────────────────────
+
+/** A deployed Holistic service, derived from its rights manifest and its Caddy route. */
+export interface AtlasNode {
+  id: string;
+  /** The port it answers on; 0 when it has no route. */
+  port: number;
+  /** The hp_* groups it declares. */
+  rights: string[] | null;
+  hasManifest: boolean;
+  hasRoute: boolean;
+  /** The repo it is built from, when the viewer can see one — '' otherwise. */
+  repo: string;
+}
+
+/** An inconsistency between what is deployed and what is declared. */
+export interface AtlasFinding {
+  severity: 'warn' | 'error';
+  message: string;
+  nodes: string[];
+}
+
+export interface AtlasGraph {
+  nodes: AtlasNode[];
+  findings: AtlasFinding[];
+  scannedAt: string;
+}
+
 /** A section of the repo "skeleton" overview rendered by StructureView. */
 export interface StructureSection {
   title: string;

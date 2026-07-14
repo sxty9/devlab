@@ -155,6 +155,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/repos/{id}/previews", s.guardWrite(s.previewCreate))
 	mux.HandleFunc("DELETE /api/repos/{id}/previews/{slug}", s.guardWrite(s.previewDelete))
 
+	// Atlas — the deployed Holistic landscape, derived from the host's own config (the services'
+	// rights manifests + their Caddy routes). Read-only, host-scoped, no workspace access.
+	mux.HandleFunc("GET /api/atlas", s.guard(s.atlasGraph))
+
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
 	mux.HandleFunc("/", s.root)
