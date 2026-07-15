@@ -174,7 +174,7 @@ export function MercuryView() {
   return (
     <MercuryDnD.Provider value={{ drag, setDrag, onMove }}>
     <div className="flex min-h-0 flex-1">
-      <aside className="dl-scroll flex w-72 shrink-0 flex-col overflow-y-auto border-r border-separator bg-surface-sidebar">
+      <aside className="dl-scroll flex w-72 shrink-0 flex-col overflow-y-auto border-r border-separator bg-surface-sidebar [scrollbar-gutter:stable]">
         <nav className="flex flex-col gap-0.5 border-b border-separator p-2">
           {SECTIONS.map((sec) => {
             const active = section === sec.id;
@@ -399,7 +399,7 @@ function TreeRow({
   if (node.isAxiom) {
     const active = selectedPath === node.path;
     return (
-      <div className="relative" {...dragProps}>
+      <div className="relative select-none" {...dragProps}>
         {indicator === 'before' && <DropLine edge="top" />}
         {indicator === 'after' && <DropLine edge="bottom" />}
         <button
@@ -424,7 +424,7 @@ function TreeRow({
       {renaming ? (
         <RenameCategoryRow node={node} pad={pad} onClose={() => setRenaming(false)} onRename={onRenameCategory} />
       ) : (
-        <div className="relative" {...dragProps}>
+        <div className="relative select-none" {...dragProps}>
           {indicator === 'before' && <DropLine edge="top" />}
           {indicator === 'after' && <DropLine edge="bottom" />}
           <div
