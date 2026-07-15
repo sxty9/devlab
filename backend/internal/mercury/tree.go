@@ -46,11 +46,20 @@ func Build(paths []string) Tree {
 	sortNode(roots[NsAxiome])
 	sortNode(roots[NsRegeln])
 	sortNode(roots[NsLaeufe])
+	// Always emit a list, never nil: an empty namespace must marshal to [] not null, or the client
+	// reads .length off null and blanks. Every list this API returns is a list.
 	return Tree{
-		Axiome: roots[NsAxiome].Children,
-		Regeln: roots[NsRegeln].Children,
-		Laeufe: roots[NsLaeufe].Children,
+		Axiome: orEmpty(roots[NsAxiome].Children),
+		Regeln: orEmpty(roots[NsRegeln].Children),
+		Laeufe: orEmpty(roots[NsLaeufe].Children),
 	}
+}
+
+func orEmpty(ns []*Node) []*Node {
+	if ns == nil {
+		return []*Node{}
+	}
+	return ns
 }
 
 // insert threads one record path into its namespace tree, creating category nodes as needed.

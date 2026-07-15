@@ -52,7 +52,9 @@ export function MercuryView() {
   }
   if (!tree) return <Splash />;
 
-  const roots = tree[section];
+  // An empty namespace can arrive as null (or absent), so coalesce — reading .length off null is
+  // what blanked the whole view when a section had no records.
+  const roots = tree[section] ?? [];
 
   return (
     <div className="flex min-h-0 flex-1">

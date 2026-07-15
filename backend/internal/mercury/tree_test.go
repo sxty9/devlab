@@ -47,3 +47,15 @@ func TestBuildArbitraryDepth(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildEmptyNamespacesAreNonNil(t *testing.T) {
+	// An empty namespace must marshal to [] not null, or the client crashes reading .length.
+	tr := Build([]string{"axiome/a/x.md"}) // only axiome populated
+	if tr.Regeln == nil || tr.Laeufe == nil {
+		t.Fatalf("empty namespaces must be [] not nil: regeln=%v laeufe=%v", tr.Regeln, tr.Laeufe)
+	}
+	empty := Build(nil)
+	if empty.Axiome == nil || empty.Regeln == nil || empty.Laeufe == nil {
+		t.Fatalf("all-empty tree must have [] slices, got %+v", empty)
+	}
+}
