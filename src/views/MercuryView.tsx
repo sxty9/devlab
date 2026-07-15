@@ -594,10 +594,13 @@ function AxiomPane({
         axiom={axiom}
         onCancel={() => setMode('view')}
         onSave={async (titel, body) => {
-          await source.mercuryEditAxiom(path, titel, body);
+          const res = await source.mercuryEditAxiom(path, titel, body);
+          // An edit keeps the path, so this pane never remounts and its item fetch never re-runs;
+          // update the local state from the server's response so the reading view reflects the edit
+          // immediately, without a page reload.
+          setAxiom(res.axiom);
           toast({ title: 'Axiom gespeichert', variant: 'success' });
           setMode('view');
-          onChanged(path);
         }}
       />
     );
