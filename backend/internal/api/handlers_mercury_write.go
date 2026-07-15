@@ -44,7 +44,7 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	categories := mercury.Categories(paths)
 
-	placement, ok := s.classify(r.Context(), cookie, csrf, categories, body.Titel, body.Body)
+	placement, ok := s.classify(r.Context(), cookie, csrf, categories, body.Titel, body.Body, "")
 	titel := body.Titel
 	var path, desc string
 	if ok {
@@ -73,10 +73,10 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 // classify runs the classification loop: prompt aigentic (claude-cli), validate, and retry with a
 // correction line on any contract violation, up to classifyAttempts. ok is false when every attempt
 // failed (the caller parks the axiom).
-func (s *Server) classify(ctx context.Context, cookie, csrf string, categories []string, titel, body string) (mercury.Placement, bool) {
+func (s *Server) classify(ctx context.Context, cookie, csrf string, categories []string, titel, body, hint string) (mercury.Placement, bool) {
 	correction := ""
 	for i := 0; i < classifyAttempts; i++ {
-		prompt := mercury.ClassifyPrompt(categories, titel, body, correction)
+		prompt := mercury.ClassifyPrompt(categories, titel, body, hint, correction)
 		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
 		if err != nil {
 			return mercury.Placement{}, false // aigentic unreachable / no subscription: park it

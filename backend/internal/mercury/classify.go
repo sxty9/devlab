@@ -61,8 +61,9 @@ func Categories(paths []string) []string {
 }
 
 // ClassifyPrompt builds the instruction: the existing tree, the axiom, and the exact JSON contract.
-// correction is empty on the first attempt, else the specific violation to fix.
-func ClassifyPrompt(categories []string, titel, body, correction string) string {
+// hint is an optional suggested top-level category (used by the migration to seed a coherent
+// structure); correction is empty on the first attempt, else the specific violation to fix.
+func ClassifyPrompt(categories []string, titel, body, hint, correction string) string {
 	var b strings.Builder
 	b.WriteString("Du bist der Kurator der Holistic-Axiome. Ein neues Axiom soll in einen bestehenden, ")
 	b.WriteString("beliebig tiefen Kategoriebaum unter `axiome/` einsortiert werden. Wähle den passendsten ")
@@ -79,7 +80,11 @@ func ClassifyPrompt(categories []string, titel, body, correction string) string 
 
 	b.WriteString("\nDas neue Axiom:\n")
 	b.WriteString("Titel: " + titel + "\n")
-	b.WriteString("Inhalt: " + body + "\n\n")
+	b.WriteString("Inhalt: " + body + "\n")
+	if hint != "" {
+		b.WriteString("Vorgeschlagene Oberkategorie (Ausgangspunkt, du darfst verfeinern): axiome/" + hint + "\n")
+	}
+	b.WriteString("\n")
 
 	b.WriteString("Antworte mit GENAU einem JSON-Objekt, ohne Codefence, ohne weiteren Text:\n")
 	b.WriteString(`{"pfad":"axiome/<kategorie>/…/<slug>.md","beschreibung":"<1 Satz, worum es geht>",`)

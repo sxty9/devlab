@@ -169,6 +169,9 @@ func (s *Server) Handler() http.Handler {
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
 	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
+	// One-time constitution migration: decompose the original axiom document into atoms and file
+	// each via aigentic. Dry-run by default (?apply=true writes). Store authority, not GitHub.
+	mux.HandleFunc("POST /api/mercury/migrate", s.guardCSRF(s.mercuryMigrate))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
