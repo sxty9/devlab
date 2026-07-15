@@ -12,7 +12,7 @@ func TestBuildArbitraryDepth(t *testing.T) {
 		"eingang/abc123.bin", // must be ignored — outside the model
 		"axiome",             // bare namespace — no record
 	}
-	tr := Build(paths)
+	tr := Build(paths, nil)
 
 	if len(tr.Axiome) != 2 {
 		t.Fatalf("axiome top-level categories = %d, want 2 (architektur, minimalismus)", len(tr.Axiome))
@@ -50,11 +50,11 @@ func TestBuildArbitraryDepth(t *testing.T) {
 
 func TestBuildEmptyNamespacesAreNonNil(t *testing.T) {
 	// An empty namespace must marshal to [] not null, or the client crashes reading .length.
-	tr := Build([]string{"axiome/a/x.md"}) // only axiome populated
+	tr := Build([]string{"axiome/a/x.md"}, nil) // only axiome populated
 	if tr.Regeln == nil || tr.Laeufe == nil {
 		t.Fatalf("empty namespaces must be [] not nil: regeln=%v laeufe=%v", tr.Regeln, tr.Laeufe)
 	}
-	empty := Build(nil)
+	empty := Build(nil, nil)
 	if empty.Axiome == nil || empty.Regeln == nil || empty.Laeufe == nil {
 		t.Fatalf("all-empty tree must have [] slices, got %+v", empty)
 	}

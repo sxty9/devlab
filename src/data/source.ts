@@ -111,6 +111,8 @@ export interface DataSource {
   mercuryDeleteAxiom(path: string): Promise<void>;
   /** Rename/re-home a whole category (moves every record under it). */
   mercuryMoveCategory(from: string, to: string): Promise<{ moved: number }>;
+  /** Set the manual order of a category's immediate children (full ordered child-name list). */
+  mercuryReorder(category: string, order: string[]): Promise<void>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

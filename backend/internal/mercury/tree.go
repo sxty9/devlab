@@ -33,8 +33,9 @@ type Tree struct {
 	Laeufe []*Node `json:"laeufe"`
 }
 
-// Build assembles the tree from the flat, sorted list of record paths the graveyard returns.
-func Build(paths []string) Tree {
+// Build assembles the tree from the flat, sorted list of record paths the graveyard returns. order
+// is the user's manual sibling arrangement (nil/empty ⇒ pure name sort).
+func Build(paths []string, order Order) Tree {
 	roots := map[string]*Node{
 		NsAxiome: {Name: NsAxiome, Path: NsAxiome},
 		NsRegeln: {Name: NsRegeln, Path: NsRegeln},
@@ -43,9 +44,10 @@ func Build(paths []string) Tree {
 	for _, p := range paths {
 		insert(roots, p)
 	}
-	sortNode(roots[NsAxiome])
-	sortNode(roots[NsRegeln])
-	sortNode(roots[NsLaeufe])
+	for _, ns := range []string{NsAxiome, NsRegeln, NsLaeufe} {
+		sortNode(roots[ns])          // deterministic name sort first
+		applyOrder(roots[ns], order) // then the user's manual arrangement on top
+	}
 	// Always emit a list, never nil: an empty namespace must marshal to [] not null, or the client
 	// reads .length off null and blanks. Every list this API returns is a list.
 	return Tree{

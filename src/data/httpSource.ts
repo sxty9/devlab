@@ -227,6 +227,9 @@ export const httpSource: DataSource = {
   async mercuryMoveCategory(from, to) {
     return json(await post('/api/mercury/move-category', { from, to }));
   },
+  async mercuryReorder(category, order) {
+    await json<void>(await post('/api/mercury/reorder', { category, order }));
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

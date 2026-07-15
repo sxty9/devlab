@@ -272,6 +272,9 @@ export const mockSource: DataSource = {
   async mercuryMoveCategory(_from: string, _to: string) {
     return { moved: 0 };
   },
+  async mercuryReorder(_category: string, _order: string[]) {
+    /* mock: no-op */
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};

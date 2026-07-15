@@ -172,6 +172,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/mercury/axiom", s.guardCSRF(s.deleteAxiom))
 	mux.HandleFunc("POST /api/mercury/move", s.guardCSRF(s.moveAxiom))
 	mux.HandleFunc("POST /api/mercury/move-category", s.guardCSRF(s.moveCategory))
+	mux.HandleFunc("POST /api/mercury/reorder", s.guardCSRF(s.mercuryReorder))
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
 	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))

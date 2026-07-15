@@ -65,6 +65,7 @@ export const dataSource: DataSource = {
   mercuryMoveAxiom: (from, to) => impl.mercuryMoveAxiom(from, to),
   mercuryDeleteAxiom: (path) => impl.mercuryDeleteAxiom(path),
   mercuryMoveCategory: (from, to) => impl.mercuryMoveCategory(from, to),
+  mercuryReorder: (category, order) => impl.mercuryReorder(category, order),
 };
 
 export function getDataSource(): DataSource {
