@@ -260,6 +260,18 @@ export const mockSource: DataSource = {
   async mercuryAddAxiom(titel: string, _body: string) {
     return { path: `axiome/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`, id: 'ax_mocknew', classified: false };
   },
+  async mercuryEditAxiom(path: string, titel: string, body: string) {
+    return { path, axiom: { id: 'ax_mock01', titel, body } };
+  },
+  async mercuryMoveAxiom(_from: string, to: string) {
+    return { path: to };
+  },
+  async mercuryDeleteAxiom(_path: string) {
+    /* mock: no-op */
+  },
+  async mercuryMoveCategory(_from: string, _to: string) {
+    return { moved: 0 };
+  },
 };
 
 const visionStore: Record<string, VisionFile[]> = {};

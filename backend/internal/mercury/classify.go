@@ -28,6 +28,21 @@ type Placement struct {
 // or "wiederverwendung" and "wieder-verwendung" becoming distinct categories.
 var pathRe = regexp.MustCompile(`^axiome(/[a-z0-9][a-z0-9-]*){1,5}/[a-z0-9][a-z0-9-]*\.md$`)
 
+// recordRe validates a user-supplied move/rename target: the two writable namespaces (axiome,
+// regeln), lowercase kebab segments, ending in a slug + ".md". laeufe/ is machine-managed and not
+// editable here.
+var recordRe = regexp.MustCompile(`^(axiome|regeln)(/[a-z0-9][a-z0-9-]*)*/[a-z0-9][a-z0-9-]*\.md$`)
+
+// categoryRe validates a category prefix (a move-category source/target): a namespace and at least
+// one kebab segment, no trailing ".md".
+var categoryRe = regexp.MustCompile(`^(axiome|regeln)(/[a-z0-9][a-z0-9-]*)+$`)
+
+// ValidRecordPath reports whether p is an acceptable axiom/rule record path for a move or rename.
+func ValidRecordPath(p string) bool { return recordRe.MatchString(p) }
+
+// ValidCategory reports whether p is an acceptable category prefix for a category rename/move.
+func ValidCategory(p string) bool { return categoryRe.MatchString(p) }
+
 // ErrNoJSON means the model produced no parseable object; ErrInvalidPlacement means it parsed but
 // broke the contract. Both drive a retry with a correction line.
 var (

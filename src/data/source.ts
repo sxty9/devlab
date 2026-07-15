@@ -103,6 +103,14 @@ export interface DataSource {
   mercuryItem(path: string): Promise<Axiom>;
   /** Add an axiom; aigentic classifies it into the tree. Returns where it landed. */
   mercuryAddAxiom(titel: string, body: string): Promise<{ path: string; id: string; classified: boolean }>;
+  /** Edit an axiom's title + body in place (id and quelle preserved). */
+  mercuryEditAxiom(path: string, titel: string, body: string): Promise<{ path: string; axiom: Axiom }>;
+  /** Move or rename an axiom (from/to are full record paths). */
+  mercuryMoveAxiom(from: string, to: string): Promise<{ path: string }>;
+  /** Delete an axiom. */
+  mercuryDeleteAxiom(path: string): Promise<void>;
+  /** Rename/re-home a whole category (moves every record under it). */
+  mercuryMoveCategory(from: string, to: string): Promise<{ moved: number }>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

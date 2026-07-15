@@ -61,6 +61,10 @@ export const dataSource: DataSource = {
   mercuryTree: () => impl.mercuryTree(),
   mercuryItem: (path) => impl.mercuryItem(path),
   mercuryAddAxiom: (titel, body) => impl.mercuryAddAxiom(titel, body),
+  mercuryEditAxiom: (path, titel, body) => impl.mercuryEditAxiom(path, titel, body),
+  mercuryMoveAxiom: (from, to) => impl.mercuryMoveAxiom(from, to),
+  mercuryDeleteAxiom: (path) => impl.mercuryDeleteAxiom(path),
+  mercuryMoveCategory: (from, to) => impl.mercuryMoveCategory(from, to),
 };
 
 export function getDataSource(): DataSource {

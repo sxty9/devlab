@@ -215,6 +215,18 @@ export const httpSource: DataSource = {
     const r = await post('/api/mercury/axiom', { titel, body });
     return json(r);
   },
+  async mercuryEditAxiom(path, titel, body) {
+    return json(await post('/api/mercury/axiom', { path, titel, body }, 'PUT'));
+  },
+  async mercuryMoveAxiom(from, to) {
+    return json(await post('/api/mercury/move', { from, to }));
+  },
+  async mercuryDeleteAxiom(path) {
+    await json<void>(await request(`/api/mercury/axiom?path=${enc(path)}`, withCsrf({ method: 'DELETE' })));
+  },
+  async mercuryMoveCategory(from, to) {
+    return json(await post('/api/mercury/move-category', { from, to }));
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

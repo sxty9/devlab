@@ -16,17 +16,16 @@ const SECTIONS: { id: SectionId; label: string; icon: (p: { className?: string }
   { id: 'laeufe', label: 'Automatische Läufe', icon: RocketIcon, empty: 'Automatische Läufe sind noch nicht eingerichtet.' },
 ];
 
-/** Mercury — the centre for the Holistic axioms, in three parts: the axioms (auto-sorted into an
- *  arbitrarily deep category tree), the implementation rules, and the scheduled runs. Read-only for
- *  now: adding axioms, the rollout and the runs are the next stages. It owns no store — the tree is
- *  a projection of aigentic's scheme-backed graveyard. */
+/** Mercury — the centre for the Holistic axioms, in three parts: the axioms (aigentic auto-sorts a
+ *  new one; the user re-files, renames, edits and deletes by hand), the implementation rules, and
+ *  the scheduled runs. It owns no store — the tree is a projection of aigentic's scheme graveyard. */
 export function MercuryView() {
   const source = useMemo(() => getDataSource(), []);
 
   const [tree, setTree] = useState<MercuryTree | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [section, setSection] = useState<SectionId>('axiome');
-  const [selected, setSelected] = useState<MercuryNode | null>(null);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
 
   const reload = useCallback(() => {
@@ -67,7 +66,7 @@ export function MercuryView() {
                 type="button"
                 onClick={() => {
                   setSection(sec.id);
-                  setSelected(null);
+                  setSelectedPath(null);
                 }}
                 className={cn(
                   'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-footnote transition duration-fast',
@@ -86,9 +85,10 @@ export function MercuryView() {
             {adding ? (
               <AddAxiomForm
                 onClose={() => setAdding(false)}
-                onAdded={async () => {
+                onAdded={async (path) => {
                   setAdding(false);
                   await reload();
+                  setSelectedPath(path);
                 }}
               />
             ) : (
@@ -108,20 +108,45 @@ export function MercuryView() {
           {roots.length === 0 ? (
             <p className="px-2.5 py-3 text-caption text-text-tertiary">{SECTIONS.find((s) => s.id === section)!.empty}</p>
           ) : (
-            roots.map((n) => <TreeRow key={n.path} node={n} depth={0} selected={selected} onSelect={setSelected} />)
+            roots.map((n) => (
+              <TreeRow
+                key={n.path}
+                node={n}
+                depth={0}
+                selectedPath={selectedPath}
+                onSelect={(p) => setSelectedPath(p)}
+                onRenameCategory={async (from, to) => {
+                  const { moved } = await source.mercuryMoveCategory(from, to);
+                  await reload();
+                  return moved;
+                }}
+              />
+            ))
           )}
         </div>
       </aside>
 
       <main className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
-        {selected ? <AxiomPane node={selected} /> : <Placeholder section={section} />}
+        {selectedPath ? (
+          <AxiomPane
+            key={selectedPath}
+            path={selectedPath}
+            onChanged={async (nextPath) => {
+              await reload();
+              setSelectedPath(nextPath);
+            }}
+          />
+        ) : (
+          <Placeholder section={section} />
+        )}
       </main>
     </div>
   );
 }
 
 /** Add an axiom: the user gives a title and text; aigentic classifies it into the tree. Mercury
- *  never asks the user to choose a category — that is the whole point. */
+ *  never asks the user to choose a category for a NEW axiom — that is the whole point. (Re-filing an
+ *  existing one by hand is what the edit surface is for.) */
 function AddAxiomForm({ onClose, onAdded }: { onClose: () => void; onAdded: (path: string) => void }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
@@ -175,29 +200,32 @@ function AddAxiomForm({ onClose, onAdded }: { onClose: () => void; onAdded: (pat
   );
 }
 
-/** One row of the category tree. Categories are collapsible to any depth; axioms are selectable
- *  leaves. Expansion is local state, so the tree remembers what you opened. */
+/** One row of the category tree. Categories are collapsible to any depth and renamable (which moves
+ *  every record under them); axioms are selectable leaves. Expansion is local state. */
 function TreeRow({
   node,
   depth,
-  selected,
+  selectedPath,
   onSelect,
+  onRenameCategory,
 }: {
   node: MercuryNode;
   depth: number;
-  selected: MercuryNode | null;
-  onSelect: (n: MercuryNode) => void;
+  selectedPath: string | null;
+  onSelect: (path: string) => void;
+  onRenameCategory: (from: string, to: string) => Promise<number>;
 }) {
   const [open, setOpen] = useState(depth < 1);
+  const [renaming, setRenaming] = useState(false);
   const pad = { paddingLeft: `${depth * 14 + 8}px` };
 
   if (node.isAxiom) {
-    const active = selected?.path === node.path;
+    const active = selectedPath === node.path;
     return (
       <button
         type="button"
         style={pad}
-        onClick={() => onSelect(node)}
+        onClick={() => onSelect(node.path)}
         className={cn(
           'flex w-full items-center gap-1.5 rounded-md py-1 pr-2 text-left text-footnote transition duration-fast',
           active ? 'bg-accent/15 text-text-primary' : 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
@@ -211,48 +239,166 @@ function TreeRow({
 
   return (
     <div>
-      <button
-        type="button"
-        style={pad}
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-1 rounded-md py-1 pr-2 text-left text-footnote font-medium text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
-      >
-        <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 transition-transform duration-fast', open && 'rotate-90')} />
-        <span className="truncate">{node.name}</span>
-      </button>
-      {open && node.children?.map((c) => <TreeRow key={c.path} node={c} depth={depth + 1} selected={selected} onSelect={onSelect} />)}
+      {renaming ? (
+        <RenameCategoryRow node={node} pad={pad} onClose={() => setRenaming(false)} onRename={onRenameCategory} />
+      ) : (
+        <div className="group flex items-center" style={pad}>
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            className="flex min-w-0 flex-1 items-center gap-1 rounded-md py-1 pr-1 text-left text-footnote font-medium text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
+          >
+            <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 transition-transform duration-fast', open && 'rotate-90')} />
+            <span className="truncate">{node.name}</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setRenaming(true)}
+            title="Kategorie umbenennen"
+            className="mr-1 shrink-0 rounded px-1 text-caption text-text-tertiary opacity-0 transition group-hover:opacity-100 hover:text-text-primary"
+          >
+            umbenennen
+          </button>
+        </div>
+      )}
+      {open && node.children?.map((c) => (
+        <TreeRow key={c.path} node={c} depth={depth + 1} selectedPath={selectedPath} onSelect={onSelect} onRenameCategory={onRenameCategory} />
+      ))}
     </div>
   );
 }
 
-/** The reading pane for a selected axiom: its title, source, and body. Content loads on demand. */
-function AxiomPane({ node }: { node: MercuryNode }) {
+/** Inline rename of a category: edits the last path segment; on save every record under it moves. */
+function RenameCategoryRow({
+  node,
+  pad,
+  onClose,
+  onRename,
+}: {
+  node: MercuryNode;
+  pad: { paddingLeft: string };
+  onClose: () => void;
+  onRename: (from: string, to: string) => Promise<number>;
+}) {
+  const { toast } = useToast();
+  const parent = node.path.slice(0, node.path.lastIndexOf('/'));
+  const [name, setName] = useState(node.name);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    const clean = name.trim();
+    if (!clean || clean === node.name || busy) return onClose();
+    setBusy(true);
+    try {
+      const moved = await onRename(node.path, `${parent}/${clean}`);
+      toast({ title: 'Kategorie umbenannt', description: `${moved} Axiome verschoben`, variant: 'success' });
+      onClose();
+    } catch (e) {
+      toast({ title: 'Umbenennen fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1 py-0.5" style={pad}>
+      <input
+        autoFocus
+        value={name}
+        disabled={busy}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => (e.key === 'Enter' ? save() : e.key === 'Escape' ? onClose() : undefined)}
+        onBlur={save}
+        className="min-w-0 flex-1 rounded border border-accent/50 bg-surface px-1.5 py-0.5 text-footnote text-text-primary outline-none"
+      />
+    </div>
+  );
+}
+
+/** The reading pane for a selected axiom: view, edit, move/rename or delete. `key={path}` remounts
+ *  it on selection change so its local state resets cleanly. */
+function AxiomPane({ path, onChanged }: { path: string; onChanged: (nextPath: string | null) => void }) {
   const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
   const [axiom, setAxiom] = useState<Axiom | null>(null);
   const [err, setErr] = useState(false);
+  const [mode, setMode] = useState<'view' | 'edit' | 'move'>('view');
+  const [busy, setBusy] = useState(false);
 
-  const load = useCallback(() => {
+  useEffect(() => {
+    let cancelled = false;
     setAxiom(null);
     setErr(false);
     source
-      .mercuryItem(node.path)
-      .then(setAxiom)
-      .catch(() => setErr(true));
-  }, [source, node.path]);
+      .mercuryItem(path)
+      .then((a) => !cancelled && setAxiom(a))
+      .catch(() => !cancelled && setErr(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [source, path]);
 
-  useEffect(load, [load]);
+  const del = async () => {
+    if (busy || !window.confirm(`Axiom „${axiom?.titel ?? path}“ löschen?`)) return;
+    setBusy(true);
+    try {
+      await source.mercuryDeleteAxiom(path);
+      toast({ title: 'Axiom gelöscht', variant: 'default' });
+      onChanged(null);
+    } catch (e) {
+      toast({ title: 'Löschen fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+      setBusy(false);
+    }
+  };
 
-  if (err) {
-    return <p className="px-8 py-7 text-footnote text-text-secondary">Dieses Axiom konnte nicht geladen werden.</p>;
+  if (err) return <p className="px-8 py-7 text-footnote text-text-secondary">Dieses Axiom konnte nicht geladen werden.</p>;
+  if (!axiom) return <p className="px-8 py-7 text-footnote text-text-tertiary">Lädt…</p>;
+
+  if (mode === 'edit') {
+    return (
+      <EditAxiomForm
+        axiom={axiom}
+        onCancel={() => setMode('view')}
+        onSave={async (titel, body) => {
+          await source.mercuryEditAxiom(path, titel, body);
+          toast({ title: 'Axiom gespeichert', variant: 'success' });
+          setMode('view');
+          onChanged(path);
+        }}
+      />
+    );
   }
-  if (!axiom) {
-    return <p className="px-8 py-7 text-footnote text-text-tertiary">Lädt…</p>;
+
+  if (mode === 'move') {
+    return (
+      <MoveAxiomForm
+        path={path}
+        onCancel={() => setMode('view')}
+        onMove={async (to) => {
+          const res = await source.mercuryMoveAxiom(path, to);
+          toast({ title: 'Axiom verschoben', description: res.path, variant: 'success' });
+          onChanged(res.path);
+        }}
+      />
+    );
   }
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
-      <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{axiom.titel || node.name}</h1>
-      <p className="mt-1 font-mono text-caption text-text-tertiary">{node.path}</p>
+      <div className="flex items-start justify-between gap-4">
+        <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{axiom.titel || path.split('/').pop()}</h1>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Button variant="secondary" size="sm" onClick={() => setMode('edit')}>
+            Bearbeiten
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => setMode('move')}>
+            Verschieben
+          </Button>
+          <Button variant="secondary" size="sm" disabled={busy} onClick={del}>
+            Löschen
+          </Button>
+        </div>
+      </div>
+      <p className="mt-1 font-mono text-caption text-text-tertiary">{path}</p>
       <div className="dl-markdown mt-5" dangerouslySetInnerHTML={{ __html: renderMarkdown(axiom.body) }} />
       {axiom.quelle && (
         <p className="mt-8 border-t border-separator pt-3 text-caption text-text-tertiary">
@@ -260,6 +406,94 @@ function AxiomPane({ node }: { node: MercuryNode }) {
         </p>
       )}
     </article>
+  );
+}
+
+/** Edit an axiom's title and body. Its id, quelle and path are preserved. */
+function EditAxiomForm({ axiom, onCancel, onSave }: { axiom: Axiom; onCancel: () => void; onSave: (titel: string, body: string) => Promise<void> }) {
+  const { toast } = useToast();
+  const [titel, setTitel] = useState(axiom.titel);
+  const [body, setBody] = useState(axiom.body);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    if (!titel.trim() || !body.trim() || busy) return;
+    setBusy(true);
+    try {
+      await onSave(titel.trim(), body.trim());
+    } catch (e) {
+      toast({ title: 'Speichern fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto flex max-w-3xl flex-col gap-3 px-8 py-7">
+      <input
+        value={titel}
+        onChange={(e) => setTitel(e.target.value)}
+        placeholder="Titel"
+        className="rounded-md border border-separator bg-surface px-3 py-2 text-title3 font-semibold text-text-primary outline-none focus:border-accent/50"
+      />
+      <textarea
+        value={body}
+        onChange={(e) => setBody(e.target.value)}
+        rows={10}
+        className="dl-scroll resize-y rounded-md border border-separator bg-surface px-3 py-2 text-body text-text-primary outline-none focus:border-accent/50"
+      />
+      <div className="flex items-center gap-2">
+        <Button variant="primary" size="sm" disabled={busy || !titel.trim() || !body.trim()} onClick={save}>
+          {busy ? 'Speichert…' : 'Speichern'}
+        </Button>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={onCancel}>
+          Abbrechen
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** Move or rename an axiom by editing its full path (category and/or slug). */
+function MoveAxiomForm({ path, onCancel, onMove }: { path: string; onCancel: () => void; onMove: (to: string) => Promise<void> }) {
+  const { toast } = useToast();
+  const [to, setTo] = useState(path);
+  const [busy, setBusy] = useState(false);
+
+  const move = async () => {
+    const clean = to.trim();
+    if (!clean || clean === path || busy) return onCancel();
+    setBusy(true);
+    try {
+      await onMove(clean);
+    } catch (e) {
+      toast({ title: 'Verschieben fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto flex max-w-3xl flex-col gap-3 px-8 py-7">
+      <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Verschieben / Umbenennen</h1>
+      <p className="text-footnote text-text-secondary">
+        Kategorie und Name stecken im Pfad. Ändere ihn, um das Axiom neu einzusortieren oder umzubenennen.
+      </p>
+      <input
+        autoFocus
+        value={to}
+        onChange={(e) => setTo(e.target.value)}
+        onKeyDown={(e) => e.key === 'Enter' && move()}
+        spellCheck={false}
+        className="rounded-md border border-separator bg-surface px-3 py-2 font-mono text-footnote text-text-primary outline-none focus:border-accent/50"
+      />
+      <div className="flex items-center gap-2">
+        <Button variant="primary" size="sm" disabled={busy || to.trim() === path} onClick={move}>
+          {busy ? 'Verschiebt…' : 'Verschieben'}
+        </Button>
+        <Button variant="secondary" size="sm" disabled={busy} onClick={onCancel}>
+          Abbrechen
+        </Button>
+      </div>
+    </div>
   );
 }
 

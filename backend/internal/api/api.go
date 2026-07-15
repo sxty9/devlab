@@ -166,6 +166,12 @@ func (s *Server) Handler() http.Handler {
 	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
 	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
 	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
+	// Edit an axiom's text; move/rename it; delete it; rename a whole category. The user owns the
+	// tree by hand. All CSRF-guarded store writes; no GitHub involved.
+	mux.HandleFunc("PUT /api/mercury/axiom", s.guardCSRF(s.editAxiom))
+	mux.HandleFunc("DELETE /api/mercury/axiom", s.guardCSRF(s.deleteAxiom))
+	mux.HandleFunc("POST /api/mercury/move", s.guardCSRF(s.moveAxiom))
+	mux.HandleFunc("POST /api/mercury/move-category", s.guardCSRF(s.moveCategory))
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
 	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
