@@ -211,9 +211,15 @@ export const httpSource: DataSource = {
     const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
     return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
   },
-  async mercuryAddAxiom(titel, body) {
-    const r = await post('/api/mercury/axiom', { titel, body });
+  async mercuryAddAxiom(titel, body, section, force) {
+    const r = await post('/api/mercury/axiom', { titel, body, section, force });
     return json(r);
+  },
+  async mercuryOptimize(titel, body, section) {
+    return json(await post('/api/mercury/optimize', { titel, body, section }));
+  },
+  async mercuryConform(titel, body) {
+    return json(await post('/api/mercury/conform', { titel, body }));
   },
   async mercuryEditAxiom(path, titel, body) {
     return json(await post('/api/mercury/axiom', { path, titel, body }, 'PUT'));
@@ -229,6 +235,71 @@ export const httpSource: DataSource = {
   },
   async mercuryReorder(category, order) {
     await json<void>(await post('/api/mercury/reorder', { category, order }));
+  },
+
+  async mercuryRuns() {
+    return json(await request('/api/mercury/runs'));
+  },
+  async mercuryRun(id) {
+    return json(await request(`/api/mercury/runs/${enc(id)}`));
+  },
+  async mercuryRunPrompt(id) {
+    return json(await request(`/api/mercury/runs/${enc(id)}/prompt`));
+  },
+  async mercuryRunCoverage() {
+    return json(await request('/api/mercury/runs/coverage'));
+  },
+  async mercuryCreateRun(body) {
+    return json(await post('/api/mercury/runs', body));
+  },
+  async mercuryUpdateRun(id, body) {
+    return json(await post(`/api/mercury/runs/${enc(id)}`, body, 'PUT'));
+  },
+  async mercuryDeleteRun(id) {
+    await json<void>(await request(`/api/mercury/runs/${enc(id)}`, withCsrf({ method: 'DELETE' })));
+  },
+  async mercuryRecomposeRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/recompose`, {}));
+  },
+  async mercuryRunAiFill() {
+    return json(await post('/api/mercury/runs/ai-fill', {}));
+  },
+  async mercuryRunAiFinetune() {
+    return json(await post('/api/mercury/runs/ai-finetune', {}));
+  },
+  async mercuryApplyRunProposal(mode, plan) {
+    await json<void>(await post('/api/mercury/runs/apply-proposal', { mode, plan }));
+  },
+  async mercuryRunHistory() {
+    return json(await request('/api/mercury/runs/history'));
+  },
+  async mercuryRestoreRunHistory(ts) {
+    await json<void>(await post('/api/mercury/runs/history/restore', { ts }));
+  },
+  async mercuryRunResults(id) {
+    return json(await request(`/api/mercury/runs/${enc(id)}/results`));
+  },
+  async mercuryRunResult(id, resultId) {
+    return json(await request(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}`));
+  },
+  async mercuryRunCalendar(days, type) {
+    const p = new URLSearchParams();
+    if (days) p.set('days', String(days));
+    if (type) p.set('type', type);
+    const q = p.toString();
+    return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
+  },
+  async mercuryRunExecutions() {
+    return json(await request('/api/mercury/runs/executions'));
+  },
+  async mercuryChat(messages) {
+    return json(await post('/api/mercury/chat', { messages }));
+  },
+  async mercuryRunNow(id) {
+    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {}));
+  },
+  async mercuryCancelRun() {
+    await json<void>(await post('/api/mercury/runs/cancel', {}));
   },
 };
 

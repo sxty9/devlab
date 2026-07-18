@@ -247,6 +247,7 @@ export const mockSource: DataSource = {
         { name: 'go', path: 'regeln/go', isAxiom: false, children: [leaf('fehler-wrappen', 'regeln/go/fehler-wrappen.md')] },
       ],
       laeufe: [],
+      meta: [leaf('implementation-standard', 'meta/implementation-standard.md')],
     };
   },
   async mercuryItem(path: string) {
@@ -257,8 +258,15 @@ export const mockSource: DataSource = {
       body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
     };
   },
-  async mercuryAddAxiom(titel: string, _body: string) {
-    return { path: `axiome/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`, id: 'ax_mocknew', classified: false };
+  async mercuryAddAxiom(titel: string, _body: string, section?: string, _force?: boolean) {
+    const ns = section || 'axiome';
+    return { path: `${ns}/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`, id: 'ax_mocknew', classified: false };
+  },
+  async mercuryOptimize(titel: string, body: string, _section?: string) {
+    return { titel, body };
+  },
+  async mercuryConform(_titel: string, _body: string) {
+    return { conforms: true, violations: [], metaCount: 0 };
   },
   async mercuryEditAxiom(path: string, titel: string, body: string) {
     return { path, axiom: { id: 'ax_mock01', titel, body } };
@@ -275,7 +283,94 @@ export const mockSource: DataSource = {
   async mercuryReorder(_category: string, _order: string[]) {
     /* mock: no-op */
   },
+  async mercuryRuns() {
+    return { runs: [], axioms: {} };
+  },
+  async mercuryRun(id: string) {
+    return {
+      run: {
+        id,
+        name: 'Mock-Lauf',
+        enabled: true,
+        schedule: { kind: 'daily' as const, timeOfDay: '03:00' },
+        axiomIds: [],
+        prompt: '',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      axioms: {},
+    };
+  },
+  async mercuryRunPrompt(_id: string) {
+    return { prompt: '# Mock-Prompt' };
+  },
+  async mercuryRunCoverage() {
+    return { covered: {}, index: {}, axioms: {} };
+  },
+  async mercuryCreateRun(body: import('@/types').RunInput) {
+    return { id: 'run_mock', ...mockRun(body) };
+  },
+  async mercuryUpdateRun(id: string, body: import('@/types').RunInput) {
+    return { id, ...mockRun(body) };
+  },
+  async mercuryDeleteRun(_id: string) {
+    /* mock: no-op */
+  },
+  async mercuryRecomposeRun(_id: string) {
+    /* mock: no-op */
+  },
+  async mercuryRunAiFill() {
+    return { proposal: { runs: [] }, axioms: {} };
+  },
+  async mercuryRunAiFinetune() {
+    return { proposal: { runs: [] }, axioms: {} };
+  },
+  async mercuryApplyRunProposal(_mode: 'fill' | 'replace', _plan: import('@/types').RunPlan) {
+    /* mock: no-op */
+  },
+  async mercuryRunHistory() {
+    return { snapshots: [] };
+  },
+  async mercuryRestoreRunHistory(_ts: string) {
+    /* mock: no-op */
+  },
+  async mercuryRunResults(_id: string) {
+    return { results: [] };
+  },
+  async mercuryRunResult(id: string, resultId: string) {
+    return { runId: id, resultId, startedAt: new Date().toISOString(), ok: true, repos: [], inputTokens: 0, outputTokens: 0, costUsd: 0, numTurns: 0 };
+  },
+  async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {
+    return { from: new Date().toISOString(), to: new Date().toISOString(), occurrences: [] };
+  },
+  async mercuryRunExecutions() {
+    return { executions: [] };
+  },
+  async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
+    return { reply: 'Mock-Antwort' };
+  },
+  async mercuryRunNow(_id: string) {
+    return { started: true };
+  },
+  async mercuryCancelRun() {
+    /* mock: no-op */
+  },
 };
+
+/** A RunInput carries only what its type needs (a ToDo has no schedule/axioms), while a Run always
+ *  has both — fill the gaps so the mock returns a well-formed Run. */
+function mockRun(body: import('@/types').RunInput) {
+  const { dueAt, ...rest } = body; // dueAt is nullable on the way IN (null clears it), never on a Run
+  return {
+    ...rest,
+    ...(dueAt ? { dueAt } : {}),
+    schedule: body.schedule ?? { kind: 'daily' as const, timeOfDay: '03:00' },
+    axiomIds: body.axiomIds ?? [],
+    prompt: '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+}
 
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};

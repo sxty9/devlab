@@ -10,11 +10,12 @@ import (
 	"strings"
 )
 
-// The three top-level namespaces of the store. Konsolidierungen are gone: changes merge directly.
+// The top-level namespaces of the store. Konsolidierungen are gone: changes merge directly.
 const (
 	NsAxiome = "axiome" // the axiom tree, arbitrarily deep
 	NsRegeln = "regeln" // Implementierungsregeln — extra rules Claude respects when implementing
 	NsLaeufe = "laeufe" // scheduled-run plans and results
+	NsMeta   = "meta"   // Meta-Axiome — the binding requirements an axiom itself must satisfy
 )
 
 // Node is one node of a namespace's tree: a category (folder) or an axiom (a .md leaf). Categories
@@ -31,6 +32,7 @@ type Tree struct {
 	Axiome []*Node `json:"axiome"`
 	Regeln []*Node `json:"regeln"`
 	Laeufe []*Node `json:"laeufe"`
+	Meta   []*Node `json:"meta"`
 }
 
 // Build assembles the tree from the flat, sorted list of record paths the graveyard returns. order
@@ -40,11 +42,12 @@ func Build(paths []string, order Order) Tree {
 		NsAxiome: {Name: NsAxiome, Path: NsAxiome},
 		NsRegeln: {Name: NsRegeln, Path: NsRegeln},
 		NsLaeufe: {Name: NsLaeufe, Path: NsLaeufe},
+		NsMeta:   {Name: NsMeta, Path: NsMeta},
 	}
 	for _, p := range paths {
 		insert(roots, p)
 	}
-	for _, ns := range []string{NsAxiome, NsRegeln, NsLaeufe} {
+	for _, ns := range []string{NsAxiome, NsRegeln, NsLaeufe, NsMeta} {
 		sortNode(roots[ns])          // deterministic name sort first
 		applyOrder(roots[ns], order) // then the user's manual arrangement on top
 	}
@@ -54,6 +57,7 @@ func Build(paths []string, order Order) Tree {
 		Axiome: orEmpty(roots[NsAxiome].Children),
 		Regeln: orEmpty(roots[NsRegeln].Children),
 		Laeufe: orEmpty(roots[NsLaeufe].Children),
+		Meta:   orEmpty(roots[NsMeta].Children),
 	}
 }
 

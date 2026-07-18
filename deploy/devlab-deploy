@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# devlab-deploy — root wrapper for Mercury autonomous-run deploys.
+#
+# Invoked ONLY by devlabd, gated by sudoers:
+#   devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-deploy
+#
+# It runs EXACTLY ONE thing: the per-repo, human-vetted deploy script at
+# /etc/devlab/deploy.d/<repo>. There is NO arbitrary-command path — the autonomous agent (which runs
+# as an unprivileged runner user, never as root) can never reach root through this wrapper. The
+# allowlist script must be root-owned and not group/other-writable, so the agent cannot tamper with it.
+#
+# Install: sudo install -o root -g root -m 0755 devlab-deploy /usr/local/sbin/devlab-deploy
+set -euo pipefail
+
+REPO="${1:-}"
+WORKSPACE="${2:-}"
+DEPLOY_D="/etc/devlab/deploy.d"
+
+log() { logger -t devlab-deploy -- "$*" 2>/dev/null || true; echo "devlab-deploy: $*"; }
+
+# 1) repo must be a bare name (no slashes, no traversal).
+if [[ ! "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$REPO" == *..* ]]; then
+  log "abgelehnt: ungültiger Repo-Name '$REPO'"; exit 2
+fi
+
+# 2) workspace must be a real directory under the devlab workspaces root.
+case "$WORKSPACE" in
+  /var/lib/devlab/workspaces/*) ;;
+  *) log "abgelehnt: Workspace '$WORKSPACE' liegt nicht unter /var/lib/devlab/workspaces"; exit 2 ;;
+esac
+[[ -d "$WORKSPACE" ]] || { log "abgelehnt: Workspace '$WORKSPACE' existiert nicht"; exit 2; }
+
+# 3) a vetted deploy script must exist for this repo.
+SCRIPT="$DEPLOY_D/$REPO"
+[[ -x "$SCRIPT" ]] || { log "kein Deploy-Skript für '$REPO' ($SCRIPT) — übersprungen"; exit 3; }
+
+# 4) the allowlist script must be root-owned and not group/other-writable (tamper-proof).
+OWNER="$(stat -c '%U' "$SCRIPT")"
+PERM="$(stat -c '%a' "$SCRIPT")"
+[[ "$OWNER" == "root" ]] || { log "abgelehnt: $SCRIPT gehört nicht root ($OWNER)"; exit 4; }
+if (( 0"$PERM" & 022 )); then log "abgelehnt: $SCRIPT ist group/other-writable ($PERM)"; exit 4; fi
+
+log "deploy '$REPO' aus '$WORKSPACE' via $SCRIPT"
+exec "$SCRIPT" "$WORKSPACE"

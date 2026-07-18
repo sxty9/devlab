@@ -41,6 +41,13 @@ func topic() string {
 	return "holistic"
 }
 
+// Owner is the GitHub owner the holistic set lives under — exported so a newly created service repo
+// lands in the same namespace this package scans (one definition, no drifting sibling).
+func Owner() string { return owner() }
+
+// Topic is the marker that makes a repo part of the holistic set (same rationale as Owner).
+func Topic() string { return topic() }
+
 // ─── Per-user GitHub visibility (production) ────────────────────────────────
 
 type userEntry struct {

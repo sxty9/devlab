@@ -4,11 +4,19 @@ import { renderMarkdown } from '@/lib/markdown';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Splash } from '@/shell/Splash';
+import RunsView from './RunsView';
+import TodosView from './TodosView';
+import GlobalCalendarView from './GlobalCalendarView';
+import MercuryChat from './MercuryChat';
 import { cn } from '@/lib/cn';
-import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon } from '@/ui/icons';
-import type { Axiom, MercuryNode, MercuryTree } from '@/types';
+import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon, LightbulbIcon } from '@/ui/icons';
+import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation } from '@/types';
 
-type SectionId = 'axiome' | 'regeln' | 'laeufe';
+type SectionId = 'axiome' | 'regeln' | 'laeufe' | 'todos' | 'kalender';
+
+// The scheme-backed namespaces (each is a tree). `meta` (Meta-Axiome) lives as a sub-tab under the
+// Axiome section rather than as its own sidebar entry, so it is a namespace but not a SectionId.
+type SchemeNs = 'axiome' | 'regeln' | 'laeufe' | 'meta';
 
 /** What a drag carries: an axiom leaf or a whole category, by its path + name. */
 interface DragItem {
@@ -67,8 +75,32 @@ const useDnD = () => useContext(MercuryDnD)!;
 const SECTIONS: { id: SectionId; label: string; icon: (p: { className?: string }) => JSX.Element; empty: string }[] = [
   { id: 'axiome', label: 'Axiome', icon: MercuryIcon, empty: 'Noch keine Axiome. Aigentic sortiert neue Axiome automatisch ein.' },
   { id: 'regeln', label: 'Implementierungsregeln', icon: SitemapIcon, empty: 'Noch keine Implementierungsregeln.' },
-  { id: 'laeufe', label: 'Automatische Läufe', icon: RocketIcon, empty: 'Automatische Läufe sind noch nicht eingerichtet.' },
+  { id: 'laeufe', label: 'Automatische Läufe', icon: RocketIcon, empty: 'Noch keine Laufregeln.' },
+  // Konkrete ToDos: one-time, manually planned tasks (ad-hoc fix, new service). Same machinery as the
+  // automatic runs, but no Laufregeln and no recurrence — it owns no scheme namespace, so no tree.
+  { id: 'todos', label: 'Konkrete ToDos', icon: CheckIcon, empty: 'Noch keine ToDos.' },
+  // The global calendar unites the automatic runs and the ToDos (colour-separated); like todos it is
+  // not scheme-backed, so it owns its pane and has no tree.
+  { id: 'kalender', label: 'Kalender', icon: RocketIcon, empty: '' },
 ];
+
+// Adding is symmetric across the scheme-backed namespaces — same form, only the namespace differs.
+// (`todos`/`kalender` have no scheme namespace; those views own their own flows.)
+const ADD_NOUN: Record<SchemeNs, string> = { axiome: 'Axiom', regeln: 'Regel', laeufe: 'Laufregel', meta: 'Meta-Axiom' };
+const ADD_PLACEHOLDER: Record<SchemeNs, string> = {
+  axiome: 'Das Axiom, atomar und knapp formuliert.',
+  regeln: 'Die Implementierungsregel, knapp formuliert.',
+  laeufe: 'Der automatisierte Lauf, knapp beschrieben.',
+  meta: 'Die verbindliche Anforderung an Axiome, präzise formuliert.',
+};
+// Empty-state text per scheme namespace (the sidebar SECTIONS.empty covers the section level; meta
+// lives under Axiome as a sub-tab, so it needs its own).
+const NS_EMPTY: Record<SchemeNs, string> = {
+  axiome: 'Noch keine Axiome. Aigentic sortiert neue Axiome automatisch ein.',
+  regeln: 'Noch keine Implementierungsregeln.',
+  laeufe: 'Noch keine Laufregeln.',
+  meta: 'Noch keine Meta-Axiome. Sie legen verbindlich fest, wie ein Axiom formuliert sein muss — jedes neue Axiom wird streng dagegen geprüft.',
+};
 
 /** Mercury — the centre for the Holistic axioms, in three parts: the axioms (aigentic auto-sorts a
  *  new one; the user re-files, renames, edits and deletes by hand), the implementation rules, and
@@ -82,6 +114,18 @@ export function MercuryView() {
   const [section, setSection] = useState<SectionId>('axiome');
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  // The "Automatische Läufe" section holds two things: the scheduled run instances (Läufe) and the
+  // global rules that govern them (Laufregeln, the laeufe/ records). A sub-tab switches between them.
+  const [laeufeTab, setLaeufeTab] = useState<'laeufe' | 'laufregeln'>('laeufe');
+  // The "Axiome" section holds two things: the axioms themselves and the Meta-Axiome that bindingly
+  // govern how an axiom must be formulated. A sub-tab switches the tree's namespace between them.
+  const [axiomeTab, setAxiomeTab] = useState<'axiome' | 'meta'>('axiome');
+  // The KI-Chat acts for ALL of Mercury, so it lives here rather than inside a section. Kept mounted
+  // so the conversation survives closing.
+  const [chatOpen, setChatOpen] = useState(false);
+  // A record + text handed to the detail pane so it opens in edit pre-filled — used when the user
+  // resolves a duplicate by extending or adjusting the existing record.
+  const [pendingDraft, setPendingDraft] = useState<{ path: string; titel: string; body: string } | null>(null);
 
   const reload = useCallback(() => {
     return source
@@ -92,9 +136,14 @@ export function MercuryView() {
 
   const [drag, setDrag] = useState<DragItem | null>(null);
 
+  // The scheme namespace currently in view: within Axiome the sub-tab picks axiome vs meta; the other
+  // scheme-backed sections map straight to their namespace. (todos/kalender aren't scheme-backed.)
+  const activeNs: SchemeNs = section === 'axiome' ? axiomeTab : (section as SchemeNs);
+
   // Drag-and-drop, mirroring the mail service: drop INTO a category (re-nest), or before/after a
   // sibling (reorder within the same parent, else re-nest into the target's branch).
-  const roots = tree ? tree[section] ?? [] : [];
+  // `todos` is not scheme-backed (it has no namespace/tree) — TodosView owns that section entirely.
+  const roots = tree && section !== 'todos' && section !== 'kalender' ? tree[activeNs] ?? [] : [];
 
   const reNest = useCallback(
     async (item: DragItem, targetCat: string) => {
@@ -171,6 +220,14 @@ export function MercuryView() {
   }
   if (!tree) return <Splash />;
 
+  // In the Läufe sub-tab the run instances take over the pane; the sidebar tree (Laufregeln) and its
+  // add form only apply to the Laufregeln sub-tab (and the other scheme-backed sections). The ToDos
+  // section is likewise fully owned by its own view.
+  const runsMode = section === 'laeufe' && laeufeTab === 'laeufe';
+  const todosMode = section === 'todos';
+  const calendarMode = section === 'kalender';
+  const treeMode = !runsMode && !todosMode && !calendarMode;
+
   return (
     <MercuryDnD.Provider value={{ drag, setDrag, onMove }}>
     <div className="flex min-h-0 flex-1">
@@ -185,6 +242,7 @@ export function MercuryView() {
                 onClick={() => {
                   setSection(sec.id);
                   setSelectedPath(null);
+                  setAdding(false); // don't carry a half-filled add form across sections
                 }}
                 className={cn(
                   'flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-footnote transition duration-fast',
@@ -198,100 +256,310 @@ export function MercuryView() {
           })}
         </nav>
 
-        {section === 'axiome' && (
-          <div className="border-b border-separator px-2 py-1.5">
-            {adding ? (
-              <AddAxiomForm
-                onClose={() => setAdding(false)}
-                onAdded={async (path) => {
-                  setAdding(false);
-                  await reload();
-                  setSelectedPath(path);
-                }}
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={() => setAdding(true)}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
-              >
-                <PlusIcon className="h-4 w-4 text-accent" />
-                Axiom hinzufügen
-              </button>
+        <div className="border-b border-separator px-2 py-1.5">
+          <button
+            type="button"
+            onClick={() => setChatOpen((o) => !o)}
+            className={cn(
+              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote transition duration-fast hover:bg-fill/10 hover:text-text-primary',
+              chatOpen ? 'bg-fill/[0.07] text-text-primary' : 'text-text-secondary',
             )}
+          >
+            <LightbulbIcon className="h-4 w-4 text-accent" />
+            KI-Chat
+          </button>
+        </div>
+
+        {section === 'laeufe' && (
+          <div className="flex gap-1 border-b border-separator p-2">
+            {(['laufregeln', 'laeufe'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => {
+                  setLaeufeTab(t);
+                  setSelectedPath(null);
+                  setAdding(false);
+                }}
+                className={cn(
+                  'flex-1 rounded-md px-2 py-1 text-center text-caption transition duration-fast',
+                  laeufeTab === t ? 'bg-fill/[0.07] font-medium text-text-primary' : 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
+                )}
+              >
+                {t === 'laeufe' ? 'Läufe' : 'Laufregeln'}
+              </button>
+            ))}
           </div>
         )}
 
-        <NamespaceDropZone namespace={section}>
-          {roots.length === 0 ? (
-            <p className="px-2.5 py-3 text-caption text-text-tertiary">{SECTIONS.find((s) => s.id === section)!.empty}</p>
-          ) : (
-            roots.map((n) => (
-              <TreeRow
-                key={n.path}
-                node={n}
-                depth={0}
-                selectedPath={selectedPath}
-                onSelect={(p) => setSelectedPath(p)}
-                onRenameCategory={async (from, to) => {
-                  const { moved } = await source.mercuryMoveCategory(from, to);
-                  await reload();
-                  return moved;
+        {section === 'axiome' && (
+          <div className="flex gap-1 border-b border-separator p-2">
+            {(['axiome', 'meta'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => {
+                  setAxiomeTab(t);
+                  setSelectedPath(null);
+                  setAdding(false);
                 }}
-              />
-            ))
-          )}
-        </NamespaceDropZone>
+                className={cn(
+                  'flex-1 rounded-md px-2 py-1 text-center text-caption transition duration-fast',
+                  axiomeTab === t ? 'bg-fill/[0.07] font-medium text-text-primary' : 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
+                )}
+              >
+                {t === 'axiome' ? 'Axiome' : 'Meta-Axiome'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {treeMode && (
+          <>
+            <div className="border-b border-separator px-2 py-1.5">
+              {adding ? (
+                <AddAxiomForm
+                  section={activeNs}
+                  onClose={() => setAdding(false)}
+                  onAdded={async (path) => {
+                    setAdding(false);
+                    await reload();
+                    setSelectedPath(path);
+                  }}
+                  onResolveDuplicate={(path, titel, body) => {
+                    // Open the EXISTING record in edit, pre-filled (extended or as-is) — the user
+                    // reviews and saves; nothing is written behind their back.
+                    setAdding(false);
+                    setPendingDraft({ path, titel, body });
+                    setSelectedPath(path);
+                  }}
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setAdding(true)}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
+                >
+                  <PlusIcon className="h-4 w-4 text-accent" />
+                  {ADD_NOUN[activeNs]} hinzufügen
+                </button>
+              )}
+            </div>
+
+            <NamespaceDropZone namespace={activeNs}>
+              {roots.length === 0 ? (
+                <p className="px-2.5 py-3 text-caption text-text-tertiary">{NS_EMPTY[activeNs]}</p>
+              ) : (
+                roots.map((n) => (
+                  <TreeRow
+                    key={n.path}
+                    node={n}
+                    depth={0}
+                    selectedPath={selectedPath}
+                    onSelect={(p) => {
+                      setPendingDraft(null);
+                      setSelectedPath(p);
+                    }}
+                    onRenameCategory={async (from, to) => {
+                      const { moved } = await source.mercuryMoveCategory(from, to);
+                      await reload();
+                      return moved;
+                    }}
+                  />
+                ))
+              )}
+            </NamespaceDropZone>
+          </>
+        )}
       </aside>
 
-      <main className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
-        {selectedPath ? (
+      <main className={cn('min-h-0 flex-1 bg-bg-base', runsMode || todosMode || calendarMode ? 'flex' : 'dl-scroll overflow-y-auto')}>
+        {calendarMode ? (
+          <GlobalCalendarView />
+        ) : todosMode ? (
+          <TodosView />
+        ) : runsMode ? (
+          <RunsView />
+        ) : selectedPath ? (
           <AxiomPane
             key={selectedPath}
             path={selectedPath}
             categories={roots}
-            namespace={section}
+            namespace={activeNs}
+            initialDraft={pendingDraft?.path === selectedPath ? { titel: pendingDraft.titel, body: pendingDraft.body } : undefined}
             onChanged={async (nextPath) => {
+              setPendingDraft(null);
               await reload();
               setSelectedPath(nextPath);
             }}
           />
         ) : (
-          <Placeholder section={section} />
+          <Placeholder section={section} label={activeNs === 'meta' ? 'Meta-Axiome' : undefined} />
         )}
       </main>
+
+      <MercuryChat open={chatOpen} onClose={() => setChatOpen(false)} onApplied={() => void reload()} />
     </div>
     </MercuryDnD.Provider>
   );
 }
 
-/** Add an axiom: the user gives a title and text; aigentic classifies it into the tree. Mercury
- *  never asks the user to choose a category for a NEW axiom — that is the whole point. (Re-filing an
- *  existing one by hand is what the edit surface is for.) */
-function AddAxiomForm({ onClose, onAdded }: { onClose: () => void; onAdded: (path: string) => void }) {
+/** Add a record to the active section: the user gives a title and text; aigentic classifies it into
+ *  that namespace's tree. The same form serves Axiome, Implementierungsregeln and Automatische Läufe
+ *  — a symmetric design. Mercury never asks the user to choose a category for a NEW record — that is
+ *  the whole point. (Re-filing an existing one by hand is what the edit surface is for.) */
+function AddAxiomForm({
+  section,
+  onClose,
+  onAdded,
+  onResolveDuplicate,
+}: {
+  section: SchemeNs;
+  onClose: () => void;
+  onAdded: (path: string) => void;
+  /** The user resolved a duplicate: open THIS record in the editor pre-filled with this text. */
+  onResolveDuplicate: (path: string, titel: string, body: string) => void;
+}) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [titel, setTitel] = useState('');
   const [body, setBody] = useState('');
   const [busy, setBusy] = useState(false);
+  // Set when the classifier reports an existing record with the same content: nothing was written,
+  // and the user chooses — extend it, adjust it, or create a new one anyway.
+  const [dup, setDup] = useState<{ path: string; axiom: Axiom; proposedTitel: string; proposedBody: string } | null>(null);
+  // Set when an axiom violates a meta-axiom: nothing was written, and the user chooses — take the AI
+  // correction, adjust it by hand, or create it regardless.
+  const [nonconform, setNonconform] = useState<{ violations: MetaViolation[]; proposedTitel: string; proposedBody: string } | null>(null);
+  const noun = ADD_NOUN[section];
 
-  const submit = async () => {
+  const submit = async (force = false) => {
     if (!titel.trim() || !body.trim() || busy) return;
     setBusy(true);
     try {
-      const res = await source.mercuryAddAxiom(titel.trim(), body.trim());
+      // Initiale KI-Optimierung (Orthografie, Generalisierung, Kürzung) VOR dem Einsortieren.
+      const opt = await source.mercuryOptimize(titel.trim(), body.trim(), section);
+      const res = await source.mercuryAddAxiom(opt.titel, opt.body, section, force);
+      if (res.duplicate) {
+        setDup({
+          path: res.duplicate.path,
+          axiom: res.duplicate.axiom,
+          proposedTitel: res.proposed?.titel ?? opt.titel,
+          proposedBody: res.proposed?.body ?? opt.body,
+        });
+        return; // nothing written — the choice is the user's
+      }
+      if (res.nonconform) {
+        setNonconform({
+          violations: res.nonconform.violations,
+          proposedTitel: res.nonconform.proposed.titel,
+          proposedBody: res.nonconform.proposed.body,
+        });
+        return; // nothing written — a meta-axiom is violated; the user decides
+      }
       toast({
-        title: res.classified ? 'Axiom einsortiert' : 'Axiom abgelegt (unsortiert)',
+        title: res.classified ? `${noun} optimiert & einsortiert` : `${noun} optimiert & abgelegt (unsortiert)`,
         description: res.path,
         variant: res.classified ? 'success' : 'default',
       });
-      onAdded(res.path);
+      if (res.path) onAdded(res.path);
     } catch (e) {
-      toast({ title: 'Axiom konnte nicht angelegt werden', description: String((e as Error)?.message ?? e), variant: 'danger' });
+      toast({ title: `${noun} konnte nicht angelegt werden`, description: String((e as Error)?.message ?? e), variant: 'danger' });
     } finally {
       setBusy(false);
     }
   };
+
+  // The duplicate fork: extend the existing record (its text + the new text, to be tidied), adjust it
+  // as it stands, or file the new one regardless.
+  if (dup) {
+    return (
+      <div className="flex flex-col gap-2 p-1">
+        <p className="text-footnote font-medium text-text-primary">Ähnlicher Eintrag existiert bereits</p>
+        <div className="rounded-md border border-separator bg-surface px-2.5 py-2">
+          <p className="text-footnote text-text-primary">{dup.axiom.titel}</p>
+          <p className="mt-0.5 font-mono text-caption text-text-tertiary">{dup.path}</p>
+          <p className="mt-1 line-clamp-3 text-caption text-text-secondary">{dup.axiom.body}</p>
+        </div>
+        <p className="text-caption text-text-tertiary">Nichts wurde gespeichert. Was soll passieren?</p>
+        <div className="flex flex-col gap-1.5">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => onResolveDuplicate(dup.path, dup.axiom.titel, `${dup.axiom.body}\n\n${dup.proposedBody}`)}
+          >
+            Vorhandenes ausweiten
+          </Button>
+          <Button variant="secondary" size="sm" onClick={() => onResolveDuplicate(dup.path, dup.axiom.titel, dup.axiom.body)}>
+            Vorhandenes anpassen
+          </Button>
+          <Button variant="secondary" size="sm" disabled={busy} onClick={() => void submit(true)}>
+            {busy ? 'Lege an…' : 'Trotzdem neu anlegen'}
+          </Button>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => setDup(null)}>
+            Zurück
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // The conformance fork: the axiom breaks a binding meta-axiom. Take the AI-corrected version
+  // (seeded into the form, re-submitted), adjust it by hand, or write it anyway.
+  if (nonconform) {
+    return (
+      <div className="flex flex-col gap-2 p-1">
+        <p className="text-footnote font-medium text-text-primary">Verstößt gegen Meta-Axiome</p>
+        <ul className="flex flex-col gap-1.5">
+          {nonconform.violations.map((v, i) => (
+            <li key={i} className="rounded-md border border-warning/30 bg-warning/[0.06] px-2.5 py-1.5">
+              <p className="text-caption font-medium text-warning">{v.meta}</p>
+              <p className="mt-0.5 text-caption text-text-secondary">{v.issue}</p>
+            </li>
+          ))}
+        </ul>
+        <div className="rounded-md border border-separator bg-surface px-2.5 py-2">
+          <p className="text-caption uppercase tracking-wide text-text-tertiary">KI-Korrektur</p>
+          <p className="mt-0.5 text-footnote text-text-primary">{nonconform.proposedTitel}</p>
+          <p className="mt-1 line-clamp-4 text-caption text-text-secondary">{nonconform.proposedBody}</p>
+        </div>
+        <p className="text-caption text-text-tertiary">Nichts wurde gespeichert. Was soll passieren?</p>
+        <div className="flex flex-col gap-1.5">
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setTitel(nonconform.proposedTitel);
+              setBody(nonconform.proposedBody);
+              setNonconform(null);
+              void submit();
+            }}
+          >
+            {busy ? 'Lege an…' : 'KI-Korrektur übernehmen'}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={busy}
+            onClick={() => {
+              setTitel(nonconform.proposedTitel);
+              setBody(nonconform.proposedBody);
+              setNonconform(null);
+            }}
+          >
+            Manuell anpassen
+          </Button>
+          <Button variant="secondary" size="sm" disabled={busy} onClick={() => void submit(true)}>
+            {busy ? 'Lege an…' : 'Trotzdem anlegen'}
+          </Button>
+          <Button variant="ghost" size="sm" disabled={busy} onClick={() => setNonconform(null)}>
+            Zurück
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-2 p-1">
@@ -305,13 +573,13 @@ function AddAxiomForm({ onClose, onAdded }: { onClose: () => void; onAdded: (pat
       <textarea
         value={body}
         onChange={(e) => setBody(e.target.value)}
-        placeholder="Das Axiom, atomar und knapp formuliert."
+        placeholder={ADD_PLACEHOLDER[section]}
         rows={4}
         className="dl-scroll resize-none rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
       />
       <div className="flex items-center gap-2">
-        <Button variant="primary" size="sm" disabled={busy || !titel.trim() || !body.trim()} onClick={submit}>
-          {busy ? 'Sortiere ein…' : 'Einsortieren'}
+        <Button variant="primary" size="sm" disabled={busy || !titel.trim() || !body.trim()} onClick={() => void submit()}>
+          {busy ? 'Optimiere & sortiere…' : 'Einsortieren'}
         </Button>
         <Button variant="secondary" size="sm" disabled={busy} onClick={onClose}>
           Abbrechen
@@ -468,7 +736,7 @@ function DropLine({ edge }: { edge: 'top' | 'bottom' }) {
 
 /** The section's scroll area doubles as a drop target for the namespace root: dropping an item on
  *  the empty space moves it to the top level. */
-function NamespaceDropZone({ namespace, children }: { namespace: SectionId; children: React.ReactNode }) {
+function NamespaceDropZone({ namespace, children }: { namespace: SchemeNs; children: React.ReactNode }) {
   const { drag, setDrag, onMove } = useDnD();
   const [over, setOver] = useState(false);
   return (
@@ -545,19 +813,29 @@ function AxiomPane({
   path,
   categories,
   namespace,
+  initialDraft,
   onChanged,
 }: {
   path: string;
   categories: MercuryNode[];
-  namespace: string;
+  namespace: SchemeNs;
+  /** Pre-fill the editor and open it straight away (duplicate resolution / AI optimization). */
+  initialDraft?: { titel: string; body: string };
   onChanged: (nextPath: string | null) => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [axiom, setAxiom] = useState<Axiom | null>(null);
   const [err, setErr] = useState(false);
-  const [mode, setMode] = useState<'view' | 'edit' | 'move'>('view');
+  const [mode, setMode] = useState<'view' | 'edit' | 'move'>(initialDraft ? 'edit' : 'view');
   const [busy, setBusy] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
+  // An AI optimization (or a duplicate resolution) is never applied silently: it pre-fills the edit
+  // form so the user reviews and saves — cancelling leaves the stored record untouched.
+  const [draft, setDraft] = useState<{ titel: string; body: string } | null>(initialDraft ?? null);
+  // Conformance against the meta-axioms — checked on demand (an aigentic call), never automatically.
+  const [conf, setConf] = useState<Conformance | null>(null);
+  const [checking, setChecking] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -571,6 +849,38 @@ function AxiomPane({
       cancelled = true;
     };
   }, [source, path]);
+
+  // "Mit KI optimieren" on an EXISTING record: polish title+body, then open the editor pre-filled so
+  // the user reviews the change before it is stored.
+  const optimize = async () => {
+    if (optimizing || busy || !axiom) return;
+    setOptimizing(true);
+    try {
+      const opt = await source.mercuryOptimize(axiom.titel, axiom.body, namespace);
+      setDraft({ titel: opt.titel, body: opt.body });
+      setMode('edit');
+      toast({ title: 'Mit KI optimiert — prüfen und speichern', variant: 'success' });
+    } catch (e) {
+      toast({ title: 'Optimierung fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+    } finally {
+      setOptimizing(false);
+    }
+  };
+
+  // "Konformität prüfen": check the stored axiom strictly against every meta-axiom. On a violation
+  // the corrected proposal can be opened in the editor for review.
+  const checkConform = async () => {
+    if (checking || busy || !axiom) return;
+    setChecking(true);
+    try {
+      const c = await source.mercuryConform(axiom.titel, axiom.body);
+      setConf(c);
+    } catch (e) {
+      toast({ title: 'Konformitätsprüfung fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const del = async () => {
     if (busy || !window.confirm(`Axiom „${axiom?.titel ?? path}“ löschen?`)) return;
@@ -592,14 +902,25 @@ function AxiomPane({
     return (
       <EditAxiomForm
         axiom={axiom}
-        onCancel={() => setMode('view')}
+        section={namespace}
+        initial={draft ?? undefined}
+        onCancel={() => {
+          setDraft(null); // discard an un-saved AI optimization
+          setMode('view');
+        }}
         onSave={async (titel, body) => {
           const res = await source.mercuryEditAxiom(path, titel, body);
-          // An edit keeps the path, so this pane never remounts and its item fetch never re-runs;
-          // update the local state from the server's response so the reading view reflects the edit
-          // immediately, without a page reload.
-          setAxiom(res.axiom);
+          setDraft(null);
           toast({ title: 'Axiom gespeichert', variant: 'success' });
+          if (res.path !== path) {
+            // The title changed the slug, so the record was renamed to keep heading and path
+            // matched; follow the new path (reloads the tree and re-selects it).
+            onChanged(res.path);
+            return;
+          }
+          // Same path: this pane won't remount and its item fetch won't re-run, so update local
+          // state from the server's response — the reading view reflects the edit without a reload.
+          setAxiom(res.axiom);
           setMode('view');
         }}
       />
@@ -630,6 +951,14 @@ function AxiomPane({
           <Button variant="secondary" size="sm" onClick={() => setMode('edit')}>
             Bearbeiten
           </Button>
+          <Button variant="secondary" size="sm" disabled={optimizing || busy} onClick={optimize}>
+            {optimizing ? 'Optimiere…' : 'Mit KI optimieren'}
+          </Button>
+          {namespace === 'axiome' && (
+            <Button variant="secondary" size="sm" disabled={checking || busy} onClick={checkConform}>
+              {checking ? 'Prüfe…' : 'Konformität prüfen'}
+            </Button>
+          )}
           <Button variant="secondary" size="sm" onClick={() => setMode('move')}>
             Verschieben
           </Button>
@@ -640,6 +969,17 @@ function AxiomPane({
       </div>
       <p className="mt-1 font-mono text-caption text-text-tertiary">{path}</p>
       <div className="dl-markdown mt-5" dangerouslySetInnerHTML={{ __html: renderMarkdown(axiom.body) }} />
+      {conf && (
+        <ConformancePanel
+          conf={conf}
+          onFix={() => {
+            if (conf.proposed) {
+              setDraft({ titel: conf.proposed.titel, body: conf.proposed.body });
+              setMode('edit');
+            }
+          }}
+        />
+      )}
       {axiom.quelle && (
         <p className="mt-8 border-t border-separator pt-3 text-caption text-text-tertiary">
           Quelle: <span className="font-mono">{axiom.quelle}</span>
@@ -649,12 +989,62 @@ function AxiomPane({
   );
 }
 
+/** The result of a "Konformität prüfen" run: conforming (a short confirmation), or a list of violated
+ *  meta-axioms with a one-click AI fix that opens the corrected version in the editor. */
+function ConformancePanel({ conf, onFix }: { conf: Conformance; onFix: () => void }) {
+  if (conf.metaCount === 0) {
+    return (
+      <div className="mt-6 rounded-md border border-separator bg-surface px-3 py-2.5 text-caption text-text-tertiary">
+        Noch keine Meta-Axiome definiert — es gibt keine verbindlichen Anforderungen zu prüfen.
+      </div>
+    );
+  }
+  if (conf.unavailable) {
+    return (
+      <div className="mt-6 rounded-md border border-separator bg-surface px-3 py-2.5 text-caption text-text-tertiary">
+        Die Konformitätsprüfung ist derzeit nicht erreichbar.
+      </div>
+    );
+  }
+  if (conf.conforms) {
+    return (
+      <div className="mt-6 rounded-md border border-success/30 bg-success/[0.06] px-3 py-2.5">
+        <p className="flex items-center gap-1.5 text-caption font-medium text-success">
+          <CheckIcon className="h-3.5 w-3.5" /> Erfüllt alle {conf.metaCount} Meta-Axiome
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="mt-6 rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2.5">
+      <p className="text-caption font-medium text-warning">Verstößt gegen Meta-Axiome</p>
+      <ul className="mt-1.5 flex flex-col gap-1.5">
+        {conf.violations.map((v, i) => (
+          <li key={i}>
+            <p className="text-caption font-medium text-text-primary">{v.meta}</p>
+            <p className="text-caption text-text-secondary">{v.issue}</p>
+          </li>
+        ))}
+      </ul>
+      {conf.proposed && (
+        <Button variant="primary" size="sm" className="mt-2.5" onClick={onFix}>
+          KI-Korrektur im Editor öffnen
+        </Button>
+      )}
+    </div>
+  );
+}
+
 /** Edit an axiom's title and body. Its id, quelle and path are preserved. */
-function EditAxiomForm({ axiom, onCancel, onSave }: { axiom: Axiom; onCancel: () => void; onSave: (titel: string, body: string) => Promise<void> }) {
+function EditAxiomForm({ axiom, section, initial, onCancel, onSave }: { axiom: Axiom; section: SchemeNs; initial?: { titel: string; body: string }; onCancel: () => void; onSave: (titel: string, body: string) => Promise<void> }) {
+  const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
-  const [titel, setTitel] = useState(axiom.titel);
-  const [body, setBody] = useState(axiom.body);
+  // `initial` carries an AI-optimized draft from the view's "Mit KI optimieren"; otherwise edit the
+  // stored record as-is.
+  const [titel, setTitel] = useState(initial?.titel ?? axiom.titel);
+  const [body, setBody] = useState(initial?.body ?? axiom.body);
   const [busy, setBusy] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
 
   const save = async () => {
     if (!titel.trim() || !body.trim() || busy) return;
@@ -664,6 +1054,21 @@ function EditAxiomForm({ axiom, onCancel, onSave }: { axiom: Axiom; onCancel: ()
     } catch (e) {
       toast({ title: 'Speichern fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
       setBusy(false);
+    }
+  };
+
+  const optimize = async () => {
+    if (!titel.trim() || !body.trim() || busy || optimizing) return;
+    setOptimizing(true);
+    try {
+      const opt = await source.mercuryOptimize(titel.trim(), body.trim(), section);
+      setTitel(opt.titel);
+      setBody(opt.body);
+      toast({ title: 'Mit KI optimiert — prüfen und speichern', variant: 'success' });
+    } catch (e) {
+      toast({ title: 'Optimierung fehlgeschlagen', description: String((e as Error)?.message ?? e), variant: 'danger' });
+    } finally {
+      setOptimizing(false);
     }
   };
 
@@ -682,10 +1087,13 @@ function EditAxiomForm({ axiom, onCancel, onSave }: { axiom: Axiom; onCancel: ()
         className="dl-scroll resize-y rounded-md border border-separator bg-surface px-3 py-2 text-body text-text-primary outline-none focus:border-accent/50"
       />
       <div className="flex items-center gap-2">
-        <Button variant="primary" size="sm" disabled={busy || !titel.trim() || !body.trim()} onClick={save}>
+        <Button variant="primary" size="sm" disabled={busy || optimizing || !titel.trim() || !body.trim()} onClick={save}>
           {busy ? 'Speichert…' : 'Speichern'}
         </Button>
-        <Button variant="secondary" size="sm" disabled={busy} onClick={onCancel}>
+        <Button variant="secondary" size="sm" disabled={busy || optimizing || !titel.trim() || !body.trim()} onClick={optimize}>
+          {optimizing ? 'Optimiere…' : 'Mit KI optimieren'}
+        </Button>
+        <Button variant="secondary" size="sm" disabled={busy || optimizing} onClick={onCancel}>
           Abbrechen
         </Button>
       </div>
@@ -899,14 +1307,14 @@ function CategoryRow({
 }
 
 /** Shown when nothing is selected in a section. */
-function Placeholder({ section }: { section: SectionId }) {
+function Placeholder({ section, label }: { section: SectionId; label?: string }) {
   const sec = SECTIONS.find((s) => s.id === section)!;
   return (
     <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
       <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-surface-raised shadow-elev-1 ring-1 ring-separator">
         <sec.icon className="h-6 w-6 text-accent" />
       </span>
-      <p className="text-footnote text-text-tertiary">{sec.label}</p>
+      <p className="text-footnote text-text-tertiary">{label ?? sec.label}</p>
     </div>
   );
 }

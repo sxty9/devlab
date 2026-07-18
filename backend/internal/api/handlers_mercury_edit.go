@@ -14,8 +14,10 @@ import (
 // primitives (put/move/delete): scheme carries a record's content with its path on a move, so a
 // re-file or rename never rewrites the axiom, and the front-matter id stays stable across it.
 
-// editAxiom replaces an axiom's title and body in place, preserving its id and quelle. The path is
-// unchanged (a rename is a move, below).
+// editAxiom replaces an axiom's title and body, preserving its id and quelle. The leaf slug is
+// re-derived from the new title so the heading always matches the path — a title change renames the
+// record within its category; a body-only edit leaves the path untouched. A re-file into another
+// category is a move (below).
 func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Path  string `json:"path"`
@@ -52,11 +54,26 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	if ax.ID == "" {
 		ax.ID = mintID() // a record that predates ids gets one now
 	}
-	if _, status, err := aigentic.GravePut(r.Context(), cookie, csrf, body.Path, firstLine(body.Body), []byte(mercury.Render(ax)), true); err != nil {
+	content := []byte(mercury.Render(ax))
+
+	// Keep the heading matched to the path: if the new title slugs to a different leaf, rename the
+	// record (same category) before writing. A body-only edit leaves the slug unchanged and never moves.
+	newPath := reslugLeaf(body.Path, body.Titel)
+	if newPath != body.Path {
+		if status, err := aigentic.GraveMove(r.Context(), cookie, csrf, body.Path, newPath); err != nil {
+			if status == http.StatusConflict {
+				writeErr(w, http.StatusConflict, "In dieser Kategorie existiert bereits ein Axiom mit diesem Titel")
+				return
+			}
+			mercuryError(w, status, err)
+			return
+		}
+	}
+	if _, status, err := aigentic.GravePut(r.Context(), cookie, csrf, newPath, firstLine(body.Body), content, true); err != nil {
 		mercuryError(w, status, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"path": body.Path, "axiom": ax})
+	writeJSON(w, http.StatusOK, map[string]any{"path": newPath, "axiom": ax})
 }
 
 // moveAxiom re-files or renames an axiom: from and to are full record paths. A category change

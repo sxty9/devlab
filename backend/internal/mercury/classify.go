@@ -23,19 +23,37 @@ type Placement struct {
 	DuplikatVon   string `json:"duplikat_von"`
 }
 
-// pathRe is deliberately stricter than scheme's path rule: lowercase kebab segments only, 1–5
-// category levels under axiome/, ending in a slug + ".md". This is what prevents "SSOT" and "ssot"
-// or "wiederverwendung" and "wieder-verwendung" becoming distinct categories.
-var pathRe = regexp.MustCompile(`^axiome(/[a-z0-9][a-z0-9-]*){1,5}/[a-z0-9][a-z0-9-]*\.md$`)
+// ValidPlacementPath reports whether p is an acceptable classifier target in namespace ns: a valid
+// record path (lowercase kebab segments, ending in a slug + ".md") that actually sits under ns/. The
+// kebab-only rule is what stops "SSOT" and "ssot", or "wieder-verwendung" and "wiederverwendung",
+// from becoming distinct categories. Depth is unconstrained and a top-level record (no category) is
+// allowed, so regeln/ and laeufe/ — whose trees are flat — file exactly like axiome/.
+func ValidPlacementPath(p, ns string) bool {
+	return recordRe.MatchString(p) && strings.HasPrefix(p, ns+"/")
+}
 
-// recordRe validates a user-supplied move/rename target: the two writable namespaces (axiome,
-// regeln), lowercase kebab segments, ending in a slug + ".md". laeufe/ is machine-managed and not
-// editable here.
-var recordRe = regexp.MustCompile(`^(axiome|regeln)(/[a-z0-9][a-z0-9-]*)*/[a-z0-9][a-z0-9-]*\.md$`)
+// nsLabel names a namespace with a human singular noun for the classifier prompt (used as a type
+// label, so the wording is right whether it files an Axiom, a Regel or a Lauf).
+func nsLabel(ns string) string {
+	switch ns {
+	case NsRegeln:
+		return "Implementierungsregel"
+	case NsLaeufe:
+		return "automatisierter Lauf"
+	case NsMeta:
+		return "Meta-Axiom"
+	default:
+		return "Axiom"
+	}
+}
+
+// recordRe validates a user-supplied move/rename target: the Mercury namespaces (axiome, regeln,
+// laeufe, meta — the tree's sections), lowercase kebab segments, ending in a slug + ".md".
+var recordRe = regexp.MustCompile(`^(axiome|regeln|laeufe|meta)(/[a-z0-9][a-z0-9-]*)*/[a-z0-9][a-z0-9-]*\.md$`)
 
 // categoryRe validates a category prefix (a move-category source/target): a namespace and at least
 // one kebab segment, no trailing ".md".
-var categoryRe = regexp.MustCompile(`^(axiome|regeln)(/[a-z0-9][a-z0-9-]*)+$`)
+var categoryRe = regexp.MustCompile(`^(axiome|regeln|laeufe|meta)(/[a-z0-9][a-z0-9-]*)+$`)
 
 // ValidRecordPath reports whether p is an acceptable axiom/rule record path for a move or rename.
 func ValidRecordPath(p string) bool { return recordRe.MatchString(p) }
@@ -50,21 +68,21 @@ var (
 	ErrInvalidPlacement = errors.New("placement violates the contract")
 )
 
-// Categories lists the existing category paths (a category is any path prefix that holds an axiom).
-// Because scheme has no empty folders, this is the complete, exact set — which is what the model is
-// shown so it reuses categories instead of inventing near-duplicates.
-func Categories(paths []string) []string {
+// Categories lists the existing category paths in namespace ns (a category is any path prefix that
+// holds a record). Because scheme has no empty folders, this is the complete, exact set — which is
+// what the model is shown so it reuses categories instead of inventing near-duplicates.
+func Categories(paths []string, ns string) []string {
 	set := map[string]bool{}
 	for _, p := range paths {
-		if !strings.HasPrefix(p, NsAxiome+"/") {
+		if !strings.HasPrefix(p, ns+"/") {
 			continue
 		}
 		segs := strings.Split(strings.TrimSuffix(p, ".md"), "/")
-		for i := 2; i <= len(segs); i++ { // prefixes from axiome/<a> up to the leaf's parent
+		for i := 2; i <= len(segs); i++ { // prefixes from ns/<a> up to the leaf's parent
 			set[strings.Join(segs[:i-1], "/")] = true
 		}
 	}
-	delete(set, NsAxiome)
+	delete(set, ns)
 	out := make([]string, 0, len(set))
 	for c := range set {
 		if c != "" {
@@ -75,39 +93,68 @@ func Categories(paths []string) []string {
 	return out
 }
 
-// ClassifyPrompt builds the instruction: the existing tree, the axiom, and the exact JSON contract.
-// hint is an optional suggested top-level category (used by the migration to seed a coherent
-// structure); correction is empty on the first attempt, else the specific violation to fix.
-func ClassifyPrompt(categories []string, titel, body, hint, correction string) string {
+// ClassifyPrompt builds the instruction: the existing categories WITH their current entries (so the
+// model can read each category's THEME, not just its name — the key to correct filing), the new
+// record, and the exact JSON contract. members maps a category path to the titles of the records in
+// it. ns is the target namespace (axiome/regeln/laeufe). hint is an optional seed category (migration
+// only); correction is empty on the first attempt, else the specific violation to fix.
+func ClassifyPrompt(categories []string, members map[string][]string, titel, body, hint, correction, ns string) string {
+	noun := nsLabel(ns)
 	var b strings.Builder
-	b.WriteString("Du bist der Kurator der Holistic-Axiome. Ein neues Axiom soll in einen bestehenden, ")
-	b.WriteString("beliebig tiefen Kategoriebaum unter `axiome/` einsortiert werden. Wähle den passendsten ")
-	b.WriteString("bestehenden Pfad; nur wenn wirklich keine Kategorie passt, lege eine neue an.\n\n")
+	b.WriteString("Du bist der Kurator der Holistic-Verfassung. Ein neuer Eintrag vom Typ „" + noun + "\" soll ")
+	b.WriteString("in den bestehenden Kategoriebaum unter `" + ns + "/` einsortiert werden.\n\n")
 
-	b.WriteString("Bestehende Kategorien:\n")
+	b.WriteString("Bestehende Kategorien mit ihren Einträgen (Pfad — Titel: Kurzfassung). Erkenne daran das ")
+	b.WriteString("THEMA jeder Kategorie UND ob es den Eintrag inhaltlich schon gibt:\n")
 	if len(categories) == 0 {
 		b.WriteString("(noch keine — du legst die erste Struktur an)\n")
 	} else {
 		for _, c := range categories {
 			b.WriteString("  " + c + "\n")
+			for i, m := range members[c] {
+				if i >= 8 {
+					b.WriteString("      …\n")
+					break
+				}
+				b.WriteString("      - " + m + "\n")
+			}
 		}
 	}
 
-	b.WriteString("\nDas neue Axiom:\n")
+	b.WriteString("\nDer neue Eintrag (" + noun + "):\n")
 	b.WriteString("Titel: " + titel + "\n")
 	b.WriteString("Inhalt: " + body + "\n")
 	if hint != "" {
-		b.WriteString("Vorgeschlagene Oberkategorie (Ausgangspunkt, du darfst verfeinern): axiome/" + hint + "\n")
+		b.WriteString("Vorgeschlagene Oberkategorie (Ausgangspunkt, du darfst verfeinern): " + ns + "/" + hint + "\n")
 	}
 	b.WriteString("\n")
 
+	b.WriteString("Ordne nach INHALT und THEMA ein: Wähle die Kategorie, deren bestehende Einträge dem neuen ")
+	b.WriteString("Eintrag inhaltlich am nächsten stehen — orientiere dich an der Bedeutung, nicht an einzelnen ")
+	b.WriteString("Stichworten. Weiche NICHT auf eine generische Kategorie (etwa prozess, unsortiert, allgemein) ")
+	b.WriteString("aus, wenn eine speziellere thematisch passt. Lege nur dann eine neue Kategorie an, wenn wirklich ")
+	b.WriteString("keine bestehende passt.\n\n")
+
+	// English-first (Implementierungsregel): category names are structure, so they are English. Mixing
+	// languages is exactly how a tree sprawls into near-duplicate categories.
+	b.WriteString("DUBLETTEN: Prüfe ZUERST, ob einer der oben gelisteten Einträge INHALTLICH dasselbe aussagt — ")
+	b.WriteString("auch wenn Titel und Wortlaut abweichen. Wenn ja, setze duplikat_von auf dessen EXAKTEN Pfad ")
+	b.WriteString("aus der Liste (nicht auf einen erfundenen). Nur wenn der Eintrag inhaltlich wirklich neu ist, ")
+	b.WriteString("lass duplikat_von null.\n\n")
+
+	b.WriteString("KATEGORIENAMEN SIND ENGLISCH (Regel „Implementierung auf Englisch\"): Muss doch einmal eine ")
+	b.WriteString("neue Kategorie entstehen, benenne sie englisch, kleingeschrieben, mit Bindestrichen ")
+	b.WriteString("(z. B. single-source-of-truth, not einzelquelle). Bestehende Kategorien werden NIE umbenannt — ")
+	b.WriteString("nutze sie exakt so, wie sie oben stehen. Erfinde keine Kategorie, die eine bestehende nur ")
+	b.WriteString("übersetzt oder umschreibt.\n\n")
+
 	b.WriteString("Antworte mit GENAU einem JSON-Objekt, ohne Codefence, ohne weiteren Text:\n")
-	b.WriteString(`{"pfad":"axiome/<kategorie>/…/<slug>.md","beschreibung":"<1 Satz, worum es geht>",`)
-	b.WriteString(`"titel":"<knapper Titel>","neue_kategorie":<true|false>,"duplikat_von":<null|"axiome/…/x.md">}` + "\n")
-	b.WriteString("Regeln: pfad beginnt mit axiome/ und endet auf .md; nur Kleinbuchstaben, Ziffern und ")
-	b.WriteString("Bindestriche in jedem Segment (keine Umlaute, keine Leerzeichen, kein CamelCase); 1 bis 5 ")
-	b.WriteString("Kategorieebenen; wähle eine bestehende Kategorie wo möglich; setze duplikat_von, wenn ein ")
-	b.WriteString("inhaltsgleiches Axiom schon existiert.\n")
+	b.WriteString(`{"pfad":"` + ns + `/<kategorie>/…/<slug>.md","beschreibung":"<1 Satz, worum es geht>",`)
+	b.WriteString(`"titel":"<knapper Titel>","neue_kategorie":<true|false>,"duplikat_von":<null|"` + ns + `/…/x.md">}` + "\n")
+	b.WriteString("Regeln: pfad beginnt mit " + ns + "/ und endet auf .md; nur Kleinbuchstaben, Ziffern und ")
+	b.WriteString("Bindestriche in jedem Segment (keine Umlaute, keine Leerzeichen, kein CamelCase); flache ")
+	b.WriteString("Ablage direkt unter " + ns + "/ ist erlaubt; setze neue_kategorie:true NUR bei einer wirklich ")
+	b.WriteString("neuen Kategorie; setze duplikat_von, wenn ein inhaltsgleicher Eintrag schon existiert.\n")
 
 	if correction != "" {
 		b.WriteString("\nKORREKTUR: " + correction + " Antworte erneut mit einem korrigierten JSON-Objekt.\n")
@@ -115,10 +162,11 @@ func ClassifyPrompt(categories []string, titel, body, hint, correction string) s
 	return b.String()
 }
 
-// ParsePlacement extracts and validates the model's JSON. knownCategories is the existing set;
-// a non-new category must be one of them. Returns a typed error whose message doubles as the
-// correction line for a retry.
-func ParsePlacement(output string, knownCategories []string) (Placement, error) {
+// ParsePlacement extracts and validates the model's JSON for a placement in namespace ns.
+// knownCategories is the existing set; a non-new category must be one of them (the namespace root
+// itself always exists, so a top-level record needs no new category). Returns a typed error whose
+// message doubles as the correction line for a retry.
+func ParsePlacement(output string, knownCategories []string, ns string) (Placement, error) {
 	raw, ok := firstJSONObject(output)
 	if !ok {
 		return Placement{}, ErrNoJSON
@@ -128,15 +176,15 @@ func ParsePlacement(output string, knownCategories []string) (Placement, error) 
 		return Placement{}, fmt.Errorf("%w: kein gültiges JSON", ErrInvalidPlacement)
 	}
 	p.Pfad = strings.TrimSpace(p.Pfad)
-	if !pathRe.MatchString(p.Pfad) {
-		return p, fmt.Errorf("%w: pfad %q entspricht nicht ^axiome(/kebab){1,5}/slug.md$", ErrInvalidPlacement, p.Pfad)
+	if !ValidPlacementPath(p.Pfad, ns) {
+		return p, fmt.Errorf("%w: pfad %q muss unter %s/ liegen, nur Kleinbuchstaben/Ziffern/Bindestriche je Segment nutzen und auf .md enden", ErrInvalidPlacement, p.Pfad, ns)
 	}
 	if strings.TrimSpace(p.Beschreibung) == "" {
 		return p, fmt.Errorf("%w: beschreibung fehlt", ErrInvalidPlacement)
 	}
 	if !p.NeueKategorie {
 		parent := p.Pfad[:strings.LastIndex(p.Pfad, "/")]
-		if !contains(knownCategories, parent) {
+		if parent != ns && !contains(knownCategories, parent) {
 			return p, fmt.Errorf("%w: kategorie %q existiert nicht; setze neue_kategorie:true oder wähle eine bestehende", ErrInvalidPlacement, parent)
 		}
 	}
