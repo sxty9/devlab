@@ -112,6 +112,31 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 **Empfehlung:** erst `report` gegen einen echten Lauf testen (erzeugt nur Berichte), dann `pr`
 (Branch + PR, nichts wird gemergt/deployt bis du prüfst), erst dann `full`.
 
+## Aktueller Betriebszustand
+
+Seit **2026-07-20** läuft der Runner scharf im Modus **`pr`** — er analysiert, implementiert,
+pusht einen Branch und öffnet einen Pull Request. Gemergt und deployt wird nichts ohne Prüfung.
+
+| Stellschraube | Wert | Begründung |
+|---|---|---|
+| `DEVLAB_RUNS_MODE` | `pr` | implementiert und öffnet PRs; kein unbeaufsichtigtes Deploy |
+| `DEVLAB_RUNS_MAX_COST_USD` | `50` | ein ungedeckelter Sweep über ~19 Repos wurde auf $150–300 **pro Nacht** geschätzt; die Reststrecke wird per Carry-over fortgesetzt, nicht verworfen |
+| `DEVLAB_RUNS_MAX_DURATION` | `4h` | Start 02:00 → Ende spätestens 06:00 |
+| `DEVLAB_RUNS_AUTOMERGE` | `720h` | 30 Tage Prüffrist, explizit gesetzt statt implizit aus dem Code |
+
+> Der Kostendeckel wirkt nur, wenn der Claude-CLI `total_cost_usd` liefert — bei Abo-Auth kann das
+> `0` sein und der Deckel liefe leer. **Geprüft am 2026-07-20:** ein realer Lauf meldete `$0.8953`,
+> die Kostenmeldung funktioniert und der Deckel greift.
+
+### Voraussetzungen für `full` (noch offen)
+
+`full` ist **nicht** einsatzbereit — der Deploy-Schritt würde für jedes Repo scheitern, weil beides
+fehlt. Vor dem Hochstufen zu erledigen:
+
+1. `sudo install -o root -g root -m 0755 deploy/devlab-deploy /usr/local/sbin/devlab-deploy`
+2. Je Repo ein geprüftes Deploy-Skript nach `/etc/devlab/deploy.d/<repo>` (Vorlage:
+   `deploy/deploy.d.example-devlab`). Ohne Eintrag überspringt der Wrapper das Repo (Exit 3).
+
 ## Kill-Switch / Rückbau
 - `DEVLAB_RUNS_MODE=off` (oder Drop-in entfernen) + `systemctl restart devlabd` → Scheduler aus.
 - Laufender Lauf: „Abbrechen" im UI (`POST /api/mercury/runs/cancel`).
