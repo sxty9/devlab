@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	ctxPerFile   = 24 << 10  // 24 KiB per context file
+	ctxPerFile    = 24 << 10  // 24 KiB per context file
 	ctxRepoBudget = 256 << 10 // 256 KiB repo snapshot (aigentic's claude-cli materializes these to a
 	// temp workdir the CLI reads via Read/Glob/Grep; other engines trim to their own budget)
 )
@@ -41,8 +41,7 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if strings.TrimSpace(body.Prompt) == "" {
-		writeErr(w, http.StatusBadRequest, "Empty prompt")
+	if !requirePrompt(w, body.Prompt) {
 		return
 	}
 	kind := body.Kind

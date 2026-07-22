@@ -8,7 +8,7 @@ import { IconButton } from '@/ui/Button';
 import { useToast } from '@/ui/Toast';
 import { FileTextIcon, PlusIcon, RefreshIcon, SearchIcon } from '@/ui/icons';
 import { gitStatusMeta } from '@/ui/git';
-import { guessLang } from '@/lib/lang';
+import { basename, guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 
 /** Flatten every file (not dir) for the search view. */
@@ -38,7 +38,7 @@ export function ProjectPanel() {
     try {
       await source.saveFile(activeRepo.id, path, '');
       await reloadRepo();
-      openFile({ id: path, name: path.split('/').pop() ?? path, lang: guessLang(path) });
+      openFile({ id: path, name: basename(path), lang: guessLang(path) });
       toast({ title: 'File created', description: path, variant: 'success' });
     } catch (e) {
       toast({ title: 'Create failed', description: String((e as Error)?.message ?? e), variant: 'danger' });

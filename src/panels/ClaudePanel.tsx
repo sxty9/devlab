@@ -5,6 +5,7 @@ import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
 import { ClaudeIcon, PlusIcon, SendIcon } from '@/ui/icons';
 import { renderMarkdown } from '@/lib/markdown';
+import { basename } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { AiMessage, AiModelCatalog } from '@/types';
 
@@ -175,7 +176,7 @@ export function ClaudePanel() {
               className={cn('truncate rounded-sm px-1.5 py-0.5 font-mono text-[11px] transition', includeFile ? 'bg-accent/15 text-accent' : 'bg-fill/10 text-text-tertiary line-through')}
               title={includeFile ? 'Offene Datei priorisiert' : 'Offene Datei nicht priorisiert'}
             >
-              +{activeFile.split('/').pop()}
+              +{basename(activeFile)}
             </button>
           )}
         </div>

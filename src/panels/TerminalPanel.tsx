@@ -7,6 +7,7 @@ import { getDataSource } from '@/data';
 import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
 import { RefreshIcon } from '@/ui/icons';
+import { cn } from '@/lib/cn';
 
 type Status = 'connecting' | 'connected' | 'closed' | 'offline';
 
@@ -180,7 +181,7 @@ export function TerminalPanel() {
         title="Terminal"
         actions={
           <>
-            <span className={`mr-1 text-[11px] ${statusColor[status]}`}>{statusText[status]}</span>
+            <span className={cn('mr-1 text-[11px]', statusColor[status])}>{statusText[status]}</span>
             <IconButton label="Reconnect" onClick={() => setNonce((n) => n + 1)}>
               <RefreshIcon className="h-4 w-4" />
             </IconButton>

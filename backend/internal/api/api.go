@@ -232,7 +232,7 @@ func (s *Server) guardWrite(h http.HandlerFunc) http.HandlerFunc {
 		}
 		u := userFrom(r)
 		if !s.githubLinked(u) {
-			writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+			writeErr(w, http.StatusForbidden, errNoGitHubLink)
 			return
 		}
 		h(w, r)
@@ -302,7 +302,7 @@ func (s *Server) repoPath(w http.ResponseWriter, r *http.Request) (string, bool)
 	if s.v.DevBypass() {
 		p, ok := discover.Path(s.reposBase, id)
 		if !ok {
-			writeErr(w, http.StatusNotFound, "Repository not found")
+			writeErr(w, http.StatusNotFound, errRepoNotFound)
 			return "", false
 		}
 		return p, true
@@ -310,12 +310,12 @@ func (s *Server) repoPath(w http.ResponseWriter, r *http.Request) (string, bool)
 	u := userFrom(r)
 	full, ok := s.resolveFullName(r.Context(), u, id)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Repository not found")
+		writeErr(w, http.StatusNotFound, errRepoNotFound)
 		return "", false
 	}
 	token, err := s.userToken(u)
 	if err != nil {
-		writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+		writeErr(w, http.StatusForbidden, errNoGitHubLink)
 		return "", false
 	}
 	p, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token, !s.v.DevBypass())
@@ -352,6 +352,34 @@ func secureHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// Error details the handlers repeat — single source of truth so the wording stays in step.
+const (
+	errRepoNotFound = "Repository not found"
+	errNoGitHubLink = "Link your GitHub account first"
+	errMissingPath  = "Missing path"
+)
+
+// requireRealGitHub rejects a feature that needs a real per-user GitHub account when running under
+// dev-bypass (the sandbox has no per-user token). Writes a 400 and returns false in that case.
+// `feature` names the plural subject, e.g. "Previews", "Pull requests".
+func (s *Server) requireRealGitHub(w http.ResponseWriter, feature string) bool {
+	if s.v.DevBypass() {
+		writeErr(w, http.StatusBadRequest, feature+" need a linked GitHub account")
+		return false
+	}
+	return true
+}
+
+// requirePrompt writes a 400 and returns false when the prompt is blank — shared by the assistant
+// and agent entry points.
+func requirePrompt(w http.ResponseWriter, prompt string) bool {
+	if strings.TrimSpace(prompt) == "" {
+		writeErr(w, http.StatusBadRequest, "Empty prompt")
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

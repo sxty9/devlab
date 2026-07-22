@@ -64,7 +64,7 @@ func (s *Server) visionUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer unlock()
 	var body struct {
-		Path      string `json:"path"`
+		Path       string `json:"path"`
 		ContentB64 string `json:"contentB64"`
 	}
 	if !decodeJSON(w, r, &body) {

@@ -13,8 +13,7 @@ import (
 // branch is already open it focuses that one instead of erroring — the action is idempotent. Under
 // dev-bypass there is no GitHub token, so it's a no-op 400.
 func (s *Server) openPR(w http.ResponseWriter, r *http.Request) {
-	if s.v.DevBypass() {
-		writeErr(w, http.StatusBadRequest, "Pull requests need a linked GitHub account")
+	if !s.requireRealGitHub(w, "Pull requests") {
 		return
 	}
 	wc, unlock, ok := s.mutateCtx(w, r, true)
@@ -40,7 +39,7 @@ func (s *Server) openPR(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
 	full, ok := s.resolveFullName(r.Context(), u, r.PathValue("id"))
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Repository not found")
+		writeErr(w, http.StatusNotFound, errRepoNotFound)
 		return
 	}
 	base, err := github.DefaultBranch(r.Context(), wc.token, full)

@@ -7,8 +7,8 @@ package model
 type Repo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
-	FullName    string `json:"fullName"`   // owner/repo (GitHub canonical)
-	Kind        string `json:"kind"`       // service | repo | library
+	FullName    string `json:"fullName"` // owner/repo (GitHub canonical)
+	Kind        string `json:"kind"`     // service | repo | library
 	Description string `json:"description"`
 	Language    string `json:"language"`
 	Icon        string `json:"icon"`       // go | ts | rust | python | shell | service | repo | library
@@ -251,12 +251,12 @@ type PullRequestResult struct {
 
 // Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
 type Comment struct {
-	ID        string `json:"id"`
-	Path      string `json:"path"`             // the vision file it's attached to
-	ParentID  string `json:"parentId"`         // "" for a top-level comment, else the parent's id
-	Author    string `json:"author"`           // Linux username (stable authorship key)
-	AuthorName string `json:"authorName"`      // display name at post time
-	Body      string `json:"body"`
-	CreatedAt string `json:"createdAt"`        // RFC3339
-	EditedAt  string `json:"editedAt,omitempty"`
+	ID         string `json:"id"`
+	Path       string `json:"path"`       // the vision file it's attached to
+	ParentID   string `json:"parentId"`   // "" for a top-level comment, else the parent's id
+	Author     string `json:"author"`     // Linux username (stable authorship key)
+	AuthorName string `json:"authorName"` // display name at post time
+	Body       string `json:"body"`
+	CreatedAt  string `json:"createdAt"` // RFC3339
+	EditedAt   string `json:"editedAt,omitempty"`
 }

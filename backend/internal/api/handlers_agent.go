@@ -44,8 +44,7 @@ func (s *Server) agent(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if strings.TrimSpace(body.Prompt) == "" {
-		writeErr(w, http.StatusBadRequest, "Empty prompt")
+	if !requirePrompt(w, body.Prompt) {
 		return
 	}
 	mode := agentModeMap[body.Mode]

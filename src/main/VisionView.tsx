@@ -3,17 +3,8 @@ import { useWorkspace } from '@/state/workspace';
 import { getDataSource } from '@/data';
 import { CommentsThread } from '@/panels/CommentsThread';
 import { renderMarkdown } from '@/lib/markdown';
+import { visionKind } from '@/lib/lang';
 import { LightbulbIcon } from '@/ui/icons';
-import type { VisionFileKind } from '@/types';
-
-function kindOf(name: string): VisionFileKind {
-  const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif', 'bmp', 'ico'].includes(ext)) return 'image';
-  if (ext === 'pdf') return 'pdf';
-  if (ext === 'md' || ext === 'markdown') return 'markdown';
-  if (['txt', 'json', 'yaml', 'yml', 'toml', 'csv', 'ts', 'tsx', 'js', 'go', 'py', 'sh', 'html', 'css'].includes(ext)) return 'text';
-  return 'other';
-}
 
 /** Main-area viewer for a Vision-Catalog file: renders by type (image/pdf/markdown/text) with the
  *  threaded discussion below. Image/PDF stream from the raw byte endpoint; text/markdown reuse the
@@ -21,7 +12,7 @@ function kindOf(name: string): VisionFileKind {
 export function VisionView({ path }: { path: string }) {
   const { activeRepo } = useWorkspace();
   const source = useMemo(() => getDataSource(), []);
-  const kind = kindOf(path);
+  const kind = visionKind(path);
   const rawUrl = source.rawUrl(activeRepo.id, path);
   const [text, setText] = useState<string | null>(null);
 

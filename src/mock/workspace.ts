@@ -1,4 +1,5 @@
 import type { Branch, Change, Commit, FileContent, FileNode, Repo, RepoData, Stage, Tab, TermLine, Worktree } from '@/types';
+import { basename } from '@/lib/lang';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Phase-1 mock workspace. Realistic but entirely local — selecting a repo/branch
@@ -531,7 +532,7 @@ function minimalRepo(opts: {
     worktrees: [{ branch: 'main', note: 'this window', current: true }],
     vision: [
       { id: 'v1', title: opts.claudeAsk.replace(/\.$/, ''), kind: 'spec', summary: opts.claudeReply, state: 'active', updated: '1h ago' },
-      { id: 'v2', title: `${opts.feature.split('/').pop()} plan`, kind: 'note', summary: 'Scoped from the feature branch; details captured here.', state: 'pending', updated: 'yesterday' },
+      { id: 'v2', title: `${basename(opts.feature)} plan`, kind: 'note', summary: 'Scoped from the feature branch; details captured here.', state: 'pending', updated: 'yesterday' },
     ],
     claude: [
       { id: 'c1', role: 'user', text: opts.claudeAsk, ts: '11:40' },

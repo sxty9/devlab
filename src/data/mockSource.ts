@@ -1,6 +1,6 @@
 import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
-import { guessLang } from '@/lib/lang';
+import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
 
 function stub(path: string): FileContent {
@@ -114,14 +114,14 @@ export const mockSource: DataSource = {
     return mockVision(id);
   },
   rawUrl(_id, path): string {
-    const label = path.split('/').pop() ?? 'file';
+    const label = basename(path) || 'file';
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300"><rect width="100%" height="100%" fill="#1e2230"/><text x="50%" y="50%" fill="#8b93a7" font-family="sans-serif" font-size="15" text-anchor="middle">${label} (mock)</text></svg>`;
     return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
   },
   async uploadVision(id, path, _contentB64): Promise<VisionFile[]> {
-    const name = path.split('/').pop() ?? path;
+    const name = basename(path);
     const list = mockVision(id);
-    if (!list.some((f) => f.path === path)) list.push({ path, name, kind: mockKind(name), size: 1024, status: 'untracked' });
+    if (!list.some((f) => f.path === path)) list.push({ path, name, kind: visionKind(name), size: 1024, status: 'untracked' });
     return list;
   },
   async deleteVision(id, path): Promise<VisionFile[]> {
@@ -219,15 +219,6 @@ export const mockSource: DataSource = {
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};
 const aiStore: Record<string, AiMessage[]> = {};
-
-function mockKind(name: string): VisionFile['kind'] {
-  const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : '';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) return 'image';
-  if (ext === 'pdf') return 'pdf';
-  if (ext === 'md' || ext === 'markdown') return 'markdown';
-  if (['txt', 'json', 'yaml', 'yml'].includes(ext)) return 'text';
-  return 'other';
-}
 
 function mockVision(id: string): VisionFile[] {
   if (!visionStore[id]) {
