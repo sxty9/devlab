@@ -631,7 +631,9 @@ function RepoBlock({ repo }: { repo: RepoResult }) {
 
       {repo.error && <p className="mt-2 rounded-md bg-danger/10 px-2.5 py-1.5 text-caption text-danger">{repo.error}</p>}
 
-      {repo.steps.length > 0 && (
+      {/* Steps can be null when a repo failed before any step ran (clone/network) — the backend
+          marshals the empty slice as null. Guard it, else `null.length` blanks the whole view. */}
+      {repo.steps && repo.steps.length > 0 && (
         <div className="mt-3 flex flex-col gap-1.5 border-t border-separator pt-3">
           {repo.steps.map((step, i) => (
             <StepRow key={`${step.name}:${i}`} step={step} />

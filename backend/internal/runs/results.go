@@ -24,6 +24,11 @@ type Result struct {
 	UpdatedAt  time.Time    `json:"updatedAt,omitempty"`
 	FinishedAt time.Time    `json:"finishedAt,omitempty"`
 	PromptHash string       `json:"promptHash,omitempty"`
+	// Mode is the safety-ladder mode (report | pr | full) this execution was started under. A resume
+	// must not continue a husk from a DIFFERENT mode: a report husk marks repos "done" after mere
+	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
+	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
+	Mode       string       `json:"mode,omitempty"`
 	OK         bool         `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
@@ -140,14 +145,12 @@ func (res Result) DoneRepos() map[string]bool {
 	return done
 }
 
-// FindStranded returns the newest execution of a run that was interrupted mid-flight — never finished
-// (FinishedAt zero) and not paused on the usage limit (Suspended false) — provided it started at or
-// after notBefore. That is the signature of a run killed by a devlabd restart / crash: the scheduler
-// advanced NextFireAt before executing, so the next fire would otherwise start a FRESH execution and
-// re-implement every repo into a duplicate PR set. Resuming this result instead skips the repos it had
-// already completed. notBefore bounds it so a long-dead result after extended downtime is not
-// resurrected. ok=false when there is nothing to resume.
-func (r *Results) FindStranded(runID string, notBefore time.Time) (Result, bool) {
+// newestHusk returns the newest unfinished (FinishedAt zero) execution of a run worked at or after
+// notBefore. includeSuspended decides whether a usage-limit-suspended husk counts. Recency is bounded
+// by last activity (UpdatedAt), not the frozen StartedAt, so a carry-over touched every night stays
+// eligible however many nights it spans while a truly abandoned husk ages out (older files predating
+// UpdatedAt fall back to StartedAt). Shared by FindStranded and FindResumable.
+func (r *Results) newestHusk(runID string, notBefore time.Time, includeSuspended bool) (Result, bool) {
 	dir := filepath.Join(r.dir, runID)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -163,12 +166,12 @@ func (r *Results) FindStranded(runID string, notBefore time.Time) (Result, bool)
 		if err != nil {
 			continue
 		}
-		if !res.FinishedAt.IsZero() || res.Suspended {
-			continue // finished, or a live suspension (handled by the normal resume path)
+		if !res.FinishedAt.IsZero() {
+			continue // already finished
 		}
-		// Bound by last activity (UpdatedAt), not the frozen StartedAt: a carry-over touched every night
-		// stays eligible however many nights it spans, while a truly abandoned husk ages out. Older files
-		// predating UpdatedAt fall back to StartedAt.
+		if res.Suspended && !includeSuspended {
+			continue // a live suspension owned by the run.Suspended pointer path
+		}
 		touched := res.UpdatedAt
 		if touched.IsZero() {
 			touched = res.StartedAt
@@ -181,6 +184,27 @@ func (r *Results) FindStranded(runID string, notBefore time.Time) (Result, bool)
 		}
 	}
 	return best, found
+}
+
+// FindStranded returns the newest execution of a run that was interrupted mid-flight — never finished
+// (FinishedAt zero) and not paused on the usage limit (Suspended false) — provided it was worked at or
+// after notBefore. That is the signature of a run killed by a devlabd restart / crash: the scheduler
+// advanced NextFireAt before executing, so the next fire would otherwise start a FRESH execution and
+// re-implement every repo into a duplicate PR set. Resuming this result instead skips the repos it had
+// already completed. notBefore bounds it so a long-dead result after extended downtime is not
+// resurrected. ok=false when there is nothing to resume.
+func (r *Results) FindStranded(runID string, notBefore time.Time) (Result, bool) {
+	return r.newestHusk(runID, notBefore, false)
+}
+
+// FindResumable is FindStranded PLUS orphaned usage-limit suspensions: an execution that suspended on
+// the limit but whose run lost its Suspended pointer (e.g. a devlabd restart landed between writing the
+// result and patching the run) would otherwise NEVER resume — it is skipped by FindStranded and no
+// pointer references it, so it freezes forever, stranding its spend. Including suspended husks here lets
+// the next fire pick it up and continue the not-yet-done repos, self-healing the lost pointer. A healthy
+// suspension (pointer intact) is resumed by resumeOrNew's pointer check first and never reaches here.
+func (r *Results) FindResumable(runID string, notBefore time.Time) (Result, bool) {
+	return r.newestHusk(runID, notBefore, true)
 }
 
 // Get returns one result document.

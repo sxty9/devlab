@@ -75,3 +75,50 @@ func TestFindStranded(t *testing.T) {
 		t.Errorf("FindStranded newest-wins: got %q ok=%v, want \"newer\"", got.ResultID, ok)
 	}
 }
+
+// TestFindResumableIncludesOrphanedSuspension pins the freeze-bug fix: an execution suspended on the
+// usage limit whose run lost its Suspended pointer must still be resumable (FindResumable), so it is
+// continued on the next fire instead of freezing forever with its spend stranded — while FindStranded
+// keeps ignoring suspended husks (that path owns only crash/carry-over husks).
+func TestFindResumableIncludesOrphanedSuspension(t *testing.T) {
+	dir := t.TempDir()
+	resDir := filepath.Join(dir, "res")
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", resDir)
+	res := NewResults()
+	now := time.Now().UTC()
+	zero := time.Time{}
+
+	writeRaw := func(runID, id string, started, updated, finished time.Time, suspended bool) {
+		r := Result{RunID: runID, ResultID: id, StartedAt: started, UpdatedAt: updated,
+			FinishedAt: finished, Suspended: suspended, Repos: []RepoResult{}}
+		b, _ := json.Marshal(r)
+		d := filepath.Join(resDir, runID)
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, id+".json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A lone suspended husk, worked recently: FindStranded ignores it, FindResumable recovers it.
+	writeRaw("run_s", "susp", now.Add(-30*time.Minute), now.Add(-10*time.Minute), zero, true)
+	if _, ok := res.FindStranded("run_s", now.Add(-12*time.Hour)); ok {
+		t.Error("FindStranded must NOT pick up a suspended husk")
+	}
+	if got, ok := res.FindResumable("run_s", now.Add(-12*time.Hour)); !ok || got.ResultID != "susp" {
+		t.Errorf("FindResumable must recover an orphaned suspension: got %q ok=%v", got.ResultID, ok)
+	}
+
+	// Still bounded by the window: an abandoned suspended husk ages out.
+	writeRaw("run_old", "stale", now.Add(-48*time.Hour), now.Add(-48*time.Hour), zero, true)
+	if _, ok := res.FindResumable("run_old", now.Add(-12*time.Hour)); ok {
+		t.Error("FindResumable must age out a suspended husk untouched past the window")
+	}
+
+	// A finished result is never resumable, suspended flag notwithstanding.
+	writeRaw("run_fin", "done", now.Add(-20*time.Minute), now.Add(-5*time.Minute), now, true)
+	if _, ok := res.FindResumable("run_fin", now.Add(-12*time.Hour)); ok {
+		t.Error("FindResumable must ignore a finished result")
+	}
+}

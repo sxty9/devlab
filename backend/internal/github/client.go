@@ -219,6 +219,11 @@ type PullRequest struct {
 	State   string `json:"state"`
 	Merged  bool   `json:"merged"` // only populated by GetPullRequest (single-PR GET), not the list endpoint
 	Title   string `json:"title"`
+	// Head is the source branch of the PR. The list endpoint populates it; the dedup check keys on
+	// Head.Ref to recognise a still-open Mercury run branch (prefix "mercury-run/").
+	Head struct {
+		Ref string `json:"ref"`
+	} `json:"head"`
 }
 
 // DefaultBranch returns a repo's default branch — the natural PR base.
@@ -322,6 +327,23 @@ func MergePullRequest(ctx context.Context, token, fullName string, number int) e
 		return fmt.Errorf("github: PR %d wurde nicht gemergt", number)
 	}
 	return nil
+}
+
+// ListOpenPullRequests returns the open PRs on fullName (newest first, first page — up to 100).
+// Each PR carries its Head.Ref, so the caller can tell a Mercury run branch from a human one. Used by
+// the dedup guard: a repo whose Mercury work is still an open PR must not be re-implemented into a
+// duplicate PR — the un-merged PR is treated as already productive.
+func ListOpenPullRequests(ctx context.Context, token, fullName string) ([]PullRequest, error) {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return nil, fmt.Errorf("github: bad repo %q", fullName)
+	}
+	q := url.Values{"state": {"open"}, "per_page": {"100"}, "sort": {"created"}, "direction": {"desc"}}
+	var prs []PullRequest
+	if _, err := do(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/pulls?"+q.Encode(), &prs); err != nil {
+		return nil, err
+	}
+	return prs, nil
 }
 
 // FindOpenPullRequest returns the open PR whose head is `head` on fullName, if one exists (so the

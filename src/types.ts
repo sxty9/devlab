@@ -451,7 +451,7 @@ export interface RepoResult {
   ok: boolean;
   deployed: boolean;
   prUrl?: string;
-  steps: RunStep[];
+  steps: RunStep[] | null; // null when the repo failed before any step ran (Go marshals the empty slice as null)
   error?: string;
   inputTokens?: number;
   outputTokens?: number;
