@@ -63,7 +63,9 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(csrfCookie); err == nil {
 		csrf = c.Value
 	}
-	req := aigentic.Request{Prompt: prompt, Inline: inline, OutputFormat: "markdown", Model: body.Model, Claude: claude}
+	// Interactive: let the model answer with a structured multiple-choice question the user can click
+	// (surfaced on result.Ask, rendered as options in the KI panel bubble).
+	req := aigentic.Request{Prompt: prompt, Inline: inline, OutputFormat: "markdown", Model: body.Model, Claude: claude, Interactive: true}
 	result, status, err := aigentic.Run(r.Context(), r.Header.Get("Cookie"), csrf, kind, req)
 	if err != nil {
 		if status == http.StatusForbidden {
@@ -77,7 +79,7 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "AI request failed")
 		return
 	}
-	reply := model.AssistantReply{Output: result.Output, Engine: result.Engine, Model: result.Model}
+	reply := model.AssistantReply{Output: result.Output, Engine: result.Engine, Model: result.Model, Ask: result.Ask}
 	reply.Usage.InputTokens = result.Usage.InputTokens
 	reply.Usage.OutputTokens = result.Usage.OutputTokens
 	reply.Usage.TotalTokens = result.Usage.TotalTokens
@@ -102,13 +104,27 @@ func buildPrompt(repo string, history []model.AiMessage, prompt string) string {
 		}
 		b.WriteString(label)
 		b.WriteString(": ")
-		b.WriteString(m.Content)
+		b.WriteString(aiMsgText(m))
 		b.WriteString("\n\n")
 	}
 	b.WriteString("User: ")
 	b.WriteString(prompt)
 	b.WriteString("\n\nAssistant:")
 	return b.String()
+}
+
+// aiMsgText is a history turn's text for the re-sent transcript. An assistant turn that was ONLY a
+// structured question (no prose) still needs words so the model keeps context; fall back to the
+// question text.
+func aiMsgText(m model.AiMessage) string {
+	if m.Content != "" || m.Ask == nil {
+		return m.Content
+	}
+	qs := make([]string, 0, len(m.Ask.Questions))
+	for _, q := range m.Ask.Questions {
+		qs = append(qs, q.Question)
+	}
+	return strings.Join(qs, "\n")
 }
 
 // collectRepoContext packs the open repo as context: a REPO_FILES.txt listing every path, then the

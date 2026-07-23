@@ -211,6 +211,31 @@ type AiMessage struct {
 	Role    string `json:"role"` // user | assistant
 	Content string `json:"content"`
 	Ts      string `json:"ts"`
+	// Ask is a structured question the assistant posed on an interactive turn; the SPA renders it
+	// as clickable options. Persisted so it survives a reload (only the last turn stays live).
+	Ask *AiAsk `json:"ask,omitempty"`
+}
+
+// AiAsk is a structured multiple-choice question the AI posed, rendered as clickable options in the
+// chat bubble (à la Claude Code). It is aigentic's "interactive" protocol shape, surfaced verbatim;
+// this package owns the DTO so both the reply and the persisted transcript reference one definition.
+type AiAsk struct {
+	Questions []AiAskQuestion `json:"questions"`
+}
+
+// AiAskQuestion is one question: a short header chip, the question text, the offered options, and
+// whether several may be chosen together.
+type AiAskQuestion struct {
+	Header      string        `json:"header,omitempty"`
+	Question    string        `json:"question"`
+	Options     []AiAskOption `json:"options"`
+	MultiSelect bool          `json:"multiSelect,omitempty"`
+}
+
+// AiAskOption is one offered choice: a short label plus an optional one-line description.
+type AiAskOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
 }
 
 // AssistantReply is what DevLab returns to the SPA after proxying an aigentic run.
@@ -224,6 +249,8 @@ type AssistantReply struct {
 		TotalTokens  int  `json:"totalTokens"`
 		Truncated    bool `json:"truncated"`
 	} `json:"usage"`
+	// Ask is set when the model replied with a structured question instead of (or alongside) prose.
+	Ask *AiAsk `json:"ask,omitempty"`
 }
 
 // AgentReply is what DevLab returns after a FULL agentic claude run in the user's workspace.
