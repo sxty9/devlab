@@ -5,7 +5,7 @@ import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { RocketIcon, PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import type { Run, RunInput, RunResultRef, RunResult, RepoResult, RunStep, Repo, RunCalendar } from '@/types';
+import type { Run, RunInput, RunTarget, RunResultRef, RunResult, RepoResult, RunStep, Repo, RunCalendar } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
@@ -30,11 +30,22 @@ function fmtDateTime(iso?: string): string {
 const fmtNum = (n: number) => n.toLocaleString('de-DE');
 const fmtCost = (n: number) => `$${n.toFixed(4)}`;
 
-/** A ToDo's single target: an existing Holistic repo, or a repo to be created. */
+/** A ToDo's destinations, normalizing a legacy single-target record into the list — existing repos by
+ *  display name, to-be-created ones prefixed "neu:". */
+function targetsOf(todo: Run): RunTarget[] {
+  if (todo.targets?.length) return todo.targets;
+  if (todo.newRepo || todo.repo) return [{ repo: todo.repo, newRepo: todo.newRepo }];
+  return [];
+}
+
+function targetLabels(todo: Run, repos: Repo[]): string[] {
+  return targetsOf(todo).map((t) => (t.newRepo ? `neu: ${t.newRepo}` : repos.find((r) => r.id === t.repo)?.name ?? t.repo ?? '—'));
+}
+
+/** A one-line summary of a ToDo's targets (— when none). */
 function targetLabel(todo: Run, repos: Repo[]): string {
-  if (todo.newRepo) return `neu: ${todo.newRepo}`;
-  if (todo.repo) return repos.find((r) => r.id === todo.repo)?.name ?? todo.repo;
-  return '—';
+  const labels = targetLabels(todo, repos);
+  return labels.length ? labels.join(', ') : '—';
 }
 
 /** A ToDo without a due date only ever runs on demand. */
@@ -687,8 +698,23 @@ function StepRow({ step }: { step: RunStep }) {
   );
 }
 
-/** Create/update form for a ToDo: name, the free-text task, the single target (existing repo OR a
- *  new one), the optional one-time due date, and the active flag. */
+/** One editable target row: an existing repo, or a new one to create. Mapped to a RunTarget on save. */
+type TargetRow = { kind: 'existing' | 'new'; repo: string; newRepo: string };
+
+/** The target rows a ToDo opens with: its stored targets (or a legacy single target folded in), else
+ *  one empty existing-repo row to start from. */
+function initialTargetRows(base: Run | null): TargetRow[] {
+  const targets = base ? targetsOf(base) : [];
+  if (targets.length === 0) return [{ kind: 'existing', repo: '', newRepo: '' }];
+  return targets.map((t) =>
+    t.newRepo ? { kind: 'new' as const, repo: '', newRepo: t.newRepo } : { kind: 'existing' as const, repo: t.repo ?? '', newRepo: '' },
+  );
+}
+
+const rowValid = (r: TargetRow) => (r.kind === 'existing' ? r.repo.trim().length > 0 : NEW_REPO_RE.test(r.newRepo.trim()));
+
+/** Create/update form for a ToDo: name, the free-text task, one or more targets (each an existing repo
+ *  or a new one to create), the optional one-time due date, and the active flag. */
 function TodoEditor({
   base,
   repos,
@@ -704,9 +730,7 @@ function TodoEditor({
   const { toast } = useToast();
   const [name, setName] = useState(base?.name ?? '');
   const [task, setTask] = useState(base?.task ?? '');
-  const [targetKind, setTargetKind] = useState<'existing' | 'new'>(base?.newRepo ? 'new' : 'existing');
-  const [repoId, setRepoId] = useState(base?.repo ?? '');
-  const [newRepo, setNewRepo] = useState(base?.newRepo ?? '');
+  const [rows, setRows] = useState<TargetRow[]>(() => initialTargetRows(base));
   // New ToDos get a sensible default Termin (next full hour); editing preserves the stored one
   // exactly — including "no Termin" (manual), which must never silently gain a schedule.
   const [due, setDue] = useState(() => (base ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
@@ -717,12 +741,14 @@ function TodoEditor({
   // Pinned at mount so the picker's floor is stable while the form is open; save() re-checks live.
   const minDue = useMemo(() => nowLocalInput(), []);
 
-  const newRepoOk = NEW_REPO_RE.test(newRepo.trim());
-  const targetOk = targetKind === 'existing' ? repoId.trim().length > 0 : newRepoOk;
+  const targetsOk = rows.length > 0 && rows.every(rowValid);
+  const setRow = (i: number, patch: Partial<TargetRow>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const addRow = () => setRows((rs) => [...rs, { kind: 'existing', repo: '', newRepo: '' }]);
+  const removeRow = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i));
   // A Termin in the past would never fire (a ToDo runs once, at its due moment). Both strings are
   // zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is a chronological one.
   const dueInPast = due !== '' && due < minDue;
-  const valid = name.trim().length > 0 && task.trim().length > 0 && targetOk && !dueInPast;
+  const valid = name.trim().length > 0 && task.trim().length > 0 && targetsOk && !dueInPast;
 
   const save = async () => {
     if (!valid || busy) return;
@@ -734,14 +760,16 @@ function TodoEditor({
       return;
     }
     setBusy(true);
-    // Exactly one target: the backend rejects both-or-neither, so only ever send the chosen one.
+    // One or more targets: each row is exactly an existing repo OR a new one. The backend re-validates
+    // and collapses duplicates.
+    const targets: RunTarget[] = rows.map((r) => (r.kind === 'existing' ? { repo: r.repo.trim() } : { newRepo: r.newRepo.trim() }));
     const body: RunInput = {
       name: name.trim(),
       type: 'todo',
       enabled,
       task: task.trim(),
       dueAt: dueIso,
-      ...(targetKind === 'existing' ? { repo: repoId.trim() } : { newRepo: newRepo.trim() }),
+      targets,
     };
     try {
       const saved = base ? await source.mercuryUpdateRun(base.id, body) : await source.mercuryCreateRun(body);
@@ -785,61 +813,80 @@ function TodoEditor({
       </div>
 
       <div>
-        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ziel</p>
-        <div className="flex flex-col gap-3 rounded-card border border-separator bg-surface p-3">
-          <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-            {(
-              [
-                { id: 'existing', label: 'Vorhandenes Repo' },
-                { id: 'new', label: 'Neues Repo anlegen' },
-              ] as const
-            ).map((opt) => (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => setTargetKind(opt.id)}
-                className={cn(
-                  'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                  targetKind === opt.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ziele</p>
+        <div className="flex flex-col gap-2">
+          {rows.map((row, i) => (
+            <div key={i} className="flex flex-col gap-2 rounded-card border border-separator bg-surface p-3">
+              <div className="flex items-center gap-2">
+                <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
+                  {(
+                    [
+                      { id: 'existing', label: 'Vorhandenes Repo' },
+                      { id: 'new', label: 'Neues Repo anlegen' },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setRow(i, { kind: opt.id })}
+                      className={cn(
+                        'rounded px-3 py-1 text-caption font-medium transition duration-fast',
+                        row.kind === opt.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
+                      )}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex-1" />
+                {rows.length > 1 && (
+                  <Button variant="ghost" size="sm" onClick={() => removeRow(i)}>
+                    Entfernen
+                  </Button>
                 )}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
+              </div>
 
-          {targetKind === 'existing' ? (
-            <>
-              <select
-                value={repoId}
-                onChange={(e) => setRepoId(e.target.value)}
-                className="w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
-              >
-                <option value="">Repo wählen…</option>
-                {sortedRepos.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.name} ({r.fullName})
-                  </option>
-                ))}
-              </select>
-              {sortedRepos.length === 0 && <p className="text-caption text-text-tertiary">Keine Repos verfügbar.</p>}
-              {repoId.trim().length === 0 && <p className="text-caption text-danger">Wähle ein Repo.</p>}
-            </>
-          ) : (
-            <>
-              <input
-                value={newRepo}
-                onChange={(e) => setNewRepo(e.target.value)}
-                placeholder="mein-neuer-service"
-                className="w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 font-mono text-footnote text-text-primary outline-none focus:border-accent/50"
-              />
-              {!newRepoOk && (
-                <p className="text-caption text-danger">
-                  Ungültiger Repo-Name (erlaubt: Buchstaben, Ziffern, Punkt, Unterstrich, Bindestrich; max. 100 Zeichen).
-                </p>
+              {row.kind === 'existing' ? (
+                <>
+                  <select
+                    value={row.repo}
+                    onChange={(e) => setRow(i, { repo: e.target.value })}
+                    className="w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
+                  >
+                    <option value="">Repo wählen…</option>
+                    {sortedRepos.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.name} ({r.fullName})
+                      </option>
+                    ))}
+                  </select>
+                  {sortedRepos.length === 0 && <p className="text-caption text-text-tertiary">Keine Repos verfügbar.</p>}
+                  {row.repo.trim().length === 0 && <p className="text-caption text-danger">Wähle ein Repo.</p>}
+                </>
+              ) : (
+                <>
+                  <input
+                    value={row.newRepo}
+                    onChange={(e) => setRow(i, { newRepo: e.target.value })}
+                    placeholder="mein-neuer-service"
+                    className="w-full rounded-md border border-separator bg-surface px-2.5 py-1.5 font-mono text-footnote text-text-primary outline-none focus:border-accent/50"
+                  />
+                  {!rowValid(row) && (
+                    <p className="text-caption text-danger">
+                      Ungültiger Repo-Name (erlaubt: Buchstaben, Ziffern, Punkt, Unterstrich, Bindestrich; max. 100 Zeichen).
+                    </p>
+                  )}
+                </>
               )}
-            </>
-          )}
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={addRow}
+            className="flex w-fit items-center gap-1 rounded-md px-1 py-1 text-caption font-medium text-accent transition duration-fast hover:text-accent/80"
+          >
+            <PlusIcon className="h-3.5 w-3.5" /> Weiteres Ziel
+          </button>
         </div>
       </div>
 
