@@ -301,6 +301,19 @@ export const httpSource: DataSource = {
   async mercuryCancelRun() {
     await json<void>(await post('/api/mercury/runs/cancel', {}));
   },
+  async mercuryUploadAttachment(id, filename, contentB64) {
+    return json<{ attachments: import('@/types').RunAttachment[] }>(
+      await post(`/api/mercury/runs/${enc(id)}/attachments`, { filename, contentB64 }),
+    ).then((r) => r.attachments);
+  },
+  async mercuryDeleteAttachment(id, attachmentId) {
+    return json<{ attachments: import('@/types').RunAttachment[] }>(
+      await request(`/api/mercury/runs/${enc(id)}/attachments/${enc(attachmentId)}`, withCsrf({ method: 'DELETE' })),
+    ).then((r) => r.attachments);
+  },
+  mercuryAttachmentRawUrl(id, attachmentId) {
+    return `/api/mercury/runs/${enc(id)}/attachments/${enc(attachmentId)}/raw`;
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */

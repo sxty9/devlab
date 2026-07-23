@@ -27,17 +27,18 @@ const version = "0.1.0"
 // Server wires the verifier + repo base + per-user GitHub link store + workspace manager into
 // HTTP handlers.
 type Server struct {
-	v          *auth.Verifier
-	reposBase  string
-	links      *links.Store // nil when no encryption key is configured (dev/preview sandbox)
-	workspaces *workspace.Manager
-	comments   *comments.Store // nil if the comments dir can't be created
-	chats      *chats.Store    // nil if the chats dir can't be created — AI transcript persistence
-	runs       *runs.Store     // Mercury's Automatische Läufe — run instances + config history
-	runResults *runs.Results   // per-execution results/logs (written by the executor, read here)
-	runPRs     *runs.PRStore   // run-created PRs awaiting merge (auto-merge after the window)
-	scheduler  *runs.Scheduler // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
-	staticDir  string          // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
+	v           *auth.Verifier
+	reposBase   string
+	links       *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	workspaces  *workspace.Manager
+	comments    *comments.Store       // nil if the comments dir can't be created
+	chats       *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
+	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
+	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
+	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
@@ -65,16 +66,17 @@ func New(v *auth.Verifier) *Server {
 		chatStore = nil
 	}
 	return &Server{
-		v:          v,
-		reposBase:  base,
-		links:      store,
-		workspaces: workspace.NewManager(),
-		comments:   cstore,
-		chats:      chatStore,
-		runs:       runs.NewStore(),
-		runResults: runs.NewResults(),
-		runPRs:     runs.NewPRStore(),
-		staticDir:  os.Getenv("DEVLAB_STATIC_DIR"),
+		v:           v,
+		reposBase:   base,
+		links:       store,
+		workspaces:  workspace.NewManager(),
+		comments:    cstore,
+		chats:       chatStore,
+		runs:        runs.NewStore(),
+		runResults:  runs.NewResults(),
+		runPRs:      runs.NewPRStore(),
+		attachments: runs.NewAttachmentStore(),
+		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
 
@@ -222,6 +224,12 @@ func (s *Server) Handler() http.Handler {
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
 	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
+
+	// ToDo media — images/documents attached to a concrete ToDo, materialized into the agent's
+	// workspace at run time so the AI considers them. Upload/remove mutate (CSRF); raw serves bytes.
+	mux.HandleFunc("POST /api/mercury/runs/{id}/attachments", s.guardCSRF(s.runAttachmentUpload))
+	mux.HandleFunc("GET /api/mercury/runs/{id}/attachments/{aid}/raw", s.guard(s.runAttachmentRaw))
+	mux.HandleFunc("DELETE /api/mercury/runs/{id}/attachments/{aid}", s.guardCSRF(s.runAttachmentDelete))
 
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.

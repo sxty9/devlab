@@ -53,6 +53,17 @@ func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string
 	return byID, idPath, laufregeln, http.StatusOK, nil
 }
 
+// todoAttachmentDescriptors maps a ToDo's stored attachment metadata to the lean descriptors the prompt
+// references (filename + type, never bytes). Shared by snapshot composition (composeInto) and the media
+// handlers so the prompt's view of the attachments has one definition.
+func todoAttachmentDescriptors(atts []runs.Attachment) []mercury.TodoAttachment {
+	out := make([]mercury.TodoAttachment, 0, len(atts))
+	for _, a := range atts {
+		out = append(out, mercury.TodoAttachment{Filename: a.Filename, MIME: a.MIME})
+	}
+	return out
+}
+
 func axiomsFor(ids []string, byID map[string]mercury.RunAxiom) []mercury.RunAxiom {
 	out := make([]mercury.RunAxiom, 0, len(ids))
 	for _, id := range ids {
@@ -77,10 +88,11 @@ func titleLegend(byID map[string]mercury.RunAxiom) map[string]string {
 func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) {
 	run.PromptAt = now
 	if run.IsTodo() {
-		// The stored snapshot is the target-agnostic base (the task itself). A ToDo can now reach several
-		// repos at once, some newly created, so the "this repo is new — scaffold it" note is per-target
-		// and is composed at execution time (see the executor), not baked into one shared snapshot.
-		run.Prompt = mercury.ComposeTodoPrompt(run.Name, run.Task, "")
+		// The stored snapshot is the target-agnostic base (the task itself plus its attachments, which are
+		// the same across targets). A ToDo can reach several repos at once, some newly created, so the
+		// "this repo is new — scaffold it" note is per-target and is composed at execution time (see the
+		// executor), not baked into one shared snapshot.
+		run.Prompt = mercury.ComposeTodoPrompt(run.Name, run.Task, "", todoAttachmentDescriptors(run.Attachments))
 		run.PromptHash = ""
 		return
 	}
@@ -409,6 +421,10 @@ func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gelöscht werden")
 		return
+	}
+	// The ToDo is gone; drop its attachment blobs too so the passive pool keeps no orphans.
+	if s.attachments != nil {
+		_ = s.attachments.DeleteAll(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

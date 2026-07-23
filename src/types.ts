@@ -357,6 +357,18 @@ export interface RunTarget {
   newRepo?: string;
 }
 
+/** One medium (image, document) attached to a ToDo. The bytes are served raw at the attachment endpoint;
+ *  this is the metadata the list and previews render. The agent takes the media into account at run time. */
+export interface RunAttachment {
+  id: string;
+  filename: string;
+  mime?: string;
+  size: number;
+  sha256?: string;
+  uploadedAt: string;
+  uploadedBy?: string;
+}
+
 /** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
  *  axioms + all Laufregeln (`stale` = that snapshot drifted from the store); a todo's prompt is just
  *  its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
@@ -370,6 +382,7 @@ export interface Run {
   // todo only
   task?: string;
   targets?: RunTarget[]; // one or more destinations (existing and/or newly-created repos)
+  attachments?: RunAttachment[]; // media (images, documents) the agent takes into account
   repo?: string; // deprecated single target — read only for records predating `targets`
   newRepo?: string; // deprecated single new-repo target — read only for legacy records
   dueAt?: string; // optional one-time due date; absent = run it manually

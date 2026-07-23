@@ -88,6 +88,9 @@ export const dataSource: DataSource = {
   mercuryChat: (messages) => impl.mercuryChat(messages),
   mercuryRunNow: (id) => impl.mercuryRunNow(id),
   mercuryCancelRun: () => impl.mercuryCancelRun(),
+  mercuryUploadAttachment: (id, filename, contentB64) => impl.mercuryUploadAttachment(id, filename, contentB64),
+  mercuryDeleteAttachment: (id, attachmentId) => impl.mercuryDeleteAttachment(id, attachmentId),
+  mercuryAttachmentRawUrl: (id, attachmentId) => impl.mercuryAttachmentRawUrl(id, attachmentId),
 };
 
 export function getDataSource(): DataSource {

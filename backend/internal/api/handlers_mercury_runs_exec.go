@@ -209,6 +209,14 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 	}
 	ghLogin, ghID := x.runnerIdentity()
 
+	// A ToDo can carry media (images, documents) the agent must take into account. Read them from the
+	// passive pool once here; each target's workspace gets them materialized (and cleaned) around its
+	// agent call, and the prompt announces them.
+	var todoAtts []loadedAttachment
+	if run.IsTodo() {
+		todoAtts = x.loadAttachments(run)
+	}
+
 	// Cap the whole sweep's wall-clock (belt-and-braces beside the per-repo timeout). A resume inherits
 	// the remaining spend budget via the accumulated res.CostUSD, but a fresh duration budget.
 	if d := maxRunDuration(); d > 0 {
@@ -218,7 +226,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 	}
 	costCeiling := maxCostUSD()
 
-	done := res.DoneRepos()     // repos already handled in a previous attempt (resume skips them)
+	done := res.DoneRepos()          // repos already handled in a previous attempt (resume skips them)
 	overallOK := res.OK || !resuming // seed from the partial result's running state
 	if resuming {
 		overallOK = true
@@ -278,7 +286,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 			carriedOver = true
 			break
 		}
-		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID]), token, ghLogin, ghID)
+		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
 			// do NOT hammer the rest — suspend the whole execution until the window resets.
@@ -391,7 +399,7 @@ type repoLimit struct {
 	hasReset bool
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64) (runs.RepoResult, repoLimit) {
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment) (runs.RepoResult, repoLimit) {
 	rr := runs.RepoResult{Repo: repo.ID}
 	step := func(name, logtxt string, ok bool) {
 		rr.Steps = append(rr.Steps, runs.Step{Name: name, OK: ok, Log: clip(logtxt), At: time.Now().UTC()})
@@ -433,7 +441,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		out, err := ex.Agent(actx, wt, agentArgs(prompt, "plan")...)
+		out, err := x.runAgent(actx, ex, wt, prompt, "plan", atts)
 		if lim := detectLimit(out, err); lim.limited {
 			return rr, lim
 		}
@@ -458,7 +466,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Error = "checkout: " + err.Error()
 		return rr, repoLimit{}
 	}
-	out, err := ex.Agent(actx, wt, agentArgs(prompt, "bypassPermissions")...)
+	out, err := x.runAgent(actx, ex, wt, prompt, "bypassPermissions", atts)
 	if lim := detectLimit(out, err); lim.limited {
 		return rr, lim
 	}
@@ -631,12 +639,83 @@ func findRepo(repos []model.Repo, idOrName string) (model.Repo, bool) {
 
 // promptFor is the prompt one repo of a run receives. An auto run uses its stored snapshot for every
 // repo; a ToDo composes its prompt per target so that ONLY a freshly-created repo (newRepo non-empty)
-// is told to scaffold from scratch, while an existing target is worked as-is.
-func (x *runExecutor) promptFor(run runs.Run, newRepo string) string {
+// is told to scaffold from scratch, while an existing target is worked as-is. A ToDo's attachments are
+// the same across targets and are announced in every target's prompt (they are materialized per repo).
+func (x *runExecutor) promptFor(run runs.Run, newRepo string, atts []loadedAttachment) string {
 	if run.IsTodo() {
-		return mercury.ComposeTodoPrompt(run.Name, run.Task, newRepo)
+		return mercury.ComposeTodoPrompt(run.Name, run.Task, newRepo, attachmentDescriptors(atts))
 	}
 	return run.Prompt
+}
+
+// loadedAttachment is one of a ToDo's media, read from the passive pool and ready to drop into a
+// workspace: its bytes, its workspace-relative destination, and the metadata the prompt references.
+type loadedAttachment struct {
+	rel  string
+	data []byte
+	meta runs.Attachment
+}
+
+// loadAttachments reads a ToDo's media from the pool once per execution. An unreadable blob is a
+// non-blocking skip (logged, left out) rather than a run-stopping error — per the runner's Laufregeln.
+func (x *runExecutor) loadAttachments(run runs.Run) []loadedAttachment {
+	if x.s.attachments == nil {
+		return nil
+	}
+	out := make([]loadedAttachment, 0, len(run.Attachments))
+	for _, a := range run.Attachments {
+		data, err := x.s.attachments.Get(run.ID, a.ID)
+		if err != nil {
+			log.Printf("devlabd: run %s attachment %s (%s) unreadable — skipping: %v", run.ID, a.ID, a.Filename, err)
+			continue
+		}
+		out = append(out, loadedAttachment{rel: mercury.TodoAttachmentRel(a.Filename), data: data, meta: a})
+	}
+	return out
+}
+
+// attachmentDescriptors projects the loaded attachments to the prompt descriptors — so only media that
+// was actually read (and will actually be present in the workspace) is announced to the agent.
+func attachmentDescriptors(atts []loadedAttachment) []mercury.TodoAttachment {
+	out := make([]mercury.TodoAttachment, 0, len(atts))
+	for _, a := range atts {
+		out = append(out, mercury.TodoAttachment{Filename: a.meta.Filename, MIME: a.meta.MIME})
+	}
+	return out
+}
+
+// writeWorkspaceAttachments materializes a ToDo's media into the agent's workspace (under
+// mercury.TodoAttachmentDir) so the agent can open them, and returns a cleanup that removes them again
+// BEFORE anything is committed — the media is CONTEXT, never part of the change set. A workspace is
+// disposable (the next run's ResetToRemote clears any leftover), so cleanup is best-effort.
+func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAttachment) (func(), error) {
+	written := make([]string, 0, len(atts))
+	cleanup := func() {
+		for _, rel := range written {
+			_ = ex.DeleteFile(wt, rel)
+		}
+	}
+	for _, a := range atts {
+		if err := ex.WriteFileBytes(wt, a.rel, a.data); err != nil {
+			cleanup() // roll back partial writes so nothing dangles into the commit
+			return func() {}, err
+		}
+		written = append(written, a.rel)
+	}
+	return cleanup, nil
+}
+
+// runAgent materializes a ToDo's attachments into the workspace, runs the claude CLI, and removes the
+// attachments again as it returns (the deferred cleanup runs the instant the agent finishes, BEFORE
+// executeRepo commits) — so the media reaches the agent yet never leaks into the PR. For an auto run
+// (no attachments) it is exactly the plain agent call.
+func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, atts []loadedAttachment) ([]byte, error) {
+	cleanup, err := writeWorkspaceAttachments(ex, wt, atts)
+	if err != nil {
+		return nil, fmt.Errorf("Medien bereitstellen: %w", err)
+	}
+	defer cleanup()
+	return ex.Agent(actx, wt, agentArgs(prompt, permMode)...)
 }
 
 // deploy runs the root wrapper, which executes ONLY the per-repo vetted allowlist script — the agent

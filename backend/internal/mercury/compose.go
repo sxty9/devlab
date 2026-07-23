@@ -46,10 +46,28 @@ func ComposeRunPrompt(runName string, axioms, laufregeln []RunAxiom) string {
 	return strings.TrimRight(b.String(), "\n") + "\n"
 }
 
+// TodoAttachmentDir is the workspace-relative directory into which the executor materializes a ToDo's
+// media before the agent runs. Kept here so the prompt reference and the executor's write path stay a
+// single source of truth. It is DevLab-internal context, removed again before anything is committed.
+const TodoAttachmentDir = ".mercury/attachments"
+
+// TodoAttachmentRel is the workspace-relative path of one attachment inside a workspace.
+func TodoAttachmentRel(filename string) string {
+	return TodoAttachmentDir + "/" + filename
+}
+
+// TodoAttachment is the descriptor of one attached medium referenced in a ToDo's prompt: enough for the
+// agent to find and recognize the file (its workspace path + declared type), never its bytes.
+type TodoAttachment struct {
+	Filename string
+	MIME     string
+}
+
 // ComposeTodoPrompt builds the prompt for a one-time ToDo: the concrete task itself. No axioms and no
 // Laufregeln are folded in — the constitution already reaches the agent through the repo's CLAUDE.md
-// (that is exactly what the rollout is for), so a ToDo carries only what is specific to it.
-func ComposeTodoPrompt(name, task, newRepo string) string {
+// (that is exactly what the rollout is for), so a ToDo carries only what is specific to it. Attached
+// media, when present, is announced with its workspace location so the agent takes it into account.
+func ComposeTodoPrompt(name, task, newRepo string, attachments []TodoAttachment) string {
 	var b strings.Builder
 	b.WriteString("# Konkretes ToDo: " + strings.TrimSpace(name) + "\n\n")
 	b.WriteString("Du bist der Holistic-Runner und führst eine einmalige, konkrete Aufgabe aus. Die ")
@@ -62,6 +80,20 @@ func ComposeTodoPrompt(name, task, newRepo string) string {
 	}
 	b.WriteString("## Aufgabe\n\n")
 	b.WriteString(strings.TrimSpace(task) + "\n")
+	if len(attachments) > 0 {
+		b.WriteString("\n## Angehängte Medien\n\n")
+		b.WriteString("Diesem ToDo sind Medien beigefügt, die bei der Umsetzung zu berücksichtigen sind. Sie liegen ")
+		b.WriteString("im Arbeitsverzeichnis unter `" + TodoAttachmentDir + "/`. Sichte sie vor der Implementierung ")
+		b.WriteString("und beziehe ihren Inhalt ein. Diese Dateien sind Kontext, NICHT Teil der Aufgabe — verändere ")
+		b.WriteString("oder committe sie nicht.\n\n")
+		for _, a := range attachments {
+			line := "- `" + TodoAttachmentRel(a.Filename) + "`"
+			if strings.TrimSpace(a.MIME) != "" {
+				line += " (" + a.MIME + ")"
+			}
+			b.WriteString(line + "\n")
+		}
+	}
 	return b.String()
 }
 
