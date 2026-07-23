@@ -57,6 +57,19 @@ function localInputToIso(v: string): string | null {
   return d.toISOString();
 }
 
+/** The earliest Termin the picker allows: the current minute. A ToDo runs once at its due moment,
+ *  so a moment already in the past would never fire — the form forbids it. */
+function nowLocalInput(): string {
+  return isoToLocalInput(new Date().toISOString());
+}
+
+/** A sensible default Termin for a fresh ToDo: the next full hour, always comfortably in the future. */
+function defaultDueLocalInput(): string {
+  const d = new Date();
+  d.setHours(d.getHours() + 1, 0, 0, 0);
+  return isoToLocalInput(d.toISOString());
+}
+
 /** Compact input/output token + cost readout, shown wherever an execution/result appears. */
 function TokenStat({ input, output, cost }: { input?: number; output?: number; cost?: number }) {
   if (input == null && output == null && cost == null) return null;
@@ -694,18 +707,32 @@ function TodoEditor({
   const [targetKind, setTargetKind] = useState<'existing' | 'new'>(base?.newRepo ? 'new' : 'existing');
   const [repoId, setRepoId] = useState(base?.repo ?? '');
   const [newRepo, setNewRepo] = useState(base?.newRepo ?? '');
-  const [due, setDue] = useState(isoToLocalInput(base?.dueAt));
+  // New ToDos get a sensible default Termin (next full hour); editing preserves the stored one
+  // exactly — including "no Termin" (manual), which must never silently gain a schedule.
+  const [due, setDue] = useState(() => (base ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
   const [busy, setBusy] = useState(false);
 
   const sortedRepos = useMemo(() => [...repos].sort((a, b) => a.name.localeCompare(b.name, 'de')), [repos]);
+  // Pinned at mount so the picker's floor is stable while the form is open; save() re-checks live.
+  const minDue = useMemo(() => nowLocalInput(), []);
 
   const newRepoOk = NEW_REPO_RE.test(newRepo.trim());
   const targetOk = targetKind === 'existing' ? repoId.trim().length > 0 : newRepoOk;
-  const valid = name.trim().length > 0 && task.trim().length > 0 && targetOk;
+  // A Termin in the past would never fire (a ToDo runs once, at its due moment). Both strings are
+  // zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is a chronological one.
+  const dueInPast = due !== '' && due < minDue;
+  const valid = name.trim().length > 0 && task.trim().length > 0 && targetOk && !dueInPast;
 
   const save = async () => {
     if (!valid || busy) return;
+    // Re-check against a fresh clock: a form left open across the minute boundary must not slip a
+    // past Termin through the mount-pinned floor above.
+    const dueIso = localInputToIso(due);
+    if (dueIso && dueIso < new Date().toISOString()) {
+      toast({ title: 'Der Termin darf nicht in der Vergangenheit liegen.', variant: 'danger' });
+      return;
+    }
     setBusy(true);
     // Exactly one target: the backend rejects both-or-neither, so only ever send the chosen one.
     const body: RunInput = {
@@ -713,7 +740,7 @@ function TodoEditor({
       type: 'todo',
       enabled,
       task: task.trim(),
-      dueAt: localInputToIso(due),
+      dueAt: dueIso,
       ...(targetKind === 'existing' ? { repo: repoId.trim() } : { newRepo: newRepo.trim() }),
     };
     try {
@@ -822,8 +849,12 @@ function TodoEditor({
           <input
             type="datetime-local"
             value={due}
+            min={minDue}
             onChange={(e) => setDue(e.target.value)}
-            className="rounded-md border border-separator bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50"
+            className={cn(
+              'rounded-md border bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50',
+              dueInPast ? 'border-danger' : 'border-separator',
+            )}
           />
           {due && (
             <Button variant="ghost" size="sm" onClick={() => setDue('')}>
@@ -831,9 +862,13 @@ function TodoEditor({
             </Button>
           )}
         </div>
-        <p className="mt-1.5 text-caption text-text-tertiary">
-          {due ? 'Das ToDo läuft einmalig zu diesem Zeitpunkt.' : 'Ohne Termin läuft das ToDo nur über „Jetzt ausführen“.'}
-        </p>
+        {dueInPast ? (
+          <p className="mt-1.5 text-caption text-danger">Der Termin darf nicht in der Vergangenheit liegen.</p>
+        ) : (
+          <p className="mt-1.5 text-caption text-text-tertiary">
+            {due ? 'Das ToDo läuft einmalig zu diesem Zeitpunkt.' : 'Ohne Termin läuft das ToDo nur über „Jetzt ausführen“.'}
+          </p>
+        )}
       </div>
 
       <label className="flex cursor-pointer items-center gap-2.5">
