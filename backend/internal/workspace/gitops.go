@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -147,6 +148,20 @@ func (e Executor) clone(ctx context.Context, wt, url, token string) error {
 // The prompt and flags are passed as argv (exec, not a shell) so there is no injection surface.
 // Long-running; the caller owns the context deadline. stderr is folded into the error on failure.
 func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte, error) {
+	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), nil)
+}
+
+// AgentStream is Agent that ALSO reports stdout line by line as it arrives (via onStdout), so the
+// autonomous runner can be followed live while it works. onStdout receives each raw line with its
+// trailing newline stripped; it must not retain the slice. The FULL stdout is still returned, so the
+// caller parses the final result exactly as in the buffered path. A nil onStdout is exactly Agent.
+func (e Executor) AgentStream(ctx context.Context, wt string, onStdout func([]byte), args ...string) ([]byte, error) {
+	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), onStdout)
+}
+
+// buildAgentCmd constructs the claude CLI invocation (per-user via devlab-exec, or direct under
+// dev-bypass), with its own process group so a cancellation can kill the WHOLE tree.
+func (e Executor) buildAgentCmd(wt string, args ...string) *exec.Cmd {
 	var cmd *exec.Cmd
 	if e.PerUser {
 		full := append([]string{"-n", "-u", e.User, execWrapper, "claude", wt}, args...)
@@ -160,8 +175,19 @@ func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte,
 	// CommandContext: it SIGKILLs only the direct child (sudo), orphaning the long-running claude —
 	// a broken kill-switch that keeps consuming the subscription and holds the run lock.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	return cmd
+}
+
+// runAgentCmd starts cmd, drains its stdout to EOF (streaming each line to onStdout when non-nil), and
+// enforces the process-group kill-switch on ctx cancellation. It returns the FULL stdout captured — even
+// on error or cancel, so the caller keeps whatever the agent produced — and folds stderr into the error.
+// The single implementation behind both Agent (onStdout nil, buffered) and AgentStream (live).
+func runAgentCmd(ctx context.Context, cmd *exec.Cmd, onStdout func([]byte)) ([]byte, error) {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	var stderr bytes.Buffer // an io.Writer (not *os.File) → os/exec drains it in its own goroutine (no deadlock)
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
@@ -191,22 +217,41 @@ func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte,
 		case <-done:
 		}
 	}()
-	err := cmd.Wait()
+
+	// Read to EOF (the process dying closes the pipe). ReadBytes, not bufio.Scanner, so one very large
+	// line — a big tool result in stream-json — never trips a token-size cap. Must finish reading before
+	// Wait() (StdoutPipe closes on exit).
+	var out bytes.Buffer
+	br := bufio.NewReader(stdout)
+	for {
+		line, rerr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			out.Write(line)
+			if onStdout != nil {
+				onStdout(bytes.TrimRight(line, "\r\n"))
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+
+	werr := cmd.Wait()
 	close(done)
-	if err != nil {
+	if werr != nil {
 		if ctx.Err() != nil {
-			return stdout.Bytes(), ctx.Err() // report the cancellation/deadline, not the wait error
+			return out.Bytes(), ctx.Err() // report the cancellation/deadline, not the wait error
 		}
 		s := strings.TrimSpace(stderr.String())
 		if s == "" {
-			s = strings.TrimSpace(stdout.String())
+			s = strings.TrimSpace(out.String())
 		}
 		if s == "" {
-			s = err.Error()
+			s = werr.Error()
 		}
-		return stdout.Bytes(), errors.New(s)
+		return out.Bytes(), errors.New(s)
 	}
-	return stdout.Bytes(), nil
+	return out.Bytes(), nil
 }
 
 // provisionWorkspace creates the user's workspace root (owned by the user) via the root helper.

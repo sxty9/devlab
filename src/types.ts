@@ -461,6 +461,7 @@ export interface RunResultRef {
 
 export interface RunStep {
   name: string; // analyze | implement | push | pr | deploy
+  running?: boolean; // in flight — while true, `log` carries the agent's streaming transcript
   ok: boolean;
   log?: string; // for analyze/implement this is the agent's full report (what was done / blocked)
   at: string;
@@ -468,6 +469,7 @@ export interface RunStep {
 
 export interface RepoResult {
   repo: string;
+  running?: boolean; // the repo currently being worked (only ever set on RunResult.live)
   ok: boolean;
   deployed: boolean;
   prUrl?: string;
@@ -488,10 +490,22 @@ export interface RunResult {
   promptHash?: string;
   ok: boolean;
   repos: RepoResult[];
+  // The repo in flight while the run executes — kept apart from `repos` (which holds only completed
+  // repos) so the live view can show it with its running steps and the agent's streaming output.
+  live?: RepoResult;
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+}
+
+/** The run executing right now, as the server sees it: its id, the live result id, and when it started
+ *  — or null when nothing runs. Read on mount (so a running run survives a page reload) and polled to
+ *  follow a live run. Reflects an actually-running process, so it is empty again after a server restart. */
+export interface RunActive {
+  runId: string;
+  resultId: string;
+  startedAt: string;
 }
 
 /** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */

@@ -6,8 +6,8 @@ import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, EmptyPlaceholder, fmtDateTime } from './MercuryExecutions';
-import type { Run, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
+import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -252,10 +252,11 @@ export default function TodosView() {
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
   const [refreshing, setRefreshing] = useState(false);
 
-  // A ToDo may be executing (started via "Jetzt ausführen"); the cancel affordance appears while so.
-  const [running, setRunning] = useState(false);
+  // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
+  // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
+  const { active, refetch: refetchActive } = useActiveRun();
+  const running = active != null;
   const [cancelling, setCancelling] = useState(false);
-  const runTimeoutRef = useRef<number | null>(null);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
   const reload = useCallback(async () => {
@@ -267,6 +268,14 @@ export default function TodosView() {
       toast({ title: 'ToDos konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // When a run finishes (active clears), refresh so the ToDo's done/last-result state updates.
+  const prevActiveRef = useRef<string | null>(null);
+  useEffect(() => {
+    const cur = active?.runId ?? null;
+    if (prevActiveRef.current && !cur) void reload();
+    prevActiveRef.current = cur;
+  }, [active, reload]);
 
   // First load owns the full-pane error state; a failing repo list only costs the target picker.
   useEffect(() => {
@@ -292,35 +301,19 @@ export default function TodosView() {
     };
   }, [source, toast]);
 
-  useEffect(
-    () => () => {
-      if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-    },
-    [],
-  );
-
-  // Mark a ToDo as in-flight and auto-clear after a ceiling (execution is detached; we can't observe
-  // completion precisely). Cancel or the ceiling ends the "aktiv" banner.
-  const startRunning = useCallback(() => {
-    setRunning(true);
-    if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-    runTimeoutRef.current = window.setTimeout(() => setRunning(false), 180000);
-  }, []);
-
   const cancelRun = useCallback(async () => {
     if (cancelling) return;
     setCancelling(true);
     try {
       await source.mercuryCancelRun();
       toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-      setRunning(false);
+      refetchActive();
     } catch (e) {
       toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setCancelling(false);
     }
-  }, [cancelling, source, toast]);
+  }, [cancelling, source, toast, refetchActive]);
 
   const refresh = useCallback(async () => {
     if (refreshing) return;
@@ -374,9 +367,10 @@ export default function TodosView() {
         key={`${selectedTodo.id}:${selectedTodo.updatedAt}`}
         todo={selectedTodo}
         repos={repos}
+        active={active && active.runId === selectedTodo.id ? active : null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
-        onRunStarted={startRunning}
+        onRunStarted={refetchActive}
         onExecuted={reload}
       />
     );
@@ -508,6 +502,7 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
 function TodoDetail({
   todo,
   repos,
+  active,
   onEdit,
   onDeleted,
   onRunStarted,
@@ -515,6 +510,7 @@ function TodoDetail({
 }: {
   todo: Run;
   repos: Repo[];
+  active: RunActive | null;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRunStarted: () => void;
@@ -526,7 +522,7 @@ function TodoDetail({
   const [runningNow, setRunningNow] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [results, setResults] = useState<RunResultRef[] | null>(null);
-  const pollRef = useRef<number | null>(null);
+  const isLive = active?.runId === todo.id;
   // Poll-detected new results mean the backend finished (and may have checked the ToDo off).
   const countRef = useRef<number | null>(null);
   const onExecutedRef = useRef(onExecuted);
@@ -566,12 +562,12 @@ function TodoDetail({
     };
   }, [source, todo.id]);
 
-  useEffect(
-    () => () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    },
-    [],
-  );
+  // When this ToDo stops being live, pull the finished execution into the list (and check it off).
+  const wasLive = useRef(false);
+  useEffect(() => {
+    if (wasLive.current && !isLive) void refreshResults();
+    wasLive.current = isLive;
+  }, [isLive, refreshResults]);
 
   const del = async () => {
     if (busy || !window.confirm(`ToDo „${todo.name}“ löschen?`)) return;
@@ -592,19 +588,7 @@ function TodoDetail({
     try {
       await source.mercuryRunNow(todo.id);
       toast({ title: 'ToDo gestartet', variant: 'success' });
-      onRunStarted();
-      // Poll this ToDo's executions so a fresh result surfaces while it runs (~2 min ceiling).
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      let ticks = 0;
-      pollRef.current = window.setInterval(() => {
-        ticks += 1;
-        void refreshResults();
-        if (ticks >= 24 && pollRef.current) {
-          window.clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-      }, 5000);
-      void refreshResults();
+      onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
@@ -674,6 +658,11 @@ function TodoDetail({
 
       <section className="mt-6 border-t border-separator pt-4">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ausführungen</p>
+        {isLive && active?.resultId && (
+          <div className="mb-3">
+            <LiveExecution runId={todo.id} resultId={active.resultId} live />
+          </div>
+        )}
         <ExecutionList runId={todo.id} results={results} />
       </section>
     </article>

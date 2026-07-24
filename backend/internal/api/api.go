@@ -209,6 +209,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/history", s.guard(s.runsHistoryList))
 	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
+	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
