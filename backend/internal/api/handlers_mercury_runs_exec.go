@@ -509,23 +509,10 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Steps = append(rr.Steps, runs.Step{Name: name, OK: ok, Log: clip(logtxt), At: time.Now().UTC()})
 	}
 
-	// Dedup — treat an un-merged Mercury PR as already productive: if this repo still has an OPEN Mercury
-	// run PR from an earlier run, do NOT implement again. Re-branching off origin/<default> (which lacks
-	// the un-merged change) and re-running the agent would redo the same work into a DUPLICATE PR. Skip
-	// the repo and point at the pending PR. report mode opens no PRs, so it never dedups. A ToDo is
-	// exempt: it is a concrete task the user explicitly requested against this repo, so an unrelated
-	// axiom-run PR must never suppress it. Placed before the clone so a to-be-skipped repo isn't even
-	// fetched. A lookup error → false (proceed): a genuine outage is then caught as an infra carry-over
-	// at the clone step, not mistaken for "no PR".
-	if x.mode != "report" && !run.IsTodo() {
-		if pr, ok := x.openMercuryPR(ctx, token, repo.FullName); ok {
-			rr.PRUrl = pr.HTMLURL
-			rr.OK = true
-			step("übersprungen", "Offener Mercury-PR "+pr.HTMLURL+" ist noch nicht gemergt — als bereits "+
-				"produktiv behandelt, keine Doppel-Implementierung.", true)
-			return rr, repoSignal{}
-		}
-	}
+	// NOTE: a repo with an open Mercury PR is NEVER skipped. The run proceeds normally; it just bases its
+	// work on main + the still-open pending PRs (see the run-branch setup below), so the agent sees not-yet-
+	// merged work as present and does not redo it, while still implementing whatever a (possibly different-
+	// axiom) run still needs.
 
 	// Clone (first run only; Ensure is a no-op once cloned). Retry a few times on a connectivity blip
 	// before giving up, and tell a network failure apart from a broken repo: a network failure carries
@@ -610,6 +597,41 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Error = "checkout: " + err.Error()
 		return rr, repoSignal{}
 	}
+
+	// Base the run on main + the still-open pending Mercury PRs (NOT a skip). Fold each open Mercury run
+	// branch into this run branch so the agent sees not-yet-merged work as already present and does not
+	// redo it — while still implementing whatever else this (possibly different-axiom) run needs. A PR
+	// branch that no longer merges cleanly is skipped with a logged note; the run still proceeds. ToDos
+	// keep a plain main base (they are explicit, targeted tasks). report mode never reaches here.
+	if !run.IsTodo() {
+		if heads := x.openMercuryPRHeads(ctx, token, repo.FullName); len(heads) > 0 {
+			_ = ex.Fetch(ctx, wt, token) // refresh the pending PR branches before merging
+			merged := 0
+			for _, h := range heads {
+				if h == runBranch {
+					continue
+				}
+				if err := ex.MergeRef(ctx, wt, "origin/"+h); err != nil {
+					step("pending-pr", "offener PR-Branch "+h+" nicht konfliktfrei mergebar — ohne ihn fortgefahren: "+err.Error(), false)
+					continue
+				}
+				merged++
+			}
+			if merged > 0 {
+				step("pending-prs", fmt.Sprintf("Base = main + %d offene(r) Mercury-PR(s) berücksichtigt — keine Doppelarbeit", merged), true)
+			}
+		}
+	}
+
+	// The run's base AFTER folding in the pending PRs. New work is measured against THIS tip (not plain
+	// origin/main), so a run that only re-surfaces already-pending changes contributes nothing new and
+	// opens no redundant PR; only genuine additions from this run get pushed.
+	baseTip, err := ex.RevParse(ctx, wt, "HEAD")
+	if err != nil {
+		rr.Error = "Base-Tip ermitteln: " + err.Error()
+		return rr, repoSignal{}
+	}
+
 	out, err := ex.Agent(actx, wt, agentArgs(run.Prompt, "bypassPermissions")...)
 	if lim := detectLimit(out, err); lim.limited {
 		return rr, lim
@@ -639,13 +661,15 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		}
 	}
 
-	ahead, err := ex.CommitsAhead(ctx, wt, "origin/"+branch)
+	// Measure what THIS run added on top of the base (main + pending PRs), not on top of plain main — so
+	// a run that only reproduced already-pending work contributes nothing new and opens no redundant PR.
+	ahead, err := ex.CommitsAhead(ctx, wt, baseTip)
 	if err != nil {
 		rr.Error = "Commits zählen: " + err.Error()
 		return rr, repoSignal{}
 	}
 	if ahead == 0 {
-		step("implement", "keine Änderungen — nichts zu committen/deployen/pushen", true)
+		step("implement", "keine neuen Änderungen über main + pending PRs hinaus — nichts zu pushen", true)
 		rr.OK = true
 		return rr, repoSignal{}
 	}
@@ -843,21 +867,22 @@ func retryInfra(ctx context.Context, attempts int, backoff time.Duration, op fun
 	return err
 }
 
-// openMercuryPR returns an open PR on fullName whose head is a Mercury run branch (prefix
-// "mercury-run/"), if any — the signal that this repo's Mercury work is still pending review and must
-// not be re-implemented into a duplicate. A lookup error returns false (the caller then proceeds; a
-// genuine outage is caught as an infra carry-over at the clone step, not mistaken for "no PR").
-func (x *runExecutor) openMercuryPR(ctx context.Context, token, fullName string) (github.PullRequest, bool) {
+// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName (prefix
+// "mercury-run/") — the still-pending, not-yet-merged work the run must BASE ON (main + pending), so it
+// neither redoes it nor skips the repo. A lookup error yields no heads (the run then bases on plain main;
+// a genuine outage is caught as an infra carry-over at the clone step).
+func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName string) []string {
 	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
 	if err != nil {
-		return github.PullRequest{}, false
+		return nil
 	}
+	var heads []string
 	for _, pr := range prs {
 		if strings.HasPrefix(pr.Head.Ref, "mercury-run/") {
-			return pr, true
+			heads = append(heads, pr.Head.Ref)
 		}
 	}
-	return github.PullRequest{}, false
+	return heads
 }
 
 // todoTarget resolves a ToDo's single target repo: an existing Holistic repo (by id or name), or a
