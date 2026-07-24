@@ -72,6 +72,36 @@ case "$verb" in
     rm -f -- "$file"
     ;;
 
+  artifact-build)
+    # Build the repo's deployable artifact AS THIS USER (the workspace owner), path-confined to the
+    # workspace root. The autonomous runner builds here and the root deploy wrapper only INSTALLS the
+    # prebuilt result — root NEVER builds agent/repo code (Finding C: an npm postinstall or go build
+    # directive would otherwise run as root). Trust-equivalent to the `claude` verb: it runs the repo's
+    # own npm/go build as this user, which the agent could run anyway. Produces <wt>/.mercury-artifact
+    # holding the Go daemon binary + the built web SPA in web/.
+    wt="${1:-}"; require_under_root "$wt"
+    [ -d "$wt" ] || die "no such workspace: $wt"
+    cd -- "$wt"
+    HOME="$(getent passwd "$SELF" | cut -d: -f6)"; export HOME
+    export USER="$SELF" LOGNAME="$SELF" GIT_TERMINAL_PROMPT=0 CGO_ENABLED=0
+    art="$wt/.mercury-artifact"
+    rm -rf -- "$art"; mkdir -p -- "$art"
+    built=0
+    if [ -f package.json ]; then
+      npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      CI=true npm run build
+      for d in dist build; do
+        if [ -d "$d" ]; then cp -a "$d" "$art/web"; built=1; break; fi
+      done
+    fi
+    if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
+    if [ -n "$gd" ]; then
+      ( cd -- "$gd" && if [ -d cmd ]; then go build -o "$art/" ./cmd/...; else go build -o "$art/" ./...; fi )
+      built=1
+    fi
+    [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod)"
+    ;;
+
   # ── preview verbs (per-user branch previews, driven by the root devlab-preview wrapper) ──
   # These run AS this user, path-confined to the workspace root, so sxgate's preview engine can
   # execute EVERY untrusted step (manifest read, checkout, build, seed) as the user, never root.

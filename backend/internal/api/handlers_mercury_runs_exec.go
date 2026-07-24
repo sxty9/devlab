@@ -936,92 +936,24 @@ func (x *runExecutor) deploy(ctx context.Context, repo model.Repo, artifactDir, 
 	return string(out), nil
 }
 
-// buildArtifact compiles repo's deployable artifact IN ITS WORKSPACE, as the UNPRIVILEGED runner
-// process itself (os/exec as the current user — NEVER root, and never through the deploy wrapper). This
-// is Finding C: building agent-written code as root would be an RCE-to-root — an npm postinstall hook
-// or a go generate step would run as root and could read the root-only prod deploy key. So the
-// privileged wrapper only ever installs a PREBUILT artifact. The result is an artifact directory UNDER
-// the workspace (<wt>/.mercury-artifact): the Go daemon binary plus the built web assets in web/. Its
-// path resolves under /var/lib/devlab/workspaces/, which the root wrapper re-checks with realpath
-// before installing.
-//
-// The recipe mirrors .sxgate/preview.conf: the web SPA (npm ci, or install when there is no lockfile,
-// then npm run build) and the Go backend (CGO_ENABLED=0 go build). Each half runs only when its
-// manifest is present, so a web-only or backend-only service still builds; a present half that fails
-// to build is a hard error (executeRepo treats a dev-deploy build failure as non-fatal upstream).
+// buildArtifact compiles repo's deployable artifact IN ITS WORKSPACE, as the UNPRIVILEGED workspace
+// OWNER (via the pinned per-user devlab-exec artifact-build verb) — NEVER root (Finding C: a build hook
+// would run as root and could read the root-only prod deploy key) and never the devlabd service user
+// (which cannot write the runs-user-owned workspace). The privileged wrapper only ever INSTALLS the
+// prebuilt result. The artifact is <wt>/.mercury-artifact (Go daemon binary + built web SPA in web/); its
+// path resolves under /var/lib/devlab/workspaces/, which the root wrapper re-checks with realpath before
+// installing. The recipe (npm + go build, mirroring .sxgate/preview.conf) lives in the artifact-build
+// verb; a build failure is non-fatal for a dev-deploy (executeRepo continues to push).
 func (x *runExecutor) buildArtifact(ctx context.Context, wt string, repo model.Repo) (string, error) {
-	artifactDir := filepath.Join(wt, ".mercury-artifact")
-	if err := os.RemoveAll(artifactDir); err != nil {
-		return "", fmt.Errorf("Artefakt-Verzeichnis leeren: %w", err)
+	ex := workspace.Executor{User: x.user, PerUser: true}
+	// Build AS THE WORKSPACE OWNER via the pinned per-user devlab-exec wrapper: the runs-user owns the
+	// workspace, and the devlabd service user that runs THIS process cannot write it — and root must
+	// never build (Finding C). The recipe (npm + CGO_ENABLED=0 go build → <wt>/.mercury-artifact with
+	// the daemon binary + web/) lives in the artifact-build verb.
+	if out, err := ex.ArtifactBuild(ctx, wt); err != nil {
+		return "", fmt.Errorf("Artefakt bauen (%s): %v: %s", repo.ID, err, clip(out))
 	}
-	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
-		return "", fmt.Errorf("Artefakt-Verzeichnis anlegen: %w", err)
-	}
-	built := false
-
-	// Web SPA: npm ci (fall back to install when there is no lockfile) then npm run build; collect the
-	// build output (dist/ or build/) into <artifactDir>/web.
-	if fileExists(filepath.Join(wt, "package.json")) {
-		if out, err := x.runBuild(ctx, wt, nil, "npm", "ci", "--no-audit", "--no-fund"); err != nil {
-			if out2, err2 := x.runBuild(ctx, wt, nil, "npm", "install", "--no-audit", "--no-fund"); err2 != nil {
-				return "", fmt.Errorf("npm install: %v: %s", err2, clip(out+out2))
-			}
-		}
-		if out, err := x.runBuild(ctx, wt, []string{"CI=true"}, "npm", "run", "build"); err != nil {
-			return "", fmt.Errorf("npm run build: %v: %s", err, clip(out))
-		}
-		src := ""
-		for _, cand := range []string{"dist", "build"} {
-			if dirExists(filepath.Join(wt, cand)) {
-				src = filepath.Join(wt, cand)
-				break
-			}
-		}
-		if src != "" {
-			if out, err := x.runBuild(ctx, wt, nil, "cp", "-a", src, filepath.Join(artifactDir, "web")); err != nil {
-				return "", fmt.Errorf("Web-Assets sammeln: %v: %s", err, clip(out))
-			}
-			built = true
-		}
-	}
-
-	// Go backend: CGO_ENABLED=0 go build of the command package(s) into the artifact dir. Prefer a
-	// backend/ module (the uniform Holistic layout), else a module at the repo root.
-	goModDir := ""
-	if fileExists(filepath.Join(wt, "backend", "go.mod")) {
-		goModDir = filepath.Join(wt, "backend")
-	} else if fileExists(filepath.Join(wt, "go.mod")) {
-		goModDir = wt
-	}
-	if goModDir != "" {
-		target := "./cmd/..."
-		if !dirExists(filepath.Join(goModDir, "cmd")) {
-			target = "./..." // no cmd/ tree — build whatever main packages exist
-		}
-		// Trailing separator on -o makes go write each main package's binary INTO artifactDir.
-		if out, err := x.runBuild(ctx, goModDir, []string{"CGO_ENABLED=0"},
-			"go", "build", "-o", artifactDir+string(os.PathSeparator), target); err != nil {
-			return "", fmt.Errorf("go build: %v: %s", err, clip(out))
-		}
-		built = true
-	}
-
-	if !built {
-		return "", fmt.Errorf("kein Build-Rezept erkannt (weder package.json noch go.mod) für %s", repo.ID)
-	}
-	return artifactDir, nil
-}
-
-// runBuild runs one build command as the runner PROCESS ITSELF (current user), rooted at dir. It never
-// uses sudo or the devlab-exec wrapper — the build must stay unprivileged (Finding C). Combined output
-// is returned for the step log.
-func (x *runExecutor) runBuild(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	cmd.Env = append(cmd.Env, extraEnv...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	return filepath.Join(wt, ".mercury-artifact"), nil
 }
 
 // prodDeployMerged ships a MERGED run PR to prod. It materializes the merged default branch in the

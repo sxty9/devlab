@@ -479,6 +479,21 @@ func (e Executor) CurrentBranch(ctx context.Context, wt string) string {
 	return s
 }
 
+// ArtifactBuild builds the repo's deployable artifact IN wt, AS THE WORKSPACE OWNER, via the pinned
+// per-user devlab-exec wrapper (artifact-build verb). It must not run as root (Finding C — a build hook
+// would execute as root) nor as the devlabd service user (which cannot write the runs-user-owned
+// workspace). Produces <wt>/.mercury-artifact (the Go daemon binary + the built web SPA in web/). Returns
+// the combined build output for error context; the artifact path is the fixed <wt>/.mercury-artifact.
+func (e Executor) ArtifactBuild(ctx context.Context, wt string) (string, error) {
+	if !e.PerUser {
+		return "", fmt.Errorf("ArtifactBuild requires per-user execution")
+	}
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "-u", e.User, execWrapper, "artifact-build", wt)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	return strings.TrimRight(string(out), "\n"), err
+}
+
 // RevParse resolves ref to a full commit SHA. Used by the autonomous runner to capture the tip AFTER it
 // bases a run on main + pending PRs, so it can later tell whether the AGENT contributed anything new.
 func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) {
