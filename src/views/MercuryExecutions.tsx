@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
+import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon } from '@/ui/icons';
 import type { RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
@@ -84,9 +85,10 @@ export function StepRow({ step }: { step: RunStep }) {
         {hasReport && <span className="shrink-0 text-caption text-text-tertiary">Bericht</span>}
       </button>
       {open && hasReport && (
-        <pre className="dl-scroll mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-separator bg-bg-base p-3 font-mono text-caption text-text-secondary">
-          {step.log}
-        </pre>
+        <div
+          className="dl-markdown dl-scroll mt-1 max-h-80 overflow-auto rounded-md border border-separator bg-bg-base p-3 text-caption text-text-secondary"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(step.log ?? '') }}
+        />
       )}
     </div>
   );
