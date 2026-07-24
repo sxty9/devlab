@@ -96,7 +96,32 @@ case "$verb" in
     fi
     if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
     if [ -n "$gd" ]; then
-      ( cd -- "$gd" && if [ -d cmd ]; then go build -o "$art/" ./cmd/...; else go build -o "$art/" ./...; fi )
+      # A repo carrying graveyard/schemegrave (aigentic) needs a cgo `-tags scheme` build that links
+      # libscheme_ffi.a. schemegrave's cgo directive references the scheme dir as a SIBLING of the repo
+      # clone (${SRCDIR}/../../../scheme = <workspace root>/scheme). The FFI lib+headers live at an
+      # instance-neutral, build-user-readable PINNED path recorded in /etc/devlab/scheme-lib-dir; we
+      # symlink it into place so the relative cgo path resolves inside the ephemeral workspace. Without
+      # a valid pin we FAIL LOUD rather than fall through to a CGO-off build — a non-scheme binary would
+      # only crash-loop a scheme grave on the target, so a broken deploy must not ship silently.
+      tags=""
+      if [ -d graveyard/schemegrave ]; then
+        [ -r /etc/devlab/scheme-lib-dir ] || die "scheme build required but /etc/devlab/scheme-lib-dir is missing"
+        schemedir="$(head -n1 /etc/devlab/scheme-lib-dir | tr -d '[:space:]')"
+        { [ -n "$schemedir" ] && [ -f "$schemedir/target/release/libscheme_ffi.a" ]; } \
+          || die "pinned scheme dir invalid: no target/release/libscheme_ffi.a under '$schemedir'"
+        # schemegrave's cgo directive links ${SRCDIR}/../../../scheme/target/release/libscheme_ffi.a and
+        # -I's .../scheme/crates/scheme-ffi/include — i.e. a `scheme` dir as a SIBLING of the repo clone.
+        # The runner may already have a `scheme` SOURCE checkout there (headers, but no built lib, which
+        # is a cargo artifact). We materialize exactly the two files the toolchain needs from the pinned
+        # prebuilt dir, creating the sibling if absent — so the link resolves whether or not scheme was
+        # cloned. prod stays install-only: the lib is prebuilt on this (dev) box, never rebuilt on prod.
+        sib="$(dirname -- "$wt")/scheme"
+        install -d "$sib/target/release" "$sib/crates/scheme-ffi/include"
+        cp -f "$schemedir/target/release/libscheme_ffi.a"         "$sib/target/release/libscheme_ffi.a"
+        cp -f "$schemedir/crates/scheme-ffi/include/scheme_ffi.h" "$sib/crates/scheme-ffi/include/scheme_ffi.h"
+        tags="scheme"; export CGO_ENABLED=1
+      fi
+      ( cd -- "$gd" && if [ -d cmd ]; then go build ${tags:+-tags "$tags"} -o "$art/" ./cmd/...; else go build ${tags:+-tags "$tags"} -o "$art/" ./...; fi )
       built=1
     fi
     [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod)"
