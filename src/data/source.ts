@@ -168,8 +168,9 @@ export interface DataSource {
   /** Upcoming occurrences over a window (default 30 days) — the auto-updating Laufkalender.
    *  `type` narrows to automatic runs or ToDos; omitted = both (the global calendar). */
   mercuryRunCalendar(days?: number, type?: RunType): Promise<RunCalendar>;
-  /** Every completed execution across all runs (Lauf-History; includes deleted runs). */
-  mercuryRunExecutions(): Promise<{ executions: RunExecution[] }>;
+  /** Completed executions (execution history; includes deleted runs). `type` narrows to automatic
+   *  runs or ToDos so each surface shows its own; omitted = the global log. */
+  mercuryRunExecutions(type?: RunType): Promise<{ executions: RunExecution[] }>;
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;

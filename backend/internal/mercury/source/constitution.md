@@ -23,6 +23,10 @@ Du arbeitest im "Holistic" Services-Ökosystem. Validiere JEDE Implementierung g
 - Rechtesystem: Einheitliches, symmetrisches Design. Jeder Service stellt ein Rechte-Manifest für den zentralen Privilege Service bereit. Feingranularität ist nur dort erlaubt, wo sie fachlich zwingend geboten ist.
 </maxim>
 
+<maxim name="Symmetry">
+- Parallele Oberflächen, die auf derselben Maschinerie oder Domäne beruhen und bewusst nebeneinander bestehen, stellen einen symmetrischen Funktionsumfang bereit — dieselben Operationen, Ansichten und Zugangspunkte. Keine Oberfläche führt eine Funktion, die eine gleichgeordnete ohne fachlichen Grund entbehrt; divergiert der Umfang, wird er zum volleren Satz hin ausgeglichen, sofern die fehlende Funktion nicht strukturell unanwendbar ist.
+</maxim>
+
 <maxim name="Minimalism">
 - Das System ist "intuitiv by Design". Keine Hilfstexte, Notes oder Tooltips im UI (außer bei extremen Spezialfällen).
 - Präsentiere Daten nicht im Überfluss, sondern strikt portioniert und bedarfsgerecht.

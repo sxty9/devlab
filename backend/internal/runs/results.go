@@ -16,6 +16,10 @@ type Result struct {
 	RunID      string       `json:"runId"`
 	ResultID   string       `json:"resultId"`
 	RunName    string       `json:"runName,omitempty"` // snapshot of the run's name (survives run deletion)
+	// Type snapshots the run's kind (auto|todo) at execution time, like RunName — so the Lauf- and
+	// ToDo-History can each show ONLY their own executions even after the run is deleted. "" (results
+	// written before this field) reads as auto, and the reader falls back to the live run's kind.
+	Type       Type         `json:"type,omitempty"`
 	StartedAt  time.Time    `json:"startedAt"`
 	// UpdatedAt is refreshed on every Save (i.e. after every repo and every carry-over), so it tracks
 	// when the execution was last worked — not just when it began. FindStranded bounds resume by this,
@@ -200,6 +204,7 @@ func (r *Results) Get(runID, resultID string) (Result, bool, error) {
 type ExecutionSummary struct {
 	RunID        string    `json:"runId"`
 	RunName      string    `json:"runName"`
+	Type         Type      `json:"type,omitempty"` // auto|todo — the run's kind, so history is split per surface
 	ResultID     string    `json:"resultId"`
 	At           time.Time `json:"at"`
 	FinishedAt   time.Time `json:"finishedAt,omitempty"`
@@ -236,7 +241,7 @@ func (r *Results) All() ([]ExecutionSummary, error) {
 				continue
 			}
 			out = append(out, ExecutionSummary{
-				RunID: res.RunID, RunName: res.RunName, ResultID: res.ResultID,
+				RunID: res.RunID, RunName: res.RunName, Type: res.Type, ResultID: res.ResultID,
 				At: res.StartedAt, FinishedAt: res.FinishedAt, OK: res.OK, RepoCount: len(res.Repos),
 				Suspended: res.Suspended, ResumeAt: res.ResumeAt,
 				InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD, NumTurns: res.NumTurns,

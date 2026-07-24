@@ -1,11 +1,76 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"devlab/backend/internal/runs"
 )
+
+// The execution history is one machinery shared by the Läufe and ToDos surfaces; ?type scopes it so
+// each tab shows ONLY its own kind. A stamped result is trusted; an unstamped one (written before the
+// stamp existed) falls back to its live run's kind. Both paths are exercised here.
+func TestRunsExecutionsFilterByType(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "res"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
+
+	store, results := runs.NewStore(), runs.NewResults()
+	// A todo whose run still exists but whose result predates the stamp → resolved via the live run.
+	if _, err := store.Mutate("create", "t", func(cur []runs.Run) ([]runs.Run, error) {
+		return append(cur, runs.Run{ID: "run_todo", Type: runs.TypeTodo, Name: "Todo"}), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(results.Save(runs.Result{RunID: "run_todo", ResultID: runs.NewResultID(now), StartedAt: now})) // unstamped
+	must(results.Save(runs.Result{RunID: "run_auto", ResultID: runs.NewResultID(now.Add(time.Second)), Type: runs.TypeAuto, StartedAt: now.Add(time.Second)}))
+	must(results.Save(runs.Result{RunID: "run_gone", ResultID: runs.NewResultID(now.Add(2 * time.Second)), Type: runs.TypeTodo, StartedAt: now.Add(2 * time.Second)})) // stamped todo, run deleted
+
+	s := &Server{runs: store, runResults: results}
+
+	fetch := func(q string) []runs.ExecutionSummary {
+		rec := httptest.NewRecorder()
+		s.runsExecutions(rec, httptest.NewRequest(http.MethodGet, "/api/mercury/runs/executions"+q, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d for %q", rec.Code, q)
+		}
+		var body struct {
+			Executions []runs.ExecutionSummary `json:"executions"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Executions
+	}
+
+	if got := fetch(""); len(got) != 3 {
+		t.Fatalf("no filter: want all 3, got %d", len(got))
+	}
+	todo := fetch("?type=todo")
+	if len(todo) != 2 {
+		t.Fatalf("type=todo: want 2 (unstamped-but-live + stamped-orphan), got %d", len(todo))
+	}
+	for _, e := range todo {
+		if e.Type != runs.TypeTodo {
+			t.Errorf("type=todo returned %s for %s (resolved kind must be handed back)", e.Type, e.RunID)
+		}
+	}
+	auto := fetch("?type=auto")
+	if len(auto) != 1 || auto[0].RunID != "run_auto" {
+		t.Fatalf("type=auto: want just run_auto, got %+v", auto)
+	}
+}
 
 // normalizeTargets is the single gate a ToDo's destinations pass through: it must accept several
 // existing/new repos, collapse duplicates, and reject a malformed or empty set.

@@ -38,6 +38,16 @@ const (
 	TypeTodo Type = "todo"
 )
 
+// NormalizeType folds the zero value (records predating ToDos) to auto, so a run's kind is always
+// exactly TypeAuto or TypeTodo. It is the single rule behind the "" == auto convention the Run model
+// documents, reused wherever a stored kind must be resolved (execution history, calendars).
+func NormalizeType(t Type) Type {
+	if t == TypeTodo {
+		return TypeTodo
+	}
+	return TypeAuto
+}
+
 // Run is one scheduled autonomous run (Type auto) or one concrete one-time task (Type todo).
 type Run struct {
 	ID      string `json:"id"`

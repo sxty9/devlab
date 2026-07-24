@@ -21,6 +21,9 @@ _Automatisch aus Mercury ausgerollt. Nicht direkt bearbeiten; ändere die Axiome
 - **Atomare Zugriffe** — Jeder lesende und schreibende Datenzugriff erfolgt atomar — unteilbar und ohne beobachtbaren Zwischenzustand.
 - **Zugangspunkt wiederverwenden** — Existiert für eine Entität bereits ein Zugangspunkt, ist er zwingend wiederzuverwenden. Parallele Datenpfade zur selben Entität werden niemals angelegt.
 
+### architecture / symmetry
+- **Symmetrische Geschwister** — Parallele Oberflächen, die auf derselben Maschinerie oder Domäne beruhen und bewusst nebeneinander bestehen, stellen einen symmetrischen Funktionsumfang bereit — dieselben Operationen, Ansichten und Zugangspunkte. Keine Oberfläche führt eine Funktion, die eine gleichgeordnete ohne fachlichen Grund entbehrt; divergiert der Umfang, wird er zum volleren Satz hin ausgeglichen, sofern die fehlende Funktion nicht strukturell unanwendbar ist.
+
 ### architecture / uniformity
 - **CLI** — Jeder Service stellt eine CLI bereit. Sie folgt in Syntax und Semantik strikt dem einheitlichen Holistic-CLI-Standard, sodass alle Service-CLIs sich gleich bedienen lassen.
 - **Code-Struktur** — Aufbau, Layout, Namenskonventionen und Repository-Grundgerüst eines Service entsprechen exakt denen der übrigen Holistic-Services. Struktur ist service-übergreifend uniform.

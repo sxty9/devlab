@@ -509,10 +509,11 @@ export interface RunCalendar {
   occurrences: RunOccurrence[];
 }
 
-/** One completed execution in the Lauf-History (with token/cost; survives run deletion). */
+/** One completed execution in the execution history (with token/cost; survives run deletion). */
 export interface RunExecution {
   runId: string;
   runName: string;
+  type?: RunType; // auto|todo — the run's kind, so each surface shows only its own executions
   resultId: string;
   at: string;
   finishedAt?: string;
