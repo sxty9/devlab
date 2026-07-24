@@ -24,15 +24,25 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// githubAuthorize starts the OAuth flow: stash a state nonce and redirect to GitHub.
-func (s *Server) githubAuthorize(w http.ResponseWriter, r *http.Request) {
+// githubOAuthConfig loads the OAuth config and verifies the link store is available, writing the
+// matching 503 and returning ok=false when GitHub linking can't proceed. Shared by authorize/callback.
+func (s *Server) githubOAuthConfig(w http.ResponseWriter) (*github.OAuthConfig, bool) {
 	cfg, err := github.LoadOAuthConfig()
 	if err != nil {
 		writeErr(w, http.StatusServiceUnavailable, "GitHub linking is not configured")
-		return
+		return nil, false
 	}
 	if s.links == nil {
 		writeErr(w, http.StatusServiceUnavailable, "GitHub link store unavailable")
+		return nil, false
+	}
+	return cfg, true
+}
+
+// githubAuthorize starts the OAuth flow: stash a state nonce and redirect to GitHub.
+func (s *Server) githubAuthorize(w http.ResponseWriter, r *http.Request) {
+	cfg, ok := s.githubOAuthConfig(w)
+	if !ok {
 		return
 	}
 	state := randHex(16)
@@ -82,13 +92,8 @@ func (s *Server) githubCallback(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Missing authorization code")
 		return
 	}
-	cfg, err := github.LoadOAuthConfig()
-	if err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "GitHub linking is not configured")
-		return
-	}
-	if s.links == nil {
-		writeErr(w, http.StatusServiceUnavailable, "GitHub link store unavailable")
+	cfg, ok := s.githubOAuthConfig(w)
+	if !ok {
 		return
 	}
 	token, scope, err := cfg.Exchange(r.Context(), code)

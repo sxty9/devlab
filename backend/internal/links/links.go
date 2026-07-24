@@ -185,7 +185,7 @@ func (s *Store) Save(user, ghLogin string, ghID int64, token, scopes string, now
 		return err
 	}
 	st := stored{
-		Link: Link{GHLogin: ghLogin, GHID: ghID, Scopes: scopes, LinkedAt: now.UTC().Format(time.RFC3339)},
+		Link:     Link{GHLogin: ghLogin, GHID: ghID, Scopes: scopes, LinkedAt: now.UTC().Format(time.RFC3339)},
 		TokenEnc: enc,
 	}
 	b, err := json.Marshal(st)

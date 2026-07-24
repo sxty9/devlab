@@ -19,7 +19,7 @@ const (
 	wrapper      = "/usr/local/sbin/devlab-preview"
 	instancesDir = "/etc/sxgate/preview/instances"
 	buildTimeout = "300" // seconds; hard-bounds a hostile build (review #1/#5)
-	maxPerUser   = 5      // review #4: cap previews per user (shared port pool / host resources)
+	maxPerUser   = 5     // review #4: cap previews per user (shared port pool / host resources)
 )
 
 var (

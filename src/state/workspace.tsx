@@ -10,7 +10,7 @@ import {
 } from 'react';
 import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, PullRequestResult, Repo, RepoData, Tab, User } from '@/types';
 import { getDataSource, type CommitResult, type DiffPayload, type PushResult } from '@/data';
-import { guessLang } from '@/lib/lang';
+import { basename, guessLang } from '@/lib/lang';
 import { useSession } from '@/state/session';
 import { useToast } from '@/ui/Toast';
 import { Splash } from '@/shell/Splash';
@@ -266,7 +266,7 @@ export function WorkspaceProvider({ repoId, children }: { repoId: string; childr
   const openDiff = useCallback(
     (path: string) => {
       const id = `diff:${path}`;
-      const name = path.split('/').pop() ?? path;
+      const name = basename(path);
       setOpenTabs((tabs) => (tabs.some((t) => t.id === id) ? tabs : [...tabs, { id, title: name, kind: 'diff', path, lang: fileIndex[path]?.lang ?? guessLang(path) }]));
       setActiveTabId(id);
       fetchDiff(path);
@@ -276,7 +276,7 @@ export function WorkspaceProvider({ repoId, children }: { repoId: string; childr
 
   const openVision = useCallback((path: string) => {
     const id = `vision:${path}`;
-    const name = path.split('/').pop() ?? path;
+    const name = basename(path);
     setOpenTabs((tabs) => (tabs.some((t) => t.id === id) ? tabs : [...tabs, { id, title: name, kind: 'vision', path }]));
     setActiveTabId(id);
   }, []);

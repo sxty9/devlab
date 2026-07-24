@@ -88,7 +88,7 @@ func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	}
 	rel := r.URL.Query().Get("path")
 	if rel == "" {
-		writeErr(w, http.StatusBadRequest, "Missing path")
+		writeErr(w, http.StatusBadRequest, errMissingPath)
 		return
 	}
 	writeJSON(w, http.StatusOK, git.FileAt(p, rel))
@@ -101,7 +101,7 @@ func (s *Server) diff(w http.ResponseWriter, r *http.Request) {
 	}
 	rel := r.URL.Query().Get("path")
 	if rel == "" {
-		writeErr(w, http.StatusBadRequest, "Missing path")
+		writeErr(w, http.StatusBadRequest, errMissingPath)
 		return
 	}
 	writeJSON(w, http.StatusOK, git.DiffFor(p, rel))
@@ -178,10 +178,8 @@ func plural(n int, noun string) string {
 	if n != 1 {
 		s += "s"
 	}
-	return itoa(n) + " " + s
+	return strconv.Itoa(n) + " " + s
 }
-
-func itoa(n int) string { return strconv.Itoa(n) }
 
 // structure derives the repo skeleton overview from the top of the file tree.
 func structure(repoPath string, tree []model.FileNode) []model.StructureSection {

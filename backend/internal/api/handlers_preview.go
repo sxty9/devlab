@@ -12,8 +12,7 @@ import (
 // the branch commit + .sxgate/preview.conf exist locally for the as-user checkout. The lock is
 // released before the (possibly slow) build so it doesn't block the user's other ops on the repo.
 func (s *Server) previewCreate(w http.ResponseWriter, r *http.Request) {
-	if s.v.DevBypass() {
-		writeErr(w, http.StatusBadRequest, "Previews need a linked GitHub account")
+	if !s.requireRealGitHub(w, "Previews") {
 		return
 	}
 	wc, unlock, ok := s.mutateCtx(w, r, true)
@@ -60,8 +59,7 @@ func (s *Server) previewList(w http.ResponseWriter, r *http.Request) {
 
 // previewDelete tears down one of the caller's previews (the wrapper re-checks ownership).
 func (s *Server) previewDelete(w http.ResponseWriter, r *http.Request) {
-	if s.v.DevBypass() {
-		writeErr(w, http.StatusBadRequest, "Previews need a linked GitHub account")
+	if !s.requireRealGitHub(w, "Previews") {
 		return
 	}
 	u := userFrom(r)

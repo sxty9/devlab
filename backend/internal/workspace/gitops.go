@@ -480,5 +480,5 @@ func (e Executor) CurrentBranch(ctx context.Context, wt string) string {
 }
 
 // Changes / Branches are read-only re-exports (run directly with safe.directory in package git).
-func Changes(wt string) []model.Change { return git.Changes(wt) }
+func Changes(wt string) []model.Change  { return git.Changes(wt) }
 func Branches(wt string) []model.Branch { return git.Branches(wt) }

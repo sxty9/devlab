@@ -19,7 +19,7 @@ const maxBodyBytes = 8 << 20 // 8 MiB request cap (file content ≤2 MiB + slack
 type writeCtx struct {
 	wt      string // working-tree path
 	user    string
-	token   string            // "" under dev-bypass (ambient git credentials)
+	token   string // "" under dev-bypass (ambient git credentials)
 	ghLogin string
 	ghID    int64
 	exec    workspace.Executor // runs mutations as the user (per-user) or directly (dev-bypass)
@@ -36,7 +36,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 	if s.v.DevBypass() {
 		p, ok := discover.Path(s.reposBase, id)
 		if !ok {
-			writeErr(w, http.StatusNotFound, "Repository not found")
+			writeErr(w, http.StatusNotFound, errRepoNotFound)
 			return nil, nil, false
 		}
 		return &writeCtx{wt: p, user: u.Username, exec: workspace.Executor{User: u.Username, PerUser: false}}, func() {}, true
@@ -44,7 +44,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 
 	full, ok := s.resolveFullName(r.Context(), u, id)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Repository not found")
+		writeErr(w, http.StatusNotFound, errRepoNotFound)
 		return nil, nil, false
 	}
 	if needPush && !s.canPush(r.Context(), u, id, full) {
@@ -53,7 +53,7 @@ func (s *Server) mutateCtx(w http.ResponseWriter, r *http.Request, needPush bool
 	}
 	token, err := s.userToken(u)
 	if err != nil {
-		writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+		writeErr(w, http.StatusForbidden, errNoGitHubLink)
 		return nil, nil, false
 	}
 	if _, err := s.workspaces.Ensure(r.Context(), u.Username, id, full, token, true); err != nil {
@@ -127,7 +127,7 @@ func (s *Server) gitWriteFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Path == "" {
-		writeErr(w, http.StatusBadRequest, "Missing path")
+		writeErr(w, http.StatusBadRequest, errMissingPath)
 		return
 	}
 	if err := wc.exec.WriteFile(wc.wt, body.Path, []byte(body.Content)); err != nil {
@@ -153,7 +153,7 @@ func (s *Server) stageOp(w http.ResponseWriter, r *http.Request, stage bool) {
 		return
 	}
 	if body.Path == "" {
-		writeErr(w, http.StatusBadRequest, "Missing path")
+		writeErr(w, http.StatusBadRequest, errMissingPath)
 		return
 	}
 	var err error
@@ -231,6 +231,14 @@ func (s *Server) writePushResult(w http.ResponseWriter, r *http.Request, wc *wri
 	writeJSON(w, http.StatusOK, model.PushResult{Branch: branch, Ahead: ahead, Behind: behind, Message: msg, Branches: branches})
 }
 
+// writeBranchResult returns the current branch + refreshed branch list — shared by branch/checkout.
+func writeBranchResult(w http.ResponseWriter, r *http.Request, wc *writeCtx) {
+	writeJSON(w, http.StatusOK, model.BranchResult{
+		Branch:   wc.exec.CurrentBranch(r.Context(), wc.wt),
+		Branches: workspace.Branches(wc.wt),
+	})
+}
+
 // gitBranch creates+checks out a branch; gitCheckout switches to an existing one.
 func (s *Server) gitBranch(w http.ResponseWriter, r *http.Request) {
 	wc, unlock, ok := s.mutateCtx(w, r, true)
@@ -249,7 +257,7 @@ func (s *Server) gitBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, model.BranchResult{Branch: wc.exec.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
+	writeBranchResult(w, r, wc)
 }
 
 func (s *Server) gitCheckout(w http.ResponseWriter, r *http.Request) {
@@ -268,5 +276,5 @@ func (s *Server) gitCheckout(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, model.BranchResult{Branch: wc.exec.CurrentBranch(r.Context(), wc.wt), Branches: workspace.Branches(wc.wt)})
+	writeBranchResult(w, r, wc)
 }

@@ -3,8 +3,8 @@ import Editor, { type OnMount } from '@monaco-editor/react';
 import { useWorkspace } from '@/state/workspace';
 import { useToast } from '@/ui/Toast';
 import { ensureDevlabTheme } from './monacoTheme';
-import { ChevronRightIcon, CopyIcon, SplitIcon } from '@/ui/icons';
-import { cn } from '@/lib/cn';
+import { PathBreadcrumb } from '@/ui/PathBreadcrumb';
+import { CopyIcon, SplitIcon } from '@/ui/icons';
 
 /** Monaco editor surface with a path breadcrumb. Fully editable: edits are held as per-tab drafts
  *  in the workspace, Cmd/Ctrl-S writes them to the backend working tree. Read-only repos (GitHub
@@ -29,8 +29,6 @@ export function EditorView({ repoId, path, lang }: { repoId: string; path: strin
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current());
   }, []);
 
-  const segments = path.split('/');
-
   const copyPath = () => {
     navigator.clipboard?.writeText(path).then(
       () => toast({ title: 'Path copied', description: path }),
@@ -42,22 +40,7 @@ export function EditorView({ repoId, path, lang }: { repoId: string; path: strin
     <div className="flex min-h-0 flex-1 flex-col bg-surface-raised">
       <div className="dl-no-select flex h-7 shrink-0 items-center gap-0.5 border-b border-separator px-2 text-caption text-text-tertiary">
         <div className="dl-scroll flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
-          {segments.map((seg, i) => {
-            const last = i === segments.length - 1;
-            return (
-              <span key={i} className="flex shrink-0 items-center gap-0.5">
-                {i > 0 && <ChevronRightIcon className="h-3 w-3 text-text-tertiary" />}
-                <span
-                  className={cn(
-                    'rounded-sm px-1 py-0.5 transition-colors',
-                    last ? 'font-medium text-text-secondary' : 'hover:bg-fill/10 hover:text-text-secondary',
-                  )}
-                >
-                  {seg}
-                </span>
-              </span>
-            );
-          })}
+          <PathBreadcrumb path={path} interactive />
           {!canWrite && (
             <span className="ml-1.5 shrink-0 rounded-sm bg-fill/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-text-tertiary" title="Read-only access on GitHub">
               read-only
