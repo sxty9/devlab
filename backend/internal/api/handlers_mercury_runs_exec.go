@@ -365,7 +365,7 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 		return existing, true
 	}
 	start := time.Now()
-	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name, Type: runs.NormalizeType(run.Type), StartedAt: start.UTC(), PromptHash: run.PromptHash}, false
+	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name, Type: runs.NormalizeType(run.Type), StartedAt: start.UTC(), PromptHash: run.PromptHash, Prompt: run.Prompt}, false
 }
 
 // suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume

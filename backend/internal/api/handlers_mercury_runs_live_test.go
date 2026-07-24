@@ -1,11 +1,31 @@
 package api
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"devlab/backend/internal/runs"
 )
+
+// A fresh execution must snapshot the run's Promptstellung, so the History can show the exact prompt
+// this run was driven by — even after the run (or its axioms) later change, or the run is deleted.
+func TestResumeOrNewSnapshotsPrompt(t *testing.T) {
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(t.TempDir(), "res"))
+	x := &runExecutor{s: &Server{runResults: runs.NewResults()}, mode: "pr"}
+
+	run := runs.Run{ID: "run_x", Name: "Lauf X", Prompt: "# Aufgabe\n\ntu dies", PromptHash: "h1"}
+	res, resuming := x.resumeOrNew(run)
+	if resuming {
+		t.Fatal("a fresh run must not resume")
+	}
+	if res.Prompt != run.Prompt {
+		t.Fatalf("prompt not snapshotted: got %q want %q", res.Prompt, run.Prompt)
+	}
+	if res.PromptHash != run.PromptHash {
+		t.Fatalf("promptHash not snapshotted: got %q want %q", res.PromptHash, run.PromptHash)
+	}
+}
 
 func TestLiveSaverThrottleAndForce(t *testing.T) {
 	n := 0
