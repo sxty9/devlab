@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -42,10 +43,14 @@ type stored struct {
 	TokenEnc string `json:"tokenEnc"` // base64(nonce || ciphertext)
 }
 
-// Store persists per-user links under a directory, encrypting tokens with a fixed key.
+// Store persists per-user links under a directory, encrypting tokens with a fixed key. A per-user
+// mutex serializes every read and write of one user's file, so a Save (tmp-write+rename), a Delete
+// and a read never interleave — access stays atomic and no caller observes a half-written state.
 type Store struct {
-	dir string
-	gcm cipher.AEAD
+	dir   string
+	gcm   cipher.AEAD
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
 }
 
 // NewStore builds the store from the environment: DEVLAB_LINKS (dir, default /var/lib/devlab/links)
@@ -71,7 +76,21 @@ func NewStore() (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("links: mkdir %s: %w", dir, err)
 	}
-	return &Store{dir: dir, gcm: gcm}, nil
+	return &Store{dir: dir, gcm: gcm, locks: map[string]*sync.Mutex{}}, nil
+}
+
+// lockFor returns the mutex serializing all access to one user's link file. Mirrors the per-key
+// lock table in the sibling stores (chats, comments); the public read/write methods hold it, the
+// private read/write helpers assume it is held.
+func (s *Store) lockFor(user string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.locks[user]
+	if !ok {
+		l = &sync.Mutex{}
+		s.locks[user] = l
+	}
+	return l
 }
 
 // loadKey reads a 32-byte AES key. The file may hold the raw 32 bytes, or a 64-char hex string,
@@ -134,6 +153,7 @@ func (s *Store) decrypt(enc string) (string, error) {
 	return string(pt), nil
 }
 
+// read loads and parses a user's on-disk record. The caller must hold the user's lockFor mutex.
 func (s *Store) read(user string) (*stored, error) {
 	p, err := s.path(user)
 	if err != nil {
@@ -153,6 +173,9 @@ func (s *Store) read(user string) (*stored, error) {
 // Save (over)writes the user's link, encrypting the token. now is injected so callers control
 // the clock (and tests stay deterministic).
 func (s *Store) Save(user, ghLogin string, ghID int64, token, scopes string, now time.Time) error {
+	l := s.lockFor(user)
+	l.Lock()
+	defer l.Unlock()
 	p, err := s.path(user)
 	if err != nil {
 		return err
@@ -183,6 +206,9 @@ func (s *Store) Save(user, ghLogin string, ghID int64, token, scopes string, now
 
 // Get returns the token-free link metadata, or (nil, nil) when the user has none linked.
 func (s *Store) Get(user string) (*Link, error) {
+	l := s.lockFor(user)
+	l.Lock()
+	defer l.Unlock()
 	st, err := s.read(user)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -190,8 +216,8 @@ func (s *Store) Get(user string) (*Link, error) {
 		}
 		return nil, err
 	}
-	l := st.Link
-	return &l, nil
+	link := st.Link
+	return &link, nil
 }
 
 // Linked reports whether the user has a stored link (cheap existence check).
@@ -203,6 +229,9 @@ func (s *Store) Linked(user string) bool {
 // Token returns the decrypted OAuth token for backend GitHub calls. Never expose this to the
 // client. Returns os.ErrNotExist (wrapped) when the user has no link.
 func (s *Store) Token(user string) (string, error) {
+	l := s.lockFor(user)
+	l.Lock()
+	defer l.Unlock()
 	st, err := s.read(user)
 	if err != nil {
 		return "", err
@@ -212,6 +241,9 @@ func (s *Store) Token(user string) (string, error) {
 
 // Delete removes the user's link (idempotent).
 func (s *Store) Delete(user string) error {
+	l := s.lockFor(user)
+	l.Lock()
+	defer l.Unlock()
 	p, err := s.path(user)
 	if err != nil {
 		return err
