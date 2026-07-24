@@ -686,7 +686,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// NEVER dev-deployed — restarting THIS devlabd would kill the running sweep; its PR still lands and
 	// its deploy happens out-of-band (its prod-deploy, which restarts the VPS not the runner, is fine
 	// via Maintain). A dev-deploy failure is NON-fatal: we log the step and still push + open the PR.
-	if x.mode == "full" && isSelfRepo(repo.ID) {
+	if x.mode == "full" && devDeployEnabled() && isSelfRepo(repo.ID) {
 		step("dev-deploy", "Selbst-Deploy übersprungen — "+repo.ID+" wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)", true)
 	} else if x.shouldDevDeploy(repo.ID) {
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
@@ -734,10 +734,20 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 }
 
 // shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
-// full mode, and NEVER for the self repo (Finding B — dev-deploying devlab restarts THIS devlabd,
-// killing the running sweep). report/pr never dev-deploy at all.
+// full mode, only while dev-deploy is enabled, and NEVER for the self repo (Finding B — dev-deploying
+// devlab restarts THIS devlabd, killing the running sweep). report/pr never dev-deploy at all.
 func (x *runExecutor) shouldDevDeploy(repoID string) bool {
-	return x.mode == "full" && !isSelfRepo(repoID)
+	return x.mode == "full" && devDeployEnabled() && !isSelfRepo(repoID)
+}
+
+// devDeployEnabled reports whether the in-run dev-deploy step is active. DEVLAB_RUNS_DEV_DEPLOY=off (or
+// 0/false/no) turns it OFF so full mode arms ONLY the prod-deploy-on-merge half of the pipeline. This is
+// how full is armed SAFELY before the dev/prod cutover: while the dev instances still serve live traffic
+// (env-less names), a run must not restart them — so dev-deploy is disabled, and only merged PRs deploy
+// (to the prod VPS, which is not the box the runner runs on). Default on.
+func devDeployEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DEV_DEPLOY")))
+	return v != "off" && v != "0" && v != "false" && v != "no"
 }
 
 // selfRepoID is the repo id of the DevLab service itself — its own run must never in-process

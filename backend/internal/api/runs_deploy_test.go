@@ -105,6 +105,22 @@ func TestShouldDevDeploy(t *testing.T) {
 			t.Errorf("mode=%s repo=%s: shouldDevDeploy=%v, want %v", c.mode, c.repoID, got, c.want)
 		}
 	}
+
+	// DEVLAB_RUNS_DEV_DEPLOY=off disables the in-run dev-deploy even in full mode (arms prod-deploy-on-
+	// merge alone, safe before the cutover). Non-off keeps it on.
+	x := &runExecutor{mode: "full"}
+	for _, v := range []string{"off", "0", "false", "no", "OFF"} {
+		t.Setenv("DEVLAB_RUNS_DEV_DEPLOY", v)
+		if x.shouldDevDeploy("aigentic") {
+			t.Errorf("DEVLAB_RUNS_DEV_DEPLOY=%q: dev-deploy must be OFF in full mode", v)
+		}
+	}
+	for _, v := range []string{"", "on", "1", "true"} {
+		t.Setenv("DEVLAB_RUNS_DEV_DEPLOY", v)
+		if !x.shouldDevDeploy("aigentic") {
+			t.Errorf("DEVLAB_RUNS_DEV_DEPLOY=%q: dev-deploy must be ON in full mode", v)
+		}
+	}
 }
 
 // ─── Maintain orchestration (behavioral, via seams) ─────────────────────────
