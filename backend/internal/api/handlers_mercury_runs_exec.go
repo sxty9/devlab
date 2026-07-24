@@ -194,14 +194,13 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 		return fail("Runner-Token nicht verfügbar (DEVLAB_RUNS_TOKEN_USER — ersatzweise DEVLAB_RUNS_USER — " +
 			"muss ein verknüpftes GitHub-Konto sein): " + err.Error())
 	}
-	// An auto run sweeps every Holistic repo; a ToDo hits exactly one (existing, or newly created).
+	// An auto run sweeps every Holistic repo; a ToDo hits its one-or-more targets — each an existing repo
+	// or one it creates first. Both feed the very same per-repo pipeline below.
 	var repos []model.Repo
+	newRepoName := map[string]string{} // repo id → its to-be-created name, so the prompt says "scaffold it"
+	var resolveFails []runs.RepoResult // targets that could not be resolved (unknown repo, create failed)
 	if run.IsTodo() {
-		target, terr := x.todoTarget(ctx, run, token)
-		if terr != nil {
-			return fail(terr.Error())
-		}
-		repos = []model.Repo{target}
+		repos, newRepoName, resolveFails = x.resolveTodoTargets(ctx, run, token)
 	} else {
 		repos, err = discover.ReposForUser(ctx, x.tokenUser, token)
 		if err != nil {
@@ -228,6 +227,19 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 				overallOK = false
 			}
 		}
+	}
+
+	// A ToDo target that could not be resolved (an unknown existing repo, or a new one that failed to
+	// create) is recorded as a failed repo result but does NOT sink the whole run — the targets that DID
+	// resolve still run. Skip any already recorded in a prior attempt so a resume never double-counts.
+	for _, rf := range resolveFails {
+		if done[rf.Repo] {
+			continue
+		}
+		res.Repos = append(res.Repos, rf)
+		done[rf.Repo] = true
+		overallOK = false
+		save()
 	}
 
 	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
@@ -266,7 +278,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 			carriedOver = true
 			break
 		}
-		rr, lim := x.executeRepo(ctx, run, repo, token, ghLogin, ghID)
+		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID]), token, ghLogin, ghID)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
 			// do NOT hammer the rest — suspend the whole execution until the window resets.
@@ -379,7 +391,7 @@ type repoLimit struct {
 	hasReset bool
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, token, ghLogin string, ghID int64) (runs.RepoResult, repoLimit) {
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64) (runs.RepoResult, repoLimit) {
 	rr := runs.RepoResult{Repo: repo.ID}
 	step := func(name, logtxt string, ok bool) {
 		rr.Steps = append(rr.Steps, runs.Step{Name: name, OK: ok, Log: clip(logtxt), At: time.Now().UTC()})
@@ -421,7 +433,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		out, err := ex.Agent(actx, wt, agentArgs(run.Prompt, "plan")...)
+		out, err := ex.Agent(actx, wt, agentArgs(prompt, "plan")...)
 		if lim := detectLimit(out, err); lim.limited {
 			return rr, lim
 		}
@@ -446,7 +458,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Error = "checkout: " + err.Error()
 		return rr, repoLimit{}
 	}
-	out, err := ex.Agent(actx, wt, agentArgs(run.Prompt, "bypassPermissions")...)
+	out, err := ex.Agent(actx, wt, agentArgs(prompt, "bypassPermissions")...)
 	if lim := detectLimit(out, err); lim.limited {
 		return rr, lim
 	}
@@ -560,28 +572,71 @@ func detectLimit(out []byte, err error) repoLimit {
 	return repoLimit{limited: limited, resetAt: resetAt, hasReset: hasReset}
 }
 
-// todoTarget resolves a ToDo's single target repo: an existing Holistic repo (by id or name), or a
-// newly created one for a newly planned service (created in the holistic owner/topic namespace, so
-// it immediately belongs to the set).
-func (x *runExecutor) todoTarget(ctx context.Context, run runs.Run, token string) (model.Repo, error) {
-	if run.NewRepo != "" {
-		full, err := github.CreateRepo(ctx, token, discover.Owner(), run.NewRepo,
-			"Holistic-Service — angelegt vom Mercury-ToDo \""+run.Name+"\"", discover.Topic())
-		if err != nil {
-			return model.Repo{}, fmt.Errorf("Repo %q anlegen: %w", run.NewRepo, err)
+// resolveTodoTargets resolves every target of a ToDo to a concrete repo. A to-be-created target is
+// created first (CreateRepo is idempotent — an already-existing repo of that name is reused, which also
+// makes a resume safe); an existing target is looked up in the discovered set. It returns the resolved
+// repos, a repo-id→new-name map (non-empty only for freshly-planned repos, so the prompt tells the
+// agent to scaffold them), and a failed RepoResult for every target that could not be resolved. The
+// existing set is listed at most once, lazily. Duplicate targets were already collapsed in validation.
+func (x *runExecutor) resolveTodoTargets(ctx context.Context, run runs.Run, token string) ([]model.Repo, map[string]string, []runs.RepoResult) {
+	newRepoName := map[string]string{}
+	var repos []model.Repo
+	var fails []runs.RepoResult
+
+	var existing []model.Repo
+	var listErr error
+	listed := false
+	ensureListed := func() {
+		if !listed {
+			existing, listErr = discover.ReposForUser(ctx, x.tokenUser, token)
+			listed = true
 		}
-		return model.Repo{ID: run.NewRepo, Name: run.NewRepo, FullName: full}, nil
 	}
-	repos, err := discover.ReposForUser(ctx, x.tokenUser, token)
-	if err != nil {
-		return model.Repo{}, fmt.Errorf("Repos ermitteln: %w", err)
+
+	for _, t := range run.TodoTargets() {
+		if t.NewRepo != "" {
+			full, err := github.CreateRepo(ctx, token, discover.Owner(), t.NewRepo,
+				"Holistic-Service — angelegt vom Mercury-ToDo \""+run.Name+"\"", discover.Topic())
+			if err != nil {
+				fails = append(fails, runs.RepoResult{Repo: t.NewRepo, OK: false, Error: fmt.Sprintf("Repo %q anlegen: %v", t.NewRepo, err)})
+				continue
+			}
+			repos = append(repos, model.Repo{ID: t.NewRepo, Name: t.NewRepo, FullName: full})
+			newRepoName[t.NewRepo] = t.NewRepo
+			continue
+		}
+		ensureListed()
+		if listErr != nil {
+			fails = append(fails, runs.RepoResult{Repo: t.Repo, OK: false, Error: "Repos ermitteln: " + listErr.Error()})
+			continue
+		}
+		if r, ok := findRepo(existing, t.Repo); ok {
+			repos = append(repos, r)
+		} else {
+			fails = append(fails, runs.RepoResult{Repo: t.Repo, OK: false, Error: fmt.Sprintf("Ziel-Repo %q nicht gefunden", t.Repo)})
+		}
 	}
+	return repos, newRepoName, fails
+}
+
+// findRepo matches a target's repo reference (an id or a bare name) against the discovered set.
+func findRepo(repos []model.Repo, idOrName string) (model.Repo, bool) {
 	for _, r := range repos {
-		if r.ID == run.Repo || r.Name == run.Repo {
-			return r, nil
+		if r.ID == idOrName || r.Name == idOrName {
+			return r, true
 		}
 	}
-	return model.Repo{}, fmt.Errorf("Ziel-Repo %q nicht gefunden", run.Repo)
+	return model.Repo{}, false
+}
+
+// promptFor is the prompt one repo of a run receives. An auto run uses its stored snapshot for every
+// repo; a ToDo composes its prompt per target so that ONLY a freshly-created repo (newRepo non-empty)
+// is told to scaffold from scratch, while an existing target is worked as-is.
+func (x *runExecutor) promptFor(run runs.Run, newRepo string) string {
+	if run.IsTodo() {
+		return mercury.ComposeTodoPrompt(run.Name, run.Task, newRepo)
+	}
+	return run.Prompt
 }
 
 // deploy runs the root wrapper, which executes ONLY the per-repo vetted allowlist script — the agent

@@ -77,7 +77,10 @@ func titleLegend(byID map[string]mercury.RunAxiom) map[string]string {
 func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) {
 	run.PromptAt = now
 	if run.IsTodo() {
-		run.Prompt = mercury.ComposeTodoPrompt(run.Name, run.Task, run.NewRepo)
+		// The stored snapshot is the target-agnostic base (the task itself). A ToDo can now reach several
+		// repos at once, some newly created, so the "this repo is new — scaffold it" note is per-target
+		// and is composed at execution time (see the executor), not baked into one shared snapshot.
+		run.Prompt = mercury.ComposeTodoPrompt(run.Name, run.Task, "")
 		run.PromptHash = ""
 		return
 	}
@@ -191,14 +194,49 @@ type runBody struct {
 	Schedule runs.Schedule `json:"schedule"`
 	AxiomIDs []string      `json:"axiomIds"`
 	// todo only
-	Task    string     `json:"task"`
-	Repo    string     `json:"repo"`
-	NewRepo string     `json:"newRepo"`
-	DueAt   *time.Time `json:"dueAt"`
+	Task    string        `json:"task"`
+	Targets []runs.Target `json:"targets"`
+	DueAt   *time.Time    `json:"dueAt"`
+	// Deprecated: a single existing/new repo. Folded into Targets when a client still sends it, so an
+	// older ToDo form keeps working.
+	Repo    string `json:"repo"`
+	NewRepo string `json:"newRepo"`
 }
 
 // repoNameRe bounds a new repo's name (it becomes a GitHub repo and a deploy-allowlist key).
 var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+
+// normalizeTargets validates and cleans a ToDo's target list: at least one target, each being exactly
+// one existing repo OR one new-repo name (bounded like a GitHub repo), with duplicates collapsed and
+// order preserved. On success it returns the cleaned list and a zero status; otherwise an HTTP status
+// and a German message. It is the single gate a ToDo's destinations pass through.
+func normalizeTargets(in []runs.Target) ([]runs.Target, int, string) {
+	if len(in) == 0 {
+		return nil, http.StatusBadRequest, "ein ToDo braucht mindestens ein Ziel: ein vorhandenes Repo oder ein neues"
+	}
+	out := make([]runs.Target, 0, len(in))
+	seen := map[string]bool{}
+	for _, t := range in {
+		repo := strings.TrimSpace(t.Repo)
+		newRepo := strings.TrimSpace(t.NewRepo)
+		if (repo == "") == (newRepo == "") {
+			return nil, http.StatusBadRequest, "jedes Ziel ist genau ein vorhandenes Repo ODER ein neues"
+		}
+		if newRepo != "" && !repoNameRe.MatchString(newRepo) {
+			return nil, http.StatusBadRequest, "ungültiger Repo-Name (erlaubt: Buchstaben, Ziffern, Punkt, Unterstrich, Bindestrich)"
+		}
+		key := "r:" + repo
+		if newRepo != "" {
+			key = "n:" + newRepo
+		}
+		if seen[key] {
+			continue // the same repo listed twice reaches it once
+		}
+		seen[key] = true
+		out = append(out, runs.Target{Repo: repo, NewRepo: newRepo})
+	}
+	return out, 0, ""
+}
 
 func validateRunBody(b *runBody, byID map[string]mercury.RunAxiom) (int, string) {
 	b.Name = strings.TrimSpace(b.Name)
@@ -211,17 +249,20 @@ func validateRunBody(b *runBody, byID map[string]mercury.RunAxiom) (int, string)
 	switch b.Type {
 	case runs.TypeTodo:
 		b.Task = strings.TrimSpace(b.Task)
-		b.Repo = strings.TrimSpace(b.Repo)
-		b.NewRepo = strings.TrimSpace(b.NewRepo)
 		if b.Task == "" {
 			return http.StatusBadRequest, "ein ToDo braucht eine Aufgabenbeschreibung"
 		}
-		if (b.Repo == "") == (b.NewRepo == "") {
-			return http.StatusBadRequest, "ein ToDo braucht genau ein Ziel: ein vorhandenes Repo ODER ein neues"
+		// Fold a legacy single-target payload (repo/newRepo) into the target list so an older client
+		// keeps working; from here on Targets is the single source of truth.
+		if len(b.Targets) == 0 && (strings.TrimSpace(b.Repo) != "" || strings.TrimSpace(b.NewRepo) != "") {
+			b.Targets = []runs.Target{{Repo: b.Repo, NewRepo: b.NewRepo}}
 		}
-		if b.NewRepo != "" && !repoNameRe.MatchString(b.NewRepo) {
-			return http.StatusBadRequest, "ungültiger Repo-Name (erlaubt: Buchstaben, Ziffern, Punkt, Unterstrich, Bindestrich)"
+		b.Repo, b.NewRepo = "", ""
+		targets, code, msg := normalizeTargets(b.Targets)
+		if code != 0 {
+			return code, msg
 		}
+		b.Targets = targets
 		return 0, ""
 	case runs.TypeAuto:
 		if err := b.Schedule.Valid(); err != nil {
@@ -264,7 +305,7 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	run := runs.Run{
 		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
-		AxiomIDs: body.AxiomIDs, Task: body.Task, Repo: body.Repo, NewRepo: body.NewRepo, DueAt: body.DueAt,
+		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
 		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
 	composeInto(&run, byID, laufregeln, now.UTC())
@@ -316,8 +357,10 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].Schedule = body.Schedule
 		cur[idx].AxiomIDs = body.AxiomIDs
 		cur[idx].Task = body.Task
-		cur[idx].Repo = body.Repo
-		cur[idx].NewRepo = body.NewRepo
+		cur[idx].Targets = body.Targets
+		// Drop any legacy single-target fields so a record edited after the upgrade keeps Targets as its
+		// only source of truth (TodoTargets prefers Targets, but leaving stale fields is untidy).
+		cur[idx].Repo, cur[idx].NewRepo = "", ""
 		cur[idx].DueAt = body.DueAt
 		cur[idx].UpdatedAt = now.UTC()
 		composeInto(&cur[idx], byID, laufregeln, now.UTC())
@@ -827,11 +870,7 @@ func (s *Server) chatContext(ctx context.Context, cookie string) (mercury.ChatCo
 		if all, err := s.runs.List(); err == nil {
 			for _, run := range all {
 				if run.IsTodo() {
-					target := run.Repo
-					if run.NewRepo != "" {
-						target = "neu: " + run.NewRepo
-					}
-					c.Todos = append(c.Todos, run.Name+" — "+target+" — "+mercury.Snippet(run.Task, 120))
+					c.Todos = append(c.Todos, run.Name+" — "+targetsLabel(run)+" — "+mercury.Snippet(run.Task, 120))
 					continue
 				}
 				c.Runs = append(c.Runs, mercury.PlannedRun{Name: run.Name, AxiomIDs: run.AxiomIDs, Schedule: fromSchedule(run.Schedule)})
@@ -876,6 +915,21 @@ func scheduleSummary(sc runs.Schedule) string {
 	default:
 		return sc.TimeOfDay
 	}
+}
+
+// targetsLabel renders a ToDo's destinations for the Mercury-wide assistant context — each target as
+// its repo id, a to-be-created one prefixed "neu:", joined by commas.
+func targetsLabel(run runs.Run) string {
+	targets := run.TodoTargets()
+	parts := make([]string, 0, len(targets))
+	for _, t := range targets {
+		if t.NewRepo != "" {
+			parts = append(parts, "neu: "+t.NewRepo)
+			continue
+		}
+		parts = append(parts, t.Repo)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func actor(r *http.Request) string {

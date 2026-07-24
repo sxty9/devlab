@@ -51,10 +51,14 @@ type Run struct {
 
 	// todo only
 	Task    string     `json:"task,omitempty"`    // the concrete task; the prompt is built from it
-	Repo    string     `json:"repo,omitempty"`    // target repo id (an existing Holistic repo)
-	NewRepo string     `json:"newRepo,omitempty"` // create this repo first (a newly planned service)
+	Targets []Target   `json:"targets,omitempty"` // one or more destinations (existing and/or newly-created repos)
 	DueAt   *time.Time `json:"dueAt,omitempty"`   // optional one-time due date; nil = run it manually
 	Done    bool       `json:"done,omitempty"`    // set after a successful execution — a ToDo fires once
+
+	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
+	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
+	Repo    string `json:"repo,omitempty"`
+	NewRepo string `json:"newRepo,omitempty"`
 	Prompt      string     `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
 	PromptAt    time.Time  `json:"promptAt,omitempty"`   // when the snapshot was composed
 	PromptHash  string     `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
@@ -82,6 +86,28 @@ type Suspension struct {
 
 // IsTodo reports whether this is a one-time concrete task rather than a recurring axiom run.
 func (r Run) IsTodo() bool { return r.Type == TypeTodo }
+
+// Target is one destination of a ToDo: an existing Holistic repo (Repo — its id or name) or a repo to
+// be created first (NewRepo — a newly planned service). Exactly one of the two is set. A ToDo carries a
+// list of these, so one task can reach several repos in a single sweep.
+type Target struct {
+	Repo    string `json:"repo,omitempty"`
+	NewRepo string `json:"newRepo,omitempty"`
+}
+
+// TodoTargets is the single source of truth for a ToDo's destinations: the Targets list as stored, or —
+// for a record written before multi-target support — the legacy single Repo/NewRepo folded into one
+// target. Every reader (validation, execution, display) goes through this so the two shapes never
+// diverge.
+func (r Run) TodoTargets() []Target {
+	if len(r.Targets) > 0 {
+		return r.Targets
+	}
+	if r.Repo != "" || r.NewRepo != "" {
+		return []Target{{Repo: r.Repo, NewRepo: r.NewRepo}}
+	}
+	return nil
+}
 
 // ResultRef is a lightweight pointer to a stored execution result (with its token/cost totals so the
 // history list can show consumption without loading the full result).

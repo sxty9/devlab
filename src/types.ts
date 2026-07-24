@@ -350,6 +350,13 @@ export interface RunSchedule {
  *  (Konkrete ToDos) — an ad-hoc fix or a newly planned service. */
 export type RunType = 'auto' | 'todo';
 
+/** One destination of a ToDo: an existing Holistic repo (`repo` — its id) or a repo to be created
+ *  first (`newRepo` — a newly planned service). Exactly one of the two is set. */
+export interface RunTarget {
+  repo?: string;
+  newRepo?: string;
+}
+
 /** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
  *  axioms + all Laufregeln (`stale` = that snapshot drifted from the store); a todo's prompt is just
  *  its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
@@ -362,8 +369,9 @@ export interface Run {
   axiomIds: string[];
   // todo only
   task?: string;
-  repo?: string; // target repo id (existing)
-  newRepo?: string; // create this repo first (new service)
+  targets?: RunTarget[]; // one or more destinations (existing and/or newly-created repos)
+  repo?: string; // deprecated single target — read only for records predating `targets`
+  newRepo?: string; // deprecated single new-repo target — read only for legacy records
   dueAt?: string; // optional one-time due date; absent = run it manually
   done?: boolean; // set after a successful execution
   prompt: string;
@@ -387,8 +395,7 @@ export interface RunInput {
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
-  repo?: string; // todo only — an existing repo id
-  newRepo?: string; // todo only — create this repo
+  targets?: RunTarget[]; // todo only — one or more destinations (existing and/or new repos)
   dueAt?: string | null; // todo only — optional one-time due date
 }
 
