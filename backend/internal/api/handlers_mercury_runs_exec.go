@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -173,6 +174,45 @@ type runExecutor struct {
 	// token; never point DEVLAB_RUNS_USER at a human account.
 	tokenUser      string
 	autoMergeAfter time.Duration
+
+	// IO seams — nil in production (the real GitHub client and deploy pipeline are used). Kept as
+	// fields so the Maintain orchestration (throttled merge-detection → prod-deploy → untrack) can be
+	// exercised in tests without a real GitHub token, real network, or a real root deploy wrapper.
+	tokenFn      func(user string) (string, error)
+	getPRFn      func(ctx context.Context, token, fullName string, number int) (github.PullRequest, error)
+	mergePRFn    func(ctx context.Context, token, fullName string, number int) error
+	prodDeployFn func(ctx context.Context, token string, p runs.PendingPR) (string, error)
+}
+
+// token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real
+// implementation. This keeps production wiring untouched (StartScheduler sets no seams) while letting
+// tests substitute deterministic fakes.
+func (x *runExecutor) token() (string, error) {
+	if x.tokenFn != nil {
+		return x.tokenFn(x.tokenUser)
+	}
+	return x.s.links.Token(x.tokenUser)
+}
+
+func (x *runExecutor) fetchPR(ctx context.Context, token, fullName string, number int) (github.PullRequest, error) {
+	if x.getPRFn != nil {
+		return x.getPRFn(ctx, token, fullName, number)
+	}
+	return github.GetPullRequest(ctx, token, fullName, number)
+}
+
+func (x *runExecutor) mergePR(ctx context.Context, token, fullName string, number int) error {
+	if x.mergePRFn != nil {
+		return x.mergePRFn(ctx, token, fullName, number)
+	}
+	return github.MergePullRequest(ctx, token, fullName, number)
+}
+
+func (x *runExecutor) runProdDeploy(ctx context.Context, token string, p runs.PendingPR) (string, error) {
+	if x.prodDeployFn != nil {
+		return x.prodDeployFn(ctx, token, p)
+	}
+	return x.prodDeployMerged(ctx, token, p)
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef, error) {
@@ -248,7 +288,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 	}
 	costCeiling := maxCostUSD()
 
-	done := res.DoneRepos()     // repos already handled in a previous attempt (resume skips them)
+	done := res.DoneRepos()          // repos already handled in a previous attempt (resume skips them)
 	overallOK := res.OK || !resuming // seed from the partial result's running state
 	if resuming {
 		overallOK = true
@@ -453,6 +493,7 @@ func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, sa
 //   - infra:   an infrastructure failure (DNS/network) hit clone or refresh, i.e. NOT the repo's own
 //     fault → carry the sweep over to the next fire (the network may be back by then), never burn
 //     through 19 clone failures and finalise the run as done.
+//
 // A zero repoSignal means the repo produced an ordinary result (success or a genuine work failure).
 type repoSignal struct {
 	limited  bool
@@ -609,10 +650,34 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	// Push + PR FIRST, deploy LAST. The remote branch and PR are the durable record of what was
-	// built; if we deployed first and the push then failed, the server would run code that exists
-	// only in a local branch the next run's ResetToRemote discards — live code with no source record
-	// and no rollback. So the record is established before anything goes live.
+	// DEV-DEPLOY (full mode only) — BEFORE the push, deliberately. dev is the very box we built on, so
+	// this workspace and its run branch already ARE the source record for the code going live here;
+	// there is no "live code with no source" risk that the old push-first ordering guarded against.
+	// That invariant still holds for PROD, which is no longer touched here at all — a prod-deploy is
+	// driven only by a MERGED PR in Maintain, where the pushed branch + merge are the durable record
+	// before anything ships to the VPS.
+	//
+	// Finding C: the build runs UNPRIVILEGED here (buildArtifact, as the runner itself); the root
+	// wrapper only installs+restarts a prebuilt artifact, never builds. Finding B: the self repo is
+	// NEVER dev-deployed — restarting THIS devlabd would kill the running sweep; its PR still lands and
+	// its deploy happens out-of-band (its prod-deploy, which restarts the VPS not the runner, is fine
+	// via Maintain). A dev-deploy failure is NON-fatal: we log the step and still push + open the PR.
+	if x.mode == "full" && isSelfRepo(repo.ID) {
+		step("dev-deploy", "Selbst-Deploy übersprungen — "+repo.ID+" wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)", true)
+	} else if x.shouldDevDeploy(repo.ID) {
+		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
+			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
+		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
+			step("dev-deploy", depLog+"\n"+derr.Error(), false)
+		} else {
+			step("dev-deploy", depLog, true)
+			rr.Deployed = true
+		}
+	}
+
+	// Push + PR. The remote branch and PR are the durable record of what was built — established before
+	// prod ever runs (prod-deploy happens only in Maintain, on merge). A push failure is terminal for
+	// this repo; the local run branch is discarded by the next run's ResetToRemote.
 	if _, err := ex.Push(ctx, wt, token); err != nil {
 		rr.Error = "push: " + err.Error()
 		return rr, repoSignal{}
@@ -636,30 +701,19 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(x.autoMergeAfter).UTC(),
 	})
 
-	// FULL: deploy the committed workspace, now that push+PR are the record. Never deploy the service
-	// we are RUNNING IN from inside its own run — the deploy script restarts devlabd, which would kill
-	// this executor mid-loop, strand the result and refire the whole sweep. That repo's PR still lands;
-	// its deploy is left to the normal (out-of-band) deploy path.
-	if x.mode == "full" {
-		if isSelfRepo(repo.ID) {
-			step("deploy", "Selbst-Deploy übersprungen — "+repo.ID+" wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy separat)", true)
-		} else {
-			depLog, derr := x.deploy(ctx, repo.Name, wt)
-			if derr != nil {
-				// The deploy failed, but push+PR already landed and the PR is tracked for auto-merge.
-				// Un-track it: code that never deployed must NOT auto-merge onto the default branch after
-				// the window. The PR stays open on GitHub for a human to judge; it just won't merge itself.
-				_ = x.s.runPRs.Remove(repo.FullName, pr.Number)
-				step("deploy", depLog+"\n"+derr.Error(), false)
-				rr.Error = "deploy: " + derr.Error()
-				return rr, repoSignal{}
-			}
-			step("deploy", depLog, true)
-			rr.Deployed = true
-		}
-	}
+	// PROD-DEPLOY is intentionally NOT done here. In the two-environment model the dev-deploy above
+	// already put this build live on the dev box; prod is reached only after the PR is MERGED (by a
+	// human or by the auto-merge window), detected and shipped by Maintain in full mode. That keeps the
+	// merge as the gate for prod and avoids deploying unreviewed code straight to the VPS.
 	rr.OK = true
 	return rr, repoSignal{}
+}
+
+// shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
+// full mode, and NEVER for the self repo (Finding B — dev-deploying devlab restarts THIS devlabd,
+// killing the running sweep). report/pr never dev-deploy at all.
+func (x *runExecutor) shouldDevDeploy(repoID string) bool {
+	return x.mode == "full" && !isSelfRepo(repoID)
 }
 
 // selfRepoID is the repo id of the DevLab service itself — its own run must never in-process
@@ -830,47 +884,269 @@ func (x *runExecutor) todoTarget(ctx context.Context, run runs.Run, token string
 	return model.Repo{}, fmt.Errorf("Ziel-Repo %q nicht gefunden", run.Repo)
 }
 
-// deploy runs the root wrapper, which executes ONLY the per-repo vetted allowlist script — the agent
-// (and this unprivileged runner) never get arbitrary sudo.
-func (x *runExecutor) deploy(ctx context.Context, repoName, wt string) (string, error) {
-	cmd := exec.CommandContext(ctx, "sudo", "-n", deployWrapper, repoName, wt)
+// deploy hands a PREBUILT artifact to the root wrapper, which INSTALLS ONLY — it never builds (Finding
+// C). env picks the target: "dev" installs the artifact to this box's local service and restarts the
+// local unit; "prod" ships the artifact to the prod VPS (over a root-held forced-command SSH key) where
+// the receiver installs+restarts. The prod TARGET host lives server-side (/etc/devlab/prod-target),
+// never here — an artifact dir the runner built, plus the repo name and env, are the only args, so a
+// compromised runner can neither build-as-root nor redirect a deploy to a foreign host. The wrapper
+// re-canonicalizes artifactDir with realpath and requires it under /var/lib/devlab/workspaces/.
+func (x *runExecutor) deploy(ctx context.Context, repo model.Repo, artifactDir, env string) (string, error) {
+	cmd := exec.CommandContext(ctx, "sudo", "-n", deployWrapper, repo.Name, artifactDir, env)
+	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), fmt.Errorf("devlab-deploy %s: %w", repoName, err)
+		return string(out), fmt.Errorf("devlab-deploy %s (%s): %w", repo.Name, env, err)
 	}
 	return string(out), nil
 }
 
-// Maintain auto-merges overdue run PRs a human didn't merge in time.
+// buildArtifact compiles repo's deployable artifact IN ITS WORKSPACE, as the UNPRIVILEGED runner
+// process itself (os/exec as the current user — NEVER root, and never through the deploy wrapper). This
+// is Finding C: building agent-written code as root would be an RCE-to-root — an npm postinstall hook
+// or a go generate step would run as root and could read the root-only prod deploy key. So the
+// privileged wrapper only ever installs a PREBUILT artifact. The result is an artifact directory UNDER
+// the workspace (<wt>/.mercury-artifact): the Go daemon binary plus the built web assets in web/. Its
+// path resolves under /var/lib/devlab/workspaces/, which the root wrapper re-checks with realpath
+// before installing.
+//
+// The recipe mirrors .sxgate/preview.conf: the web SPA (npm ci, or install when there is no lockfile,
+// then npm run build) and the Go backend (CGO_ENABLED=0 go build). Each half runs only when its
+// manifest is present, so a web-only or backend-only service still builds; a present half that fails
+// to build is a hard error (executeRepo treats a dev-deploy build failure as non-fatal upstream).
+func (x *runExecutor) buildArtifact(ctx context.Context, wt string, repo model.Repo) (string, error) {
+	artifactDir := filepath.Join(wt, ".mercury-artifact")
+	if err := os.RemoveAll(artifactDir); err != nil {
+		return "", fmt.Errorf("Artefakt-Verzeichnis leeren: %w", err)
+	}
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		return "", fmt.Errorf("Artefakt-Verzeichnis anlegen: %w", err)
+	}
+	built := false
+
+	// Web SPA: npm ci (fall back to install when there is no lockfile) then npm run build; collect the
+	// build output (dist/ or build/) into <artifactDir>/web.
+	if fileExists(filepath.Join(wt, "package.json")) {
+		if out, err := x.runBuild(ctx, wt, nil, "npm", "ci", "--no-audit", "--no-fund"); err != nil {
+			if out2, err2 := x.runBuild(ctx, wt, nil, "npm", "install", "--no-audit", "--no-fund"); err2 != nil {
+				return "", fmt.Errorf("npm install: %v: %s", err2, clip(out+out2))
+			}
+		}
+		if out, err := x.runBuild(ctx, wt, []string{"CI=true"}, "npm", "run", "build"); err != nil {
+			return "", fmt.Errorf("npm run build: %v: %s", err, clip(out))
+		}
+		src := ""
+		for _, cand := range []string{"dist", "build"} {
+			if dirExists(filepath.Join(wt, cand)) {
+				src = filepath.Join(wt, cand)
+				break
+			}
+		}
+		if src != "" {
+			if out, err := x.runBuild(ctx, wt, nil, "cp", "-a", src, filepath.Join(artifactDir, "web")); err != nil {
+				return "", fmt.Errorf("Web-Assets sammeln: %v: %s", err, clip(out))
+			}
+			built = true
+		}
+	}
+
+	// Go backend: CGO_ENABLED=0 go build of the command package(s) into the artifact dir. Prefer a
+	// backend/ module (the uniform Holistic layout), else a module at the repo root.
+	goModDir := ""
+	if fileExists(filepath.Join(wt, "backend", "go.mod")) {
+		goModDir = filepath.Join(wt, "backend")
+	} else if fileExists(filepath.Join(wt, "go.mod")) {
+		goModDir = wt
+	}
+	if goModDir != "" {
+		target := "./cmd/..."
+		if !dirExists(filepath.Join(goModDir, "cmd")) {
+			target = "./..." // no cmd/ tree — build whatever main packages exist
+		}
+		// Trailing separator on -o makes go write each main package's binary INTO artifactDir.
+		if out, err := x.runBuild(ctx, goModDir, []string{"CGO_ENABLED=0"},
+			"go", "build", "-o", artifactDir+string(os.PathSeparator), target); err != nil {
+			return "", fmt.Errorf("go build: %v: %s", err, clip(out))
+		}
+		built = true
+	}
+
+	if !built {
+		return "", fmt.Errorf("kein Build-Rezept erkannt (weder package.json noch go.mod) für %s", repo.ID)
+	}
+	return artifactDir, nil
+}
+
+// runBuild runs one build command as the runner PROCESS ITSELF (current user), rooted at dir. It never
+// uses sudo or the devlab-exec wrapper — the build must stay unprivileged (Finding C). Combined output
+// is returned for the step log.
+func (x *runExecutor) runBuild(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, extraEnv...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// prodDeployMerged ships a MERGED run PR to prod. It materializes the merged default branch in the
+// runner's workspace (Ensure + Lock + ResetToRemote), builds the artifact UNPRIVILEGED (Finding C),
+// then hands it to the deploy wrapper with env=prod (which ships the prebuilt artifact to the VPS and
+// installs+restarts there). The self repo is fine here — this restarts the VPS devlabd, not the dev
+// runner. A nil error means prod is live on the merged code; Maintain then untracks the PR.
+func (x *runExecutor) prodDeployMerged(ctx context.Context, token string, p runs.PendingPR) (string, error) {
+	name := p.Repo
+	if i := strings.LastIndex(p.Repo, "/"); i >= 0 {
+		name = p.Repo[i+1:]
+	}
+	repo := model.Repo{ID: name, Name: name, FullName: p.Repo}
+
+	if _, err := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true); err != nil {
+		return "", fmt.Errorf("workspace: %w", err)
+	}
+	unlock, err := x.s.workspaces.Lock(x.user, repo.ID)
+	if err != nil {
+		return "", fmt.Errorf("lock: %w", err)
+	}
+	defer unlock()
+	branch, err := github.DefaultBranch(ctx, token, repo.FullName)
+	if err != nil || branch == "" {
+		return "", fmt.Errorf("default branch: %v", err)
+	}
+	wt, err := x.s.workspaces.Path(x.user, repo.ID)
+	if err != nil {
+		return "", fmt.Errorf("workspace-Pfad: %w", err)
+	}
+	ex := workspace.Executor{User: x.user, PerUser: true}
+	if err := ex.ResetToRemote(ctx, wt, token, branch); err != nil {
+		return "", fmt.Errorf("auf %s zurücksetzen: %w", branch, err)
+	}
+	artifactDir, err := x.buildArtifact(ctx, wt, repo)
+	if err != nil {
+		return "", fmt.Errorf("build: %w", err)
+	}
+	return x.deploy(ctx, repo, artifactDir, "prod")
+}
+
+func fileExists(p string) bool { fi, err := os.Stat(p); return err == nil && !fi.IsDir() }
+func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
+
+// Maintain reconciles tracked run PRs each tick.
+//
+// report/pr mode behaves EXACTLY as before (Finding A): a PR still inside its auto-merge window is
+// skipped BEFORE any GitHub call (shouldCheckPR), so those modes make ZERO extra GitHub calls; only an
+// OVERDUE PR is fetched and, if still open, auto-merged, and a merged/closed one is untracked.
+//
+// full mode additionally detects merges (human OR auto) to drive a PROD-deploy, but THROTTLES the
+// per-PR reads: an in-window PR is re-fetched at most once per recheck interval (default 5m, tracked
+// via PendingPR.LastChecked), so the sweep never GETs every tracked PR every 30s tick and exhausts the
+// rate budget. A merged PR is shipped to prod; the PR is untracked only on a SUCCESSFUL prod-deploy, so
+// a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
+// success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
 	prs, err := x.s.runPRs.List()
 	if err != nil || len(prs) == 0 {
 		return
 	}
-	token, err := x.s.links.Token(x.tokenUser)
+	token, err := x.token()
 	if err != nil {
 		return
 	}
 	now := time.Now()
+	recheck := prRecheck()
 	for _, p := range prs {
-		if now.Before(p.MergeBy) {
-			continue // human still has time to merge
+		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
+			continue // report/pr: within window → not touched. full: throttled between rechecks.
 		}
-		cur, err := github.GetPullRequest(ctx, token, p.Repo, p.Number)
+		if x.mode == "full" {
+			_ = x.s.runPRs.Touch(p.Repo, p.Number, now) // stamp the recheck up front (throttle even on error)
+		}
+		cur, err := x.fetchPR(ctx, token, p.Repo, p.Number)
 		if err != nil {
-			continue // transient; retry next tick
+			continue // transient; retry next eligible tick
 		}
-		if cur.Merged || cur.State != "open" {
-			_ = x.s.runPRs.Remove(p.Repo, p.Number) // already merged or closed → stop tracking
-			continue
+		switch decidePR(x.mode, cur, !now.Before(p.MergeBy)) {
+		case prUntrack:
+			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
+		case prMerge:
+			if err := x.mergePR(ctx, token, p.Repo, p.Number); err != nil {
+				log.Printf("devlabd: auto-merge %s#%d failed (will retry): %v", p.Repo, p.Number, err)
+				continue
+			}
+			log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			if x.mode != "full" {
+				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
+			}
+			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
+		case prDeploy:
+			depLog, derr := x.runProdDeploy(ctx, token, p)
+			if derr != nil {
+				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
+				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
+			}
+			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+		case prNone:
+			// full-mode recheck: still open within its window → nothing to do yet.
 		}
-		if err := github.MergePullRequest(ctx, token, p.Repo, p.Number); err != nil {
-			log.Printf("devlabd: auto-merge %s#%d failed (will retry): %v", p.Repo, p.Number, err)
-			continue
-		}
-		_ = x.s.runPRs.Remove(p.Repo, p.Number)
-		log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
 	}
+}
+
+// prAction is Maintain's decision for one tracked PR after it has been fetched.
+type prAction int
+
+const (
+	prNone    prAction = iota // leave it tracked, do nothing this tick
+	prMerge                   // overdue and still open → auto-merge
+	prDeploy                  // merged → prod-deploy then untrack (full mode only)
+	prUntrack                 // merged (report/pr) or closed without merge → stop tracking
+)
+
+const defaultPRRecheck = 5 * time.Minute
+
+// prRecheck is the minimum spacing between full-mode merge-detection reads of one in-window PR.
+// DEVLAB_RUNS_PR_RECHECK overrides; a non-positive value keeps the default.
+func prRecheck() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PR_RECHECK")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultPRRecheck
+}
+
+// shouldCheckPR reports whether Maintain may spend a GitHub read on this tracked PR now. An OVERDUE PR
+// is always checked (to auto-merge / detect a merge) in every mode — historical behavior. report/pr
+// mode NEVER touches an in-window PR (zero extra calls). full mode rechecks an in-window PR too, but at
+// most once per recheck interval, so a large tracked set can't exhaust the rate budget (Finding A).
+func shouldCheckPR(mode string, now, mergeBy, lastChecked time.Time, recheck time.Duration) bool {
+	if !now.Before(mergeBy) {
+		return true // overdue
+	}
+	if mode != "full" {
+		return false // report/pr: in-window PRs are never fetched
+	}
+	return lastChecked.IsZero() || now.Sub(lastChecked) >= recheck
+}
+
+// decidePR maps a freshly-fetched PR (+ whether it is past its auto-merge deadline) to an action.
+// report/pr NEVER deploy: a merged or closed PR is simply untracked. full mode turns a merged PR (by a
+// human OR the auto-merge) into a prod-deploy, auto-merges an overdue still-open PR, and leaves an
+// in-window still-open PR alone.
+func decidePR(mode string, pr github.PullRequest, overdue bool) prAction {
+	if pr.Merged {
+		if mode == "full" {
+			return prDeploy
+		}
+		return prUntrack
+	}
+	if pr.State != "open" {
+		return prUntrack // closed without merging
+	}
+	if overdue {
+		return prMerge
+	}
+	return prNone
 }
 
 func (x *runExecutor) runnerIdentity() (string, int64) {

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# devlab-deploy-recv — VPS-side INSTALL-ONLY receiver for prod deploys. It is the forced command
+# behind the root-held deploy key: the dev box ships a PREBUILT artifact here and then triggers an
+# install. THIS HOST NEVER BUILDS (no go, no npm) — prod runs only prebuilt bytes.
+#
+# authorized_keys line (root's ~/.ssh/authorized_keys on the VPS — ONE logical line; the leading
+# option list is what turns a normal key into a locked-down deploy key):
+#
+#   command="/usr/local/sbin/devlab-deploy-recv",restrict ssh-ed25519 AAAA...devkey... devlab-prod-deploy
+#
+#   `restrict` = no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding (and any
+#   future restrictions). Combined with command="…" it means: whatever the client asks for, sshd runs
+#   ONLY this script. The client's requested command arrives in $SSH_ORIGINAL_COMMAND (no argv).
+#
+# This script permits EXACTLY two operations, both confined to staging/prod, and rejects all else:
+#   1. rsync receive   -> delegated to rrsync, which confines every path in the rsync request under
+#      the staging root and allows ONLY writes (-wo). This is how the prebuilt bytes arrive; it is
+#      impossible to write outside <STAGING_ROOT> or to read anything back.
+#   2. install <repo>  -> copy the staged prebuilt artifact into prod paths + restart the prod unit.
+# So even a COMPROMISED dev key can only push files into staging and (re)install a KNOWN repo — never
+# run an arbitrary command as this host's ssh user, never escape the staging/prod paths.
+#
+# Exit codes: 0 ok · 2 bad/blocked request · 3 no staged artifact / no mapping · 5 rrsync missing ·
+#             10 staged input missing.
+#
+# Install (on the VPS): sudo install -o root -g root -m 0755 devlab-deploy-recv /usr/local/sbin/devlab-deploy-recv
+set -euo pipefail
+
+STAGING_ROOT="/var/lib/devlab/staging"
+
+log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
+die() { log "$1"; exit "${2:-2}"; }
+
+mkdir -p "$STAGING_ROOT"
+
+# The client command: forced-command path uses $SSH_ORIGINAL_COMMAND; a direct/local run uses argv.
+CMD="${SSH_ORIGINAL_COMMAND:-$*}"
+
+# ── operation 1: rsync receive (the prebuilt upload) ──────────────────────────────────────────────
+# Match only an rsync SERVER receive; hand it to rrsync locked to the staging root. rrsync (shipped
+# with rsync) rejects absolute paths, '..', and any non-receive mode, so the client can write ONLY
+# under <STAGING_ROOT>/<its-chosen-subdir>.
+case "$CMD" in
+  rsync\ --server\ *)
+    rrsync=""
+    for c in rrsync /usr/bin/rrsync /usr/share/rsync/scripts/rrsync /usr/lib/rsync/rrsync; do
+      p="$(command -v "$c" 2>/dev/null || true)"; [[ -n "$p" ]] && { rrsync="$p"; break; }
+    done
+    [[ -n "$rrsync" ]] || die "rrsync not found; cannot confine rsync receive" 5
+    exec "$rrsync" -wo "$STAGING_ROOT"
+    ;;
+esac
+
+# ── operation 2: install trigger — "[devlab-deploy-recv] <repo>" ─────────────────────────────────
+# Disable globbing before word-splitting the (untrusted) command so a '*' cannot expand to filenames.
+set -f
+# Deliberate, glob-disabled word-split of the (untrusted) client command into program + repo.
+# shellcheck disable=SC2086
+set -- $CMD
+set +f
+case "${1:-}" in devlab-deploy-recv|*/devlab-deploy-recv) shift ;; esac
+REPO="${1:-}"
+[[ $# -le 1 ]] || die "unexpected extra arguments" 2
+{ [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$REPO" != *..* ]]; } || die "invalid repo name '${REPO:-<none>}'" 2
+
+# Resolve the staged artifact and require it stays under the staging root (defeat symlink escapes).
+SRC="$STAGING_ROOT/$REPO"
+real="$(realpath -e -- "$SRC" 2>/dev/null)" || die "no staged artifact for '$REPO' ($SRC)" 3
+rootreal="$(realpath -e -- "$STAGING_ROOT")"
+case "$real/" in "$rootreal"/*) : ;; *) die "staged path escapes staging root" 2 ;; esac
+
+log "install-only prod deploy of '$REPO' from $real"
+
+# Per-repo prod install: map the prebuilt artifact to concrete prod paths + unit. NO build. Add a
+# case per deployable repo (mirrors the dev-side per-repo install).
+case "$REPO" in
+  devlab)
+    BIN="$real/devlabd"; WEB="$real/dist"
+    [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
+    [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
+    install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
+    mkdir -p /var/lib/devlab/www
+    rsync -a --delete "$WEB"/ /var/lib/devlab/www/
+    systemctl restart devlabd
+    ;;
+  *)
+    die "no prod install mapping for repo '$REPO'" 3
+    ;;
+esac
+
+log "prod deploy of '$REPO' done"
