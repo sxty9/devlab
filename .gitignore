@@ -9,6 +9,9 @@ dist/
 .shots.mjs
 .shot.mjs
 
+# machine-local Claude Code settings
+.claude/settings.local.json
+
 # go backend build artifacts
 /devlabd
 backend/devlabd

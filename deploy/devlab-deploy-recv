@@ -84,7 +84,14 @@ case "$REPO" in
     systemctl restart devlabd
     ;;
   *)
-    die "no prod install mapping for repo '$REPO'" 3
+    # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
+    # to /opt/<repo>/bin/<repo>d and restart <repo>.service — the standard layout every service shares.
+    # <repo> is already charset+traversal validated above, so the derived paths are bounded.
+    gbin="$real/${REPO}d"
+    [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
+    install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+    install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+    systemctl restart "$REPO"
     ;;
 esac
 
