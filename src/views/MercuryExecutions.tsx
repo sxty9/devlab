@@ -162,6 +162,33 @@ export function RepoBlock({ repo }: { repo: RepoResult }) {
   );
 }
 
+/** The run's Promptstellung for one execution: the exact prompt the agent was driven by, snapshotted at
+ *  run time and rendered as Markdown. Collapsed by default — an auto run's prompt folds in every axiom
+ *  and can be long, so it stays portioned until asked for, mirroring a step's Bericht. Renders nothing
+ *  when the execution predates prompt capture. Execution-level (shown once), never repeated per repo. */
+export function PromptDisclosure({ prompt }: { prompt?: string }) {
+  const [open, setOpen] = useState(false);
+  if (!prompt) return null;
+  return (
+    <div className="rounded-card border border-separator bg-surface">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 rounded-card px-3 py-2 text-left transition hover:bg-fill/10"
+      >
+        <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 text-text-tertiary transition-transform duration-fast', open && 'rotate-90')} />
+        <span className="flex-1 truncate text-footnote font-medium text-text-secondary">Promptstellung</span>
+      </button>
+      {open && (
+        <div
+          className="dl-markdown dl-scroll mx-3 mb-3 max-h-80 overflow-auto rounded-md border border-separator bg-bg-base p-3 text-caption text-text-secondary"
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(prompt) }}
+        />
+      )}
+    </div>
+  );
+}
+
 /** The full execution document as a page: title, totals, then each repo with its steps and reports.
  *  The right pane of an aggregate ExecutionHistory. */
 export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: string }) {
@@ -202,6 +229,12 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
+
+      {res.prompt && (
+        <div className="mt-4">
+          <PromptDisclosure prompt={res.prompt} />
+        </div>
+      )}
 
       <section className="mt-6 flex flex-col gap-4">
         {res.repos.length === 0 ? (
@@ -355,6 +388,7 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
+      <PromptDisclosure prompt={res.prompt} />
       {res.repos.length === 0 ? (
         <p className="text-caption text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
       ) : (
@@ -483,6 +517,7 @@ export function LiveExecution({ runId, resultId, live }: { runId: string; result
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
+      <PromptDisclosure prompt={res.prompt} />
       {repos.map((repo, i) => (
         <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />
       ))}

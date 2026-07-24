@@ -13,22 +13,27 @@ import (
 // even after the run is deleted — logs are historized and persistent, viewable via the orphan-logs
 // listing. The scheduler/executor (Phase 2) writes these; the management layer only reads them.
 type Result struct {
-	RunID      string       `json:"runId"`
-	ResultID   string       `json:"resultId"`
-	RunName    string       `json:"runName,omitempty"` // snapshot of the run's name (survives run deletion)
+	RunID    string `json:"runId"`
+	ResultID string `json:"resultId"`
+	RunName  string `json:"runName,omitempty"` // snapshot of the run's name (survives run deletion)
 	// Type snapshots the run's kind (auto|todo) at execution time, like RunName — so the Lauf- and
 	// ToDo-History can each show ONLY their own executions even after the run is deleted. "" (results
 	// written before this field) reads as auto, and the reader falls back to the live run's kind.
-	Type       Type         `json:"type,omitempty"`
-	StartedAt  time.Time    `json:"startedAt"`
+	Type      Type      `json:"type,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
 	// UpdatedAt is refreshed on every Save (i.e. after every repo and every carry-over), so it tracks
 	// when the execution was last worked — not just when it began. FindStranded bounds resume by this,
 	// so a multi-night carry-over that is touched each night never ages out, while a genuinely abandoned
 	// husk does. Zero on results written before this field existed (FindStranded falls back to StartedAt).
-	UpdatedAt  time.Time    `json:"updatedAt,omitempty"`
-	FinishedAt time.Time    `json:"finishedAt,omitempty"`
-	PromptHash string       `json:"promptHash,omitempty"`
-	OK         bool         `json:"ok"`
+	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	PromptHash string    `json:"promptHash,omitempty"`
+	// Prompt is the run's Promptstellung snapshotted at execution start — the exact prompt the agent was
+	// driven by (auto: axioms + Laufregeln; todo: the task). Snapshotted like RunName/Type/PromptHash so
+	// the History shows THIS execution's prompt even after the run — or its axioms — later change, or the
+	// run is deleted. Empty on results written before this field existed.
+	Prompt string `json:"prompt,omitempty"`
+	OK     bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
@@ -214,12 +219,12 @@ func (r *Results) Get(runID, resultID string) (Result, bool, error) {
 // ExecutionSummary is one completed execution across all runs — the Lauf-History row (with token/cost
 // and the run name snapshot so it survives the run's deletion).
 type ExecutionSummary struct {
-	RunID        string    `json:"runId"`
-	RunName      string    `json:"runName"`
-	Type         Type      `json:"type,omitempty"` // auto|todo — the run's kind, so history is split per surface
-	ResultID     string    `json:"resultId"`
-	At           time.Time `json:"at"`
-	FinishedAt   time.Time `json:"finishedAt,omitempty"`
+	RunID        string     `json:"runId"`
+	RunName      string     `json:"runName"`
+	Type         Type       `json:"type,omitempty"` // auto|todo — the run's kind, so history is split per surface
+	ResultID     string     `json:"resultId"`
+	At           time.Time  `json:"at"`
+	FinishedAt   time.Time  `json:"finishedAt,omitempty"`
 	OK           bool       `json:"ok"`
 	Suspended    bool       `json:"suspended,omitempty"`
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`

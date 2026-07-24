@@ -488,6 +488,9 @@ export interface RunResult {
   startedAt: string;
   finishedAt?: string;
   promptHash?: string;
+  /** The run's Promptstellung for THIS execution — the exact prompt the agent was driven by,
+   *  snapshotted at run time. Absent on executions recorded before it was captured. */
+  prompt?: string;
   ok: boolean;
   repos: RepoResult[];
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed

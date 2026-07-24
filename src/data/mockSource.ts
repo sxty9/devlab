@@ -338,7 +338,18 @@ export const mockSource: DataSource = {
     return { results: [] };
   },
   async mercuryRunResult(id: string, resultId: string) {
-    return { runId: id, resultId, startedAt: new Date().toISOString(), ok: true, repos: [], inputTokens: 0, outputTokens: 0, costUsd: 0, numTurns: 0 };
+    return {
+      runId: id,
+      resultId,
+      startedAt: new Date().toISOString(),
+      ok: true,
+      prompt: '# Konkretes ToDo: Beispiel\n\n## Aufgabe\n\nBeispielhafte Promptstellung dieser Ausführung.',
+      repos: [],
+      inputTokens: 0,
+      outputTokens: 0,
+      costUsd: 0,
+      numTurns: 0,
+    };
   },
   async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {
     return { from: new Date().toISOString(), to: new Date().toISOString(), occurrences: [] };
