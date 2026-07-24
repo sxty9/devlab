@@ -6,27 +6,8 @@ import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
 import { FileIcon, FileTextIcon, PlusIcon, RefreshIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
+import { humanSize, toBase64 } from '@/lib/file';
 import type { VisionFile } from '@/types';
-
-function humanSize(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Read a File as base64 (without the data-URL prefix). */
-function toBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => {
-      const s = String(r.result);
-      const i = s.indexOf(',');
-      resolve(i >= 0 ? s.slice(i + 1) : s);
-    };
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(file);
-  });
-}
 
 /** The Vision Catalog: idea deposits (images, PDFs, specs, notes) from the repo's /vision folder,
  *  attachable and discussable by collaborators. */

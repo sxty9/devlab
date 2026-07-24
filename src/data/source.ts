@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -177,6 +177,14 @@ export interface DataSource {
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
+
+  // ── ToDo media (images/documents the agent takes into account) ─────────────
+  /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */
+  mercuryUploadAttachment(id: string, filename: string, contentB64: string): Promise<RunAttachment[]>;
+  /** Remove one attachment from a ToDo; returns the refreshed list. */
+  mercuryDeleteAttachment(id: string, attachmentId: string): Promise<RunAttachment[]>;
+  /** Direct URL for an <img>/link to an attachment's raw bytes (correct MIME). */
+  mercuryAttachmentRawUrl(id: string, attachmentId: string): string;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */

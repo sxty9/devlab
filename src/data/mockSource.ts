@@ -355,6 +355,15 @@ export const mockSource: DataSource = {
   async mercuryCancelRun() {
     /* mock: no-op */
   },
+  async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {
+    return [];
+  },
+  async mercuryDeleteAttachment(_id: string, _attachmentId: string): Promise<import('@/types').RunAttachment[]> {
+    return [];
+  },
+  mercuryAttachmentRawUrl(id: string, attachmentId: string) {
+    return `/api/mercury/runs/${id}/attachments/${attachmentId}/raw`;
+  },
 };
 
 /** A RunInput carries only what its type needs (a ToDo has no schedule/axioms), while a Run always

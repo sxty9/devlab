@@ -3,9 +3,21 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
-import { RocketIcon, PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon } from '@/ui/icons';
+import { humanSize, toBase64 } from '@/lib/file';
+import { RocketIcon, PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import type { Run, RunInput, RunTarget, RunResultRef, RunResult, RepoResult, RunStep, Repo, RunCalendar } from '@/types';
+import type { Run, RunInput, RunTarget, RunAttachment, RunResultRef, RunResult, RepoResult, RunStep, Repo, RunCalendar } from '@/types';
+
+/** A single-file cap that matches the backend (25 MiB). */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+/** A ToDo is a focused task, not a media library — matches the backend ceiling. */
+const MAX_ATTACHMENTS = 20;
+
+/** True for a MIME the browser can show inline as an image thumbnail. */
+const isImageMime = (m?: string) => !!m && m.startsWith('image/');
+
+/** A newly picked file held in the editor until the ToDo is saved (then uploaded to its id). */
+type PendingAttachment = { name: string; b64: string; size: number; mime: string };
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
@@ -101,6 +113,153 @@ function OkPill({ ok }: { ok: boolean }) {
     >
       {ok ? 'OK' : 'Fehler'}
     </span>
+  );
+}
+
+/** One attachment tile: an image thumbnail or a file glyph, with the name and size. `href` (when set)
+ *  opens the raw bytes in a new tab; `preview` is a data/URL for the image thumbnail; `onRemove` adds a
+ *  remove affordance. Shared by the editor (add/remove) and the detail pane (read-only). */
+function AttachmentCard({
+  name,
+  mime,
+  size,
+  preview,
+  href,
+  onRemove,
+}: {
+  name: string;
+  mime?: string;
+  size: number;
+  preview?: string;
+  href?: string;
+  onRemove?: () => void;
+}) {
+  const body = (
+    <>
+      <span className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded bg-fill/10">
+        {preview && isImageMime(mime) ? (
+          <img src={preview} alt={name} className="h-full w-full object-cover" />
+        ) : (
+          <FileIcon className="h-5 w-5 text-text-tertiary" />
+        )}
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-footnote text-text-secondary">{name}</span>
+        <span className="text-caption text-text-tertiary">{humanSize(size)}</span>
+      </span>
+    </>
+  );
+  return (
+    <div className="flex items-center gap-2 rounded-card border border-separator bg-surface p-2">
+      {href ? (
+        <a href={href} target="_blank" rel="noreferrer" className="flex min-w-0 flex-1 items-center gap-2 hover:opacity-80">
+          {body}
+        </a>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-center gap-2">{body}</div>
+      )}
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`${name} entfernen`}
+          className="shrink-0 rounded p-1 text-text-tertiary transition hover:bg-fill/10 hover:text-danger"
+        >
+          <XIcon className="h-3.5 w-3.5" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** The editor's media section: attach images/documents to a ToDo. Already-saved attachments and freshly
+ *  picked ones are shown together; both are committed when the ToDo is saved (uploads/removals then). */
+function MediaField({
+  existing,
+  pending,
+  rawUrl,
+  onPick,
+  onRemoveExisting,
+  onRemovePending,
+}: {
+  existing: RunAttachment[];
+  pending: PendingAttachment[];
+  rawUrl: (attachmentId: string) => string | undefined;
+  onPick: (files: FileList) => void;
+  onRemoveExisting: (id: string) => void;
+  onRemovePending: (index: number) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const full = existing.length + pending.length >= MAX_ATTACHMENTS;
+  return (
+    <div>
+      <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Medien</p>
+      <div className="flex flex-col gap-2">
+        {existing.map((a) => (
+          <AttachmentCard
+            key={a.id}
+            name={a.filename}
+            mime={a.mime}
+            size={a.size}
+            preview={isImageMime(a.mime) ? rawUrl(a.id) : undefined}
+            href={rawUrl(a.id)}
+            onRemove={() => onRemoveExisting(a.id)}
+          />
+        ))}
+        {pending.map((p, i) => (
+          <AttachmentCard
+            key={`pending:${i}:${p.name}`}
+            name={p.name}
+            mime={p.mime}
+            size={p.size}
+            preview={isImageMime(p.mime) ? `data:${p.mime};base64,${p.b64}` : undefined}
+            onRemove={() => onRemovePending(i)}
+          />
+        ))}
+        <input
+          ref={inputRef}
+          type="file"
+          multiple
+          accept="image/*,application/pdf,text/*,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
+          className="hidden"
+          onChange={(e) => {
+            if (e.target.files?.length) onPick(e.target.files);
+            e.target.value = ''; // allow re-picking the same file
+          }}
+        />
+        <button
+          type="button"
+          disabled={full}
+          onClick={() => inputRef.current?.click()}
+          className="flex w-fit items-center gap-1 rounded-md px-1 py-1 text-caption font-medium text-accent transition duration-fast hover:text-accent/80 disabled:cursor-not-allowed disabled:text-text-tertiary"
+        >
+          <PlusIcon className="h-3.5 w-3.5" /> Medien anhängen
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** The detail pane's read-only media grid — each tile opens the file. */
+function DetailMedia({ todoId, attachments }: { todoId: string; attachments: RunAttachment[] }) {
+  const source = useMemo(() => getDataSource(), []);
+  if (attachments.length === 0) return null;
+  return (
+    <section className="mt-6">
+      <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Medien</p>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        {attachments.map((a) => (
+          <AttachmentCard
+            key={a.id}
+            name={a.filename}
+            mime={a.mime}
+            size={a.size}
+            preview={isImageMime(a.mime) ? source.mercuryAttachmentRawUrl(todoId, a.id) : undefined}
+            href={source.mercuryAttachmentRawUrl(todoId, a.id)}
+          />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -527,6 +686,8 @@ function TodoDetail({
         )}
       </section>
 
+      <DetailMedia todoId={todo.id} attachments={todo.attachments ?? []} />
+
       <section className="mt-6">
         <button
           type="button"
@@ -737,6 +898,46 @@ function TodoEditor({
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
   const [busy, setBusy] = useState(false);
 
+  // Media the AI takes into account. Existing (saved) attachments and newly picked ones are both
+  // committed on save: removals and uploads run against the saved ToDo id, so a brand-new ToDo can
+  // carry media too (it is created first, then its files are uploaded).
+  const [existingAtts] = useState<RunAttachment[]>(base?.attachments ?? []);
+  const [removedIds, setRemovedIds] = useState<Set<string>>(() => new Set());
+  const [pending, setPending] = useState<PendingAttachment[]>([]);
+  const visibleAtts = useMemo(() => existingAtts.filter((a) => !removedIds.has(a.id)), [existingAtts, removedIds]);
+
+  const pickFiles = useCallback(
+    async (files: FileList) => {
+      const taken = new Set([...visibleAtts.map((a) => a.filename.toLowerCase()), ...pending.map((p) => p.name.toLowerCase())]);
+      let count = visibleAtts.length + pending.length;
+      const added: PendingAttachment[] = [];
+      for (const file of Array.from(files)) {
+        if (count >= MAX_ATTACHMENTS) {
+          toast({ title: 'Zu viele Anhänge', description: `Höchstens ${MAX_ATTACHMENTS} Dateien je ToDo.`, variant: 'danger' });
+          break;
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          toast({ title: 'Datei zu groß', description: `${file.name} überschreitet 25 MB.`, variant: 'danger' });
+          continue;
+        }
+        if (taken.has(file.name.toLowerCase())) {
+          toast({ title: 'Name bereits vergeben', description: file.name, variant: 'danger' });
+          continue;
+        }
+        try {
+          const b64 = await toBase64(file);
+          added.push({ name: file.name, b64, size: file.size, mime: file.type });
+          taken.add(file.name.toLowerCase());
+          count += 1;
+        } catch {
+          toast({ title: 'Datei konnte nicht gelesen werden', description: file.name, variant: 'danger' });
+        }
+      }
+      if (added.length) setPending((p) => [...p, ...added]);
+    },
+    [visibleAtts, pending, toast],
+  );
+
   const sortedRepos = useMemo(() => [...repos].sort((a, b) => a.name.localeCompare(b.name, 'de')), [repos]);
   // Pinned at mount so the picker's floor is stable while the form is open; save() re-checks live.
   const minDue = useMemo(() => nowLocalInput(), []);
@@ -773,6 +974,22 @@ function TodoEditor({
     };
     try {
       const saved = base ? await source.mercuryUpdateRun(base.id, body) : await source.mercuryCreateRun(body);
+      // Commit media against the saved id: removals first (frees the name), then uploads. A media
+      // failure does not undo the saved ToDo — surface it and carry on so the rest still applies.
+      for (const attId of removedIds) {
+        try {
+          await source.mercuryDeleteAttachment(saved.id, attId);
+        } catch (e) {
+          toast({ title: 'Anhang konnte nicht entfernt werden', description: msg(e), variant: 'danger' });
+        }
+      }
+      for (const p of pending) {
+        try {
+          await source.mercuryUploadAttachment(saved.id, p.name, p.b64);
+        } catch (e) {
+          toast({ title: `Anhang „${p.name}“ fehlgeschlagen`, description: msg(e), variant: 'danger' });
+        }
+      }
       toast({ title: base ? 'ToDo gespeichert' : 'ToDo angelegt', variant: 'success' });
       await onSaved(saved.id);
     } catch (e) {
@@ -811,6 +1028,15 @@ function TodoEditor({
         </p>
         {task.trim().length === 0 && <p className="mt-1.5 text-caption text-danger">Eine Aufgabenbeschreibung ist erforderlich.</p>}
       </div>
+
+      <MediaField
+        existing={visibleAtts}
+        pending={pending}
+        rawUrl={(attId) => (base ? source.mercuryAttachmentRawUrl(base.id, attId) : undefined)}
+        onPick={pickFiles}
+        onRemoveExisting={(attId) => setRemovedIds((s) => new Set(s).add(attId))}
+        onRemovePending={(i) => setPending((p) => p.filter((_, j) => j !== i))}
+      />
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ziele</p>

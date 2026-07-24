@@ -50,15 +50,16 @@ type Run struct {
 	AxiomIDs []string `json:"axiomIds"`
 
 	// todo only
-	Task    string     `json:"task,omitempty"`    // the concrete task; the prompt is built from it
-	Targets []Target   `json:"targets,omitempty"` // one or more destinations (existing and/or newly-created repos)
-	DueAt   *time.Time `json:"dueAt,omitempty"`   // optional one-time due date; nil = run it manually
-	Done    bool       `json:"done,omitempty"`    // set after a successful execution — a ToDo fires once
+	Task        string       `json:"task,omitempty"`        // the concrete task; the prompt is built from it
+	Targets     []Target     `json:"targets,omitempty"`     // one or more destinations (existing and/or newly-created repos)
+	Attachments []Attachment `json:"attachments,omitempty"` // media (images, documents) the agent must take into account
+	DueAt       *time.Time   `json:"dueAt,omitempty"`       // optional one-time due date; nil = run it manually
+	Done        bool         `json:"done,omitempty"`        // set after a successful execution — a ToDo fires once
 
 	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
 	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
-	Repo    string `json:"repo,omitempty"`
-	NewRepo string `json:"newRepo,omitempty"`
+	Repo        string     `json:"repo,omitempty"`
+	NewRepo     string     `json:"newRepo,omitempty"`
 	Prompt      string     `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
 	PromptAt    time.Time  `json:"promptAt,omitempty"`   // when the snapshot was composed
 	PromptHash  string     `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
@@ -109,6 +110,21 @@ func (r Run) TodoTargets() []Target {
 	return nil
 }
 
+// Attachment is metadata for one media file attached to a ToDo (an image, a document, …). The bytes
+// live in the passive attachment pool (see AttachmentStore), keyed by (run id, attachment id); this
+// record — stored inline on the Run — is the single source of truth for WHICH attachments exist. A
+// ToDo carries media so the agent can take it into account while implementing the task; the executor
+// materializes the pool into the agent's workspace at run time.
+type Attachment struct {
+	ID         string    `json:"id"`
+	Filename   string    `json:"filename"`
+	MIME       string    `json:"mime,omitempty"`
+	Size       int64     `json:"size"`
+	SHA256     string    `json:"sha256,omitempty"`
+	UploadedAt time.Time `json:"uploadedAt"`
+	UploadedBy string    `json:"uploadedBy,omitempty"`
+}
+
 // ResultRef is a lightweight pointer to a stored execution result (with its token/cost totals so the
 // history list can show consumption without loading the full result).
 type ResultRef struct {
@@ -154,6 +170,14 @@ func NewID() string {
 	var b [10]byte
 	_, _ = rand.Read(b[:])
 	return "run_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+}
+
+// NewAttachmentID mints an unguessable attachment id. It is used as a path segment in the attachment
+// pool, so it is bounded to the same [a-z0-9] shape the pool's guard enforces.
+func NewAttachmentID() string {
+	var b [10]byte
+	_, _ = rand.Read(b[:])
+	return "att_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
 }
 
 func (s *Store) load() ([]Run, error) {
