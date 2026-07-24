@@ -75,7 +75,7 @@ log "install-only prod deploy of '$REPO' from $real"
 # case per deployable repo (mirrors the dev-side per-repo install).
 case "$REPO" in
   devlab)
-    BIN="$real/devlabd"; WEB="$real/dist"
+    BIN="$real/devlabd"; WEB="$real/web"
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd

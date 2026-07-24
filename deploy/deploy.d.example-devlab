@@ -19,7 +19,7 @@ ENVN="${2:?env required}"
 
 # What the runner built for devlab: the daemon binary + the built SPA. (Prebuilt — verify, never make.)
 BIN="$ART/devlabd"          # prebuilt Go binary  (backend/cmd/devlabd)
-WEB="$ART/dist"             # prebuilt Vite SPA
+WEB="$ART/web"              # prebuilt Vite SPA (buildArtifact writes the SPA to <artifact>/web)
 [[ -f "$BIN" ]] || { echo "[deploy devlab] missing prebuilt binary: $BIN" >&2; exit 10; }
 [[ -d "$WEB" ]] || { echo "[deploy devlab] missing prebuilt web dir:  $WEB" >&2; exit 10; }
 
@@ -60,7 +60,7 @@ case "$ENVN" in
     STAGE="$(mktemp -d)"
     trap 'rm -rf "$STAGE"' EXIT
     install -m 0755 "$BIN" "$STAGE/devlabd"
-    cp -a "$WEB" "$STAGE/dist"
+    cp -a "$WEB" "$STAGE/web"
 
     echo "[deploy devlab] prod: ship prebuilt artifact -> $TARGET:$STAGING/"
     # rrsync (the remote forced command) confines this receive to <stagingRoot>/devlab on the VPS.
