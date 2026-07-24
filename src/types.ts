@@ -292,6 +292,230 @@ export interface RepoData {
   structure: StructureSection[];
 }
 
+// ── Mercury — the axiom-management model (scheme-backed, via aigentic) ────────
+
+/** One node of a namespace tree: a category (folder) or an axiom (leaf). Categories nest to any
+ *  depth; `path` is the node's stable scheme address. */
+export interface MercuryNode {
+  name: string;
+  path: string;
+  isAxiom: boolean;
+  children?: MercuryNode[];
+}
+
+/** The whole model, grouped by namespace. */
+export interface MercuryTree {
+  axiome: MercuryNode[];
+  regeln: MercuryNode[];
+  laeufe: MercuryNode[];
+  meta: MercuryNode[];
+}
+
+/** One unmet meta-axiom: which requirement, and the concrete way the axiom fails it. */
+export interface MetaViolation {
+  meta: string;
+  issue: string;
+}
+
+/** The verdict of checking an axiom against every meta-axiom (with a corrected proposal when it fails). */
+export interface Conformance {
+  conforms: boolean;
+  violations: MetaViolation[];
+  proposed?: { titel: string; body: string };
+  metaCount: number;
+  unavailable?: boolean; // the checker (aigentic) was unreachable — treated as conforming
+}
+
+/** A parsed axiom record: front-matter fields + the body markdown. */
+export interface Axiom {
+  id: string;
+  titel: string;
+  quelle?: string;
+  body: string;
+}
+
+// ── Mercury — Automatische Läufe (scheduled autonomous run instances) ─────────
+
+export type RunScheduleKind = 'daily' | 'weekly';
+
+/** A recurring schedule: a time-of-day, either every day or on selected weekdays (0=Sun..6=Sat). */
+export interface RunSchedule {
+  kind: RunScheduleKind;
+  timeOfDay: string; // "HH:MM", 24h
+  weekdays?: number[];
+}
+
+/** The two things that share the run machinery: `auto` = a recurring, axiom-driven run over all
+ *  Holistic repos (Automatische Läufe); `todo` = a one-time concrete task against ONE repo
+ *  (Konkrete ToDos) — an ad-hoc fix or a newly planned service. */
+export type RunType = 'auto' | 'todo';
+
+/** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
+ *  axioms + all Laufregeln (`stale` = that snapshot drifted from the store); a todo's prompt is just
+ *  its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
+export interface Run {
+  id: string;
+  name: string;
+  type?: RunType; // absent = auto (records predating ToDos)
+  enabled: boolean;
+  schedule: RunSchedule;
+  axiomIds: string[];
+  // todo only
+  task?: string;
+  repo?: string; // target repo id (existing)
+  newRepo?: string; // create this repo first (new service)
+  dueAt?: string; // optional one-time due date; absent = run it manually
+  done?: boolean; // set after a successful execution
+  prompt: string;
+  promptAt?: string;
+  promptHash?: string;
+  createdAt: string;
+  updatedAt: string;
+  nextFireAt?: string;
+  lastFiredAt?: string;
+  lastResult?: RunResultRef;
+  stale?: boolean;
+  // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
+  suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
+}
+
+/** The editable fields of a run or todo (create/update payload). */
+export interface RunInput {
+  name: string;
+  type?: RunType; // default 'auto'
+  enabled: boolean;
+  schedule?: RunSchedule; // auto only
+  axiomIds?: string[]; // auto only
+  task?: string; // todo only
+  repo?: string; // todo only — an existing repo id
+  newRepo?: string; // todo only — create this repo
+  dueAt?: string | null; // todo only — optional one-time due date
+}
+
+export interface RunList {
+  runs: Run[];
+  axioms: Record<string, string>; // axiom id → title, for display
+}
+
+/** Which axioms are already backed by a run (badges), plus id→path and id→title lookups. */
+export interface RunCoverage {
+  covered: Record<string, string[]>; // axiom id → run ids
+  index: Record<string, string>; // axiom id → scheme path
+  axioms: Record<string, string>; // axiom id → title
+}
+
+/** One proposed run from an AI-planning button (reviewable before it is applied). */
+export interface PlannedRun {
+  name: string;
+  axiomIds: string[];
+  schedule: RunSchedule;
+  rationale?: string;
+}
+
+export interface RunPlan {
+  runs: PlannedRun[];
+}
+
+export interface RunProposal {
+  proposal: RunPlan;
+  axioms: Record<string, string>; // axiom id → title, so the review can name the axioms
+}
+
+/** One entry in the run-config history (each mutation snapshots the full config). */
+export interface RunSnapshotMeta {
+  ts: string;
+  action: string;
+  actor: string;
+  runCount: number;
+}
+
+export interface RunResultRef {
+  resultId: string;
+  at: string;
+  ok: boolean;
+  repoCount: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+}
+
+export interface RunStep {
+  name: string; // analyze | implement | push | pr | deploy
+  ok: boolean;
+  log?: string; // for analyze/implement this is the agent's full report (what was done / blocked)
+  at: string;
+}
+
+export interface RepoResult {
+  repo: string;
+  ok: boolean;
+  deployed: boolean;
+  prUrl?: string;
+  steps: RunStep[];
+  error?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  numTurns?: number;
+}
+
+export interface RunResult {
+  runId: string;
+  resultId: string;
+  runName?: string;
+  startedAt: string;
+  finishedAt?: string;
+  promptHash?: string;
+  ok: boolean;
+  repos: RepoResult[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  numTurns: number;
+}
+
+/** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */
+export interface RunOccurrence {
+  runId: string;
+  runName: string;
+  type: RunType;
+  at: string;
+  schedule: string;
+}
+
+export interface RunCalendar {
+  from: string;
+  to: string;
+  occurrences: RunOccurrence[];
+}
+
+/** One completed execution in the Lauf-History (with token/cost; survives run deletion). */
+export interface RunExecution {
+  runId: string;
+  runName: string;
+  resultId: string;
+  at: string;
+  finishedAt?: string;
+  ok: boolean;
+  repoCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  numTurns: number;
+}
+
+/** One turn of the free-form run-planning chat. */
+export interface RunChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/** A chat reply, optionally carrying a reviewable run-plan the model proposed. */
+export interface RunChatReply {
+  reply: string;
+  proposal?: RunPlan;
+}
+
 // ── Atlas — the deployed Holistic landscape ──────────────────────────────────
 
 /** A deployed Holistic service, derived from its rights manifest and its Caddy route. */

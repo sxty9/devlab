@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Example per-repo deploy script for the `devlab` repo, run by devlab-deploy AS ROOT with the run's
+# workspace as $1. Install ONE of these per deployable repo at /etc/devlab/deploy.d/<reponame>,
+# root-owned, mode 0755 (NOT group/other-writable — the wrapper refuses otherwise).
+#
+#   sudo install -o root -g root -m 0755 deploy/deploy.d.example-devlab /etc/devlab/deploy.d/devlab
+#
+# Keep it minimal, explicit, and idempotent: build from the workspace, install, restart. This is the
+# ONLY place autonomous runs touch the host — vet it like a production deploy step, because it is one.
+set -euo pipefail
+
+WT="${1:?workspace required}"
+cd "$WT"
+
+echo "[deploy devlab] build from $WT"
+( cd backend && CGO_ENABLED=0 go build -o /tmp/devlabd.deploy ./cmd/devlabd )
+npm ci --silent && npm run build --silent
+
+echo "[deploy devlab] install + restart"
+install -o root -g root -m 0755 /tmp/devlabd.deploy /usr/local/bin/devlabd
+rm -f /tmp/devlabd.deploy
+# SPA: copy into place BEFORE pruning, so the site is never empty for a moment.
+cp -a "$WT/dist/." /var/lib/devlab/www/
+systemctl restart devlabd
+
+echo "[deploy devlab] done"

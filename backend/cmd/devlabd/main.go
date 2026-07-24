@@ -34,13 +34,21 @@ func main() {
 		log.Print("devlabd: holistic SSO mode (hp_devlab_access required)")
 	}
 
+	server := api.New(v)
 	srv := &http.Server{
-		Handler:           api.New(v).Handler(),
+		Handler:           server.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// Mercury's run scheduler runs in the background for the process lifetime; it stays dormant
+	// unless DEVLAB_RUNS_MODE + DEVLAB_RUNS_USER are configured. Cancelled on shutdown so an
+	// in-flight run drains before the process exits.
+	schedCtx, schedCancel := context.WithCancel(context.Background())
+	server.StartScheduler(schedCtx)
+
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
+		schedCancel()
 		log.Fatalf("devlabd: listen %s: %v", *listen, err)
 	}
 	go func() {
@@ -54,6 +62,7 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	schedCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)

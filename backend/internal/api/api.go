@@ -18,6 +18,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
 
@@ -32,6 +33,10 @@ type Server struct {
 	workspaces *workspace.Manager
 	comments   *comments.Store // nil if the comments dir can't be created
 	chats      *chats.Store    // nil if the chats dir can't be created — AI transcript persistence
+	runs       *runs.Store     // Mercury's Automatische Läufe — run instances + config history
+	runResults *runs.Results   // per-execution results/logs (written by the executor, read here)
+	runPRs     *runs.PRStore   // run-created PRs awaiting merge (auto-merge after the window)
+	scheduler  *runs.Scheduler // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	staticDir  string          // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -66,6 +71,9 @@ func New(v *auth.Verifier) *Server {
 		workspaces: workspace.NewManager(),
 		comments:   cstore,
 		chats:      chatStore,
+		runs:       runs.NewStore(),
+		runResults: runs.NewResults(),
+		runPRs:     runs.NewPRStore(),
 		staticDir:  os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
@@ -159,6 +167,62 @@ func (s *Server) Handler() http.Handler {
 	// rights manifests + their Caddy routes). Read-only, host-scoped, no workspace access.
 	mux.HandleFunc("GET /api/atlas", s.guard(s.atlasGraph))
 
+	// Mercury — the axiom-management model over aigentic's scheme-backed graveyard. Read tier for
+	// now (the tree and a record); the caller's session is forwarded to aigentic.
+	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
+	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
+	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
+	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
+	// Edit an axiom's text; move/rename it; delete it; rename a whole category. The user owns the
+	// tree by hand. All CSRF-guarded store writes; no GitHub involved.
+	mux.HandleFunc("PUT /api/mercury/axiom", s.guardCSRF(s.editAxiom))
+	mux.HandleFunc("DELETE /api/mercury/axiom", s.guardCSRF(s.deleteAxiom))
+	mux.HandleFunc("POST /api/mercury/move", s.guardCSRF(s.moveAxiom))
+	mux.HandleFunc("POST /api/mercury/move-category", s.guardCSRF(s.moveCategory))
+	mux.HandleFunc("POST /api/mercury/reorder", s.guardCSRF(s.mercuryReorder))
+	// Polish a record (orthography, generalization, brevity) via aigentic — the "Mit KI optimieren"
+	// button and the auto-optimize on add. Returns the polished text; does not persist.
+	mux.HandleFunc("POST /api/mercury/optimize", s.guardCSRF(s.optimizeRecord))
+	// Check an axiom strictly against every meta-axiom (the binding requirements an axiom must satisfy).
+	// Returns conformance + violations + a corrected proposal; does not persist.
+	mux.HandleFunc("POST /api/mercury/conform", s.guardCSRF(s.conformRecord))
+	// The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. Lives at the
+	// Mercury level (not inside a section), and may return a reviewable run-plan proposal.
+	mux.HandleFunc("POST /api/mercury/chat", s.guardCSRF(s.mercuryChat))
+	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
+	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
+	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
+	// One-time constitution migration: decompose the original axiom document into atoms and file
+	// each via aigentic. Dry-run by default (?apply=true writes). Store authority, not GitHub.
+	mux.HandleFunc("POST /api/mercury/migrate", s.guardCSRF(s.mercuryMigrate))
+
+	// Automatische Läufe — run instances: scheduled autonomous runs over all holistic repos, whose
+	// prompt is composed from their axioms + all global Laufregeln. Reads under guard; store writes
+	// (CRUD, AI-planning proposals + apply, config history) under guardCSRF (aigentic/store authority,
+	// no GitHub). Literal sub-paths (coverage/history/ai-*) precede the {id} routes so Go's mux picks
+	// them first. Execution ("run now"/scheduler) is a separate, gated phase.
+	mux.HandleFunc("GET /api/mercury/runs", s.guard(s.runsList))
+	mux.HandleFunc("GET /api/mercury/runs/coverage", s.guard(s.runsCoverage))
+	mux.HandleFunc("GET /api/mercury/runs/history", s.guard(s.runsHistoryList))
+	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
+	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
+	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
+	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
+	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
+	mux.HandleFunc("GET /api/mercury/runs/{id}/results/{rid}", s.guard(s.runResultGet))
+	mux.HandleFunc("POST /api/mercury/runs", s.guardCSRF(s.runCreate))
+	mux.HandleFunc("PUT /api/mercury/runs/{id}", s.guardCSRF(s.runUpdate))
+	mux.HandleFunc("DELETE /api/mercury/runs/{id}", s.guardCSRF(s.runDelete))
+	mux.HandleFunc("POST /api/mercury/runs/{id}/recompose", s.guardCSRF(s.runRecompose))
+	mux.HandleFunc("POST /api/mercury/runs/ai-fill", s.guardCSRF(s.runsAiFill))
+	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
+	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))
+	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
+	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
+	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
+	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
+
 	// Unknown /api paths 404 as JSON; everything else serves the built SPA (with client-routing
 	// fallback to index.html) when DEVLAB_STATIC_DIR is set, else 404.
 	mux.HandleFunc("/", s.root)
@@ -233,6 +297,19 @@ func (s *Server) guardWrite(h http.HandlerFunc) http.HandlerFunc {
 		u := userFrom(r)
 		if !s.githubLinked(u) {
 			writeErr(w, http.StatusForbidden, "Link your GitHub account first")
+			return
+		}
+		h(w, r)
+	})
+}
+
+// guardCSRF gates a mutating request that does NOT touch a GitHub repo: a DevLab session (guard) +
+// CSRF, without the GitHub-link requirement. Used by Mercury's axiom writes, whose authority is
+// aigentic's hp_aigentic_run on the forwarded session, not GitHub.
+func (s *Server) guardCSRF(h http.HandlerFunc) http.HandlerFunc {
+	return s.guard(func(w http.ResponseWriter, r *http.Request) {
+		if !s.v.CheckCSRF(r) {
+			writeErr(w, http.StatusForbidden, "Invalid CSRF token")
 			return
 		}
 		h(w, r)

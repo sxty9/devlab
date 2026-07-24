@@ -1,0 +1,88 @@
+package runs
+
+import (
+	"fmt"
+	"regexp"
+	"time"
+)
+
+// Kind is a recurrence kind. Deliberately minimal — no cron dependency; daily or weekly covers the
+// intended cadence and computes trivially with time.Now.
+type Kind string
+
+const (
+	Daily  Kind = "daily"
+	Weekly Kind = "weekly"
+)
+
+// Schedule is a recurring schedule: a time-of-day, either every day or on selected weekdays. Times
+// are interpreted in the server's local timezone.
+type Schedule struct {
+	Kind      Kind           `json:"kind"`
+	TimeOfDay string         `json:"timeOfDay"`          // "HH:MM", 24h
+	Weekdays  []time.Weekday `json:"weekdays,omitempty"` // weekly only; 0=Sunday … 6=Saturday
+}
+
+var timeOfDayRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+
+// Valid reports whether the schedule is well-formed.
+func (s Schedule) Valid() error {
+	if !timeOfDayRe.MatchString(s.TimeOfDay) {
+		return fmt.Errorf("timeOfDay %q ist nicht HH:MM (24h)", s.TimeOfDay)
+	}
+	switch s.Kind {
+	case Daily:
+		if len(s.Weekdays) != 0 {
+			return fmt.Errorf("daily-Schedule darf keine Wochentage haben")
+		}
+	case Weekly:
+		if len(s.Weekdays) == 0 {
+			return fmt.Errorf("weekly-Schedule braucht mindestens einen Wochentag")
+		}
+		for _, d := range s.Weekdays {
+			if d < time.Sunday || d > time.Saturday {
+				return fmt.Errorf("ungültiger Wochentag %d", d)
+			}
+		}
+	default:
+		return fmt.Errorf("schedule-Kind %q ist nicht daily|weekly", s.Kind)
+	}
+	return nil
+}
+
+func (s Schedule) hourMin() (int, int) {
+	var h, m int
+	_, _ = fmt.Sscanf(s.TimeOfDay, "%d:%d", &h, &m)
+	return h, m
+}
+
+// Next returns the first fire time strictly after `after`, in after's location. Always computed
+// forward from the given instant — so after downtime the scheduler fires once (catch-up), never N
+// times for the missed periods.
+func (s Schedule) Next(after time.Time) (time.Time, error) {
+	if err := s.Valid(); err != nil {
+		return time.Time{}, err
+	}
+	h, m := s.hourMin()
+	loc := after.Location()
+	base := time.Date(after.Year(), after.Month(), after.Day(), h, m, 0, 0, loc)
+	switch s.Kind {
+	case Daily:
+		if !base.After(after) {
+			base = base.AddDate(0, 0, 1)
+		}
+		return base, nil
+	case Weekly:
+		want := map[time.Weekday]bool{}
+		for _, d := range s.Weekdays {
+			want[d] = true
+		}
+		for i := 0; i < 8; i++ { // today .. +7 days covers every weekday exactly once
+			c := base.AddDate(0, 0, i)
+			if want[c.Weekday()] && c.After(after) {
+				return c, nil
+			}
+		}
+	}
+	return time.Time{}, fmt.Errorf("kein nächster Zeitpunkt bestimmbar")
+}

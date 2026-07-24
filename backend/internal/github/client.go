@@ -174,11 +174,16 @@ func RepoPermission(ctx context.Context, token, fullName string) (string, error)
 
 // doPost issues a POST with a JSON body and decodes the response — the mutating twin of do().
 func doPost(ctx context.Context, token, url string, body, out any) (*http.Response, error) {
+	return doMethod(ctx, http.MethodPost, token, url, body, out)
+}
+
+// doMethod is doPost generalized over the HTTP method (POST/PUT/…) — one request path, no siblings.
+func doMethod(ctx context.Context, method, token, url string, body, out any) (*http.Response, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +217,7 @@ type PullRequest struct {
 	Number  int    `json:"number"`
 	HTMLURL string `json:"html_url"`
 	State   string `json:"state"`
+	Merged  bool   `json:"merged"` // only populated by GetPullRequest (single-PR GET), not the list endpoint
 	Title   string `json:"title"`
 }
 
@@ -243,6 +249,79 @@ func CreatePullRequest(ctx context.Context, token, fullName, head, base, title, 
 		return PullRequest{}, err
 	}
 	return pr, nil
+}
+
+// CreateRepo creates a repository under owner and tags it with topic so it joins the holistic set —
+// used by a "Konkrete ToDo" that plans a NEW service. Idempotent: an existing repo is returned as-is
+// rather than erroring. Returns the full name (owner/name).
+func CreateRepo(ctx context.Context, token, owner, name, description, topic string) (string, error) {
+	full := owner + "/" + name
+	if _, err := DefaultBranch(ctx, token, full); err == nil {
+		return full, nil // already there — creating is a no-op
+	}
+	payload := map[string]any{"name": name, "description": description, "private": true, "auto_init": true}
+	var created struct {
+		FullName string `json:"full_name"`
+	}
+	// Prefer the org namespace (where the holistic set lives); fall back to the caller's own namespace.
+	if _, err := doPost(ctx, token, apiBase+"/orgs/"+owner+"/repos", payload, &created); err != nil {
+		if _, uerr := doPost(ctx, token, apiBase+"/user/repos", payload, &created); uerr != nil {
+			return "", fmt.Errorf("github: create %s: %w", full, err)
+		}
+	}
+	if created.FullName == "" {
+		created.FullName = full
+	}
+	if topic != "" {
+		if err := SetTopics(ctx, token, created.FullName, []string{topic}); err != nil {
+			return created.FullName, err // the repo exists; it just isn't in the set yet
+		}
+	}
+	return created.FullName, nil
+}
+
+// SetTopics replaces a repo's topics (holistic membership is owner + topic).
+func SetTopics(ctx context.Context, token, fullName string, topics []string) error {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return fmt.Errorf("github: bad repo %q", fullName)
+	}
+	_, err := doMethod(ctx, http.MethodPut, token, apiBase+"/repos/"+owner+"/"+name+"/topics",
+		map[string]any{"names": topics}, nil)
+	return err
+}
+
+// GetPullRequest fetches a single PR, including whether it has been merged (the list/search
+// endpoints do not report `merged`, so the auto-merge check needs this).
+func GetPullRequest(ctx context.Context, token, fullName string, number int) (PullRequest, error) {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return PullRequest{}, fmt.Errorf("github: bad repo %q", fullName)
+	}
+	var pr PullRequest
+	if _, err := do(ctx, token, fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number), &pr); err != nil {
+		return PullRequest{}, err
+	}
+	return pr, nil
+}
+
+// MergePullRequest merges a PR (merge commit). It returns nil only when GitHub confirms the merge —
+// a non-mergeable PR (conflicts, required checks) surfaces as an error, never a silent no-op.
+func MergePullRequest(ctx context.Context, token, fullName string, number int) error {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return fmt.Errorf("github: bad repo %q", fullName)
+	}
+	var res struct {
+		Merged bool `json:"merged"`
+	}
+	if _, err := doMethod(ctx, http.MethodPut, token, fmt.Sprintf("%s/repos/%s/%s/pulls/%d/merge", apiBase, owner, name, number), map[string]any{"merge_method": "merge"}, &res); err != nil {
+		return err
+	}
+	if !res.Merged {
+		return fmt.Errorf("github: PR %d wurde nicht gemergt", number)
+	}
+	return nil
 }
 
 // FindOpenPullRequest returns the open PR whose head is `head` on fullName, if one exists (so the

@@ -9,7 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"devlab/backend/internal/git"
 	"devlab/backend/internal/model"
@@ -147,16 +150,53 @@ func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte,
 	var cmd *exec.Cmd
 	if e.PerUser {
 		full := append([]string{"-n", "-u", e.User, execWrapper, "claude", wt}, args...)
-		cmd = exec.CommandContext(ctx, "sudo", full...)
+		cmd = exec.Command("sudo", full...)
 	} else {
-		cmd = exec.CommandContext(ctx, "claude", args...)
+		cmd = exec.Command("claude", args...)
 		cmd.Dir = wt
 	}
 	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	// Own process group so a cancellation kills the WHOLE tree (sudo → devlab-exec → claude). NOT
+	// CommandContext: it SIGKILLs only the direct child (sudo), orphaning the long-running claude —
+	// a broken kill-switch that keeps consuming the subscription and holds the run lock.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				// Negative pid = signal the whole process group; SIGTERM first (let claude flush),
+				// then SIGKILL as a backstop. Wait for the SIGTERM to take before escalating — but
+				// stop if the process is already reaped (done), so a recycled pgid is never SIGKILL'd.
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					// Re-check done non-blockingly: if Wait() reaped the group in the instant the timer
+					// fired (select picks randomly when both are ready), the pgid may be recycled — skip
+					// the SIGKILL rather than signal an unrelated group.
+					select {
+					case <-done:
+					default:
+						_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					}
+				}
+			}
+		case <-done:
+		}
+	}()
+	err := cmd.Wait()
+	close(done)
+	if err != nil {
+		if ctx.Err() != nil {
+			return stdout.Bytes(), ctx.Err() // report the cancellation/deadline, not the wait error
+		}
 		s := strings.TrimSpace(stderr.String())
 		if s == "" {
 			s = strings.TrimSpace(stdout.String())
@@ -360,6 +400,49 @@ func (e Executor) Fetch(ctx context.Context, wt, token string) error {
 		return lerr
 	}
 	return err
+}
+
+// ResetToRemote makes the workspace an exact copy of origin/<branch>: fetch, hard reset, drop
+// untracked leftovers. For the AUTONOMOUS RUNNER only — Manager.Ensure clones once and then returns
+// the existing checkout forever, so without this a run analyses (and in pr/full mode branches off)
+// whatever was cloned the first time, silently working against stale code. Destructive by design:
+// a run workspace is disposable, so anything left over from a previous run must not leak into the
+// next one. Never call this on a workspace a human edits.
+func (e Executor) ResetToRemote(ctx context.Context, wt, token, branch string) error {
+	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
+	}
+	if err := e.Fetch(ctx, wt, token); err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "origin/"+branch)); err != nil {
+		return fmt.Errorf("reset: %w", err)
+	}
+	// -x also removes ignored files (build artefacts, node_modules): a stale artefact can make an
+	// agent's verification pass for the wrong reason.
+	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
+		return fmt.Errorf("clean: %w", err)
+	}
+	return nil
+}
+
+// CommitsAhead counts commits on HEAD that base does not have — i.e. how much there is to push.
+// The autonomous runner needs this because an agent commits its own work: after such a run the
+// working tree is CLEAN, so a working-tree-only check concludes "nothing happened" and silently
+// throws the implementation away. What is ahead of the base branch is the honest measure.
+func (e Executor) CommitsAhead(ctx context.Context, wt, base string) (int, error) {
+	if base == "" || strings.HasPrefix(base, "-") {
+		return 0, fmt.Errorf("invalid base %q", base)
+	}
+	out, err := runGit(e.gitIn(ctx, wt, "", "rev-list", "--count", base+"..HEAD"))
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return 0, fmt.Errorf("unparsable rev-list count %q: %w", out, err)
+	}
+	return n, nil
 }
 
 // CreateBranch creates and checks out a new branch (optionally from a start point).

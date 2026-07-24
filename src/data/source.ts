@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Branch, Change, Comment, FileContent, PullRequestResult, Repo, RepoData, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -97,6 +97,86 @@ export interface DataSource {
 
   // ── Atlas (the deployed Holistic landscape, derived from the host's own config) ──
   atlas(): Promise<AtlasGraph>;
+
+  // ── Mercury (the axiom model over aigentic's scheme graveyard) ──────────────
+  mercuryTree(): Promise<MercuryTree>;
+  mercuryItem(path: string): Promise<Axiom>;
+  /**
+   * Add a record to a section (`axiome` | `regeln` | `laeufe`, default `axiome`); aigentic
+   * classifies it into that namespace's tree. Returns where it landed.
+   */
+  /** Add a record. If the classifier finds an existing record with the same content, NOTHING is
+   *  written and `duplicate` + `proposed` come back so the user can extend/adjust it or force a new
+   *  one via `force`. */
+  mercuryAddAxiom(
+    titel: string,
+    body: string,
+    section?: string,
+    force?: boolean,
+  ): Promise<{
+    path?: string;
+    id?: string;
+    classified?: boolean;
+    duplicate?: { path: string; axiom: Axiom };
+    proposed?: { titel: string; body: string; path: string };
+    // An axiom that violates a meta-axiom is not written; the violations + an AI correction come back.
+    nonconform?: { violations: MetaViolation[]; proposed: { titel: string; body: string; path: string } };
+  }>;
+  /** Polish a record (orthography, generalization, brevity) via aigentic; returns improved text, does not persist. */
+  mercuryOptimize(titel: string, body: string, section?: string): Promise<{ titel: string; body: string }>;
+  /** Check an axiom strictly against every meta-axiom (the binding requirements an axiom must satisfy). */
+  mercuryConform(titel: string, body: string): Promise<Conformance>;
+  /** Edit an axiom's title + body in place (id and quelle preserved). */
+  mercuryEditAxiom(path: string, titel: string, body: string): Promise<{ path: string; axiom: Axiom }>;
+  /** Move or rename an axiom (from/to are full record paths). */
+  mercuryMoveAxiom(from: string, to: string): Promise<{ path: string }>;
+  /** Delete an axiom. */
+  mercuryDeleteAxiom(path: string): Promise<void>;
+  /** Rename/re-home a whole category (moves every record under it). */
+  mercuryMoveCategory(from: string, to: string): Promise<{ moved: number }>;
+  /** Set the manual order of a category's immediate children (full ordered child-name list). */
+  mercuryReorder(category: string, order: string[]): Promise<void>;
+
+  // ── Mercury — Automatische Läufe (run instances) ────────────────────────────
+  /** List all runs (each with a `stale` flag) plus an axiom id→title legend. */
+  mercuryRuns(): Promise<RunList>;
+  /** One run + the axiom id→title legend. */
+  mercuryRun(id: string): Promise<{ run: Run; axioms: Record<string, string> }>;
+  /** Live-compose a run's prompt from the current scheme (does not persist). */
+  mercuryRunPrompt(id: string): Promise<{ prompt: string }>;
+  /** Which axioms are already covered by a run (+ id→path, id→title). */
+  mercuryRunCoverage(): Promise<RunCoverage>;
+  mercuryCreateRun(body: RunInput): Promise<Run>;
+  mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
+  mercuryDeleteRun(id: string): Promise<void>;
+  /** Refresh a run's prompt snapshot from the current scheme. */
+  mercuryRecomposeRun(id: string): Promise<void>;
+  /** Ask AI to plan the not-yet-covered axioms into runs (reviewable; writes nothing). */
+  mercuryRunAiFill(): Promise<RunProposal>;
+  /** Ask AI to regroup the current runs (reviewable; writes nothing). */
+  mercuryRunAiFinetune(): Promise<RunProposal>;
+  /** Persist a reviewed proposal. `fill` creates/extends named runs; `replace` replaces the set. */
+  mercuryApplyRunProposal(mode: 'fill' | 'replace', plan: RunPlan): Promise<void>;
+  /** Config-change history (each mutation is a snapshot). */
+  mercuryRunHistory(): Promise<{ snapshots: RunSnapshotMeta[] }>;
+  /** Restore a past run-config snapshot by its timestamp. */
+  mercuryRestoreRunHistory(ts: string): Promise<void>;
+  /** Execution-result history for a run (persists past deletion). */
+  mercuryRunResults(id: string): Promise<{ results: RunResultRef[] }>;
+  /** One execution result document. */
+  mercuryRunResult(id: string, resultId: string): Promise<RunResult>;
+  /** Upcoming occurrences over a window (default 30 days) — the auto-updating Laufkalender.
+   *  `type` narrows to automatic runs or ToDos; omitted = both (the global calendar). */
+  mercuryRunCalendar(days?: number, type?: RunType): Promise<RunCalendar>;
+  /** Every completed execution across all runs (Lauf-History; includes deleted runs). */
+  mercuryRunExecutions(): Promise<{ executions: RunExecution[] }>;
+  /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
+   *  reviewable run-plan proposal when asked to create/change runs. */
+  mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
+  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
+  mercuryRunNow(id: string): Promise<{ started: boolean }>;
+  /** Abort the run currently in progress (kill-switch). */
+  mercuryCancelRun(): Promise<void>;
 }
 
 /** Thrown by httpSource when the backend returns 401 (login required / expired). */
