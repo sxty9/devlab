@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon } from '@/ui/icons';
-import type { RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -62,53 +62,82 @@ export function EmptyPlaceholder({ text }: { text: string }) {
 }
 
 /** One step (analyze/implement/push/pr/deploy). analyze/implement carry the agent's report (`log`),
- *  shown as a collapsible Bericht. */
+ *  shown as a collapsible Bericht. While a step is `running`, its log is the agent's LIVE transcript:
+ *  the step auto-expands, renders the transcript preformatted (not markdown) and follows the tail. */
 export function StepRow({ step }: { step: RunStep }) {
+  const running = !!step.running;
   const [open, setOpen] = useState(false);
   const hasReport = !!step.log;
+  const show = running || open; // a running step is always expanded — the point is to watch it
+  const logRef = useRef<HTMLPreElement>(null);
+
+  // Keep the live transcript scrolled to the newest line as it streams in.
+  useEffect(() => {
+    if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [running, step.log]);
 
   return (
     <div>
       <button
         type="button"
-        disabled={!hasReport}
+        disabled={!hasReport && !running}
         onClick={() => hasReport && setOpen((o) => !o)}
-        className={cn('flex w-full items-center gap-2 rounded-md px-1 py-1 text-left transition', hasReport ? 'hover:bg-fill/10' : 'cursor-default')}
+        className={cn('flex w-full items-center gap-2 rounded-md px-1 py-1 text-left transition', hasReport || running ? 'hover:bg-fill/10' : 'cursor-default')}
       >
-        {hasReport ? (
-          <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 text-text-tertiary transition-transform duration-fast', open && 'rotate-90')} />
+        {hasReport || running ? (
+          <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 text-text-tertiary transition-transform duration-fast', show && 'rotate-90')} />
         ) : (
           <span className="w-3.5 shrink-0" />
         )}
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', step.ok ? 'bg-success' : 'bg-danger')} />
+        <span className={cn('h-2 w-2 shrink-0 rounded-full', running ? 'animate-pulse bg-warning' : step.ok ? 'bg-success' : 'bg-danger')} />
         <span className="flex-1 truncate text-footnote font-medium text-text-secondary">{step.name}</span>
-        {hasReport && <span className="shrink-0 text-caption text-text-tertiary">Bericht</span>}
+        <span className="shrink-0 text-caption text-text-tertiary">{running ? 'läuft…' : hasReport ? 'Bericht' : ''}</span>
       </button>
-      {open && hasReport && (
-        <div
-          className="dl-markdown dl-scroll mt-1 max-h-80 overflow-auto rounded-md border border-separator bg-bg-base p-3 text-caption text-text-secondary"
-          dangerouslySetInnerHTML={{ __html: renderMarkdown(step.log ?? '') }}
-        />
-      )}
+      {show &&
+        (running ? (
+          <pre
+            ref={logRef}
+            className="dl-scroll mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-separator bg-bg-base p-3 font-mono text-caption text-text-secondary"
+          >
+            {step.log ? step.log : 'Der Agent arbeitet…'}
+          </pre>
+        ) : (
+          hasReport && (
+            <div
+              className="dl-markdown dl-scroll mt-1 max-h-80 overflow-auto rounded-md border border-separator bg-bg-base p-3 text-caption text-text-secondary"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(step.log ?? '') }}
+            />
+          )
+        ))}
     </div>
   );
 }
 
-/** One repository within an execution: status, deploy/PR, per-repo tokens, and its steps. */
+/** One repository within an execution: status, deploy/PR, per-repo tokens, and its steps. A `running`
+ *  repo (the one in flight, from RunResult.live) wears an amber "läuft" pill instead of a status. */
 export function RepoBlock({ repo }: { repo: RepoResult }) {
+  const running = !!repo.running;
   return (
-    <div className="rounded-card border border-separator bg-surface p-3">
+    <div className={cn('rounded-card border bg-surface p-3', running ? 'border-warning/40' : 'border-separator')}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="min-w-0 flex-1 truncate font-mono text-footnote font-medium text-text-primary">{repo.repo}</span>
-        <OkPill ok={repo.ok} />
-        <span
-          className={cn(
-            'rounded px-1.5 py-0.5 text-caption font-medium',
-            repo.deployed ? 'bg-success/15 text-success' : 'bg-fill/15 text-text-tertiary',
-          )}
-        >
-          {repo.deployed ? 'deployed' : 'nicht deployed'}
-        </span>
+        {running ? (
+          <span className="flex shrink-0 items-center gap-1.5 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-warning" /> läuft
+          </span>
+        ) : (
+          <OkPill ok={repo.ok} />
+        )}
+        {!running && (
+          <span
+            className={cn(
+              'rounded px-1.5 py-0.5 text-caption font-medium',
+              repo.deployed ? 'bg-success/15 text-success' : 'bg-fill/15 text-text-tertiary',
+            )}
+          >
+            {repo.deployed ? 'deployed' : 'nicht deployed'}
+          </span>
+        )}
         {repo.prUrl && (
           <a href={repo.prUrl} target="_blank" rel="noreferrer" className="text-caption font-medium text-accent hover:underline">
             PR öffnen
@@ -368,5 +397,97 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
         );
       })}
     </ul>
+  );
+}
+
+/** Poll the server for the run executing right now (its id + live result id), or null. This is the
+ *  single source of truth for "a run is live": read on mount it RESTORES the running state after a page
+ *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
+ *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
+ *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
+export function useActiveRun(): { active: RunActive | null; refetch: () => void } {
+  const source = useMemo(() => getDataSource(), []);
+  const [active, setActive] = useState<RunActive | null>(null);
+  const [bump, setBump] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const r = await source.mercuryRunActive();
+        if (!cancelled) setActive(r.active);
+      } catch {
+        /* transient — keep the last known state */
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 2500);
+    };
+    void poll();
+    const onFocus = () => setBump((b) => b + 1); // re-check when the tab regains focus
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [source, bump]);
+
+  return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already
+ *  finished, and the one in flight (its running steps and the agent's streaming output). Polls only
+ *  while `live`; once the run settles it fetches the final state once and stops, so the finished result
+ *  stays on screen. Reuses RepoBlock/StepRow, so a live run and a past one look the same — just moving. */
+export function LiveExecution({ runId, resultId, live }: { runId: string; resultId: string; live: boolean }) {
+  const source = useMemo(() => getDataSource(), []);
+  const [res, setRes] = useState<RunResult | null>(null);
+  const [err, setErr] = useState(false);
+  const resRef = useRef<RunResult | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const r = await source.mercuryRunResult(runId, resultId);
+        if (!cancelled) {
+          resRef.current = r;
+          setRes(r);
+          setErr(false);
+        }
+      } catch {
+        if (!cancelled && !resRef.current) setErr(true); // only surface if we never got a document
+      }
+      if (!cancelled && live) timer = window.setTimeout(poll, 2000);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [source, runId, resultId, live]);
+
+  if (!res) {
+    return <p className="text-footnote text-text-tertiary">{err ? 'Live-Ausführung wird vorbereitet…' : 'Lädt…'}</p>;
+  }
+
+  const repos = res.repos ?? [];
+  return (
+    <div className="flex flex-col gap-3 rounded-card border border-warning/30 bg-warning/5 p-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="flex items-center gap-1.5 text-footnote font-medium text-text-primary">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> {live ? 'Läuft gerade' : 'Gerade beendet'}
+        </span>
+        <span className="text-caption text-text-tertiary">seit {fmtDateTime(res.startedAt)}</span>
+        <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
+        <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
+      </div>
+      {repos.map((repo, i) => (
+        <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />
+      ))}
+      {res.live && <RepoBlock key="live" repo={res.live} />}
+      {repos.length === 0 && !res.live && <p className="text-caption text-text-tertiary">Der Lauf startet…</p>}
+    </div>
   );
 }

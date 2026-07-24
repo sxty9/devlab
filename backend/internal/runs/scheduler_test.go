@@ -14,10 +14,11 @@ type fakeExec struct {
 	maintain int
 }
 
-func (f *fakeExec) Execute(_ context.Context, run Run) (ResultRef, error) {
+func (f *fakeExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
 	f.mu.Lock()
 	f.executed = append(f.executed, run.ID)
 	f.mu.Unlock()
+	report("res_1")
 	return ResultRef{ResultID: "res_1", At: time.Now(), OK: true}, nil
 }
 func (f *fakeExec) Maintain(context.Context) {
@@ -29,6 +30,57 @@ func (f *fakeExec) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.executed)
+}
+
+// blockingExec reports a result id, signals it has started, then blocks until released — so a test can
+// observe Active() WHILE a run is in flight.
+type blockingExec struct {
+	reported chan string
+	release  chan struct{}
+}
+
+func (b *blockingExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
+	report("res_live")
+	b.reported <- run.ID
+	<-b.release
+	return ResultRef{ResultID: "res_live", OK: true}, nil
+}
+func (b *blockingExec) Maintain(context.Context) {}
+
+func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{
+		{ID: "r", Enabled: true, Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, NextFireAt: &past, AxiomIDs: []string{"x"}},
+	})
+	be := &blockingExec{reported: make(chan string, 1), release: make(chan struct{})}
+	s := NewScheduler(store, be, time.Second)
+	s.logf = func(string, ...any) {}
+
+	if a := s.Active(); a != nil {
+		t.Fatalf("expected no activity before firing, got %+v", a)
+	}
+	if !s.FireNow("r", "t") {
+		t.Fatal("FireNow returned false")
+	}
+	<-be.reported // the run has reported its result id and is now blocked mid-execution
+
+	a := s.Active()
+	if a == nil || a.RunID != "r" || a.ResultID != "res_live" {
+		t.Fatalf("Active() did not reflect the running run: %+v", a)
+	}
+	if a.StartedAt.IsZero() {
+		t.Error("Active().StartedAt not stamped")
+	}
+
+	close(be.release) // let the run finish → Active clears
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.Active() == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("Active() did not clear after the run finished")
 }
 
 func seedStore(t *testing.T, runsIn []Run) *Store {
@@ -84,11 +136,12 @@ type scriptedExec struct {
 	resps []ResultRef
 }
 
-func (f *scriptedExec) Execute(_ context.Context, run Run) (ResultRef, error) {
+func (f *scriptedExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := len(f.calls)
 	f.calls = append(f.calls, run)
+	report("res")
 	if i < len(f.resps) {
 		return f.resps[i], nil
 	}

@@ -34,6 +34,13 @@ type Result struct {
 	Suspended bool         `json:"suspended,omitempty"`
 	ResumeAt  *time.Time   `json:"resumeAt,omitempty"`
 	Repos     []RepoResult `json:"repos"`
+	// Live is the repo CURRENTLY being worked, published as the execution progresses so the UI can
+	// follow a run step by step (and the agent's output as it streams). It is deliberately SEPARATE from
+	// Repos: Repos holds only COMPLETED repos (DoneRepos/resume skip exactly those), so a half-done repo
+	// must never leak into it — a crash would otherwise make a resume treat it as finished and never
+	// re-implement it. Cleared the instant a repo completes (its finished result moves into Repos) and on
+	// finish. Purely additive for observation — no scheduling or resume logic reads it.
+	Live *RepoResult `json:"live,omitempty"`
 	// Token/cost totals across all repos of this execution.
 	InputTokens  int     `json:"inputTokens"`
 	OutputTokens int     `json:"outputTokens"`
@@ -43,7 +50,9 @@ type Result struct {
 
 // RepoResult is the outcome of a run against one repository.
 type RepoResult struct {
-	Repo         string  `json:"repo"`
+	Repo string `json:"repo"`
+	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
+	Running      bool    `json:"running,omitempty"`
 	OK           bool    `json:"ok"`
 	Deployed     bool    `json:"deployed"`
 	PRUrl        string  `json:"prUrl,omitempty"`
@@ -57,10 +66,13 @@ type RepoResult struct {
 
 // Step is one stage of the per-repo pipeline (analyze | implement | push | pr | deploy).
 type Step struct {
-	Name string    `json:"name"`
-	OK   bool      `json:"ok"`
-	Log  string    `json:"log,omitempty"`
-	At   time.Time `json:"at"`
+	Name string `json:"name"`
+	// Running marks a step still in progress — the agent step carries its streaming transcript in Log
+	// while Running is true, and the finished report once it clears. Set only on a Live repo's steps.
+	Running bool      `json:"running,omitempty"`
+	OK      bool      `json:"ok"`
+	Log     string    `json:"log,omitempty"`
+	At      time.Time `json:"at"`
 }
 
 // Results stores execution results at runs-results/<runId>/<resultId>.json.

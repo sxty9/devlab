@@ -298,6 +298,9 @@ export const httpSource: DataSource = {
   async mercuryRunNow(id) {
     return json(await post(`/api/mercury/runs/${enc(id)}/run`, {}));
   },
+  async mercuryRunActive() {
+    return json(await request('/api/mercury/runs/active'));
+  },
   async mercuryCancelRun() {
     await json<void>(await post('/api/mercury/runs/cancel', {}));
   },

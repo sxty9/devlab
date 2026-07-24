@@ -6,9 +6,10 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, TokenStat, EmptyPlaceholder, fmtDateTime } from './MercuryExecutions';
+import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import type {
   Run,
+  RunActive,
   RunInput,
   RunSchedule,
   RunList,
@@ -78,10 +79,12 @@ export default function RunsView() {
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
-  // A run may be executing (started via "Jetzt ausführen"); the global cancel appears while so.
-  const [running, setRunning] = useState(false);
+  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
+  // live-follow view — survive a page reload instead of living only in this component. The global cancel
+  // shows whenever a run is live.
+  const { active, refetch: refetchActive } = useActiveRun();
+  const running = active != null;
   const [cancelling, setCancelling] = useState(false);
-  const runTimeoutRef = useRef<number | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
   const reload = useCallback(async () => {
@@ -94,6 +97,14 @@ export default function RunsView() {
       toast({ title: 'Läufe konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
+  const prevActiveRef = useRef<string | null>(null);
+  useEffect(() => {
+    const cur = active?.runId ?? null;
+    if (prevActiveRef.current && !cur) void reload();
+    prevActiveRef.current = cur;
+  }, [active, reload]);
 
   // First load owns the full-screen error state.
   useEffect(() => {
@@ -114,35 +125,19 @@ export default function RunsView() {
     };
   }, [source]);
 
-  useEffect(
-    () => () => {
-      if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-    },
-    [],
-  );
-
-  // Mark a run as in-flight and auto-clear after a ceiling (execution is detached; we can't observe
-  // completion precisely). Cancel or the ceiling ends the "aktiv" banner.
-  const startRunning = useCallback(() => {
-    setRunning(true);
-    if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-    runTimeoutRef.current = window.setTimeout(() => setRunning(false), 180000);
-  }, []);
-
   const cancelRun = useCallback(async () => {
     if (cancelling) return;
     setCancelling(true);
     try {
       await source.mercuryCancelRun();
       toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      if (runTimeoutRef.current) window.clearTimeout(runTimeoutRef.current);
-      setRunning(false);
+      refetchActive();
     } catch (e) {
       toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setCancelling(false);
     }
-  }, [cancelling, source, toast]);
+  }, [cancelling, source, toast, refetchActive]);
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -215,10 +210,11 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
+        active={active && active.runId === selectedRun.id ? active : null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRecomposed={reload}
-        onRunStarted={startRunning}
+        onRunStarted={refetchActive}
       />
     );
   } else {
@@ -381,6 +377,7 @@ function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSe
 function RunDetail({
   run,
   axioms,
+  active,
   onEdit,
   onDeleted,
   onRecomposed,
@@ -388,6 +385,7 @@ function RunDetail({
 }: {
   run: Run;
   axioms: Record<string, string>;
+  active: RunActive | null;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRecomposed: () => void | Promise<void>;
@@ -401,7 +399,7 @@ function RunDetail({
   const [prompt, setPrompt] = useState<string | null>(null);
   const [promptLoading, setPromptLoading] = useState(false);
   const [results, setResults] = useState<RunResultRef[] | null>(null);
-  const pollRef = useRef<number | null>(null);
+  const isLive = active?.runId === run.id;
 
   const refreshResults = useCallback(async () => {
     try {
@@ -423,12 +421,12 @@ function RunDetail({
     };
   }, [source, run.id]);
 
-  useEffect(
-    () => () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    },
-    [],
-  );
+  // When this run stops being live, pull the freshly-finished execution into the history list below.
+  const wasLive = useRef(false);
+  useEffect(() => {
+    if (wasLive.current && !isLive) void refreshResults();
+    wasLive.current = isLive;
+  }, [isLive, refreshResults]);
 
   const togglePrompt = async () => {
     const next = !promptOpen;
@@ -479,19 +477,7 @@ function RunDetail({
     try {
       await source.mercuryRunNow(run.id);
       toast({ title: 'Lauf gestartet', variant: 'success' });
-      onRunStarted();
-      // Poll this run's executions so a fresh result surfaces while it runs.
-      if (pollRef.current) window.clearInterval(pollRef.current);
-      let ticks = 0;
-      pollRef.current = window.setInterval(() => {
-        ticks += 1;
-        void refreshResults();
-        if (ticks >= 24 && pollRef.current) {
-          window.clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-      }, 5000);
-      void refreshResults();
+      onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
@@ -582,11 +568,16 @@ function RunDetail({
 
       <section className="mt-6 border-t border-separator pt-4">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ausführungen</p>
+        {isLive && active?.resultId && (
+          <div className="mb-3">
+            <LiveExecution runId={run.id} resultId={active.resultId} live />
+          </div>
+        )}
         {results === null ? (
           <p className="text-footnote text-text-tertiary">Lädt…</p>
         ) : results.length === 0 ? (
           <p className="text-footnote text-text-tertiary">
-            Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.
+            {isLive ? 'Läuft gerade – siehe oben.' : 'Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.'}
           </p>
         ) : (
           <ul className="flex flex-col gap-1.5">

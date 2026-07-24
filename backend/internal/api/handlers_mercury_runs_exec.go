@@ -175,12 +175,18 @@ type runExecutor struct {
 	autoMergeAfter time.Duration
 }
 
-func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef, error) {
+func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(resultID string)) (runs.ResultRef, error) {
 	// Resume an execution suspended on the usage limit (same ResultID, skip the repos already done), or
 	// start a fresh one. A resume that can't find its open result silently starts fresh.
 	res, resuming := x.resumeOrNew(run)
 	res.Suspended, res.ResumeAt = false, nil // recomputed below if we hit the limit again
-	save := func() { _ = x.s.runResults.Save(res) }
+	res.Live = nil                           // drop any stale in-flight repo left by a crashed prior attempt
+	saver := &liveSaver{do: func() { _ = x.s.runResults.Save(res) }}
+	save := saver.force
+	// Publish the live result id (so /active can point the UI at this execution) and materialize the
+	// result file up front — so a run is followable, and survives a page reload, from its first moment.
+	report(res.ResultID)
+	save()
 
 	fail := func(msg string) (runs.ResultRef, error) {
 		res.FinishedAt = time.Now().UTC()
@@ -286,7 +292,8 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 			carriedOver = true
 			break
 		}
-		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts)
+		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
+		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
 			// do NOT hammer the rest — suspend the whole execution until the window resets.
@@ -306,6 +313,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef
 			carriedOver = true
 			break
 		}
+		rr.Running = false // a recorded repo is complete, never in-flight
 		res.Repos = append(res.Repos, rr)
 		res.InputTokens += rr.InputTokens
 		res.OutputTokens += rr.OutputTokens
@@ -399,10 +407,15 @@ type repoLimit struct {
 	hasReset bool
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment) (runs.RepoResult, repoLimit) {
-	rr := runs.RepoResult{Repo: repo.ID}
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoLimit) {
+	rr := runs.RepoResult{Repo: repo.ID, Running: true}
+	res.Live = &rr // publish this repo as the in-flight one; the caller clears Live once it settles
+	saver.force()
+	// step records a COMPLETED stage and re-saves, so the fast git stages (push/pr/deploy) also surface
+	// live as they land. The long agent stages instead use runAgentLive (a running step that streams).
 	step := func(name, logtxt string, ok bool) {
 		rr.Steps = append(rr.Steps, runs.Step{Name: name, OK: ok, Log: clip(logtxt), At: time.Now().UTC()})
+		saver.force()
 	}
 
 	if _, err := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true); err != nil {
@@ -441,17 +454,15 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		out, err := x.runAgent(actx, ex, wt, prompt, "plan", atts)
-		if lim := detectLimit(out, err); lim.limited {
+		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", atts, &rr, saver)
+		if lim.limited {
 			return rr, lim
 		}
 		if err != nil {
-			step("analyze", agentError(err), false)
 			rr.Error = "analyze: " + err.Error()
 			return rr, repoLimit{}
 		}
-		step("analyze", parseClaudeResult(out).Output, true) // the agent's report (per the Bericht Laufregel)
-		applyUsage(&rr, out)
+		applyUsage(&rr, final) // the agent's report already streamed into the analyze step
 		rr.OK = true
 		return rr, repoLimit{}
 	}
@@ -466,17 +477,15 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Error = "checkout: " + err.Error()
 		return rr, repoLimit{}
 	}
-	out, err := x.runAgent(actx, ex, wt, prompt, "bypassPermissions", atts)
-	if lim := detectLimit(out, err); lim.limited {
+	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", atts, &rr, saver)
+	if lim.limited {
 		return rr, lim
 	}
 	if err != nil {
-		step("implement", agentError(err), false)
 		rr.Error = "implement: " + err.Error()
 		return rr, repoLimit{}
 	}
-	step("implement", parseClaudeResult(out).Output, true) // the agent's report (per the Bericht Laufregel)
-	applyUsage(&rr, out)
+	applyUsage(&rr, final) // the agent's report already streamed into the implement step
 
 	// The agent usually commits its own work — Claude Code does that routinely. Judging by the
 	// WORKING TREE alone therefore misses a finished implementation entirely: the tree is clean, the
@@ -709,13 +718,93 @@ func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAt
 // attachments again as it returns (the deferred cleanup runs the instant the agent finishes, BEFORE
 // executeRepo commits) — so the media reaches the agent yet never leaks into the PR. For an auto run
 // (no attachments) it is exactly the plain agent call.
-func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, atts []loadedAttachment) ([]byte, error) {
+func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, atts []loadedAttachment, onLine func([]byte)) ([]byte, error) {
 	cleanup, err := writeWorkspaceAttachments(ex, wt, atts)
 	if err != nil {
 		return nil, fmt.Errorf("Medien bereitstellen: %w", err)
 	}
 	defer cleanup()
+	// Stream when a live sink is present (a real run) and streaming is enabled — so the agent can be
+	// followed as it works. Otherwise the plain buffered call. resultEvent() reconciles both wire formats.
+	if onLine != nil && streamEnabled() {
+		return ex.AgentStream(actx, wt, onLine, streamAgentArgs(prompt, permMode)...)
+	}
 	return ex.Agent(actx, wt, agentArgs(prompt, permMode)...)
+}
+
+// liveSaver persists the in-progress result. Boundary events (a step starting/ending, a repo starting)
+// force an immediate save; the streaming hot path — a line of agent output — uses throttled(), which
+// coalesces to at most one save per interval so a chatty agent never thrashes the disk.
+type liveSaver struct {
+	do   func()
+	last time.Time
+}
+
+func (l *liveSaver) force() {
+	l.last = time.Now()
+	l.do()
+}
+
+func (l *liveSaver) throttled() {
+	const interval = 1200 * time.Millisecond
+	if time.Since(l.last) < interval {
+		return
+	}
+	l.force()
+}
+
+// agentStep renders the long agent stage (analyze/implement) as a LIVE step: a running step whose log
+// grows with the agent's streaming transcript, finalized to the agent's report on success or the error
+// text on failure. The fast git stages record completed steps directly (via executeRepo's step()).
+type agentStep struct {
+	rr    *runs.RepoResult
+	saver *liveSaver
+	idx   int
+	tr    transcript
+}
+
+func beginAgentStep(rr *runs.RepoResult, saver *liveSaver, name string) *agentStep {
+	rr.Steps = append(rr.Steps, runs.Step{Name: name, Running: true, At: time.Now().UTC()})
+	saver.force()
+	return &agentStep{rr: rr, saver: saver, idx: len(rr.Steps) - 1}
+}
+
+// onProgress folds one line of streamed agent output into the running step's transcript (throttled save).
+func (a *agentStep) onProgress(line []byte) {
+	if a.tr.push(line) {
+		a.rr.Steps[a.idx].Log = a.tr.clipped()
+		a.saver.throttled()
+	}
+}
+
+func (a *agentStep) finish(report string) {
+	s := &a.rr.Steps[a.idx]
+	s.Running, s.OK, s.Log = false, true, clip(report)
+	a.saver.force()
+}
+
+func (a *agentStep) fail(logtxt string) {
+	s := &a.rr.Steps[a.idx]
+	s.Running, s.OK, s.Log = false, false, clip(logtxt)
+	a.saver.force()
+}
+
+// runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
+// (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
+// (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoLimit, err error) {
+	ag := beginAgentStep(rr, saver, name)
+	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, atts, ag.onProgress)
+	final = resultEvent(out)
+	if l := detectLimit(final, aerr); l.limited {
+		return final, l, aerr // leave the step running; the repo is not recorded
+	}
+	if aerr != nil {
+		ag.fail(agentError(aerr))
+		return final, repoLimit{}, aerr
+	}
+	ag.finish(parseClaudeResult(final).Output)
+	return final, repoLimit{}, nil
 }
 
 // deploy runs the root wrapper, which executes ONLY the per-repo vetted allowlist script — the agent
@@ -851,6 +940,19 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
+}
+
+// runActive reports the run executing in THIS process right now — its id, the live result id (once the
+// executor mints it), and when it started — or null when nothing runs. It is the single source of truth
+// the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
+// mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
+// scheme scan), so it is safe to poll frequently.
+func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
+	var active *runs.Activity
+	if s.scheduler != nil {
+		active = s.scheduler.Active()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"active": active})
 }
 
 // runCancel aborts the run in progress (kill-switch).

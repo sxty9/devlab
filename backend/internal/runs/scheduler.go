@@ -18,8 +18,23 @@ var ErrRunAborted = errors.New("run aborted by kill-switch")
 // (auto-merging overdue PRs). It is injected by the api layer so the runs package never imports it —
 // the runs package owns scheduling + persistence, the api layer owns side effects.
 type Executor interface {
-	Execute(ctx context.Context, run Run) (ResultRef, error)
+	// Execute runs a run end-to-end. report is invoked as soon as the execution's result id is known
+	// (freshly minted or resumed) so the scheduler can publish it as the live Activity — the UI locates
+	// the in-flight result document by that id. The scheduler always passes a non-nil report; it may go
+	// uncalled if the run fails before a result exists.
+	Execute(ctx context.Context, run Run, report func(resultID string)) (ResultRef, error)
 	Maintain(ctx context.Context)
+}
+
+// Activity is a snapshot of the run currently executing: its id, the live result id (once the executor
+// reports it), and when this attempt started. Held in memory only — it exists exactly while a run's
+// goroutine is alive, so it is the honest "is a run live right now" signal: a restart clears it because
+// the goroutine dies with the process. The UI reads it (via the /active endpoint) to restore the
+// "Lauf aktiv" state after a reload and to follow the live result.
+type Activity struct {
+	RunID     string    `json:"runId"`
+	ResultID  string    `json:"resultId,omitempty"`
+	StartedAt time.Time `json:"startedAt"`
 }
 
 // Scheduler fires due runs on a ticker, one at a time, and advances each run's schedule forward from
@@ -32,9 +47,10 @@ type Scheduler struct {
 
 	runMu sync.Mutex // held for the duration of ONE run — guarantees one run at a time
 
-	curMu   sync.Mutex
-	curID   string
-	curStop context.CancelCauseFunc
+	curMu       sync.Mutex
+	curID       string
+	curStop     context.CancelCauseFunc
+	curActivity *Activity
 }
 
 // NewScheduler builds a scheduler. tick defaults to 30s.
@@ -181,7 +197,16 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 		})
 	}
 
-	ref, err := s.exec.Execute(ctx, run)
+	// Publish the live result id the instant the executor knows it, so /active can point the UI at the
+	// in-flight result document (single source of truth: the scheduler owns "what is live").
+	report := func(resultID string) {
+		s.curMu.Lock()
+		if s.curActivity != nil {
+			s.curActivity.ResultID = resultID
+		}
+		s.curMu.Unlock()
+	}
+	ref, err := s.exec.Execute(ctx, run, report)
 	if err != nil {
 		s.logf("devlabd: run %s execution error: %v", id, err)
 	}
@@ -245,14 +270,27 @@ func (s *Scheduler) Current() string {
 	return s.curID
 }
 
+// Active returns a snapshot of the run currently executing (id, live result id, start), or nil when
+// nothing runs. Copied out under the lock so callers can read it freely.
+func (s *Scheduler) Active() *Activity {
+	s.curMu.Lock()
+	defer s.curMu.Unlock()
+	if s.curActivity == nil {
+		return nil
+	}
+	a := *s.curActivity
+	return &a
+}
+
 func (s *Scheduler) setCurrent(id string, cancel context.CancelCauseFunc) {
 	s.curMu.Lock()
 	s.curID, s.curStop = id, cancel
+	s.curActivity = &Activity{RunID: id, StartedAt: time.Now().UTC()}
 	s.curMu.Unlock()
 }
 
 func (s *Scheduler) clearCurrent() {
 	s.curMu.Lock()
-	s.curID, s.curStop = "", nil
+	s.curID, s.curStop, s.curActivity = "", nil, nil
 	s.curMu.Unlock()
 }
