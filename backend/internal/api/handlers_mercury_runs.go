@@ -802,8 +802,12 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"from": now, "to": horizon, "occurrences": occs})
 }
 
-// runsExecutions returns every completed execution across all runs (newest first, with token/cost) —
-// the Lauf-History. Includes executions of runs that were since deleted (persistent logs).
+// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
+// Includes executions of runs that were since deleted (persistent logs). ?type=auto|todo scopes it to
+// one surface (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the
+// global log. Each execution's kind is resolved from the stamp on the result, falling back to the live
+// run's kind for older (unstamped) results, and to auto for an orphan with neither (the "" == auto
+// convention). The resolved kind is returned so the caller sees a definite auto|todo.
 func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 	if s.runResults == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"executions": []any{}})
@@ -814,7 +818,35 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": execs})
+	// runID → kind, so an unstamped result inherits the type of its still-existing run.
+	kindByRun := map[string]runs.Type{}
+	if s.runs != nil {
+		if all, listErr := s.runs.List(); listErr == nil {
+			for _, run := range all {
+				kindByRun[run.ID] = runs.NormalizeType(run.Type)
+			}
+		}
+	}
+	resolve := func(e runs.ExecutionSummary) runs.Type {
+		if e.Type != "" {
+			return runs.NormalizeType(e.Type)
+		}
+		if k, ok := kindByRun[e.RunID]; ok {
+			return k
+		}
+		return runs.TypeAuto
+	}
+	want := strings.TrimSpace(r.URL.Query().Get("type"))
+	out := make([]runs.ExecutionSummary, 0, len(execs))
+	for _, e := range execs {
+		kind := resolve(e)
+		if want != "" && want != "all" && string(kind) != want {
+			continue
+		}
+		e.Type = kind // hand back the resolved kind, never an empty one
+		out = append(out, e)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
 }
 
 // mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the

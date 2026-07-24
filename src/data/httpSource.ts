@@ -289,8 +289,8 @@ export const httpSource: DataSource = {
     const q = p.toString();
     return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
   },
-  async mercuryRunExecutions() {
-    return json(await request('/api/mercury/runs/executions'));
+  async mercuryRunExecutions(type) {
+    return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
   },
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));

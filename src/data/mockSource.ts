@@ -343,7 +343,7 @@ export const mockSource: DataSource = {
   async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {
     return { from: new Date().toISOString(), to: new Date().toISOString(), occurrences: [] };
   },
-  async mercuryRunExecutions() {
+  async mercuryRunExecutions(_type?: import('@/types').RunType) {
     return { executions: [] };
   },
   async mercuryChat(_messages: import('@/types').RunChatMessage[]) {

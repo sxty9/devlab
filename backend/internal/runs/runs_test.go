@@ -32,6 +32,40 @@ func TestEmptyListsMarshalAsArraysNotNull(t *testing.T) {
 	}
 }
 
+func TestNormalizeTypeFoldsEmptyToAuto(t *testing.T) {
+	cases := map[Type]Type{"": TypeAuto, TypeAuto: TypeAuto, TypeTodo: TypeTodo, "bogus": TypeAuto}
+	for in, want := range cases {
+		if got := NormalizeType(in); got != want {
+			t.Errorf("NormalizeType(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A stored result carries its run's kind so the execution history can be split per surface (Läufe vs
+// ToDos) even after the run is deleted. All() must surface that stamp on every summary.
+func TestAllCarriesTypeStamp(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "res"))
+	res := NewResults()
+	if err := res.Save(Result{RunID: "run_a", ResultID: NewResultID(time.Now()), Type: TypeTodo, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := res.Save(Result{RunID: "run_b", ResultID: NewResultID(time.Now().Add(time.Second)), Type: TypeAuto, StartedAt: time.Now().Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	all, err := res.All()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Type{}
+	for _, e := range all {
+		got[e.RunID] = e.Type
+	}
+	if got["run_a"] != TypeTodo || got["run_b"] != TypeAuto {
+		t.Fatalf("type stamp not surfaced by All(): %+v", got)
+	}
+}
+
 func TestScheduleNextDaily(t *testing.T) {
 	s := Schedule{Kind: Daily, TimeOfDay: "03:00"}
 	// before the time-of-day → same day
