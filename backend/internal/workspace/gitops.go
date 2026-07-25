@@ -524,6 +524,53 @@ func (e Executor) CurrentBranch(ctx context.Context, wt string) string {
 	return s
 }
 
+// ArtifactBuild builds the repo's deployable artifact IN wt, AS THE WORKSPACE OWNER, via the pinned
+// per-user devlab-exec wrapper (artifact-build verb). It must not run as root (Finding C — a build hook
+// would execute as root) nor as the devlabd service user (which cannot write the runs-user-owned
+// workspace). Produces <wt>/.mercury-artifact (the Go daemon binary + the built web SPA in web/). Returns
+// the combined build output for error context; the artifact path is the fixed <wt>/.mercury-artifact.
+func (e Executor) ArtifactBuild(ctx context.Context, wt string) (string, error) {
+	if !e.PerUser {
+		return "", fmt.Errorf("ArtifactBuild requires per-user execution")
+	}
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "-u", e.User, execWrapper, "artifact-build", wt)
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	return strings.TrimRight(string(out), "\n"), err
+}
+
+// RevParse resolves ref to a full commit SHA. Used by the autonomous runner to capture the tip AFTER it
+// bases a run on main + pending PRs, so it can later tell whether the AGENT contributed anything new.
+func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) {
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return "", fmt.Errorf("invalid ref %q", ref)
+	}
+	s, err := runGit(e.gitIn(ctx, wt, "", "rev-parse", ref))
+	return strings.TrimSpace(s), err
+}
+
+// mergeRefRe restricts MergeRef to Mercury run branches on origin — the only refs the autonomous runner
+// ever folds into a run's base (the still-open pending PRs). A hostile branch name cannot reach git.
+var mergeRefRe = regexp.MustCompile(`^origin/mercury-run/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+
+// MergeRef merges ref into the current branch (default merge; a merge commit is authored as the runner
+// identity when the histories diverge). On conflict it ABORTS the merge and returns an error, leaving the
+// branch exactly as before — the caller then proceeds without that pending PR in the base. Restricted to
+// origin/mercury-run/* refs. This is how the runner bases a run on "main + pending PRs" so it never redoes
+// not-yet-merged work while still implementing what a (possibly different-axiom) run still needs.
+func (e Executor) MergeRef(ctx context.Context, wt, ref string) error {
+	if strings.Contains(ref, "..") || !mergeRefRe.MatchString(ref) {
+		return fmt.Errorf("invalid merge ref %q", ref)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "",
+		"-c", "user.name=mercury-run", "-c", "user.email=mercury-run@local",
+		"merge", "--no-edit", ref)); err != nil {
+		_, _ = runGit(e.gitIn(ctx, wt, "", "merge", "--abort"))
+		return fmt.Errorf("merge %s: %w", ref, err)
+	}
+	return nil
+}
+
 // Changes / Branches are read-only re-exports (run directly with safe.directory in package git).
 func Changes(wt string) []model.Change  { return git.Changes(wt) }
 func Branches(wt string) []model.Branch { return git.Branches(wt) }

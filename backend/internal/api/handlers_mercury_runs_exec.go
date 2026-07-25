@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -35,7 +36,10 @@ import (
 //   full   — pr + deploy the committed workspace via the devlab-deploy allowlist wrapper
 
 const (
-	deployWrapper   = "/usr/local/sbin/devlab-deploy"
+	deployWrapper = "/usr/local/sbin/devlab-deploy"
+	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
+	// no deploy target at all — see hasDeployTarget.
+	deployScriptDir = "/etc/devlab/deploy.d"
 	runAgentTimeout = 60 * time.Minute // a full implement pass can be long
 	runnerPreamble  = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
@@ -173,6 +177,55 @@ type runExecutor struct {
 	// token; never point DEVLAB_RUNS_USER at a human account.
 	tokenUser      string
 	autoMergeAfter time.Duration
+
+	// IO seams — nil in production (the real GitHub client and deploy pipeline are used). Kept as
+	// fields so the Maintain orchestration (throttled merge-detection → prod-deploy → untrack) can be
+	// exercised in tests without a real GitHub token, real network, or a real root deploy wrapper.
+	tokenFn      func(user string) (string, error)
+	getPRFn      func(ctx context.Context, token, fullName string, number int) (github.PullRequest, error)
+	mergePRFn    func(ctx context.Context, token, fullName string, number int) error
+	prodDeployFn func(ctx context.Context, token string, p runs.PendingPR) (string, error)
+	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
+	// /etc that a test can neither create nor rely on.
+	deployTargetFn func(repoName string) bool
+}
+
+// token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real
+// implementation. This keeps production wiring untouched (StartScheduler sets no seams) while letting
+// tests substitute deterministic fakes.
+func (x *runExecutor) token() (string, error) {
+	if x.tokenFn != nil {
+		return x.tokenFn(x.tokenUser)
+	}
+	return x.s.links.Token(x.tokenUser)
+}
+
+func (x *runExecutor) fetchPR(ctx context.Context, token, fullName string, number int) (github.PullRequest, error) {
+	if x.getPRFn != nil {
+		return x.getPRFn(ctx, token, fullName, number)
+	}
+	return github.GetPullRequest(ctx, token, fullName, number)
+}
+
+func (x *runExecutor) mergePR(ctx context.Context, token, fullName string, number int) error {
+	if x.mergePRFn != nil {
+		return x.mergePRFn(ctx, token, fullName, number)
+	}
+	return github.MergePullRequest(ctx, token, fullName, number)
+}
+
+func (x *runExecutor) runProdDeploy(ctx context.Context, token string, p runs.PendingPR) (string, error) {
+	if x.prodDeployFn != nil {
+		return x.prodDeployFn(ctx, token, p)
+	}
+	return x.prodDeployMerged(ctx, token, p)
+}
+
+func (x *runExecutor) deployable(repoName string) bool {
+	if x.deployTargetFn != nil {
+		return x.deployTargetFn(repoName)
+	}
+	return hasDeployTarget(repoName)
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(resultID string)) (runs.ResultRef, error) {
@@ -194,12 +247,35 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		save()
 		return runs.ResultRef{ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos)}, fmt.Errorf("%s", msg)
 	}
+	// carryOver stops WITHOUT finalising (FinishedAt stays zero) so the next fire resumes this same
+	// result and skips the done repos — for transient infrastructure failures (no network) that must not
+	// be recorded as a permanent, "run complete" failure. It is the infra sibling of fail().
+	carryOver := func(reason string) (runs.ResultRef, error) {
+		res.OK = false
+		save()
+		log.Printf("devlabd: run %s carried over before completing (%s) — next fire resumes it", run.ID, reason)
+		return runs.ResultRef{
+			ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
+			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
+		}, nil
+	}
 
 	token, err := x.s.links.Token(x.tokenUser)
 	if err != nil {
 		return fail("Runner-Token nicht verfügbar (DEVLAB_RUNS_TOKEN_USER — ersatzweise DEVLAB_RUNS_USER — " +
 			"muss ein verknüpftes GitHub-Konto sein): " + err.Error())
 	}
+
+	// Self-healing preflight: if GitHub is unreachable, WAIT for connectivity to return before touching
+	// any repo (a short DNS/link blip must not turn into a whole failed night). Only after it stays down
+	// past the wait budget do we carry the sweep over to the next fire — never finalise it as failed.
+	if err := ensureGitHubReachable(ctx, token); err != nil {
+		if isInfraError(err) || ctx.Err() != nil {
+			return carryOver("GitHub nicht erreichbar (Netz/DNS): " + err.Error())
+		}
+		return fail("GitHub-Vorabprüfung fehlgeschlagen: " + err.Error())
+	}
+
 	// An auto run sweeps every Holistic repo; a ToDo hits its one-or-more targets — each an existing repo
 	// or one it creates first. Both feed the very same per-repo pipeline below.
 	var repos []model.Repo
@@ -210,6 +286,9 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	} else {
 		repos, err = discover.ReposForUser(ctx, x.tokenUser, token)
 		if err != nil {
+			if isInfraError(err) {
+				return carryOver("Repo-Discovery (Netz/DNS): " + err.Error())
+			}
 			return fail("Holistic-Repos konnten nicht ermittelt werden: " + err.Error())
 		}
 	}
@@ -299,6 +378,16 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			// do NOT hammer the rest — suspend the whole execution until the window resets.
 			return x.suspend(run, &res, lim, save)
 		}
+		if lim.infra {
+			// Infrastructure failure (DNS/network) — NOT this repo's fault, and a sign the rest will fail
+			// too. Do NOT record the repo (it retries) and stop the sweep: carry over so the next fire
+			// resumes from here once connectivity is back, rather than burning the night on clone failures
+			// and finalising the run as "done, all failed". This is the self-healing deferral.
+			log.Printf("devlabd: run %s hit an infrastructure failure on %s (%s) — carrying the rest to the next run",
+				run.ID, repo.ID, lim.infraErr)
+			carriedOver = true
+			break
+		}
 		// If the context ended DURING this repo (duration cap or shutdown, not a deliberate abort) before
 		// it produced any durable result, do NOT record the half-done repo — carry over so it retries
 		// cleanly on resume instead of being skipped as a permanent failure. Drop ONLY a repo that
@@ -350,28 +439,66 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	}, nil
 }
 
-// resumeOrNew continues an interrupted execution, or mints a fresh one. Two interruption kinds resume
+// resumeOrNew continues an interrupted execution, or mints a fresh one. Three interruption kinds resume
 // the SAME result (so repos already done are skipped, never re-implemented into duplicate PRs):
-//  1. a usage-limit suspension (run.Suspended points at the open result); and
+//  1. a usage-limit suspension (run.Suspended points at the open result);
 //  2. a crash/restart mid-run — no suspension, but a stranded result (unfinished, unsuspended) is on
-//     disk. Without (2), a devlabd restart during a sweep makes the next fire redo every repo.
+//     disk. Without (2), a devlabd restart during a sweep makes the next fire redo every repo; and
+//  3. an ORPHANED suspension — an execution that paused on the limit but whose run lost its Suspended
+//     pointer (a restart between the two writes). FindResumable recovers it, so it no longer freezes
+//     forever with its spend stranded (the freeze bug).
+//
+// A husk started under a DIFFERENT safety-ladder mode is NOT continued (a report husk marks repos
+// "done" after mere analysis; resuming it in pr mode would skip implementing them). Such a husk is
+// reaped — finalised as failed so it stops lingering — and a fresh execution starts.
 func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
+	fresh := func() runs.Result {
+		start := time.Now()
+		return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
+			Type: runs.NormalizeType(run.Type), Mode: x.mode, StartedAt: start.UTC(),
+			PromptHash: run.PromptHash, Prompt: run.Prompt}
+	}
+	consider := func(existing runs.Result) (runs.Result, bool, bool) {
+		if existing.Mode != "" && existing.Mode != x.mode {
+			x.reap(existing, fmt.Sprintf("Modus gewechselt (%s → %s) — Husk nicht fortgesetzt", existing.Mode, x.mode))
+			return runs.Result{}, false, true // reaped: don't resume, fall through to fresh
+		}
+		return existing, true, false
+	}
 	if run.Suspended != nil && run.Suspended.ResultID != "" {
 		if existing, ok, _ := x.s.runResults.Get(run.ID, run.Suspended.ResultID); ok {
-			return existing, true
+			if res, resume, reaped := consider(existing); resume {
+				return res, true
+			} else if reaped {
+				return fresh(), false
+			}
 		}
 	}
-	if existing, ok := x.s.runResults.FindStranded(run.ID, time.Now().Add(-strandedWindow)); ok {
-		return existing, true
+	if existing, ok := x.s.runResults.FindResumable(run.ID, time.Now().Add(-strandedWindow)); ok {
+		if res, resume, _ := consider(existing); resume {
+			return res, true
+		}
 	}
-	start := time.Now()
-	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name, Type: runs.NormalizeType(run.Type), StartedAt: start.UTC(), PromptHash: run.PromptHash, Prompt: run.Prompt}, false
+	return fresh(), false
+}
+
+// reap finalises an unresumable husk (mode-mismatched, or otherwise not to be continued) as a failed,
+// FINISHED result so it stops showing as "suspended"/unfinished forever and cannot be picked up again.
+// The work it already did remains in its stored report; only its open state is closed out.
+func (x *runExecutor) reap(res runs.Result, reason string) {
+	res.Suspended = false
+	res.ResumeAt = nil
+	res.FinishedAt = time.Now().UTC()
+	res.OK = false
+	res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false, Error: "abgeschlossen (nicht fortgesetzt): " + reason})
+	_ = x.s.runResults.Save(res)
+	log.Printf("devlabd: reaped husk %s/%s — %s", res.RunID, res.ResultID, reason)
 }
 
 // suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
 // budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
 // the scheduler clears the suspension and stops retrying).
-func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoLimit, save func()) (runs.ResultRef, error) {
+func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
 		attempts = run.Suspended.Attempts
@@ -399,15 +526,23 @@ func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoLimit, sav
 		Suspended: true, ResumeAt: &resumeAt}, nil
 }
 
-// repoLimit reports whether a repo step stopped on the Claude usage limit (and when the window resets).
-// A limited repo is NOT recorded as a result — it retries when the execution resumes.
-type repoLimit struct {
+// repoSignal reports why a repo step stopped in a way that must NOT be recorded as a terminal repo
+// result — the repo retries when the execution resumes/carries over, rather than being marked done:
+//   - limited: the Claude usage window is exhausted → suspend the whole execution until it resets.
+//   - infra:   an infrastructure failure (DNS/network) hit clone or refresh, i.e. NOT the repo's own
+//     fault → carry the sweep over to the next fire (the network may be back by then), never burn
+//     through 19 clone failures and finalise the run as done.
+//
+// A zero repoSignal means the repo produced an ordinary result (success or a genuine work failure).
+type repoSignal struct {
 	limited  bool
 	resetAt  time.Time
 	hasReset bool
+	infra    bool
+	infraErr string
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoLimit) {
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
 	rr := runs.RepoResult{Repo: repo.ID, Running: true}
 	res.Live = &rr // publish this repo as the in-flight one; the caller clears Live once it settles
 	saver.force()
@@ -418,35 +553,62 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		saver.force()
 	}
 
-	if _, err := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true); err != nil {
+	// NOTE: a repo with an open Mercury PR is NEVER skipped. The run proceeds normally; it just bases its
+	// work on main + the still-open pending PRs (see the run-branch setup below), so the agent sees not-yet-
+	// merged work as present and does not redo it, while still implementing whatever a (possibly different-
+	// axiom) run still needs.
+
+	// Clone (first run only; Ensure is a no-op once cloned). Retry a few times on a connectivity blip
+	// before giving up, and tell a network failure apart from a broken repo: a network failure carries
+	// the whole sweep over (infra), a repo failure is this repo's own terminal error.
+	if err := retryInfra(ctx, 3, 10*time.Second, func() error {
+		_, e := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true)
+		return e
+	}); err != nil {
+		if isInfraError(err) {
+			return rr, repoSignal{infra: true, infraErr: "clone " + repo.ID + ": " + err.Error()}
+		}
 		rr.Error = "clone: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	unlock, err := x.s.workspaces.Lock(x.user, repo.ID)
 	if err != nil {
 		rr.Error = "lock: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	defer unlock()
-	branch, err := github.DefaultBranch(ctx, token, repo.FullName)
-	if err != nil || branch == "" {
+	var branch string
+	if err := retryInfra(ctx, 3, 10*time.Second, func() error {
+		b, e := github.DefaultBranch(ctx, token, repo.FullName)
+		branch = b
+		return e
+	}); err != nil || branch == "" {
+		if isInfraError(err) {
+			return rr, repoSignal{infra: true, infraErr: "default branch " + repo.ID + ": " + err.Error()}
+		}
 		rr.Error = "default branch: " + errString(err)
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	wt, err := x.s.workspaces.Path(x.user, repo.ID)
 	if err != nil {
 		rr.Error = "workspace: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	ex := workspace.Executor{User: x.user, PerUser: true}
 
 	// Ensure() returns an ALREADY-CLONED workspace untouched — it never fetches. Without this the
 	// runner analyses the snapshot taken at first clone (and in pr/full mode branches off a stale
 	// origin/<branch>), so nightly runs silently work against outdated code and never see anything
-	// pushed since. Refresh to the real remote state before the agent looks at it.
-	if err := ex.ResetToRemote(ctx, wt, token, branch); err != nil {
+	// pushed since. Refresh to the real remote state before the agent looks at it. Network-classified so
+	// a fetch failure carries over rather than failing the repo.
+	if err := retryInfra(ctx, 3, 10*time.Second, func() error {
+		return ex.ResetToRemote(ctx, wt, token, branch)
+	}); err != nil {
+		if isInfraError(err) {
+			return rr, repoSignal{infra: true, infraErr: "workspace aktualisieren " + repo.ID + ": " + err.Error()}
+		}
 		rr.Error = "workspace aktualisieren: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 
 	actx, cancel := context.WithTimeout(ctx, runAgentTimeout)
@@ -460,30 +622,65 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		}
 		if err != nil {
 			rr.Error = "analyze: " + err.Error()
-			return rr, repoLimit{}
+			return rr, repoSignal{}
 		}
 		applyUsage(&rr, final) // the agent's report already streamed into the analyze step
 		rr.OK = true
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 
 	// PR / FULL: implement on a fresh run branch.
 	runBranch := "mercury-run/" + run.ID + "/" + runs.NewResultID(time.Now())
 	if err := ex.CreateBranch(ctx, wt, runBranch, "origin/"+branch); err != nil {
 		rr.Error = "branch: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	if err := ex.Checkout(ctx, wt, runBranch); err != nil {
 		rr.Error = "checkout: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
+
+	// Base the run on main + the still-open pending Mercury PRs (NOT a skip). Fold each open Mercury run
+	// branch into this run branch so the agent sees not-yet-merged work as already present and does not
+	// redo it — while still implementing whatever else this (possibly different-axiom) run needs. A PR
+	// branch that no longer merges cleanly is skipped with a logged note; the run still proceeds. ToDos
+	// keep a plain main base (they are explicit, targeted tasks). report mode never reaches here.
+	if !run.IsTodo() {
+		if heads := x.openMercuryPRHeads(ctx, token, repo.FullName); len(heads) > 0 {
+			_ = ex.Fetch(ctx, wt, token) // refresh the pending PR branches before merging
+			merged := 0
+			for _, h := range heads {
+				if h == runBranch {
+					continue
+				}
+				if err := ex.MergeRef(ctx, wt, "origin/"+h); err != nil {
+					step("pending-pr", "offener PR-Branch "+h+" nicht konfliktfrei mergebar — ohne ihn fortgefahren: "+err.Error(), false)
+					continue
+				}
+				merged++
+			}
+			if merged > 0 {
+				step("pending-prs", fmt.Sprintf("Base = main + %d offene(r) Mercury-PR(s) berücksichtigt — keine Doppelarbeit", merged), true)
+			}
+		}
+	}
+
+	// The run's base AFTER folding in the pending PRs. New work is measured against THIS tip (not plain
+	// origin/main), so a run that only re-surfaces already-pending changes contributes nothing new and
+	// opens no redundant PR; only genuine additions from this run get pushed.
+	baseTip, err := ex.RevParse(ctx, wt, "HEAD")
+	if err != nil {
+		rr.Error = "Base-Tip ermitteln: " + err.Error()
+		return rr, repoSignal{}
+	}
+
 	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
 	}
 	if err != nil {
 		rr.Error = "implement: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	applyUsage(&rr, final) // the agent's report already streamed into the implement step
 
@@ -495,33 +692,69 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		for _, c := range changes {
 			if err := ex.Stage(ctx, wt, c.Path); err != nil {
 				rr.Error = "stage " + c.Path + ": " + err.Error()
-				return rr, repoLimit{}
+				return rr, repoSignal{}
 			}
 		}
 		if _, _, err := ex.Commit(ctx, wt, "mercury-run: "+run.Name, ghLogin, ghID); err != nil {
 			rr.Error = "commit: " + err.Error()
-			return rr, repoLimit{}
+			return rr, repoSignal{}
 		}
 	}
 
-	ahead, err := ex.CommitsAhead(ctx, wt, "origin/"+branch)
+	// Measure what THIS run added on top of the base (main + pending PRs), not on top of plain main — so
+	// a run that only reproduced already-pending work contributes nothing new and opens no redundant PR.
+	ahead, err := ex.CommitsAhead(ctx, wt, baseTip)
 	if err != nil {
 		rr.Error = "Commits zählen: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	if ahead == 0 {
-		step("implement", "keine Änderungen — nichts zu committen/deployen/pushen", true)
+		step("implement", "keine neuen Änderungen über main + pending PRs hinaus — nichts zu pushen", true)
 		rr.OK = true
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 
-	// Push + PR FIRST, deploy LAST. The remote branch and PR are the durable record of what was
-	// built; if we deployed first and the push then failed, the server would run code that exists
-	// only in a local branch the next run's ResetToRemote discards — live code with no source record
-	// and no rollback. So the record is established before anything goes live.
+	// DEV-DEPLOY (full mode only) — BEFORE the push, deliberately. dev is the very box we built on, so
+	// this workspace and its run branch already ARE the source record for the code going live here;
+	// there is no "live code with no source" risk that the old push-first ordering guarded against.
+	// That invariant still holds for PROD, which is no longer touched here at all — a prod-deploy is
+	// driven only by a MERGED PR in Maintain, where the pushed branch + merge are the durable record
+	// before anything ships to the VPS.
+	//
+	// Finding C: the build runs UNPRIVILEGED here (buildArtifact, as the runner itself); the root
+	// wrapper only installs+restarts a prebuilt artifact, never builds. Finding B: the self repo is
+	// NEVER dev-deployed — restarting THIS devlabd would kill the running sweep; its PR still lands and
+	// its deploy happens out-of-band (its prod-deploy, which restarts the VPS not the runner, is fine
+	// via Maintain). A dev-deploy failure is NON-fatal: we log the step and still push + open the PR.
+	//
+	// EVERY full-mode repo records a dev-deploy step, including one that is skipped: an omitted step reads
+	// as "never attempted" in the pipeline view, which is how a whole disabled half of the pipeline stayed
+	// invisible. A skip that is expected (self repo, switched off, no deploy target) is a SUCCESSFUL step
+	// carrying its reason; only a real build/install failure is red.
+	switch {
+	case x.mode != "full":
+		// report/pr never deploy at all — no step, as before.
+	case !x.shouldDevDeploy(repo.ID):
+		step("dev-deploy", devDeploySkipReason(repo.ID), true)
+	case !x.deployable(repo.Name):
+		step("dev-deploy", noDeployTargetReason(repo.Name), true)
+	default:
+		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
+			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
+		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
+			step("dev-deploy", depLog+"\n"+derr.Error(), false)
+		} else {
+			step("dev-deploy", depLog, true)
+			rr.Deployed = true
+		}
+	}
+
+	// Push + PR. The remote branch and PR are the durable record of what was built — established before
+	// prod ever runs (prod-deploy happens only in Maintain, on merge). A push failure is terminal for
+	// this repo; the local run branch is discarded by the next run's ResetToRemote.
 	if _, err := ex.Push(ctx, wt, token); err != nil {
 		rr.Error = "push: " + err.Error()
-		return rr, repoLimit{}
+		return rr, repoSignal{}
 	}
 	step("push", runBranch, true)
 
@@ -532,7 +765,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		} else {
 			step("pr", err.Error(), false)
 			rr.Error = "pr: " + err.Error()
-			return rr, repoLimit{}
+			return rr, repoSignal{}
 		}
 	}
 	rr.PRUrl = pr.HTMLURL
@@ -542,30 +775,64 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(x.autoMergeAfter).UTC(),
 	})
 
-	// FULL: deploy the committed workspace, now that push+PR are the record. Never deploy the service
-	// we are RUNNING IN from inside its own run — the deploy script restarts devlabd, which would kill
-	// this executor mid-loop, strand the result and refire the whole sweep. That repo's PR still lands;
-	// its deploy is left to the normal (out-of-band) deploy path.
-	if x.mode == "full" {
-		if isSelfRepo(repo.ID) {
-			step("deploy", "Selbst-Deploy übersprungen — "+repo.ID+" wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy separat)", true)
-		} else {
-			depLog, derr := x.deploy(ctx, repo.Name, wt)
-			if derr != nil {
-				// The deploy failed, but push+PR already landed and the PR is tracked for auto-merge.
-				// Un-track it: code that never deployed must NOT auto-merge onto the default branch after
-				// the window. The PR stays open on GitHub for a human to judge; it just won't merge itself.
-				_ = x.s.runPRs.Remove(repo.FullName, pr.Number)
-				step("deploy", depLog+"\n"+derr.Error(), false)
-				rr.Error = "deploy: " + derr.Error()
-				return rr, repoLimit{}
-			}
-			step("deploy", depLog, true)
-			rr.Deployed = true
-		}
-	}
+	// PROD-DEPLOY is intentionally NOT done here. In the two-environment model the dev-deploy above
+	// already put this build live on the dev box; prod is reached only after the PR is MERGED (by a
+	// human or by the auto-merge window), detected and shipped by Maintain in full mode. That keeps the
+	// merge as the gate for prod and avoids deploying unreviewed code straight to the VPS.
 	rr.OK = true
-	return rr, repoLimit{}
+	return rr, repoSignal{}
+}
+
+// shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
+// full mode, only while dev-deploy is enabled, and NEVER for the self repo (Finding B — dev-deploying
+// devlab restarts THIS devlabd, killing the running sweep). report/pr never dev-deploy at all.
+func (x *runExecutor) shouldDevDeploy(repoID string) bool {
+	return x.mode == "full" && devDeployEnabled() && !isSelfRepo(repoID)
+}
+
+// devDeploySkipReason explains, for the recorded step, why shouldDevDeploy said no in full mode — the
+// self-repo guard (Finding B) or the kill switch. It never invents a third reason: any other "no" comes
+// from the deploy target, which hasDeployTarget/noDeployTargetReason report.
+func devDeploySkipReason(repoID string) string {
+	if isSelfRepo(repoID) {
+		return "Selbst-Deploy übersprungen — " + repoID + " wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)"
+	}
+	return "dev-deploy abgeschaltet (DEVLAB_RUNS_DEV_DEPLOY) — nur der prod-Deploy bei Merge ist scharf"
+}
+
+// hasDeployTarget reports whether repoName has a vetted per-repo deploy script — the SAME allowlist the
+// root wrapper enforces (/etc/devlab/deploy.d/<repo>), and therefore the single source of truth for "is
+// this repo deployable at all". Repos without one are libraries, templates, axiom/semantics data or
+// tooling: they install no service anywhere, so building and deploying them is not a failure to report
+// but a step to SKIP — visibly, and BEFORE the build. Attempting it anyway produced the two noisiest
+// false alarms in the pipeline: a red "nothing to build (no package.json / go.mod)" for data repos, and a
+// merged PR whose prod-deploy failed with wrapper exit 3 and was retried every recheck interval forever.
+func hasDeployTarget(repoName string) bool {
+	fi, err := os.Stat(filepath.Join(deployScriptDir, repoName))
+	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
+}
+
+func noDeployTargetReason(repoName string) string {
+	return "kein Deploy-Ziel — für " + repoName + " ist kein geprüftes Deploy-Skript hinterlegt (" +
+		filepath.Join(deployScriptDir, repoName) + "); das Repo installiert keinen Dienst, es gibt nichts zu deployen"
+}
+
+// repoNameOf reduces an owner/repo full name to the bare repo name the deploy allowlist is keyed by.
+func repoNameOf(fullName string) string {
+	if i := strings.LastIndex(fullName, "/"); i >= 0 {
+		return fullName[i+1:]
+	}
+	return fullName
+}
+
+// devDeployEnabled reports whether the in-run dev-deploy step is active. DEVLAB_RUNS_DEV_DEPLOY=off (or
+// 0/false/no) turns it OFF so full mode arms ONLY the prod-deploy-on-merge half of the pipeline. This is
+// how full is armed SAFELY before the dev/prod cutover: while the dev instances still serve live traffic
+// (env-less names), a run must not restart them — so dev-deploy is disabled, and only merged PRs deploy
+// (to the prod VPS, which is not the box the runner runs on). Default on.
+func devDeployEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DEV_DEPLOY")))
+	return v != "off" && v != "0" && v != "false" && v != "no"
 }
 
 // selfRepoID is the repo id of the DevLab service itself — its own run must never in-process
@@ -583,10 +850,134 @@ func isSelfRepo(repoID string) bool {
 	return strings.EqualFold(strings.TrimSpace(repoID), selfRepoID())
 }
 
-// detectLimit adapts mercury.DetectUsageLimit to the executor's repoLimit signal.
-func detectLimit(out []byte, err error) repoLimit {
+// detectLimit adapts mercury.DetectUsageLimit to the executor's repoSignal signal.
+func detectLimit(out []byte, err error) repoSignal {
 	limited, resetAt, hasReset := mercury.DetectUsageLimit(out, err)
-	return repoLimit{limited: limited, resetAt: resetAt, hasReset: hasReset}
+	return repoSignal{limited: limited, resetAt: resetAt, hasReset: hasReset}
+}
+
+// infraErrorMarkers are substrings of git/HTTP errors that mean the HOST's connectivity failed, not the
+// repository — a DNS outage, a dropped link, a refused/timed-out connection. Matched case-insensitively.
+// These must carry the sweep over (retry later) rather than fail the repo permanently.
+var infraErrorMarkers = []string{
+	"could not resolve host",
+	"temporary failure in name resolution",
+	"server misbehaving",
+	"name or service not known",
+	"dial tcp",
+	"no such host",
+	"connection refused",
+	"connection reset",
+	"network is unreachable",
+	"no route to host",
+	"i/o timeout",
+	"timeout",
+	"timed out",
+	"tls handshake",
+	"unexpected eof",
+	"eof",
+	"could not read from remote",
+	"failed to connect",
+	"operation timed out",
+}
+
+// isInfraError reports whether an error is an infrastructure/connectivity failure (host can't reach
+// GitHub) rather than a problem with the specific repo or the work. This is the "gucken, WARUM nicht
+// geklont werden kann" step: the runner distinguishes "the network is down" from "this repo is broken"
+// and reacts differently — the former is transient and retried, the latter is a real per-repo failure.
+func isInfraError(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	for _, s := range infraErrorMarkers {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// githubReachable probes GitHub's API (a cheap, unauthenticated-safe rate-limit GET) to decide whether
+// connectivity is up. Uses the token so a network-level block surfaces, not an auth wall.
+func githubReachable(ctx context.Context, token string) error {
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	// GET /user is a minimal authenticated call; an infra error here is a genuine connectivity failure,
+	// while any HTTP response (even an error status) proves the network itself is up.
+	_, err := github.GetViewer(pctx, token)
+	return err
+}
+
+// ensureGitHubReachable is the self-healing wait: before a sweep starts, if GitHub is unreachable the
+// runner does not charge ahead cloning 19 repos into 19 DNS failures — it WAITS for connectivity to
+// come back (short blips like the 5-minute resolver degradation that killed the 21.07 night), retrying
+// with backoff. Returns nil once reachable, or the last error if it never came up within the budget
+// (the caller then carries the whole sweep over to the next fire). Honours ctx cancellation/deadline.
+func ensureGitHubReachable(ctx context.Context, token string) error {
+	const attempts = 8
+	const backoff = 30 * time.Second
+	var last error
+	for i := 0; i < attempts; i++ {
+		if err := githubReachable(ctx, token); err == nil {
+			if i > 0 {
+				log.Printf("devlabd: GitHub reachable again after %s — sweep proceeding", plural(i, "retry"))
+			}
+			return nil
+		} else if !isInfraError(err) {
+			return nil // reachable enough (a non-connectivity error still proves the network is up)
+		} else {
+			last = err
+		}
+		if i < attempts-1 {
+			log.Printf("devlabd: GitHub unreachable (%v) — waiting %s before retry %d/%d", last, backoff, i+2, attempts)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
+	return last
+}
+
+// retryInfra runs op up to `attempts` times, but ONLY retries INFRASTRUCTURE failures (a network blip);
+// a real error (repo gone, auth rejected, a work failure) returns immediately so the caller can handle
+// it as terminal. Backs off between tries and honours ctx cancellation. Returns the last error (nil on
+// success). This is the "noch paar mal versuchen" — a couple of retries before resigning.
+func retryInfra(ctx context.Context, attempts int, backoff time.Duration, op func() error) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = op(); err == nil || !isInfraError(err) {
+			return err
+		}
+		if i < attempts-1 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(backoff):
+			}
+		}
+	}
+	return err
+}
+
+// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName (prefix
+// "mercury-run/") — the still-pending, not-yet-merged work the run must BASE ON (main + pending), so it
+// neither redoes it nor skips the repo. A lookup error yields no heads (the run then bases on plain main;
+// a genuine outage is caught as an infra carry-over at the clone step).
+func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName string) []string {
+	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
+	if err != nil {
+		return nil
+	}
+	var heads []string
+	for _, pr := range prs {
+		if strings.HasPrefix(pr.Head.Ref, "mercury-run/") {
+			heads = append(heads, pr.Head.Ref)
+		}
+	}
+	return heads
 }
 
 // resolveTodoTargets resolves every target of a ToDo to a concrete repo. A to-be-created target is
@@ -792,7 +1183,7 @@ func (a *agentStep) fail(logtxt string) {
 // runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
 // (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
 // (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoLimit, err error) {
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
 	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, atts, ag.onProgress)
 	final = resultEvent(out)
@@ -801,53 +1192,211 @@ func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, 
 	}
 	if aerr != nil {
 		ag.fail(agentError(aerr))
-		return final, repoLimit{}, aerr
+		return final, repoSignal{}, aerr
 	}
 	ag.finish(parseClaudeResult(final).Output)
-	return final, repoLimit{}, nil
+	return final, repoSignal{}, nil
 }
 
-// deploy runs the root wrapper, which executes ONLY the per-repo vetted allowlist script — the agent
-// (and this unprivileged runner) never get arbitrary sudo.
-func (x *runExecutor) deploy(ctx context.Context, repoName, wt string) (string, error) {
-	cmd := exec.CommandContext(ctx, "sudo", "-n", deployWrapper, repoName, wt)
+// deploy hands a PREBUILT artifact to the root wrapper, which INSTALLS ONLY — it never builds (Finding
+// C). env picks the target: "dev" installs the artifact to this box's local service and restarts the
+// local unit; "prod" ships the artifact to the prod VPS (over a root-held forced-command SSH key) where
+// the receiver installs+restarts. The prod TARGET host lives server-side (/etc/devlab/prod-target),
+// never here — an artifact dir the runner built, plus the repo name and env, are the only args, so a
+// compromised runner can neither build-as-root nor redirect a deploy to a foreign host. The wrapper
+// re-canonicalizes artifactDir with realpath and requires it under /var/lib/devlab/workspaces/.
+func (x *runExecutor) deploy(ctx context.Context, repo model.Repo, artifactDir, env string) (string, error) {
+	cmd := exec.CommandContext(ctx, "sudo", "-n", deployWrapper, repo.Name, artifactDir, env)
+	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), fmt.Errorf("devlab-deploy %s: %w", repoName, err)
+		return string(out), fmt.Errorf("devlab-deploy %s (%s): %w", repo.Name, env, err)
 	}
 	return string(out), nil
 }
 
-// Maintain auto-merges overdue run PRs a human didn't merge in time.
+// buildArtifact compiles repo's deployable artifact IN ITS WORKSPACE, as the UNPRIVILEGED workspace
+// OWNER (via the pinned per-user devlab-exec artifact-build verb) — NEVER root (Finding C: a build hook
+// would run as root and could read the root-only prod deploy key) and never the devlabd service user
+// (which cannot write the runs-user-owned workspace). The privileged wrapper only ever INSTALLS the
+// prebuilt result. The artifact is <wt>/.mercury-artifact (Go daemon binary + built web SPA in web/); its
+// path resolves under /var/lib/devlab/workspaces/, which the root wrapper re-checks with realpath before
+// installing. The recipe (npm + go build, mirroring .sxgate/preview.conf) lives in the artifact-build
+// verb; a build failure is non-fatal for a dev-deploy (executeRepo continues to push).
+func (x *runExecutor) buildArtifact(ctx context.Context, wt string, repo model.Repo) (string, error) {
+	ex := workspace.Executor{User: x.user, PerUser: true}
+	// Build AS THE WORKSPACE OWNER via the pinned per-user devlab-exec wrapper: the runs-user owns the
+	// workspace, and the devlabd service user that runs THIS process cannot write it — and root must
+	// never build (Finding C). The recipe (npm + CGO_ENABLED=0 go build → <wt>/.mercury-artifact with
+	// the daemon binary + web/) lives in the artifact-build verb.
+	if out, err := ex.ArtifactBuild(ctx, wt); err != nil {
+		return "", fmt.Errorf("Artefakt bauen (%s): %v: %s", repo.ID, err, clip(out))
+	}
+	return filepath.Join(wt, ".mercury-artifact"), nil
+}
+
+// prodDeployMerged ships a MERGED run PR to prod. It materializes the merged default branch in the
+// runner's workspace (Ensure + Lock + ResetToRemote), builds the artifact UNPRIVILEGED (Finding C),
+// then hands it to the deploy wrapper with env=prod (which ships the prebuilt artifact to the VPS and
+// installs+restarts there). The self repo is fine here — this restarts the VPS devlabd, not the dev
+// runner. A nil error means prod is live on the merged code; Maintain then untracks the PR.
+func (x *runExecutor) prodDeployMerged(ctx context.Context, token string, p runs.PendingPR) (string, error) {
+	name := repoNameOf(p.Repo)
+	repo := model.Repo{ID: name, Name: name, FullName: p.Repo}
+
+	if _, err := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true); err != nil {
+		return "", fmt.Errorf("workspace: %w", err)
+	}
+	unlock, err := x.s.workspaces.Lock(x.user, repo.ID)
+	if err != nil {
+		return "", fmt.Errorf("lock: %w", err)
+	}
+	defer unlock()
+	branch, err := github.DefaultBranch(ctx, token, repo.FullName)
+	if err != nil || branch == "" {
+		return "", fmt.Errorf("default branch: %v", err)
+	}
+	wt, err := x.s.workspaces.Path(x.user, repo.ID)
+	if err != nil {
+		return "", fmt.Errorf("workspace-Pfad: %w", err)
+	}
+	ex := workspace.Executor{User: x.user, PerUser: true}
+	if err := ex.ResetToRemote(ctx, wt, token, branch); err != nil {
+		return "", fmt.Errorf("auf %s zurücksetzen: %w", branch, err)
+	}
+	artifactDir, err := x.buildArtifact(ctx, wt, repo)
+	if err != nil {
+		return "", fmt.Errorf("build: %w", err)
+	}
+	return x.deploy(ctx, repo, artifactDir, "prod")
+}
+
+func fileExists(p string) bool { fi, err := os.Stat(p); return err == nil && !fi.IsDir() }
+func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.IsDir() }
+
+// Maintain reconciles tracked run PRs each tick.
+//
+// report/pr mode behaves EXACTLY as before (Finding A): a PR still inside its auto-merge window is
+// skipped BEFORE any GitHub call (shouldCheckPR), so those modes make ZERO extra GitHub calls; only an
+// OVERDUE PR is fetched and, if still open, auto-merged, and a merged/closed one is untracked.
+//
+// full mode additionally detects merges (human OR auto) to drive a PROD-deploy, but THROTTLES the
+// per-PR reads: an in-window PR is re-fetched at most once per recheck interval (default 5m, tracked
+// via PendingPR.LastChecked), so the sweep never GETs every tracked PR every 30s tick and exhausts the
+// rate budget. A merged PR is shipped to prod; the PR is untracked only on a SUCCESSFUL prod-deploy, so
+// a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
+// success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
 	prs, err := x.s.runPRs.List()
 	if err != nil || len(prs) == 0 {
 		return
 	}
-	token, err := x.s.links.Token(x.tokenUser)
+	token, err := x.token()
 	if err != nil {
 		return
 	}
 	now := time.Now()
+	recheck := prRecheck()
 	for _, p := range prs {
-		if now.Before(p.MergeBy) {
-			continue // human still has time to merge
+		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
+			continue // report/pr: within window → not touched. full: throttled between rechecks.
 		}
-		cur, err := github.GetPullRequest(ctx, token, p.Repo, p.Number)
+		if x.mode == "full" {
+			_ = x.s.runPRs.Touch(p.Repo, p.Number, now) // stamp the recheck up front (throttle even on error)
+		}
+		cur, err := x.fetchPR(ctx, token, p.Repo, p.Number)
 		if err != nil {
-			continue // transient; retry next tick
+			continue // transient; retry next eligible tick
 		}
-		if cur.Merged || cur.State != "open" {
-			_ = x.s.runPRs.Remove(p.Repo, p.Number) // already merged or closed → stop tracking
-			continue
+		switch decidePR(x.mode, cur, !now.Before(p.MergeBy)) {
+		case prUntrack:
+			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
+		case prMerge:
+			if err := x.mergePR(ctx, token, p.Repo, p.Number); err != nil {
+				log.Printf("devlabd: auto-merge %s#%d failed (will retry): %v", p.Repo, p.Number, err)
+				continue
+			}
+			log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			if x.mode != "full" {
+				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
+			}
+			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
+		case prDeploy:
+			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
+			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
+			if name := repoNameOf(p.Repo); !x.deployable(name) {
+				_ = x.s.runPRs.Remove(p.Repo, p.Number)
+				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
+				continue
+			}
+			depLog, derr := x.runProdDeploy(ctx, token, p)
+			if derr != nil {
+				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
+				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
+			}
+			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+		case prNone:
+			// full-mode recheck: still open within its window → nothing to do yet.
 		}
-		if err := github.MergePullRequest(ctx, token, p.Repo, p.Number); err != nil {
-			log.Printf("devlabd: auto-merge %s#%d failed (will retry): %v", p.Repo, p.Number, err)
-			continue
-		}
-		_ = x.s.runPRs.Remove(p.Repo, p.Number)
-		log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
 	}
+}
+
+// prAction is Maintain's decision for one tracked PR after it has been fetched.
+type prAction int
+
+const (
+	prNone    prAction = iota // leave it tracked, do nothing this tick
+	prMerge                   // overdue and still open → auto-merge
+	prDeploy                  // merged → prod-deploy then untrack (full mode only)
+	prUntrack                 // merged (report/pr) or closed without merge → stop tracking
+)
+
+const defaultPRRecheck = 5 * time.Minute
+
+// prRecheck is the minimum spacing between full-mode merge-detection reads of one in-window PR.
+// DEVLAB_RUNS_PR_RECHECK overrides; a non-positive value keeps the default.
+func prRecheck() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PR_RECHECK")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultPRRecheck
+}
+
+// shouldCheckPR reports whether Maintain may spend a GitHub read on this tracked PR now. An OVERDUE PR
+// is always checked (to auto-merge / detect a merge) in every mode — historical behavior. report/pr
+// mode NEVER touches an in-window PR (zero extra calls). full mode rechecks an in-window PR too, but at
+// most once per recheck interval, so a large tracked set can't exhaust the rate budget (Finding A).
+func shouldCheckPR(mode string, now, mergeBy, lastChecked time.Time, recheck time.Duration) bool {
+	if !now.Before(mergeBy) {
+		return true // overdue
+	}
+	if mode != "full" {
+		return false // report/pr: in-window PRs are never fetched
+	}
+	return lastChecked.IsZero() || now.Sub(lastChecked) >= recheck
+}
+
+// decidePR maps a freshly-fetched PR (+ whether it is past its auto-merge deadline) to an action.
+// report/pr NEVER deploy: a merged or closed PR is simply untracked. full mode turns a merged PR (by a
+// human OR the auto-merge) into a prod-deploy, auto-merges an overdue still-open PR, and leaves an
+// in-window still-open PR alone.
+func decidePR(mode string, pr github.PullRequest, overdue bool) prAction {
+	if pr.Merged {
+		if mode == "full" {
+			return prDeploy
+		}
+		return prUntrack
+	}
+	if pr.State != "open" {
+		return prUntrack // closed without merging
+	}
+	if overdue {
+		return prMerge
+	}
+	return prNone
 }
 
 func (x *runExecutor) runnerIdentity() (string, int64) {

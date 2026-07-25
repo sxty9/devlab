@@ -17,6 +17,12 @@ type PendingPR struct {
 	RunID     string    `json:"runId"`
 	CreatedAt time.Time `json:"createdAt"`
 	MergeBy   time.Time `json:"mergeBy"` // auto-merge on/after this time
+	// LastChecked is when Maintain last spent a GitHub read on this PR. It exists ONLY for full mode's
+	// merge-detection throttle: an in-window PR is re-fetched at most once per recheck interval, so the
+	// sweep never GETs every tracked PR every tick and exhausts the rate budget. report/pr mode never
+	// reads or writes it (those modes only ever touch OVERDUE PRs), so their behavior is unchanged and
+	// zero-value here. Older stored files simply carry the zero time.
+	LastChecked time.Time `json:"lastChecked,omitempty"`
 }
 
 // PRStore persists the pending-PR set (a small JSON file, same discipline as the runs store).
@@ -92,6 +98,28 @@ func (s *PRStore) Remove(repo string, number int) error {
 		out = append(out, p)
 	}
 	return s.save(out)
+}
+
+// Touch records that a tracked PR was just checked (full-mode throttle). A no-op if it isn't tracked
+// (already merged/untracked between the List and here). Never creates a PR.
+func (s *PRStore) Touch(repo string, number int, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return err
+	}
+	changed := false
+	for i := range cur {
+		if cur[i].Repo == repo && cur[i].Number == number {
+			cur[i].LastChecked = at
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.save(cur)
 }
 
 func (s *PRStore) save(prs []PendingPR) error {

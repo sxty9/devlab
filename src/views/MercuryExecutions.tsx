@@ -4,7 +4,7 @@ import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
-import { RocketIcon, RefreshIcon, ChevronRightIcon } from '@/ui/icons';
+import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
@@ -151,7 +151,9 @@ export function RepoBlock({ repo }: { repo: RepoResult }) {
 
       {repo.error && <p className="mt-2 rounded-md bg-danger/10 px-2.5 py-1.5 text-caption text-danger">{repo.error}</p>}
 
-      {repo.steps.length > 0 && (
+      {/* Steps can be null when a repo failed before any step ran (clone/network) — the backend
+          marshals the empty slice as null. Guard it, else `null.length` blanks the whole view. */}
+      {repo.steps && repo.steps.length > 0 && (
         <div className="mt-3 flex flex-col gap-1.5 border-t border-separator pt-3">
           {repo.steps.map((step, i) => (
             <StepRow key={`${step.name}:${i}`} step={step} />
@@ -189,8 +191,190 @@ export function PromptDisclosure({ prompt }: { prompt?: string }) {
   );
 }
 
-/** The full execution document as a page: title, totals, then each repo with its steps and reports.
- *  The right pane of an aggregate ExecutionHistory. */
+// ── GitLab-inspired pipeline view of one execution ────────────────────────────
+// One run execution = a pipeline. Stages run left→right; each repo is a job flowing through them, shown
+// as a status pill sitting on the pipeline line (GitLab's stages→jobs graph). The Merge stage is a manual
+// gate (a human/auto-merge outside the run); Prod-Deploy is downstream (green once the repo is deployed).
+
+type JobStatus = 'success' | 'failed' | 'skipped' | 'manual' | 'pending';
+
+interface PipelineStage {
+  key: string;
+  label: string;
+  manual?: boolean;
+}
+
+// The full dev/prod pipeline. A report-mode execution (read-only analysis) collapses to a single stage.
+const PIPELINE_STAGES: PipelineStage[] = [
+  { key: 'implement', label: 'Implement' },
+  { key: 'dev-deploy', label: 'Dev-Deploy' },
+  { key: 'push', label: 'Push' },
+  { key: 'pr', label: 'PR' },
+  { key: 'merge', label: 'Merge', manual: true },
+  { key: 'prod-deploy', label: 'Prod-Deploy' },
+];
+const REPORT_STAGES: PipelineStage[] = [{ key: 'analyze', label: 'Analyze' }];
+const RUN_STEP_KEYS = ['implement', 'dev-deploy', 'push', 'pr'];
+
+interface Job {
+  status: JobStatus;
+  log?: string;
+  href?: string;
+}
+
+// deriveJobs maps one repo's recorded steps onto the canonical stage chain, GitLab-style: a recorded step
+// is success/failed by its ok flag; once something fails the later run stages are skipped; a run stage
+// with no step is either a bypass (no changes → no push/PR) or, when the repo errored before any step ran
+// (e.g. a clone failure leaves no steps), the failure point. Merge is a manual gate while a PR is open;
+// Prod-Deploy is pending until the PR merges and the repo reports deployed.
+function deriveJobs(repo: RepoResult, stages: PipelineStage[]): Job[] {
+  const byName = new Map((repo.steps ?? []).map((s) => [s.name, s]));
+  const anyRunStep = RUN_STEP_KEYS.some((k) => byName.has(k));
+  let terminal = false;
+  return stages.map((stage) => {
+    const step = byName.get(stage.key);
+    if (step) {
+      if (!step.ok) terminal = true;
+      return { status: step.ok ? 'success' : 'failed', log: step.log || undefined };
+    }
+    if (stage.key === 'merge') return { status: repo.prUrl ? 'manual' : 'skipped', href: repo.prUrl };
+    if (stage.key === 'prod-deploy') {
+      return { status: repo.deployed ? 'success' : repo.prUrl ? 'pending' : 'skipped' };
+    }
+    if (!RUN_STEP_KEYS.includes(stage.key) || terminal) return { status: 'skipped' };
+    // No recorded step for this run stage and nothing has failed yet: the failure point when the repo
+    // errored before recording any step (clone/setup), otherwise a bypassed stage.
+    if (repo.error && !anyRunStep) {
+      terminal = true;
+      return { status: 'failed', log: repo.error };
+    }
+    return { status: 'skipped' };
+  });
+}
+
+const JOB_STYLES: Record<JobStatus, { dot: string; pill: string; label: string }> = {
+  success: { dot: 'bg-success', pill: 'border-success/30 bg-success/10 text-success', label: 'OK' },
+  failed: { dot: 'bg-danger', pill: 'border-danger/30 bg-danger/10 text-danger', label: 'Fehler' },
+  manual: { dot: 'bg-accent', pill: 'border-accent/40 bg-accent/10 text-accent', label: 'manuell' },
+  pending: { dot: 'bg-warning', pill: 'border-warning/30 bg-warning/10 text-warning', label: 'ausstehend' },
+  skipped: { dot: 'bg-fill', pill: 'border-separator bg-surface text-text-tertiary', label: 'übersprungen' },
+};
+
+function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onSelect: () => void }) {
+  const st = JOB_STYLES[job.status];
+  const clickable = !!(job.log || job.href);
+  return (
+    <button
+      type="button"
+      disabled={!clickable}
+      onClick={onSelect}
+      className={cn(
+        'relative z-10 flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition',
+        st.pill,
+        selected && 'ring-2 ring-accent/40',
+        clickable ? 'cursor-pointer hover:brightness-110' : 'cursor-default',
+      )}
+    >
+      {job.status === 'manual' ? (
+        <PlayIcon className="h-3 w-3 shrink-0" />
+      ) : (
+        <span className={cn('h-2 w-2 shrink-0 rounded-full', st.dot)} />
+      )}
+      <span className="truncate">{st.label}</span>
+    </button>
+  );
+}
+
+/** The whole execution rendered as a GitLab-style pipeline: repos (rows) × stages (columns). */
+export function ExecutionPipeline({ result }: { result: RunResult }) {
+  const [sel, setSel] = useState<{ repo: number; stage: number } | null>(null);
+  // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This
+  // must NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps)
+  // as "report" — that would collapse to a single Analyze stage and hide the failures. Such a run has no
+  // analyze step anywhere, so it correctly falls through to the pipeline, where the failure shows as
+  // implement=failed.
+  const hasAnalyze = result.repos.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
+  const hasRunStep = result.repos.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
+  const isReport = hasAnalyze && !hasRunStep;
+  const stages = isReport ? REPORT_STAGES : PIPELINE_STAGES;
+
+  if (result.repos.length === 0) {
+    return <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>;
+  }
+
+  const selJob = sel ? deriveJobs(result.repos[sel.repo], stages)[sel.stage] : null;
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-text-tertiary">
+        {(['success', 'failed', 'manual', 'pending', 'skipped'] as JobStatus[]).map((s) => (
+          <span key={s} className="inline-flex items-center gap-1.5">
+            <span className={cn('h-2 w-2 rounded-full', JOB_STYLES[s].dot)} />
+            {JOB_STYLES[s].label}
+          </span>
+        ))}
+      </div>
+
+      <div className="dl-scroll overflow-x-auto rounded-card border border-separator bg-surface">
+        <div className="min-w-max">
+          <div className="flex items-center border-b border-separator px-3 py-2">
+            <div className="w-44 shrink-0 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Repository</div>
+            {stages.map((st) => (
+              <div key={st.key} className="w-32 shrink-0 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
+                {st.label}
+              </div>
+            ))}
+          </div>
+
+          {result.repos.map((repo, ri) => {
+            const jobs = deriveJobs(repo, stages);
+            return (
+              <div key={`${repo.repo}:${ri}`} className="flex items-center border-b border-separator px-3 py-2.5 last:border-0">
+                <div className="flex w-44 shrink-0 items-center gap-2 pr-2">
+                  <span className={cn('h-2 w-2 shrink-0 rounded-full', repo.ok ? 'bg-success' : 'bg-danger')} />
+                  <span className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{repo.repo}</span>
+                </div>
+                <div className="relative flex items-center">
+                  <span className="pointer-events-none absolute inset-x-2 top-1/2 h-px -translate-y-1/2 bg-separator" aria-hidden />
+                  {jobs.map((job, si) => (
+                    <div key={si} className="flex w-32 shrink-0 items-center">
+                      <JobPill
+                        job={job}
+                        selected={sel?.repo === ri && sel?.stage === si}
+                        onSelect={() => setSel(sel?.repo === ri && sel?.stage === si ? null : { repo: ri, stage: si })}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {selJob && (selJob.log || selJob.href) && (
+        <div className="rounded-card border border-separator bg-bg-base p-3">
+          <div className="mb-1.5 flex items-center justify-between gap-2">
+            <span className="text-caption font-semibold uppercase tracking-wide text-text-tertiary">
+              {result.repos[sel!.repo].repo} · {stages[sel!.stage].label}
+            </span>
+            {selJob.href && (
+              <a href={selJob.href} target="_blank" rel="noreferrer" className="shrink-0 text-caption font-medium text-accent hover:underline">
+                PR öffnen ↗
+              </a>
+            )}
+          </div>
+          {selJob.log && (
+            <pre className="dl-scroll max-h-80 overflow-auto whitespace-pre-wrap font-mono text-caption text-text-secondary">{selJob.log}</pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The full execution document as a page: title, totals, then the repos as a GitLab-style pipeline or a
+ *  detailed list (toggle). The right pane of an aggregate ExecutionHistory. */
 export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: string }) {
   const source = useMemo(() => getDataSource(), []);
   const [res, setRes] = useState<RunResult | null>(null);
@@ -212,8 +396,15 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
   if (err) return <p className="px-8 py-7 text-footnote text-text-secondary">Diese Ausführung konnte nicht geladen werden.</p>;
   if (!res) return <p className="px-8 py-7 text-footnote text-text-tertiary">Lädt…</p>;
 
+  return <ExecutionDetailBody res={res} />;
+}
+
+/** The execution body: title, totals, prompt, then the repos as a GitLab-style pipeline (default) or a
+ *  detailed per-repo list, toggled by the viewer. Both read the same recorded steps. */
+function ExecutionDetailBody({ res }: { res: RunResult }) {
+  const [view, setView] = useState<'pipeline' | 'list'>('pipeline');
   return (
-    <article className="mx-auto max-w-3xl px-8 py-7">
+    <article className="mx-auto max-w-5xl px-8 py-7">
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
@@ -225,9 +416,26 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
         <OkPill ok={res.ok} />
       </div>
 
-      <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
-        <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
-        <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
+          <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
+          <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
+        </div>
+        <div className="inline-flex rounded-md border border-separator bg-surface p-0.5 text-footnote">
+          {(['pipeline', 'list'] as const).map((v) => (
+            <button
+              key={v}
+              type="button"
+              onClick={() => setView(v)}
+              className={cn(
+                'rounded px-2.5 py-1 font-medium transition',
+                view === v ? 'bg-accent/15 text-text-primary' : 'text-text-tertiary hover:text-text-secondary',
+              )}
+            >
+              {v === 'pipeline' ? 'Pipeline' : 'Liste'}
+            </button>
+          ))}
+        </div>
       </div>
 
       {res.prompt && (
@@ -236,11 +444,17 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
         </div>
       )}
 
-      <section className="mt-6 flex flex-col gap-4">
-        {res.repos.length === 0 ? (
-          <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
+      <section className="mt-6">
+        {view === 'pipeline' ? (
+          <ExecutionPipeline result={res} />
         ) : (
-          res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+          <div className="flex flex-col gap-4">
+            {res.repos.length === 0 ? (
+              <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
+            ) : (
+              res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+            )}
+          </div>
         )}
       </section>
     </article>

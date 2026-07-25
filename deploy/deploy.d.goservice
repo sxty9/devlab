@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Generic per-repo INSTALL-ONLY deploy for a uniform Holistic Go service (/opt/<repo>/bin/<repo>d +
+# <repo>.service). Symlink one per service into the allowlist, all pointing here:
+#     sudo ln -sfn /etc/devlab/deploy.d/_goservice /etc/devlab/deploy.d/<repo>
+# Run by devlab-deploy AS ROOT with: <script> <artifactDir> <env>. The repo is the invoked name
+# (basename "$0"), so ONE script serves every uniform Go service. THIS SCRIPT NEVER BUILDS — the runner
+# built the artifact unprivileged; here root only installs prebuilt bytes (env=dev, local) or ships them
+# to the prod VPS (env=prod). Exit: 0 ok · 2 unknown env · 10 missing prebuilt input · 11 missing prod cfg.
+set -euo pipefail
+ART="${1:?artifact dir required}"
+ENVN="${2:?env required}"
+REPO="$(basename "$0")"
+BIN="$ART/${REPO}d"   # go build ./cmd/... writes cmd/<repo>d into the artifact
+[[ -f "$BIN" ]] || { echo "[deploy $REPO] missing prebuilt binary: $BIN" >&2; exit 10; }
+
+case "$ENVN" in
+  dev)
+    # Local install on THIS (dev) box + restart the dev unit.
+    install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+    install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
+    systemctl restart "$REPO"
+    echo "[deploy $REPO] dev: installed + restarted"
+    ;;
+  prod)
+    # Ship the prebuilt binary to the prod VPS (server-side target + root-held forced-command key), then
+    # trigger the install-only receiver there.
+    TARGET_FILE="/etc/devlab/prod-target"; KEY="/etc/devlab/prod-deploy-key"
+    [[ -r "$TARGET_FILE" && -r "$KEY" ]] || { echo "[deploy $REPO] missing prod config" >&2; exit 11; }
+    TARGET="$(head -n1 "$TARGET_FILE" | tr -d '[:space:]')"
+    [[ -n "$TARGET" ]] || { echo "[deploy $REPO] empty prod target" >&2; exit 11; }
+    SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+    STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
+    install -m 0755 "$BIN" "$STAGE/${REPO}d"
+    echo "[deploy $REPO] prod: ship -> $TARGET:$REPO/"
+    rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "$STAGE"/ "$TARGET:$REPO/"
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "$TARGET" devlab-deploy-recv "$REPO"
+    echo "[deploy $REPO] prod: done"
+    ;;
+  *)
+    echo "[deploy $REPO] unknown env: $ENVN" >&2; exit 2 ;;
+esac

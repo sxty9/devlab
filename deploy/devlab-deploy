@@ -1,44 +1,97 @@
 #!/usr/bin/env bash
-# devlab-deploy — root wrapper for Mercury autonomous-run deploys.
+# devlab-deploy — root INSTALL-ONLY wrapper for Mercury autonomous-run deploys.
 #
-# Invoked ONLY by devlabd, gated by sudoers:
+# Contract:  devlab-deploy <repo> <artifactDir> <env>
+#   <repo>         bare repository name (letters/digits/._-, no slashes, no '..')
+#   <artifactDir>  directory holding the PREBUILT artifact (daemon binary + web/dist) that the
+#                  UNPRIVILEGED runner produced in its own workspace. MUST canonicalize under
+#                  /var/lib/devlab/workspaces/.
+#   <env>          strictly one of {dev, prod}
+#
+# Invoked ONLY by devlabd (user `devlab`), gated by sudoers:
 #   devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-deploy
 #
-# It runs EXACTLY ONE thing: the per-repo, human-vetted deploy script at
-# /etc/devlab/deploy.d/<repo>. There is NO arbitrary-command path — the autonomous agent (which runs
-# as an unprivileged runner user, never as root) can never reach root through this wrapper. The
-# allowlist script must be root-owned and not group/other-writable, so the agent cannot tamper with it.
+# SECURITY — THIS WRAPPER NEVER BUILDS. Compiling agent-written code as root is an RCE-to-root: a
+# package.json postinstall hook or a Go build directive would execute as root and could read the
+# root-only prod deploy key. So the runner builds the artifact AS ITSELF; root here only INSTALLS
+# prebuilt bytes + restarts a unit (env=dev) or SHIPS them to the prod VPS (env=prod). There is no
+# arbitrary-command path: this wrapper execs EXACTLY one per-repo, human-vetted script at
+# /etc/devlab/deploy.d/<repo>, which must be root-owned and not group/other-writable so the agent
+# cannot tamper with it. The prod TARGET host stays server-side (/etc/devlab/prod-target), never an
+# argument, so a manipulated runner cannot redirect a prod deploy to a host it controls.
+#
+# Exit codes: 0 ok · 2 bad argument · 3 no per-repo script · 4 per-repo script not tamper-proof.
 #
 # Install: sudo install -o root -g root -m 0755 devlab-deploy /usr/local/sbin/devlab-deploy
 set -euo pipefail
 
 REPO="${1:-}"
-WORKSPACE="${2:-}"
+ARTIFACT="${2:-}"
+ENVN="${3:-}"
+WORKSPACES_ROOT="/var/lib/devlab/workspaces"
 DEPLOY_D="/etc/devlab/deploy.d"
 
 log() { logger -t devlab-deploy -- "$*" 2>/dev/null || true; echo "devlab-deploy: $*"; }
 
+[[ $# -eq 3 ]] || { log "usage: devlab-deploy <repo> <artifactDir> <env>"; exit 2; }
+
 # 1) repo must be a bare name (no slashes, no traversal).
 if [[ ! "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$REPO" == *..* ]]; then
-  log "abgelehnt: ungültiger Repo-Name '$REPO'"; exit 2
+  log "rejected: invalid repo name '$REPO'"; exit 2
 fi
 
-# 2) workspace must be a real directory under the devlab workspaces root.
-case "$WORKSPACE" in
-  /var/lib/devlab/workspaces/*) ;;
-  *) log "abgelehnt: Workspace '$WORKSPACE' liegt nicht unter /var/lib/devlab/workspaces"; exit 2 ;;
+# 2) env must be exactly dev or prod.
+case "$ENVN" in
+  dev|prod) : ;;
+  *) log "rejected: invalid env '$ENVN' (want dev|prod)"; exit 2 ;;
 esac
-[[ -d "$WORKSPACE" ]] || { log "abgelehnt: Workspace '$WORKSPACE' existiert nicht"; exit 2; }
 
-# 3) a vetted deploy script must exist for this repo.
+# 3) artifact dir must be a real, existing directory that CANONICALIZES under the workspaces root.
+#    realpath resolves '..' and every symlink, so we test the CANONICAL path — NOT a string/glob
+#    prefix. The v1 case-glob was trivially bypassed by
+#    /var/lib/devlab/workspaces/../../tmp/evil; here that collapses to /tmp/evil and is rejected.
+[[ -n "$ARTIFACT" ]] || { log "rejected: empty artifact dir"; exit 2; }
+real="$(realpath -e -- "$ARTIFACT" 2>/dev/null)" \
+  || { log "rejected: artifact dir does not resolve: $ARTIFACT"; exit 2; }
+rootreal="$(realpath -e -- "$WORKSPACES_ROOT" 2>/dev/null)" \
+  || { log "workspaces root missing: $WORKSPACES_ROOT"; exit 2; }
+[[ -d "$real" ]] || { log "rejected: artifact dir is not a directory: $ARTIFACT"; exit 2; }
+case "$real/" in
+  "$rootreal"/*) : ;;
+  *) log "rejected: artifact dir '$real' is not under $rootreal"; exit 2 ;;
+esac
+
+# 4) a vetted per-repo deploy script must exist for this repo.
 SCRIPT="$DEPLOY_D/$REPO"
-[[ -x "$SCRIPT" ]] || { log "kein Deploy-Skript für '$REPO' ($SCRIPT) — übersprungen"; exit 3; }
+[[ -x "$SCRIPT" ]] || { log "no deploy script for '$REPO' ($SCRIPT) — skipped"; exit 3; }
 
-# 4) the allowlist script must be root-owned and not group/other-writable (tamper-proof).
-OWNER="$(stat -c '%U' "$SCRIPT")"
-PERM="$(stat -c '%a' "$SCRIPT")"
-[[ "$OWNER" == "root" ]] || { log "abgelehnt: $SCRIPT gehört nicht root ($OWNER)"; exit 4; }
-if (( 0"$PERM" & 022 )); then log "abgelehnt: $SCRIPT ist group/other-writable ($PERM)"; exit 4; fi
+# 5) the per-repo script AND its directory must be root-owned and not group/other-writable, so the
+#    unprivileged agent can neither rewrite the script nor swap it for another (tamper-proof).
+for p in "$DEPLOY_D" "$SCRIPT"; do
+  owner="$(stat -c '%U' "$p")"
+  perm="$(stat -c '%a' "$p")"
+  [[ "$owner" == "root" ]] || { log "rejected: $p not owned by root ($owner)"; exit 4; }
+  if (( 0"$perm" & 022 )); then log "rejected: $p is group/other-writable ($perm)"; exit 4; fi
+done
 
-log "deploy '$REPO' aus '$WORKSPACE' via $SCRIPT"
-exec "$SCRIPT" "$WORKSPACE"
+log "install-only deploy of '$REPO' from '$real' (env=$ENVN) via $SCRIPT"
+
+# 6) run the vetted script OUTSIDE the caller's mount namespace.
+#    devlabd is hardened with ProtectSystem=strict (+PrivateTmp), and a systemd sandbox is inherited by
+#    EVERY child — sudo and root included. Root therefore saw /opt, /usr/local and /etc as READ-ONLY, so
+#    `install … /opt/<repo>/bin/<repo>d` failed with EROFS ("Read-only file system") on every in-run
+#    dev-deploy while the same script worked from a shell. Widening the daemon's ReadWritePaths would
+#    have to enumerate every path a deploy may ever touch (/opt, /usr/local/bin, /etc/systemd/system for
+#    a brand-new unit, …) and would loosen the daemon's own sandbox. Instead we hand the script to PID 1:
+#    systemd-run starts it as a transient unit in the HOST namespace, so an install-only deploy writes the
+#    real filesystem while devlabd stays fully confined. --pipe forwards stdout/stderr, --wait propagates
+#    the script's exit status, --collect reaps the unit. Falls back to a direct exec where PID 1 is not
+#    reachable (no systemd, container) — there is no sandbox to escape there either.
+if command -v systemd-run >/dev/null 2>&1 && [[ -S /run/systemd/private ]]; then
+  exec systemd-run --quiet --collect --wait --pipe \
+    --description="DevLab install-only deploy: $REPO ($ENVN)" \
+    --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --setenv=HOME=/root \
+    -- "$SCRIPT" "$real" "$ENVN"
+fi
+exec "$SCRIPT" "$real" "$ENVN"

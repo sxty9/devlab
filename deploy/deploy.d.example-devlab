@@ -1,26 +1,78 @@
 #!/usr/bin/env bash
-# Example per-repo deploy script for the `devlab` repo, run by devlab-deploy AS ROOT with the run's
-# workspace as $1. Install ONE of these per deployable repo at /etc/devlab/deploy.d/<reponame>,
-# root-owned, mode 0755 (NOT group/other-writable — the wrapper refuses otherwise).
+# Per-repo INSTALL-ONLY deploy script for the `devlab` repo. Run by devlab-deploy AS ROOT with:
+#     /etc/devlab/deploy.d/devlab <artifactDir> <env>
+# where <artifactDir> is a PREBUILT artifact (built by the UNPRIVILEGED runner in its workspace) and
+# <env> is dev|prod. Install one of these per deployable repo, root-owned, mode 0755 (NOT
+# group/other-writable — the wrapper refuses otherwise):
+#     sudo install -o root -g root -m 0755 deploy/deploy.d.example-devlab /etc/devlab/deploy.d/devlab
 #
-#   sudo install -o root -g root -m 0755 deploy/deploy.d.example-devlab /etc/devlab/deploy.d/devlab
+# THIS SCRIPT NEVER BUILDS. No go, no npm. It only copies prebuilt bytes into place and restarts a
+# unit (env=dev, on THIS dev box) or SHIPS the prebuilt artifact to the prod VPS (env=prod). That is
+# the entire security model: agent-written code is compiled as the unprivileged runner, never here
+# as root, so a hostile postinstall/build directive can never run with root privileges.
 #
-# Keep it minimal, explicit, and idempotent: build from the workspace, install, restart. This is the
-# ONLY place autonomous runs touch the host — vet it like a production deploy step, because it is one.
+# Exit codes: 0 ok · 2 unknown env · 10 missing prebuilt input · 11 missing prod config.
 set -euo pipefail
 
-WT="${1:?workspace required}"
-cd "$WT"
+ART="${1:?artifact dir required}"
+ENVN="${2:?env required}"
 
-echo "[deploy devlab] build from $WT"
-( cd backend && CGO_ENABLED=0 go build -o /tmp/devlabd.deploy ./cmd/devlabd )
-npm ci --silent && npm run build --silent
+# What the runner built for devlab: the daemon binary + the built SPA. (Prebuilt — verify, never make.)
+BIN="$ART/devlabd"          # prebuilt Go binary  (backend/cmd/devlabd)
+WEB="$ART/web"              # prebuilt Vite SPA (buildArtifact writes the SPA to <artifact>/web)
+[[ -f "$BIN" ]] || { echo "[deploy devlab] missing prebuilt binary: $BIN" >&2; exit 10; }
+[[ -d "$WEB" ]] || { echo "[deploy devlab] missing prebuilt web dir:  $WEB" >&2; exit 10; }
 
-echo "[deploy devlab] install + restart"
-install -o root -g root -m 0755 /tmp/devlabd.deploy /usr/local/bin/devlabd
-rm -f /tmp/devlabd.deploy
-# SPA: copy into place BEFORE pruning, so the site is never empty for a moment.
-cp -a "$WT/dist/." /var/lib/devlab/www/
-systemctl restart devlabd
+case "$ENVN" in
+  dev)
+    # Install the PREBUILT artifact into this box's local service paths and restart the local unit.
+    # (rsync --delete updates in place — the site is never emptied mid-copy — and prunes stale assets.)
+    echo "[deploy devlab] dev: install prebuilt binary + web, restart local devlabd"
+    install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
+    mkdir -p /var/lib/devlab/www
+    rsync -a --delete "$WEB"/ /var/lib/devlab/www/
+    systemctl restart devlabd
+    echo "[deploy devlab] dev: done"
+    ;;
 
-echo "[deploy devlab] done"
+  prod)
+    # SHIP the PREBUILT artifact to the prod VPS, then trigger an install-only receive there.
+    #   - target host is SERVER-SIDE (never an argument): /etc/devlab/prod-target  (one line: user@host)
+    #   - transfer uses a ROOT-HELD private key whose authorized_keys entry FORCES the remote command
+    #     to devlab-deploy-recv (see deploy/devlab-deploy-recv). The same key carries both the rsync
+    #     upload (confined to the VPS staging root by rrsync) and the install trigger.
+    REPO="devlab"
+    TARGET_FILE="/etc/devlab/prod-target"      # e.g. "ubuntu@10.10.0.1" (WireGuard overlay) or the VPS IP
+    KEY="/etc/devlab/prod-deploy-key"          # root-only (0600) SSH private key; forced-command on the VPS
+    STAGING="$REPO"                            # rrsync-confined destination subdir -> <stagingRoot>/devlab
+
+    [[ -r "$TARGET_FILE" ]] || { echo "[deploy devlab] prod: missing $TARGET_FILE" >&2; exit 11; }
+    [[ -r "$KEY" ]]         || { echo "[deploy devlab] prod: missing deploy key $KEY" >&2; exit 11; }
+    TARGET="$(head -n1 "$TARGET_FILE" | tr -d '[:space:]')"
+    [[ -n "$TARGET" ]]      || { echo "[deploy devlab] prod: empty target in $TARGET_FILE" >&2; exit 11; }
+
+    # IdentitiesOnly + BatchMode: use ONLY this key, never prompt. Pin the host key in root's
+    # known_hosts on first deploy; accept-new is the pragmatic TOFU default for a fresh VPS.
+    SSH_OPTS=(-i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+
+    # Stage a clean copy holding EXACTLY the prebuilt bytes recv expects (binary + dist/), so the
+    # upload never carries stray workspace files.
+    STAGE="$(mktemp -d)"
+    trap 'rm -rf "$STAGE"' EXIT
+    install -m 0755 "$BIN" "$STAGE/devlabd"
+    cp -a "$WEB" "$STAGE/web"
+
+    echo "[deploy devlab] prod: ship prebuilt artifact -> $TARGET:$STAGING/"
+    # rrsync (the remote forced command) confines this receive to <stagingRoot>/devlab on the VPS.
+    rsync -az --delete -e "ssh ${SSH_OPTS[*]}" "$STAGE"/ "$TARGET:$STAGING/"
+
+    echo "[deploy devlab] prod: trigger install-only receive on $TARGET"
+    # REPO is a fixed literal here; recv re-validates the repo name server-side regardless.
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "$TARGET" devlab-deploy-recv "$REPO"
+    echo "[deploy devlab] prod: done"
+    ;;
+
+  *)
+    echo "[deploy devlab] unknown env: $ENVN" >&2; exit 2 ;;
+esac
