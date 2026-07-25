@@ -79,11 +79,11 @@ Holistic wird parallel zur Web-Oberfläche als native Mobile-Plattform geführt.
 </maxim>
 
 <maxim name="Per-App Distribution">
-- Jeder Service wird als eigenständige App ausgeliefert (Bundle-ID org.sxty9.holistic.<serviceId>); die "Holistic"-App ist Launcher und App-Manager (Bundle-ID org.sxty9.holistic.launcher). Der native App-Name ist der statische ServicePlugin.displayName; er wird nicht pro Locale lokalisiert (der Contract führt keinen i18n-Key dafür). i18n gilt für die Laufzeit-Inhalte der App.
+- Jeder Service wird als eigenständige App ausgeliefert (Bundle-ID <org>.holistic.<serviceId>); die "Holistic"-App ist Launcher und App-Manager (Bundle-ID <org>.holistic.launcher). Der native App-Name ist der statische ServicePlugin.displayName; er wird nicht pro Locale lokalisiert (der Contract führt keinen i18n-Key dafür). i18n gilt für die Laufzeit-Inhalte der App.
 - Der Installationszustand der Launcher-App ist rein client-seitig und gilt pro Gerät; er ist nie account- oder servergebunden und wird nicht über Geräte synchronisiert.
 - Der Service-Katalog des Launchers blendet Dienste aus, zu denen der gekoppelte User keine Rechte besitzt bzw. die nicht serviceVisibleByDefault sind; die rechteunabhängige Installations-Wahrheit bleibt davon unberührt.
 - Konfiguration wird zentral im Launcher/App-Manager gebündelt geführt (analog zum Privilege Service im Web), nicht in den einzelnen Service-Apps. Falsch in einer Service-App platzierte Konfiguration ist dorthin umzuordnen.
-- Abgrenzung zum Web-Tab-Modell: Die Web-Regel, dass n Services einen Tab mitgestalten, bleibt für die Web-Oberfläche unverändert verbindlich. Mobil bildet jede Service-App ausschließlich den eigenen Service-Beitrag ab; service-übergreifende Sichten verbleiben der Web-Oberfläche oder werden im Launcher aggregiert. Service-übergreifende Navigation erfolgt nativ über OS-Deep-Links in org.sxty9.holistic.<targetId>.
+- Abgrenzung zum Web-Tab-Modell: Die Web-Regel, dass n Services einen Tab mitgestalten, bleibt für die Web-Oberfläche unverändert verbindlich. Mobil bildet jede Service-App ausschließlich den eigenen Service-Beitrag ab; service-übergreifende Sichten verbleiben der Web-Oberfläche oder werden im Launcher aggregiert. Service-übergreifende Navigation erfolgt nativ über OS-Deep-Links in <org>.holistic.<targetId>.
 </maxim>
 
 <klaerung_im_nachtlauf>
