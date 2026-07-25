@@ -1,7 +1,7 @@
 import { useWorkspace } from '@/state/workspace';
 import type { PanelId, Stage, StageState } from '@/types';
 import { ChevronRightIcon, GitBranchIcon } from '@/ui/icons';
-import { PREVIEW_URL } from '@/lib/constants';
+import { PREVIEW_URL, previewHost } from '@/lib/constants';
 import { cn } from '@/lib/cn';
 
 const dotCls: Record<StageState, string> = {
@@ -69,7 +69,7 @@ export function StatusBar() {
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/70" />
                 <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
               </span>
-              <span className="hidden font-mono md:inline">preview-{activeRepo.name}.henrysoase.org</span>
+              <span className="hidden font-mono md:inline">{previewHost(activeRepo.name)}</span>
             </a>
             <span className="h-3.5 w-px bg-separator" />
           </>

@@ -3,7 +3,7 @@ import { useToast } from '@/ui/Toast';
 import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
 import { Button } from '@/ui/Button';
 import { tintSoftBg, tintText } from '@/ui/tint';
-import { PREVIEW_URL } from '@/lib/constants';
+import { PREVIEW_URL, previewHost } from '@/lib/constants';
 import { basename, guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { StructureSection } from '@/types';
@@ -26,7 +26,7 @@ export function StructureView() {
   const deploy = () => {
     toast({ title: 'Building preview…', description: `${activeRepo.name} · sxgate · MODE=static` });
     window.setTimeout(
-      () => toast({ title: 'Preview is live', description: `preview-${activeRepo.name}.henrysoase.org`, variant: 'success' }),
+      () => toast({ title: 'Preview is live', description: previewHost(activeRepo.name), variant: 'success' }),
       1500,
     );
   };
