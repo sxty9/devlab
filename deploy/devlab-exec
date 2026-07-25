@@ -96,31 +96,39 @@ case "$verb" in
     fi
     if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
     if [ -n "$gd" ]; then
-      # A repo carrying graveyard/schemegrave (aigentic) needs a cgo `-tags scheme` build that links
-      # libscheme_ffi.a. schemegrave's cgo directive references the scheme dir as a SIBLING of the repo
-      # clone (${SRCDIR}/../../../scheme = <workspace root>/scheme). The FFI lib+headers live at an
-      # instance-neutral, build-user-readable PINNED path recorded in /etc/devlab/scheme-lib-dir; we
-      # symlink it into place so the relative cgo path resolves inside the ephemeral workspace. Without
-      # a valid pin we FAIL LOUD rather than fall through to a CGO-off build — a non-scheme binary would
-      # only crash-loop a scheme grave on the target, so a broken deploy must not ship silently.
+      # ── graves: cgo storage backends that are compiled in ONLY behind a build tag ──────────────────
+      # A Holistic service can carry a "grave": a store implemented in Rust and reached over its C ABI
+      # (aigentic: scheme + lakearch, scrapr: lakearch), each gated by `//go:build <grave>`. Miss the tag
+      # and the build still SUCCEEDS — it just yields a binary whose grave answers "built without <grave>
+      # support", which crash-loops the unit the moment it is deployed. So a tag is never optional: EVERY
+      # grave whose sources are present is compiled in, and one we cannot satisfy FAILS THE BUILD LOUDLY
+      # instead of shipping a silently crippled binary. (Handling only `scheme` here is what let a
+      # dev-deploy install a lakearch-less scraprd and take the service down.)
+      #
+      # Uniform per grave <g>: the prebuilt lib+header live at the instance-neutral, build-user-readable
+      # PINNED path in /etc/devlab/<g>-lib-dir, laid out as <pin>/target/release/lib<g>_ffi.a and
+      # <pin>/crates/<g>-ffi/include/<g>_ffi.h. The cgo directives reach them through a <g> dir that is a
+      # SIBLING of the repo clone (${SRCDIR}/../../../<g>), so we materialize exactly those two files into
+      # that sibling — creating it when the repo was never cloned there, and overwriting a SOURCE checkout's
+      # missing cargo artifacts. prod stays install-only: the libs are prebuilt here, never built on a target.
       tags=""
-      if [ -d graveyard/schemegrave ]; then
-        [ -r /etc/devlab/scheme-lib-dir ] || die "scheme build required but /etc/devlab/scheme-lib-dir is missing"
-        schemedir="$(head -n1 /etc/devlab/scheme-lib-dir | tr -d '[:space:]')"
-        { [ -n "$schemedir" ] && [ -f "$schemedir/target/release/libscheme_ffi.a" ]; } \
-          || die "pinned scheme dir invalid: no target/release/libscheme_ffi.a under '$schemedir'"
-        # schemegrave's cgo directive links ${SRCDIR}/../../../scheme/target/release/libscheme_ffi.a and
-        # -I's .../scheme/crates/scheme-ffi/include — i.e. a `scheme` dir as a SIBLING of the repo clone.
-        # The runner may already have a `scheme` SOURCE checkout there (headers, but no built lib, which
-        # is a cargo artifact). We materialize exactly the two files the toolchain needs from the pinned
-        # prebuilt dir, creating the sibling if absent — so the link resolves whether or not scheme was
-        # cloned. prod stays install-only: the lib is prebuilt on this (dev) box, never rebuilt on prod.
-        sib="$(dirname -- "$wt")/scheme"
-        install -d "$sib/target/release" "$sib/crates/scheme-ffi/include"
-        cp -f "$schemedir/target/release/libscheme_ffi.a"         "$sib/target/release/libscheme_ffi.a"
-        cp -f "$schemedir/crates/scheme-ffi/include/scheme_ffi.h" "$sib/crates/scheme-ffi/include/scheme_ffi.h"
-        tags="scheme"; export CGO_ENABLED=1
-      fi
+      for g in scheme lakearch; do
+        # The tag itself is the signal: a positive `//go:build … <g> …` term anywhere in the Go sources.
+        # `//go:build !<g>` (the pure-Go stand-in) must NOT count, hence the two explicit patterns.
+        grep -rqsE --include='*.go' -e "^//go:build ${g}\b" -e "^//go:build .*[^!]${g}\b" . || continue
+        pin="/etc/devlab/${g}-lib-dir"
+        [ -r "$pin" ] || die "$g build required but $pin is missing"
+        gdir="$(head -n1 "$pin" | tr -d '[:space:]')"
+        lib="$gdir/target/release/lib${g}_ffi.a"
+        hdr="$gdir/crates/${g}-ffi/include/${g}_ffi.h"
+        { [ -n "$gdir" ] && [ -f "$lib" ] && [ -f "$hdr" ]; } \
+          || die "pinned $g dir invalid: need target/release/lib${g}_ffi.a + crates/${g}-ffi/include/${g}_ffi.h under '$gdir'"
+        sib="$(dirname -- "$wt")/$g"
+        install -d "$sib/target/release" "$sib/crates/${g}-ffi/include"
+        cp -f "$lib" "$sib/target/release/lib${g}_ffi.a"
+        cp -f "$hdr" "$sib/crates/${g}-ffi/include/${g}_ffi.h"
+        tags="${tags:+$tags,}$g"; export CGO_ENABLED=1
+      done
       ( cd -- "$gd" && if [ -d cmd ]; then go build ${tags:+-tags "$tags"} -o "$art/" ./cmd/...; else go build ${tags:+-tags "$tags"} -o "$art/" ./...; fi )
       built=1
     fi

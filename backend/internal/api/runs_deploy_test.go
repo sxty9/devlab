@@ -192,8 +192,9 @@ func TestMaintainFullModeMergedProdDeploysOnceThenUntracks(t *testing.T) {
 			getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
 				return github.PullRequest{Merged: true, State: "closed"}, nil
 			},
-			mergePRFn:    func(context.Context, string, string, int) error { merges++; return nil },
-			prodDeployFn: func(context.Context, string, runs.PendingPR) (string, error) { deploys++; return "ok", nil },
+			mergePRFn:      func(context.Context, string, string, int) error { merges++; return nil },
+			prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { deploys++; return "ok", nil },
+			deployTargetFn: func(string) bool { return true },
 		}
 
 		x.Maintain(context.Background())
@@ -227,6 +228,7 @@ func TestMaintainFullModeMergedProdDeploysOnceThenUntracks(t *testing.T) {
 				deploys++
 				return "", errors.New("ship failed")
 			},
+			deployTargetFn: func(string) bool { return true },
 		}
 
 		x.Maintain(context.Background())
@@ -241,6 +243,36 @@ func TestMaintainFullModeMergedProdDeploysOnceThenUntracks(t *testing.T) {
 			t.Errorf("a failed prod-deploy must keep the PR tracked for retry, got %+v", r)
 		}
 	})
+}
+
+// TestMaintainFullModeMergedWithoutDeployTargetUntracks pins the retry-storm fix: a merged PR for a repo
+// with NO vetted deploy script (a library, template or data repo) has nothing to ship, so it is untracked
+// WITHOUT a deploy attempt. Before this, every such PR was re-fetched and re-deployed every recheck
+// interval forever — each attempt resetting the workspace and failing with wrapper exit 3.
+func TestMaintainFullModeMergedWithoutDeployTargetUntracks(t *testing.T) {
+	store := tempPRStore(t)
+	if err := store.Add(runs.PendingPR{Repo: "o/prizm", Number: 4, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var deploys int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { deploys++; return "", nil },
+		deployTargetFn: func(string) bool { return false },
+	}
+
+	x.Maintain(context.Background())
+
+	if deploys != 0 {
+		t.Errorf("a repo without a deploy target must NOT be deployed, got %d attempts", deploys)
+	}
+	if r, _ := store.List(); len(r) != 0 {
+		t.Errorf("merged PR without a deploy target must be untracked, still tracked: %+v", r)
+	}
 }
 
 // TestMaintainFullModeThrottlesInWindowRecheck confirms the per-PR throttle: an in-window PR fetched
@@ -259,8 +291,9 @@ func TestMaintainFullModeThrottlesInWindowRecheck(t *testing.T) {
 			gets++
 			return github.PullRequest{State: "open"}, nil // in-window + open → prNone
 		},
-		mergePRFn:    func(context.Context, string, string, int) error { return nil },
-		prodDeployFn: func(context.Context, string, runs.PendingPR) (string, error) { return "", nil },
+		mergePRFn:      func(context.Context, string, string, int) error { return nil },
+		prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { return "", nil },
+		deployTargetFn: func(string) bool { return true },
 	}
 
 	x.Maintain(context.Background()) // first pass fetches once and stamps LastChecked

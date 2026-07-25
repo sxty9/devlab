@@ -75,4 +75,23 @@ for p in "$DEPLOY_D" "$SCRIPT"; do
 done
 
 log "install-only deploy of '$REPO' from '$real' (env=$ENVN) via $SCRIPT"
+
+# 6) run the vetted script OUTSIDE the caller's mount namespace.
+#    devlabd is hardened with ProtectSystem=strict (+PrivateTmp), and a systemd sandbox is inherited by
+#    EVERY child — sudo and root included. Root therefore saw /opt, /usr/local and /etc as READ-ONLY, so
+#    `install … /opt/<repo>/bin/<repo>d` failed with EROFS ("Read-only file system") on every in-run
+#    dev-deploy while the same script worked from a shell. Widening the daemon's ReadWritePaths would
+#    have to enumerate every path a deploy may ever touch (/opt, /usr/local/bin, /etc/systemd/system for
+#    a brand-new unit, …) and would loosen the daemon's own sandbox. Instead we hand the script to PID 1:
+#    systemd-run starts it as a transient unit in the HOST namespace, so an install-only deploy writes the
+#    real filesystem while devlabd stays fully confined. --pipe forwards stdout/stderr, --wait propagates
+#    the script's exit status, --collect reaps the unit. Falls back to a direct exec where PID 1 is not
+#    reachable (no systemd, container) — there is no sandbox to escape there either.
+if command -v systemd-run >/dev/null 2>&1 && [[ -S /run/systemd/private ]]; then
+  exec systemd-run --quiet --collect --wait --pipe \
+    --description="DevLab install-only deploy: $REPO ($ENVN)" \
+    --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    --setenv=HOME=/root \
+    -- "$SCRIPT" "$real" "$ENVN"
+fi
 exec "$SCRIPT" "$real" "$ENVN"

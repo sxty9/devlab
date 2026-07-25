@@ -36,7 +36,10 @@ import (
 //   full   — pr + deploy the committed workspace via the devlab-deploy allowlist wrapper
 
 const (
-	deployWrapper   = "/usr/local/sbin/devlab-deploy"
+	deployWrapper = "/usr/local/sbin/devlab-deploy"
+	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
+	// no deploy target at all — see hasDeployTarget.
+	deployScriptDir = "/etc/devlab/deploy.d"
 	runAgentTimeout = 60 * time.Minute // a full implement pass can be long
 	runnerPreamble  = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
@@ -182,6 +185,9 @@ type runExecutor struct {
 	getPRFn      func(ctx context.Context, token, fullName string, number int) (github.PullRequest, error)
 	mergePRFn    func(ctx context.Context, token, fullName string, number int) error
 	prodDeployFn func(ctx context.Context, token string, p runs.PendingPR) (string, error)
+	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
+	// /etc that a test can neither create nor rely on.
+	deployTargetFn func(repoName string) bool
 }
 
 // token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real
@@ -213,6 +219,13 @@ func (x *runExecutor) runProdDeploy(ctx context.Context, token string, p runs.Pe
 		return x.prodDeployFn(ctx, token, p)
 	}
 	return x.prodDeployMerged(ctx, token, p)
+}
+
+func (x *runExecutor) deployable(repoName string) bool {
+	if x.deployTargetFn != nil {
+		return x.deployTargetFn(repoName)
+	}
+	return hasDeployTarget(repoName)
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run) (runs.ResultRef, error) {
@@ -686,9 +699,19 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// NEVER dev-deployed — restarting THIS devlabd would kill the running sweep; its PR still lands and
 	// its deploy happens out-of-band (its prod-deploy, which restarts the VPS not the runner, is fine
 	// via Maintain). A dev-deploy failure is NON-fatal: we log the step and still push + open the PR.
-	if x.mode == "full" && devDeployEnabled() && isSelfRepo(repo.ID) {
-		step("dev-deploy", "Selbst-Deploy übersprungen — "+repo.ID+" wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)", true)
-	} else if x.shouldDevDeploy(repo.ID) {
+	//
+	// EVERY full-mode repo records a dev-deploy step, including one that is skipped: an omitted step reads
+	// as "never attempted" in the pipeline view, which is how a whole disabled half of the pipeline stayed
+	// invisible. A skip that is expected (self repo, switched off, no deploy target) is a SUCCESSFUL step
+	// carrying its reason; only a real build/install failure is red.
+	switch {
+	case x.mode != "full":
+		// report/pr never deploy at all — no step, as before.
+	case !x.shouldDevDeploy(repo.ID):
+		step("dev-deploy", devDeploySkipReason(repo.ID), true)
+	case !x.deployable(repo.Name):
+		step("dev-deploy", noDeployTargetReason(repo.Name), true)
+	default:
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
 			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
 		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
@@ -738,6 +761,41 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 // devlab restarts THIS devlabd, killing the running sweep). report/pr never dev-deploy at all.
 func (x *runExecutor) shouldDevDeploy(repoID string) bool {
 	return x.mode == "full" && devDeployEnabled() && !isSelfRepo(repoID)
+}
+
+// devDeploySkipReason explains, for the recorded step, why shouldDevDeploy said no in full mode — the
+// self-repo guard (Finding B) or the kill switch. It never invents a third reason: any other "no" comes
+// from the deploy target, which hasDeployTarget/noDeployTargetReason report.
+func devDeploySkipReason(repoID string) string {
+	if isSelfRepo(repoID) {
+		return "Selbst-Deploy übersprungen — " + repoID + " wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)"
+	}
+	return "dev-deploy abgeschaltet (DEVLAB_RUNS_DEV_DEPLOY) — nur der prod-Deploy bei Merge ist scharf"
+}
+
+// hasDeployTarget reports whether repoName has a vetted per-repo deploy script — the SAME allowlist the
+// root wrapper enforces (/etc/devlab/deploy.d/<repo>), and therefore the single source of truth for "is
+// this repo deployable at all". Repos without one are libraries, templates, axiom/semantics data or
+// tooling: they install no service anywhere, so building and deploying them is not a failure to report
+// but a step to SKIP — visibly, and BEFORE the build. Attempting it anyway produced the two noisiest
+// false alarms in the pipeline: a red "nothing to build (no package.json / go.mod)" for data repos, and a
+// merged PR whose prod-deploy failed with wrapper exit 3 and was retried every recheck interval forever.
+func hasDeployTarget(repoName string) bool {
+	fi, err := os.Stat(filepath.Join(deployScriptDir, repoName))
+	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
+}
+
+func noDeployTargetReason(repoName string) string {
+	return "kein Deploy-Ziel — für " + repoName + " ist kein geprüftes Deploy-Skript hinterlegt (" +
+		filepath.Join(deployScriptDir, repoName) + "); das Repo installiert keinen Dienst, es gibt nichts zu deployen"
+}
+
+// repoNameOf reduces an owner/repo full name to the bare repo name the deploy allowlist is keyed by.
+func repoNameOf(fullName string) string {
+	if i := strings.LastIndex(fullName, "/"); i >= 0 {
+		return fullName[i+1:]
+	}
+	return fullName
 }
 
 // devDeployEnabled reports whether the in-run dev-deploy step is active. DEVLAB_RUNS_DEV_DEPLOY=off (or
@@ -962,10 +1020,7 @@ func (x *runExecutor) buildArtifact(ctx context.Context, wt string, repo model.R
 // installs+restarts there). The self repo is fine here — this restarts the VPS devlabd, not the dev
 // runner. A nil error means prod is live on the merged code; Maintain then untracks the PR.
 func (x *runExecutor) prodDeployMerged(ctx context.Context, token string, p runs.PendingPR) (string, error) {
-	name := p.Repo
-	if i := strings.LastIndex(p.Repo, "/"); i >= 0 {
-		name = p.Repo[i+1:]
-	}
+	name := repoNameOf(p.Repo)
 	repo := model.Repo{ID: name, Name: name, FullName: p.Repo}
 
 	if _, err := x.s.workspaces.Ensure(ctx, x.user, repo.ID, repo.FullName, token, true); err != nil {
@@ -1046,6 +1101,13 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
+			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
+			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
+			if name := repoNameOf(p.Repo); !x.deployable(name) {
+				_ = x.s.runPRs.Remove(p.Repo, p.Number)
+				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
+				continue
+			}
 			depLog, derr := x.runProdDeploy(ctx, token, p)
 			if derr != nil {
 				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
