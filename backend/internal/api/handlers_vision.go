@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/base64"
+	"errors"
 	"mime"
 	"net/http"
 	"path"
@@ -9,7 +10,6 @@ import (
 	"time"
 
 	"devlab/backend/internal/auth"
-	"devlab/backend/internal/comments"
 	"devlab/backend/internal/git"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/workspace"
@@ -172,7 +172,15 @@ func (s *Server) commentAdd(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, saved)
 }
 
-// commentDelete removes a comment (author or admin) and cascades to its replies.
+// errCommentForbidden is the verdict the delete-policy closure returns when the requester neither owns
+// the comment nor is an admin. The policy lives HERE, in the handler — the comments store is a passive
+// pool that only executes the decision atomically under its lock; it does not make it.
+var errCommentForbidden = errors.New("comment: forbidden")
+
+// commentDelete removes a comment (author or admin) and cascades to its replies. Authorization is a
+// policy decision, so it is supplied to the passive store as a closure: the store calls it with the
+// target comment under its lock and aborts the delete (writing nothing) if it rejects — the check
+// stays atomic with the delete while the store owns no access-control logic.
 func (s *Server) commentDelete(w http.ResponseWriter, r *http.Request) {
 	if s.comments == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Comments are unavailable")
@@ -184,8 +192,14 @@ func (s *Server) commentDelete(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r)
 	id := r.PathValue("id")
 	cid := r.PathValue("cid")
-	if err := s.comments.Delete(id, cid, u.Username, u.IsAdmin); err != nil {
-		if err == comments.ErrForbidden {
+	err := s.comments.Delete(id, cid, func(c model.Comment) error {
+		if !u.IsAdmin && c.Author != u.Username {
+			return errCommentForbidden
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errCommentForbidden) {
 			writeErr(w, http.StatusForbidden, "You can only delete your own comments")
 			return
 		}

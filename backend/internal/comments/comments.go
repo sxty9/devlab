@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,9 +22,6 @@ import (
 
 // repoRe bounds the repo id to safe filename characters (defends the per-repo file path).
 var repoRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-
-// ErrForbidden means the requester may not delete a comment they don't own (and isn't admin).
-var ErrForbidden = errors.New("comments: not allowed")
 
 // Store persists per-repo comment threads under a directory, one JSON file per repo.
 type Store struct {
@@ -157,9 +153,13 @@ func (s *Store) Add(repo string, c model.Comment, now time.Time) (model.Comment,
 	return c, nil
 }
 
-// Delete removes a comment (author or admin only) and cascades to its descendant replies so no
-// orphaned thread remains. Idempotent when the id is already gone.
-func (s *Store) Delete(repo, id, requester string, isAdmin bool) error {
+// Delete removes a comment and cascades to its descendant replies so no orphaned thread remains.
+// authorize is called with the located target comment under the store lock; returning an error aborts
+// the delete before anything is written — so WHO may delete is the caller's policy decision, made
+// outside this passive pool, yet still evaluated atomically with the delete (no observable in-between
+// state, no time-of-check/time-of-use gap). A nil authorize deletes unconditionally. Idempotent when
+// the id is already gone (authorize is not consulted — there is nothing to delete).
+func (s *Store) Delete(repo, id string, authorize func(model.Comment) error) error {
 	l := s.lockFor(repo)
 	l.Lock()
 	defer l.Unlock()
@@ -177,8 +177,10 @@ func (s *Store) Delete(repo, id, requester string, isAdmin bool) error {
 	if target == nil {
 		return nil
 	}
-	if !isAdmin && target.Author != requester {
-		return ErrForbidden
+	if authorize != nil {
+		if err := authorize(*target); err != nil {
+			return err
+		}
 	}
 	remove := map[string]bool{id: true}
 	for changed := true; changed; {
