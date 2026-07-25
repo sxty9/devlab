@@ -1,4 +1,4 @@
-import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, RepoData, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -216,39 +216,9 @@ export const mockSource: DataSource = {
   },
 
   async mercuryTree() {
-    const leaf = (name: string, path: string) => ({ name, path, isAxiom: true });
-    return {
-      axiome: [
-        {
-          name: 'architektur',
-          path: 'axiome/architektur',
-          isAxiom: false,
-          children: [
-            {
-              name: 'ssot',
-              path: 'axiome/architektur/ssot',
-              isAxiom: false,
-              children: [
-                leaf('atomare-zugriffe', 'axiome/architektur/ssot/atomare-zugriffe.md'),
-                leaf('kein-paralleler-datenpfad', 'axiome/architektur/ssot/kein-paralleler-datenpfad.md'),
-              ],
-            },
-            leaf('passive-pools', 'axiome/architektur/passive-pools.md'),
-          ],
-        },
-        {
-          name: 'minimalismus',
-          path: 'axiome/minimalismus',
-          isAxiom: false,
-          children: [leaf('keine-tooltips', 'axiome/minimalismus/keine-tooltips.md')],
-        },
-      ],
-      regeln: [
-        { name: 'go', path: 'regeln/go', isAxiom: false, children: [leaf('fehler-wrappen', 'regeln/go/fehler-wrappen.md')] },
-      ],
-      laeufe: [],
-      meta: [leaf('implementation-standard', 'meta/implementation-standard.md')],
-    };
+    // A fresh deep copy each read: setTree must see a NEW reference or React skips the re-render — the
+    // very reason a freshly added axiom would not appear. Adds/removes mutate axiomTree (see below).
+    return cloneTree();
   },
   async mercuryItem(path: string) {
     return {
@@ -260,7 +230,9 @@ export const mockSource: DataSource = {
   },
   async mercuryAddAxiom(titel: string, _body: string, section?: string, _force?: boolean) {
     const ns = section || 'axiome';
-    return { path: `${ns}/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`, id: 'ax_mocknew', classified: false };
+    const path = `${ns}/unsortiert/${titel.toLowerCase().replace(/\s+/g, '-')}.md`;
+    treeInsert(path); // the new record shows up in the tree at once, as it does against the backend
+    return { path, id: mockId('ax'), classified: false };
   },
   async mercuryOptimize(titel: string, body: string, _section?: string) {
     return { titel, body };
@@ -274,8 +246,8 @@ export const mockSource: DataSource = {
   async mercuryMoveAxiom(_from: string, to: string) {
     return { path: to };
   },
-  async mercuryDeleteAxiom(_path: string) {
-    /* mock: no-op */
+  async mercuryDeleteAxiom(path: string) {
+    treeRemove(path);
   },
   async mercuryMoveCategory(_from: string, _to: string) {
     return { moved: 0 };
@@ -284,7 +256,8 @@ export const mockSource: DataSource = {
     /* mock: no-op */
   },
   async mercuryRuns() {
-    return { runs: [], axioms: {} };
+    // Fresh copies so setList always sees a new reference (and can't mutate the store by ref).
+    return { runs: runStore.map((r) => ({ ...r })), axioms: {} };
   },
   async mercuryRun(id: string) {
     return {
@@ -307,14 +280,26 @@ export const mockSource: DataSource = {
   async mercuryRunCoverage() {
     return { covered: {}, index: {}, axioms: {} };
   },
-  async mercuryCreateRun(body: import('@/types').RunInput) {
-    return { id: 'run_mock', ...mockRun(body) };
+  async mercuryCreateRun(body: RunInput) {
+    const run: Run = { id: mockId('run'), ...mockRun(body) };
+    runStore.push(run); // appended → the next mercuryRuns() reload lists it, so it appears at once
+    return run;
   },
-  async mercuryUpdateRun(id: string, body: import('@/types').RunInput) {
-    return { id, ...mockRun(body) };
+  async mercuryUpdateRun(id: string, body: RunInput) {
+    const idx = runStore.findIndex((r) => r.id === id);
+    const run: Run = {
+      ...mockRun(body),
+      id,
+      createdAt: idx >= 0 ? runStore[idx].createdAt : new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    if (idx >= 0) runStore[idx] = run;
+    else runStore.push(run);
+    return run;
   },
-  async mercuryDeleteRun(_id: string) {
-    /* mock: no-op */
+  async mercuryDeleteRun(id: string) {
+    const idx = runStore.findIndex((r) => r.id === id);
+    if (idx >= 0) runStore.splice(idx, 1);
   },
   async mercuryRecomposeRun(_id: string) {
     /* mock: no-op */
@@ -398,6 +383,111 @@ function mockRun(body: import('@/types').RunInput) {
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};
 const aiStore: Record<string, AiMessage[]> = {};
+
+// --- Mercury is stateful in the mock, exactly like commentStore/visionStore above: a newly added
+//     ToDo, Lauf or axiom must appear in its list at once — the same way it does against the real
+//     backend. (Before this these were dead stubs, so an added element never showed until you gave up
+//     and it was simply lost — the "neu hinzugefügte Elemente aktualisieren sich nicht" bug.) These
+//     are passive in-memory pools; every read returns a FRESH copy so setList/setTree re-render. ---
+let mockSeq = 0;
+const mockId = (prefix: string) => `${prefix}_mock${(mockSeq += 1)}`;
+
+/** ToDos + Läufe, discriminated by `type` — the one store the backend keeps in runs.json. Starts empty,
+ *  like a fresh instance; create/update/delete below keep it in sync so the list reflects every change. */
+const runStore: Run[] = [];
+
+/** The axiom / Implementierungsregeln / Läufe / Meta tree the sidebar renders — seeded with a believable
+ *  sample, then mutated by add/delete so the sidebar reflects changes live. Mirrors the backend, which
+ *  derives the tree from the record paths. */
+const axiomTree: MercuryTree = {
+  axiome: [
+    {
+      name: 'architektur',
+      path: 'axiome/architektur',
+      isAxiom: false,
+      children: [
+        {
+          name: 'ssot',
+          path: 'axiome/architektur/ssot',
+          isAxiom: false,
+          children: [
+            { name: 'atomare-zugriffe', path: 'axiome/architektur/ssot/atomare-zugriffe.md', isAxiom: true },
+            { name: 'kein-paralleler-datenpfad', path: 'axiome/architektur/ssot/kein-paralleler-datenpfad.md', isAxiom: true },
+          ],
+        },
+        { name: 'passive-pools', path: 'axiome/architektur/passive-pools.md', isAxiom: true },
+      ],
+    },
+    {
+      name: 'minimalismus',
+      path: 'axiome/minimalismus',
+      isAxiom: false,
+      children: [{ name: 'keine-tooltips', path: 'axiome/minimalismus/keine-tooltips.md', isAxiom: true }],
+    },
+  ],
+  regeln: [
+    { name: 'go', path: 'regeln/go', isAxiom: false, children: [{ name: 'fehler-wrappen', path: 'regeln/go/fehler-wrappen.md', isAxiom: true }] },
+  ],
+  laeufe: [],
+  meta: [{ name: 'implementation-standard', path: 'meta/implementation-standard.md', isAxiom: true }],
+};
+
+function cloneNode(n: MercuryNode): MercuryNode {
+  return n.children
+    ? { name: n.name, path: n.path, isAxiom: n.isAxiom, children: n.children.map(cloneNode) }
+    : { name: n.name, path: n.path, isAxiom: n.isAxiom };
+}
+/** A fresh copy each read — a new object graph so setTree always sees a changed reference. */
+function cloneTree(): MercuryTree {
+  return {
+    axiome: axiomTree.axiome.map(cloneNode),
+    regeln: axiomTree.regeln.map(cloneNode),
+    laeufe: axiomTree.laeufe.map(cloneNode),
+    meta: axiomTree.meta.map(cloneNode),
+  };
+}
+
+/** Insert a leaf at `path`, creating category nodes along the way — the freshly added record then
+ *  appears in the sidebar, the same tree the backend derives from its record paths. */
+function treeInsert(path: string): void {
+  const segs = path.split('/').filter(Boolean);
+  if (segs.length < 2) return;
+  const ns = segs[0] as keyof MercuryTree;
+  let level = axiomTree[ns];
+  if (!level) return;
+  let prefix = ns;
+  for (let i = 1; i < segs.length; i += 1) {
+    prefix += `/${segs[i]}`;
+    const isLeaf = i === segs.length - 1;
+    const name = isLeaf ? segs[i].replace(/\.md$/, '') : segs[i];
+    let node = level.find((n) => n.name === name && n.isAxiom === isLeaf);
+    if (!node) {
+      node = isLeaf ? { name, path: prefix, isAxiom: true } : { name, path: prefix, isAxiom: false, children: [] };
+      level.push(node);
+    }
+    if (!isLeaf) {
+      if (!node.children) node.children = [];
+      level = node.children;
+    }
+  }
+}
+
+/** Remove the node at `path` (a leaf, or a category with its subtree) from the tree. */
+function treeRemove(path: string): void {
+  const segs = path.split('/').filter(Boolean);
+  if (segs.length < 2) return;
+  const ns = segs[0] as keyof MercuryTree;
+  let level = axiomTree[ns];
+  if (!level) return;
+  for (let i = 1; i < segs.length - 1; i += 1) {
+    const cat = level.find((n) => !n.isAxiom && n.name === segs[i]);
+    if (!cat?.children) return;
+    level = cat.children;
+  }
+  const leaf = segs[segs.length - 1].replace(/\.md$/, '');
+  const idx = level.findIndex((n) => n.name === leaf);
+  if (idx >= 0) level.splice(idx, 1);
+}
 
 function mockVision(id: string): VisionFile[] {
   if (!visionStore[id]) {
