@@ -7,6 +7,7 @@ import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { RunTuningFields } from './RunTuning';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -626,6 +627,11 @@ function TodoDetail({
             <CheckIcon className="h-3 w-3" /> Erledigt
           </span>
         )}
+        {(todo.model || todo.effort) && (
+          <span className="rounded bg-fill/10 px-1.5 py-0.5 font-medium text-text-secondary">
+            {[todo.model, todo.effort].filter(Boolean).join(' · ')}
+          </span>
+        )}
         <span>Termin: {dueLabel(todo)}</span>
       </div>
 
@@ -701,6 +707,8 @@ function TodoEditor({
   const { toast } = useToast();
   const [name, setName] = useState(base?.name ?? '');
   const [task, setTask] = useState(base?.task ?? '');
+  const [model, setModel] = useState(base?.model ?? '');
+  const [effort, setEffort] = useState(base?.effort ?? '');
   const [rows, setRows] = useState<TargetRow[]>(() => initialTargetRows(base));
   // New ToDos get a sensible default Termin (next full hour); editing preserves the stored one
   // exactly — including "no Termin" (manual), which must never silently gain a schedule.
@@ -778,6 +786,8 @@ function TodoEditor({
       name: name.trim(),
       type: 'todo',
       enabled,
+      model,
+      effort,
       task: task.trim(),
       dueAt: dueIso,
       targets,
@@ -958,6 +968,8 @@ function TodoEditor({
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-accent" />
         <span className="text-footnote text-text-primary">Aktiv</span>
       </label>
+
+      <RunTuningFields model={model} effort={effort} onModelChange={setModel} onEffortChange={setEffort} />
 
       <div className="flex items-center gap-2">
         <Button variant="primary" size="sm" disabled={!valid || busy} onClick={save}>

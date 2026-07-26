@@ -55,6 +55,14 @@ type Run struct {
 	Type    Type   `json:"type"` // "" is read as auto (records predating ToDos)
 	Enabled bool   `json:"enabled"`
 
+	// Model + Effort tune the Claude engine the executor drives for THIS run/todo. Both are shared by
+	// auto and todo. Empty selects the runner default (opus / max), so records predating this field keep
+	// behaving exactly as before. Model is a CLI model id or alias (e.g. "opus", "claude-opus-4-8"); Effort
+	// is one of low|medium|high|xhigh|max|ultracode — "ultracode" being the maximal tier the executor maps
+	// to max reasoning plus multi-agent orchestration.
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+
 	// auto only
 	Schedule Schedule `json:"schedule"`
 	AxiomIDs []string `json:"axiomIds"`

@@ -377,6 +377,8 @@ export interface Run {
   name: string;
   type?: RunType; // absent = auto (records predating ToDos)
   enabled: boolean;
+  model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
+  effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
   schedule: RunSchedule;
   axiomIds: string[];
   // todo only
@@ -405,6 +407,8 @@ export interface RunInput {
   name: string;
   type?: RunType; // default 'auto'
   enabled: boolean;
+  model?: string; // Claude model id/alias; '' or absent = runner default (opus)
+  effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
@@ -491,6 +495,10 @@ export interface RunResult {
   /** The run's Promptstellung for THIS execution — the exact prompt the agent was driven by,
    *  snapshotted at run time. Absent on executions recorded before it was captured. */
   prompt?: string;
+  /** Which Claude engine drove THIS execution: the resolved model, and the selected effort tier
+   *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
+  model?: string;
+  effort?: string;
   ok: boolean;
   repos: RepoResult[];
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed

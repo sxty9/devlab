@@ -454,8 +454,9 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 	fresh := func() runs.Result {
 		start := time.Now()
+		model, _, _ := tuningFor(run).resolve() // the engine this execution is minted with (re-stamped on resume, see consider)
 		return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
-			Type: runs.NormalizeType(run.Type), Mode: x.mode, StartedAt: start.UTC(),
+			Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
 			PromptHash: run.PromptHash, Prompt: run.Prompt}
 	}
 	consider := func(existing runs.Result) (runs.Result, bool, bool) {
@@ -463,6 +464,11 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 			x.reap(existing, fmt.Sprintf("Modus gewechselt (%s → %s) — Husk nicht fortgesetzt", existing.Mode, x.mode))
 			return runs.Result{}, false, true // reaped: don't resume, fall through to fresh
 		}
+		// A resumed attempt is driven by the run's CURRENT tuning (executeRepo reads tuningFor(run) each
+		// fire), so re-stamp the engine label to match — else a legacy husk shows no model, and one whose
+		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
+		m, _, _ := tuningFor(run).resolve()
+		existing.Model, existing.Effort = m, run.Effort
 		return existing, true, false
 	}
 	if run.Suspended != nil && run.Suspended.ResultID != "" {
@@ -616,7 +622,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", atts, &rr, saver)
+		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
 		if lim.limited {
 			return rr, lim
 		}
@@ -674,7 +680,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", atts, &rr, saver)
+	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
 	}
@@ -1109,7 +1115,7 @@ func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAt
 // attachments again as it returns (the deferred cleanup runs the instant the agent finishes, BEFORE
 // executeRepo commits) — so the media reaches the agent yet never leaks into the PR. For an auto run
 // (no attachments) it is exactly the plain agent call.
-func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, atts []loadedAttachment, onLine func([]byte)) ([]byte, error) {
+func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, t agentTuning, atts []loadedAttachment, onLine func([]byte)) ([]byte, error) {
 	cleanup, err := writeWorkspaceAttachments(ex, wt, atts)
 	if err != nil {
 		return nil, fmt.Errorf("Medien bereitstellen: %w", err)
@@ -1118,9 +1124,9 @@ func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, 
 	// Stream when a live sink is present (a real run) and streaming is enabled — so the agent can be
 	// followed as it works. Otherwise the plain buffered call. resultEvent() reconciles both wire formats.
 	if onLine != nil && streamEnabled() {
-		return ex.AgentStream(actx, wt, onLine, streamAgentArgs(prompt, permMode)...)
+		return ex.AgentStream(actx, wt, onLine, streamAgentArgs(prompt, permMode, t)...)
 	}
-	return ex.Agent(actx, wt, agentArgs(prompt, permMode)...)
+	return ex.Agent(actx, wt, agentArgs(prompt, permMode, t)...)
 }
 
 // liveSaver persists the in-progress result. Boundary events (a step starting/ending, a repo starting)
@@ -1183,9 +1189,9 @@ func (a *agentStep) fail(logtxt string) {
 // runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
 // (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
 // (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
-	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, atts, ag.onProgress)
+	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
 	final = resultEvent(out)
 	if l := detectLimit(final, aerr); l.limited {
 		return final, l, aerr // leave the step running; the repo is not recorded
@@ -1446,14 +1452,59 @@ func parseClaudeUsage(out []byte) usage {
 	}
 }
 
-func agentArgs(prompt, mode string) []string {
+// agentTuning selects the model + effort tier for one agent invocation, taken from the run/todo. Empty
+// fields fall back to the runner defaults (opus / max), so a record written before these fields existed
+// behaves exactly as before.
+type agentTuning struct {
+	model  string
+	effort string
+}
+
+func tuningFor(run runs.Run) agentTuning { return agentTuning{model: run.Model, effort: run.Effort} }
+
+// ultracodeDirective is folded into the runner's system prompt when a run picks the "ultracode" effort:
+// the maximal tier runs at max reasoning AND asks the agent to decompose and verify via multi-agent
+// orchestration, trading token economy for thoroughness. It is opt-in per run — the default never sets it.
+const ultracodeDirective = "Operate in ultracode mode: decompose the task and use multi-agent workflow " +
+	"orchestration, adversarially verifying your work before committing. Favour correctness and " +
+	"completeness over token economy."
+
+// resolve turns the (possibly empty) tuning into the concrete claude CLI model + effort and the system
+// preamble. "ultracode" is not a native --effort level, so it maps to max plus the ultracode directive;
+// every other empty case falls back to the historical opus / max the runner has always used.
+func (t agentTuning) resolve() (model, effort, preamble string) {
+	// Re-guard at the argv boundary: this feeds a bypassPermissions CLI, so a model/effort that somehow
+	// reached the store unvalidated (a hand-edited runs.json, a future writer that skips validateTuning)
+	// still cannot put an arbitrary token onto the command line — a non-conforming value falls back to the
+	// safe default rather than being forwarded verbatim.
+	model = t.model
+	if model == "" || !runModelRe.MatchString(model) {
+		model = "opus"
+	}
+	effort = t.effort
+	if effort != "" && !runEffortAllowed[effort] {
+		effort = ""
+	}
+	preamble = runnerPreamble
+	switch effort {
+	case "ultracode":
+		effort = "max"
+		preamble = runnerPreamble + "\n\n" + ultracodeDirective
+	case "":
+		effort = "max"
+	}
+	return model, effort, preamble
+}
+
+func agentArgs(prompt, mode string, t agentTuning) []string {
+	model, effort, preamble := t.resolve()
 	return []string{
 		"-p", prompt,
 		"--output-format", "json",
 		"--permission-mode", mode,
-		"--model", "opus",
-		"--effort", "max",
-		"--append-system-prompt", runnerPreamble,
+		"--model", model,
+		"--effort", effort,
+		"--append-system-prompt", preamble,
 	}
 }
 

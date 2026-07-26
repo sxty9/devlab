@@ -8,6 +8,7 @@ import { renderMarkdown } from '@/lib/markdown';
 import { basename } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { AiMessage, AiModelCatalog } from '@/types';
+import { NATIVE_EFFORTS } from '@/views/RunTuning';
 
 const ENGINES = [
   { id: 'choose', label: 'Auto (Router)' },
@@ -225,7 +226,7 @@ export function ClaudePanel() {
             className="ml-auto rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
             title="Reasoning effort"
           >
-            {['low', 'medium', 'high', 'xhigh', 'max'].map((x) => (
+            {NATIVE_EFFORTS.map((x) => (
               <option key={x} value={x}>{x}</option>
             ))}
           </select>

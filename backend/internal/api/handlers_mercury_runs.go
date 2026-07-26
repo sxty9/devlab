@@ -203,6 +203,8 @@ type runBody struct {
 	Name     string        `json:"name"`
 	Type     runs.Type     `json:"type"` // "" = auto
 	Enabled  bool          `json:"enabled"`
+	Model    string        `json:"model"`  // Claude model id/alias; "" = runner default (opus)
+	Effort   string        `json:"effort"` // low|medium|high|xhigh|max|ultracode; "" = runner default (max)
 	Schedule runs.Schedule `json:"schedule"`
 	AxiomIDs []string      `json:"axiomIds"`
 	// todo only
@@ -217,6 +219,38 @@ type runBody struct {
 
 // repoNameRe bounds a new repo's name (it becomes a GitHub repo and a deploy-allowlist key).
 var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+
+// runEffortAllowed is the effort ladder a run/todo may pick: the native claude CLI --effort levels
+// (effortAllowed — the very set the KI tab uses) PLUS "ultracode", Holistic's maximal tier, which the
+// executor translates to max effort plus multi-agent orchestration (see agentTuning.resolve). Derived
+// from the one native set so the two can never drift. Empty selects the runner default (max).
+var runEffortAllowed = func() map[string]bool {
+	m := map[string]bool{"ultracode": true}
+	for k := range effortAllowed {
+		m[k] = true
+	}
+	return m
+}()
+
+// runModelRe bounds a selected model to the shape a CLI model alias or id takes (opus, claude-opus-4-8,
+// claude-fable-5, …) so a stored value can never smuggle extra arguments into the executor's CLI call.
+// Empty selects the runner default (opus). The offerable set itself is the aigentic model catalog
+// (GET /api/assistant/models) — the single source the KI tab already reads — so this is only a guard.
+var runModelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// validateTuning trims and guards the model + effort a run/todo carries. Both are shared by auto and
+// todo and both are optional (empty = runner default), so it runs before the per-type branch.
+func validateTuning(b *runBody) (int, string) {
+	b.Model = strings.TrimSpace(b.Model)
+	if b.Model != "" && !runModelRe.MatchString(b.Model) {
+		return http.StatusBadRequest, "ungültiges Modell"
+	}
+	b.Effort = strings.TrimSpace(b.Effort)
+	if b.Effort != "" && !runEffortAllowed[b.Effort] {
+		return http.StatusBadRequest, "ungültiger Effort (erlaubt: low, medium, high, xhigh, max, ultracode)"
+	}
+	return 0, ""
+}
 
 // normalizeTargets validates and cleans a ToDo's target list: at least one target, each being exactly
 // one existing repo OR one new-repo name (bounded like a GitHub repo), with duplicates collapsed and
@@ -254,6 +288,9 @@ func validateRunBody(b *runBody, byID map[string]mercury.RunAxiom) (int, string)
 	b.Name = strings.TrimSpace(b.Name)
 	if b.Name == "" {
 		return http.StatusBadRequest, "name ist erforderlich"
+	}
+	if code, msg := validateTuning(b); code != 0 {
+		return code, msg
 	}
 	if b.Type == "" {
 		b.Type = runs.TypeAuto
@@ -317,6 +354,7 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	run := runs.Run{
 		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
+		Model: body.Model, Effort: body.Effort,
 		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
 		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
@@ -366,6 +404,8 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].Name = body.Name
 		cur[idx].Type = body.Type
 		cur[idx].Enabled = body.Enabled
+		cur[idx].Model = body.Model
+		cur[idx].Effort = body.Effort
 		cur[idx].Schedule = body.Schedule
 		cur[idx].AxiomIDs = body.AxiomIDs
 		cur[idx].Task = body.Task
