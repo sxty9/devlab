@@ -170,7 +170,7 @@ type runExecutor struct {
 	// token belongs to a real linked account (the owner). DEVLAB_RUNS_TOKEN_USER sets it; it
 	// defaults to user.
 	//
-	// WARNING: user is the WORKSPACE owner, and executeRepo calls ResetToRemote (git reset --hard +
+	// WARNING: user is the WORKSPACE owner, and executeRepo runs CleanWorktree (git reset --hard HEAD +
 	// clean -fdx) on /var/lib/devlab/workspaces/<user>/<repo> before every run. The DevLab IDE keys
 	// its OWN workspace by the logged-in username under the same path. So DEVLAB_RUNS_USER must be a
 	// DEDICATED account (devlab-runs) that no human ever uses interactively — otherwise a nightly run
@@ -1139,7 +1139,7 @@ func attachmentDescriptors(atts []loadedAttachment) []mercury.TodoAttachment {
 // writeWorkspaceAttachments materializes a ToDo's media into the agent's workspace (under
 // mercury.TodoAttachmentDir) so the agent can open them, and returns a cleanup that removes them again
 // BEFORE anything is committed — the media is CONTEXT, never part of the change set. A workspace is
-// disposable (the next run's ResetToRemote clears any leftover), so cleanup is best-effort.
+// disposable (the next run's CleanWorktree clears any leftover), so cleanup is best-effort.
 func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAttachment) (func(), error) {
 	written := make([]string, 0, len(atts))
 	cleanup := func() {
