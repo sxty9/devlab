@@ -356,10 +356,19 @@ export default function TodosView() {
 
   let rightPane: ReactNode;
   if (mode === 'create') {
-    rightPane = <TodoEditor base={null} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />;
+    rightPane = (
+      <TodoEditor base={null} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} onRunStarted={refetchActive} />
+    );
   } else if (mode === 'edit' && selectedTodo) {
     rightPane = (
-      <TodoEditor key={selectedTodo.id} base={selectedTodo} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />
+      <TodoEditor
+        key={selectedTodo.id}
+        base={selectedTodo}
+        repos={repos}
+        onCancel={() => setMode('view')}
+        onSaved={handleSaved}
+        onRunStarted={refetchActive}
+      />
     );
   } else if (selectedTodo) {
     rightPane = (
@@ -684,27 +693,42 @@ function initialTargetRows(base: Run | null): TargetRow[] {
 
 const rowValid = (r: TargetRow) => (r.kind === 'existing' ? r.repo.trim().length > 0 : NEW_REPO_RE.test(r.newRepo.trim()));
 
+/** How a ToDo runs. "now" executes it the instant it is saved, "scheduled" fires it once at a chosen
+ *  moment, "ondemand" only ever runs via "Jetzt ausführen". A fresh ToDo defaults to "now". */
+type RunMode = 'now' | 'scheduled' | 'ondemand';
+const RUN_MODES: { id: RunMode; label: string }[] = [
+  { id: 'now', label: 'Now' },
+  { id: 'scheduled', label: 'Scheduled' },
+  { id: 'ondemand', label: 'On demand' },
+];
+
 /** Create/update form for a ToDo: name, the free-text task, one or more targets (each an existing repo
- *  or a new one to create), the optional one-time due date, and the active flag. */
+ *  or a new one to create), how it runs (now / scheduled / on demand), and the active flag. */
 function TodoEditor({
   base,
   repos,
   onCancel,
   onSaved,
+  onRunStarted,
 }: {
   base: Run | null;
   repos: Repo[];
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
+  onRunStarted?: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [name, setName] = useState(base?.name ?? '');
   const [task, setTask] = useState(base?.task ?? '');
   const [rows, setRows] = useState<TargetRow[]>(() => initialTargetRows(base));
-  // New ToDos get a sensible default Termin (next full hour); editing preserves the stored one
-  // exactly — including "no Termin" (manual), which must never silently gain a schedule.
-  const [due, setDue] = useState(() => (base ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
+  // How the ToDo runs. A fresh ToDo defaults to "now" (create → execute at once); editing reflects the
+  // stored plan — a due date is "scheduled", none is "ondemand". "now" is a save-time action, not a
+  // stored state, so re-editing a ToDo that was run once shows it as "ondemand".
+  const [mode, setMode] = useState<RunMode>(() => (base ? (base.dueAt ? 'scheduled' : 'ondemand') : 'now'));
+  // The scheduled moment. Kept populated with a sensible default (next full hour) even outside
+  // "scheduled" mode, so switching to it is never an empty field; an edited scheduled ToDo shows its own.
+  const [due, setDue] = useState(() => (base?.dueAt ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
   const [busy, setBusy] = useState(false);
 
@@ -756,18 +780,20 @@ function TodoEditor({
   const setRow = (i: number, patch: Partial<TargetRow>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, { kind: 'existing', repo: '', newRepo: '' }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i));
-  // A Termin in the past would never fire (a ToDo runs once, at its due moment). Both strings are
-  // zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is a chronological one.
+  // Only "scheduled" needs a valid moment: a missing or past one would never fire (a ToDo runs once,
+  // at its due moment). Both strings are zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is
+  // a chronological one.
   const dueInPast = due !== '' && due < minDue;
-  const valid = name.trim().length > 0 && task.trim().length > 0 && targetsOk && !dueInPast;
+  const scheduleBad = mode === 'scheduled' && (due === '' || dueInPast);
+  const valid = name.trim().length > 0 && task.trim().length > 0 && targetsOk && !scheduleBad;
 
   const save = async () => {
     if (!valid || busy) return;
-    // Re-check against a fresh clock: a form left open across the minute boundary must not slip a
-    // past Termin through the mount-pinned floor above.
-    const dueIso = localInputToIso(due);
-    if (dueIso && dueIso < new Date().toISOString()) {
-      toast({ title: 'Der Termin darf nicht in der Vergangenheit liegen.', variant: 'danger' });
+    // "scheduled" only: re-check against a fresh clock so a form left open across the minute boundary
+    // can't slip a past moment through the mount-pinned floor above. "now"/"ondemand" carry no date.
+    const dueIso = mode === 'scheduled' ? localInputToIso(due) : null;
+    if (mode === 'scheduled' && (!dueIso || dueIso < new Date().toISOString())) {
+      toast({ title: "The time can't be in the past.", variant: 'danger' });
       return;
     }
     setBusy(true);
@@ -800,7 +826,20 @@ function TodoEditor({
           toast({ title: `Anhang „${p.name}“ fehlgeschlagen`, description: msg(e), variant: 'danger' });
         }
       }
-      toast({ title: base ? 'ToDo gespeichert' : 'ToDo angelegt', variant: 'success' });
+      // "now": create/save, then execute at once — reusing the very same run-now access point as the
+      // detail view (single source of truth). The ToDo is already saved, so a busy executor (409) or an
+      // unconfigured one (503) is a non-fatal warning, not a lost ToDo.
+      if (mode === 'now') {
+        try {
+          await source.mercuryRunNow(saved.id);
+          toast({ title: 'ToDo gestartet', variant: 'success' });
+          onRunStarted?.();
+        } catch (e) {
+          toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
+        }
+      } else {
+        toast({ title: base ? 'ToDo gespeichert' : 'ToDo angelegt', variant: 'success' });
+      }
       await onSaved(saved.id);
     } catch (e) {
       toast({ title: 'Speichern fehlgeschlagen', description: msg(e), variant: 'danger' });
@@ -927,30 +966,38 @@ function TodoEditor({
       </div>
 
       <div>
-        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Termin</p>
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="datetime-local"
-            value={due}
-            min={minDue}
-            onChange={(e) => setDue(e.target.value)}
-            className={cn(
-              'rounded-md border bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50',
-              dueInPast ? 'border-danger' : 'border-separator',
-            )}
-          />
-          {due && (
-            <Button variant="ghost" size="sm" onClick={() => setDue('')}>
-              Termin entfernen
-            </Button>
-          )}
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Execution</p>
+        <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
+          {RUN_MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => setMode(m.id)}
+              className={cn(
+                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
+                mode === m.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              {m.label}
+            </button>
+          ))}
         </div>
-        {dueInPast ? (
-          <p className="mt-1.5 text-caption text-danger">Der Termin darf nicht in der Vergangenheit liegen.</p>
-        ) : (
-          <p className="mt-1.5 text-caption text-text-tertiary">
-            {due ? 'Das ToDo läuft einmalig zu diesem Zeitpunkt.' : 'Ohne Termin läuft das ToDo nur über „Jetzt ausführen“.'}
-          </p>
+        {mode === 'scheduled' && (
+          <div className="mt-2">
+            <input
+              type="datetime-local"
+              value={due}
+              min={minDue}
+              onChange={(e) => setDue(e.target.value)}
+              className={cn(
+                'rounded-md border bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50',
+                scheduleBad ? 'border-danger' : 'border-separator',
+              )}
+            />
+            {scheduleBad && (
+              <p className="mt-1.5 text-caption text-danger">{due === '' ? 'Pick a date and time.' : "The time can't be in the past."}</p>
+            )}
+          </div>
         )}
       </div>
 
