@@ -96,6 +96,45 @@ func TestDevBranchGrows(t *testing.T) {
 	}
 }
 
+// TestDevStateAccumulatesAcrossRuns is req 7b: the dev state (what a dev-deploy ships — the mercury-dev
+// tip) only ever GROWS across runs; a later run never removes an earlier run's work. Two runs each add a
+// file; a fresh checkout of mercury-dev then carries BOTH.
+func TestDevStateAccumulatesAcrossRuns(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+
+	run := func(work, file string) {
+		if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+			t.Fatalf("prepare %s: %v", work, err)
+		}
+		if err := e.CleanWorktree(ctx, wt); err != nil {
+			t.Fatalf("clean %s: %v", work, err)
+		}
+		if err := e.FoldInBranch(ctx, wt, "main"); err != nil {
+			t.Fatalf("fold %s: %v", work, err)
+		}
+		writeF(t, filepath.Join(wt, file), work+"\n")
+		gitT(t, wt, "add", "-A")
+		gitCommit(t, wt, work)
+		if _, err := e.PushRefs(ctx, wt, "", false, dev); err != nil {
+			t.Fatalf("push %s: %v", work, err)
+		}
+	}
+	run("run 1", "one.txt")
+	run("run 2", "two.txt") // a second run on the SAME persistent branch
+
+	// What a dev-deploy would ship — the published mercury-dev tip — carries BOTH runs' work.
+	shipped := filepath.Join(t.TempDir(), "shipped")
+	gitT(t, "", "clone", "-b", dev, origin, shipped)
+	if !exists(shipped, "one.txt") {
+		t.Errorf("run 1's work vanished from the dev state — a later run removed it")
+	}
+	if !exists(shipped, "two.txt") {
+		t.Errorf("run 2's work missing from the dev state")
+	}
+}
+
 // TestCleanWorktreeKeepsHistory is req 4: hygiene removes an aborted run's half-changes (uncommitted
 // tracked edits + untracked files) WITHOUT touching history — the accumulated commits and the branch
 // pointer are untouched.

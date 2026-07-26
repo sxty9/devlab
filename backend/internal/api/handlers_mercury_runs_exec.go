@@ -122,7 +122,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 		log.Printf("devlabd: runs scheduler OFF under dev-bypass")
 		return
 	}
-	if s.runs == nil || s.runResults == nil || s.runPRs == nil || s.links == nil {
+	if s.runs == nil || s.runResults == nil || s.runPRs == nil || s.deliveries == nil || s.links == nil {
 		log.Printf("devlabd: runs scheduler OFF — stores unavailable")
 		return
 	}
@@ -573,10 +573,10 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		saver.force()
 	}
 
-	// NOTE: a repo with an open Mercury PR is NEVER skipped. The run proceeds normally; it just bases its
-	// work on main + the still-open pending PRs (see the run-branch setup below), so the agent sees not-yet-
-	// merged work as present and does not redo it, while still implementing whatever a (possibly different-
-	// axiom) run still needs.
+	// NOTE: a repo with an open Mercury PR is NEVER skipped, and its not-yet-merged work is never redone.
+	// The run builds on the persistent dev branch (mercury-dev), which already CARRIES every prior
+	// delivery — so the agent sees not-yet-merged work as present without any PR-folding step (see the dev
+	// branch setup below).
 
 	// Clone (first run only; Ensure is a no-op once cloned). Retry a few times on a connectivity blip
 	// before giving up, and tell a network failure apart from a broken repo: a network failure carries
