@@ -106,7 +106,7 @@ func TestRollbackOpenClosesPR(t *testing.T) {
 		return github.PullRequest{State: "open", Merged: false}, nil
 	}
 	x.counterBookFn = func(context.Context, string, runs.Delivery, string) (counterBookResult, error) {
-		return counterBookResult{before: "aaaaaaa", after: "ccccccc", defaultBranch: "main"}, nil
+		return counterBookResult{changed: true, before: "aaaaaaa", after: "ccccccc", defaultBranch: "main"}, nil
 	}
 	x.commentPRFn = func(context.Context, string, string, int, string) error { commented++; return nil }
 	x.closePRFn = func(context.Context, string, string, int) error { closed++; return nil }
@@ -145,7 +145,7 @@ func TestRollbackMergedCreatesReversingPR(t *testing.T) {
 		if !strings.HasPrefix(reversalBranch, "mercury-run/run_x/revert-") {
 			t.Errorf("reversal branch = %q, want a stacked revert branch", reversalBranch)
 		}
-		return counterBookResult{before: "bbbbbbb", after: "ddddddd", defaultBranch: "main"}, nil
+		return counterBookResult{changed: true, before: "bbbbbbb", after: "ddddddd", defaultBranch: "main"}, nil
 	}
 	var createdBase string
 	x.createPRFn = func(_ context.Context, _, _, head, base, _, _ string) (github.PullRequest, error) {
@@ -177,6 +177,43 @@ func TestRollbackMergedCreatesReversingPR(t *testing.T) {
 	}
 	if d, _, _ := deliv.Get("d1"); d.Status != runs.DeliveryReverted {
 		t.Errorf("original delivery status = %q, want reverted", d.Status)
+	}
+}
+
+// TestRollbackNoChangeIsIdempotent pins the idempotent path: when the counter-booking finds nothing to
+// undo (the effect is already gone — e.g. a retried rollback), an OPEN delivery is still closed and
+// marked reverted without error, and no reversing PR is created.
+func TestRollbackNoChangeIsIdempotent(t *testing.T) {
+	x, deliv, _, _ := rollbackExecutor(t, "pr")
+	_ = deliv.Add(runs.Delivery{ID: "d1", Repo: "o/x", Branch: "mercury-run/d1", DevBranch: "mercury-dev",
+		FromCommit: "aaaaaaa", ToCommit: "bbbbbbb", PRNumber: 5, Status: runs.DeliveryOpen, RunName: "R1", CreatedAt: t0})
+
+	var closed, created int
+	x.getPRFn = func(context.Context, string, string, int) (github.PullRequest, error) {
+		return github.PullRequest{State: "open", Merged: false}, nil
+	}
+	x.counterBookFn = func(context.Context, string, runs.Delivery, string) (counterBookResult, error) {
+		return counterBookResult{changed: false, before: "bbbbbbb", after: "bbbbbbb", defaultBranch: "main"}, nil
+	}
+	x.commentPRFn = func(context.Context, string, string, int, string) error { return nil }
+	x.closePRFn = func(context.Context, string, string, int) error { closed++; return nil }
+	x.createPRFn = func(context.Context, string, string, string, string, string, string) (github.PullRequest, error) {
+		created++
+		return github.PullRequest{}, nil
+	}
+
+	out, err := x.RollbackDelivery(context.Background(), "d1", "tester")
+	if err != nil {
+		t.Fatalf("RollbackDelivery: %v", err)
+	}
+	if !out.Reverted || !out.NoChange {
+		t.Fatalf("expected reverted + no-change, got %+v", out)
+	}
+	if closed != 1 || created != 0 {
+		t.Errorf("no-change open rollback must close the PR (got %d) and create no PR (got %d)", closed, created)
+	}
+	if d, _, _ := deliv.Get("d1"); d.Status != runs.DeliveryReverted {
+		t.Errorf("delivery must be marked reverted, got %q", d.Status)
 	}
 }
 

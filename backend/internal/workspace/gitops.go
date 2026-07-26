@@ -625,29 +625,41 @@ func (e Executor) PushRefs(ctx context.Context, wt, token string, force bool, br
 // RevertRange counter-books a delivery: it applies the reverse of every commit in from..to as ONE new
 // reversing commit on the current branch (the "Gegenbuchung"). History is NEVER rewritten — the original
 // commits remain and the dev branch only grows (req 10). The range MUST be linear (the delivery range is
-// captured AFTER the default-branch fold, so it holds only the agent's own commits, no merges). If the
-// reverse does not apply cleanly — later work built on this delivery and touched the same lines — it makes
-// NO guess (req 12): it restores the branch and returns conflicted=true so the caller raises a ToDo
-// instead of committing a mangled revert.
-func (e Executor) RevertRange(ctx context.Context, wt, from, to, ghLogin string, ghID int64, message string) (conflicted bool, err error) {
+// captured AFTER the default-branch fold, so it holds only the agent's own commits, no merges).
+//
+// It returns three outcomes so the caller reacts precisely:
+//   - conflicted=true: the reverse does not apply cleanly — later work built on this delivery and touched
+//     the same lines (or the range contains a merge). No guess is made (req 12): the branch is restored
+//     untouched and the caller raises a ToDo instead of committing a mangled revert.
+//   - changed=false (conflicted=false, err=nil): the reverse applied but produced NOTHING to book — the
+//     delivery's effect is already absent (already counter-booked, or a later change removed it). No
+//     commit is made; the caller treats it as an idempotent no-op rather than an error.
+//   - changed=true: a single counter-booking commit was made.
+func (e Executor) RevertRange(ctx context.Context, wt, from, to, ghLogin string, ghID int64, message string) (conflicted, changed bool, err error) {
 	if !commitRe.MatchString(from) || !commitRe.MatchString(to) {
-		return false, fmt.Errorf("invalid commit range %q..%q", from, to)
+		return false, false, fmt.Errorf("invalid commit range %q..%q", from, to)
 	}
 	if from == to {
-		return false, errors.New("empty delivery range (from == to)")
+		return false, false, errors.New("empty delivery range (from == to)")
 	}
 	if strings.TrimSpace(message) == "" {
-		return false, errors.New("empty counter-booking message")
+		return false, false, errors.New("empty counter-booking message")
 	}
 	restore := func() {
-		_, _ = runGit(e.gitIn(ctx, wt, "", "revert", "--abort"))
+		_, _ = runGit(e.gitIn(ctx, wt, "", "revert", "--abort")) // clears any sequencer state
 		_, _ = runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "HEAD"))
 		_, _ = runGit(e.gitIn(ctx, wt, "", "clean", "-fd"))
 	}
 	// --no-commit stages the reverse of the whole range so it lands as a single counter-booking commit.
 	if _, rerr := runGit(e.gitIn(ctx, wt, "", "revert", "--no-commit", from+".."+to)); rerr != nil {
-		restore() // conflict (or an empty/degenerate range) → make no guess, leave the branch untouched
-		return true, nil
+		restore() // conflict (or a merge in range) → make no guess, leave the branch untouched
+		return true, false, nil
+	}
+	// A revert that stages nothing means the effect is already gone (idempotent retry, or later work
+	// removed it) — NOT an error and NOT a commit. Clear the sequencer state and report "no change".
+	if _, diffErr := runGit(e.gitIn(ctx, wt, "", "diff", "--cached", "--quiet")); diffErr == nil {
+		restore()
+		return false, false, nil
 	}
 	name, email := ghLogin, ""
 	if name == "" {
@@ -658,9 +670,9 @@ func (e Executor) RevertRange(ctx context.Context, wt, from, to, ghLogin string,
 	pre := []string{"-c", "user.name=" + name, "-c", "user.email=" + email}
 	if _, cerr := runGit(e.gitIn(ctx, wt, "", append(pre, "commit", "-m", message)...)); cerr != nil {
 		restore()
-		return false, fmt.Errorf("counter-booking commit: %w", cerr)
+		return false, false, fmt.Errorf("counter-booking commit: %w", cerr)
 	}
-	return false, nil
+	return false, true, nil
 }
 
 // CommitsAhead counts commits on HEAD that base does not have — i.e. how much there is to push.

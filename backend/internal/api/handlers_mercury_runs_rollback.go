@@ -28,10 +28,12 @@ import (
 var errDeliveryNotFound = errors.New("delivery not found")
 
 // counterBookResult is what the git side of a rollback reports back to the orchestration: whether the
-// reverse applied cleanly, the dev tip before/after the counter-booking commit (the reversal's range),
-// the repo's default branch (so a reversing PR can be based without a second lookup), and the dev-deploy.
+// reverse conflicted, whether it actually changed anything (false = the effect was already gone, an
+// idempotent no-op), the dev tip before/after the counter-booking commit (the reversal's range), the
+// repo's default branch (so a reversing PR can be based without a second lookup), and the dev-deploy.
 type counterBookResult struct {
 	conflicted    bool
+	changed       bool
 	before, after string
 	defaultBranch string
 	deployed      bool
@@ -44,6 +46,7 @@ type RollbackOutcome struct {
 	Reverted           bool   `json:"reverted"`
 	AlreadyReverted    bool   `json:"alreadyReverted,omitempty"`
 	Conflict           bool   `json:"conflict,omitempty"`
+	NoChange           bool   `json:"noChange,omitempty"` // the delivery's effect was already absent (idempotent no-op)
 	TodoID             string `json:"todoId,omitempty"`
 	LaterOpen          int    `json:"laterOpen,omitempty"`
 	ClosedPR           int    `json:"closedPr,omitempty"`
@@ -124,11 +127,13 @@ func (x *runExecutor) RollbackDelivery(ctx context.Context, deliveryID, actor st
 	}
 
 	// A merged delivery's counter-booking is itself a delivery with a stacked reversing PR; snapshot its
-	// branch during counterBook so the reversal is addressable like any other change.
+	// branch during counterBook so the reversal is addressable like any other change. The identifiers are
+	// DETERMINISTIC (derived from the delivery id) so a retried rollback reuses the same branch/record
+	// instead of proliferating duplicates.
 	reversalBranch, reversalID := "", ""
 	if merged {
-		reversalID = runs.NewDeliveryID()
-		reversalBranch = "mercury-run/" + d.RunID + "/revert-" + reversalID
+		reversalID = "dlv_rev_" + strings.TrimPrefix(d.ID, "dlv_")
+		reversalBranch = "mercury-run/" + d.RunID + "/revert-" + d.ID
 	}
 
 	cb, err := x.counterBook(ctx, token, d, reversalBranch)
@@ -150,8 +155,32 @@ func (x *runExecutor) RollbackDelivery(ctx context.Context, deliveryID, actor st
 		return out, nil
 	}
 	out.Deployed = cb.deployed
-
 	now := time.Now().UTC()
+
+	if !cb.changed {
+		// Nothing to counter-book: the delivery's effect is already absent from the dev state (a repeated
+		// rollback, or later work removed it). Mark it reverted idempotently and, if its PR is still open,
+		// close it. A MERGED delivery whose effect is already gone from dev is logged — dev is correct, but
+		// the merged default branch may still carry it, which a fresh rollback (once un-marked) would catch.
+		out.NoChange = true
+		if !merged && d.PRNumber != 0 {
+			_ = x.commentPR(ctx, token, d.Repo, d.PRNumber, rollbackCloseReason(d, actor))
+			if err := x.closePR(ctx, token, d.Repo, d.PRNumber); err != nil {
+				return out, fmt.Errorf("close PR: %w", err)
+			}
+			out.ClosedPR = d.PRNumber
+		} else if merged {
+			log.Printf("devlabd: rollback of delivery %s — dev already lacks its effect; the merged default branch may still carry it", d.ID)
+		}
+		_ = x.s.deliveries.Update(d.ID, func(dv *runs.Delivery) {
+			dv.Status = runs.DeliveryReverted
+			dv.RevertedAt = &now
+			dv.RevertedBy = actor
+		})
+		out.Reverted = true
+		return out, nil
+	}
+
 	if merged {
 		// The reversing PR stacks like any other change (req 11): on the latest open delivery, else default.
 		prBase := cb.defaultBranch
@@ -228,12 +257,17 @@ func (x *runExecutor) counterBookReal(ctx context.Context, token string, d runs.
 		return counterBookResult{}, fmt.Errorf("dev tip: %w", err)
 	}
 	ghLogin, ghID := x.runnerIdentity()
-	conflicted, err := ex.RevertRange(ctx, wt, d.FromCommit, d.ToCommit, ghLogin, ghID, counterBookMessage(d))
+	conflicted, changed, err := ex.RevertRange(ctx, wt, d.FromCommit, d.ToCommit, ghLogin, ghID, counterBookMessage(d))
 	if err != nil {
 		return counterBookResult{}, fmt.Errorf("counter-booking: %w", err)
 	}
 	if conflicted {
 		return counterBookResult{conflicted: true, defaultBranch: branch}, nil
+	}
+	if !changed {
+		// The delivery's effect is already absent (a repeated rollback, or later work removed it). No new
+		// commit, nothing to push — an idempotent no-op. The dev tip is unchanged.
+		return counterBookResult{changed: false, before: before, after: before, defaultBranch: branch}, nil
 	}
 	after, err := ex.RevParse(ctx, wt, "HEAD")
 	if err != nil {
@@ -249,7 +283,7 @@ func (x *runExecutor) counterBookReal(ctx context.Context, token string, d runs.
 	if _, err := ex.PushRefs(ctx, wt, token, false, pushRefs...); err != nil {
 		return counterBookResult{}, fmt.Errorf("push: %w", err)
 	}
-	res := counterBookResult{before: before, after: after, defaultBranch: branch}
+	res := counterBookResult{changed: true, before: before, after: after, defaultBranch: branch}
 	// Re-deliver dev (req 10): the dev state changed, so dev must be re-shipped (full mode only).
 	if x.mode == "full" && x.shouldDevDeploy(repo.ID) && x.deployable(repo.Name) {
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr == nil {

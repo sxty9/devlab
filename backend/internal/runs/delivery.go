@@ -26,7 +26,7 @@ type Delivery struct {
 	RunName  string `json:"runName,omitempty"` // snapshot so a delivery is legible after the run is deleted
 	Repo     string `json:"repo"`              // owner/name
 
-	// Branch is the immutable per-delivery snapshot branch (mercury-run/<runId>/<resultId>) whose tip is
+	// Branch is the immutable per-delivery snapshot branch (mercury-run/<runId>/<deliveryId>) whose tip is
 	// ToCommit; its PR is stacked on BaseBranch so the PR shows only THIS delivery's changes. DevBranch is
 	// the persistent integration branch (mercury-dev) this delivery grew — the state dev actually serves.
 	Branch     string `json:"branch"`
