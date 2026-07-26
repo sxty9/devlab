@@ -19,7 +19,7 @@ export function Modal({
   description?: string;
   children: ReactNode;
   footer?: ReactNode;
-  size?: 'sm' | 'md' | 'lg';
+  size?: 'sm' | 'md' | 'lg' | 'xl';
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
 
@@ -50,7 +50,7 @@ export function Modal({
         className={cn(
           'relative w-full origin-center overflow-hidden rounded-card border border-separator bg-surface-raised',
           'shadow-elev-3 ring-1 ring-black/5 animate-pop-in focus:outline-none',
-          size === 'sm' ? 'max-w-sm' : size === 'lg' ? 'max-w-2xl' : 'max-w-md',
+          size === 'sm' ? 'max-w-sm' : size === 'lg' ? 'max-w-2xl' : size === 'xl' ? 'max-w-5xl' : 'max-w-md',
         )}
       >
         <div className="flex items-start gap-3 border-b border-separator px-5 py-4">

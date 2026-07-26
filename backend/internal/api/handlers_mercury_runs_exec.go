@@ -1496,12 +1496,134 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
 // mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
 // scheme scan), so it is safe to poll frequently.
+//
+// Alongside it the endpoint returns `inflight`: the transparent list of every run the system is currently
+// working — the executing one PLUS every run SUSPENDED mid-execution on the usage limit (waiting to
+// resume). `active` stays the minimal projection existing consumers depend on; `inflight` is the enriched
+// list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
+// parallel data path.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
 	var active *runs.Activity
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active})
+	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+}
+
+// inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,
+// state "executing") or SUSPENDED on the usage limit mid-execution (state "suspended", waiting for its
+// window to reset). A portioned, read-only projection assembled for the "Aktive Läufe" overview so the UI
+// can render a transparent list — which run, on which repo/step, how far, how much spent — without a
+// follow-up fetch per run. Purely observational: nothing here drives scheduling or resume.
+type inFlightRun struct {
+	RunID   string `json:"runId"`
+	RunName string `json:"runName"`
+	Type    string `json:"type"`  // auto|todo
+	State   string `json:"state"` // executing|suspended
+
+	ResultID  string     `json:"resultId,omitempty"`
+	StartedAt *time.Time `json:"startedAt,omitempty"` // execution start (executing)
+	ResumeAt  *time.Time `json:"resumeAt,omitempty"`  // when a suspended run resumes
+	Attempts  int        `json:"attempts,omitempty"`  // suspended: resume attempts so far
+
+	CurrentRepo string `json:"currentRepo,omitempty"` // the repo in flight (executing)
+	CurrentStep string `json:"currentStep,omitempty"` // the step running right now (executing)
+	ReposDone   int    `json:"reposDone"`             // repos already completed this execution
+	ReposTotal  int    `json:"reposTotal,omitempty"`  // known only for ToDos (exact target count)
+
+	InputTokens  int     `json:"inputTokens"`
+	OutputTokens int     `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
+	NumTurns     int     `json:"numTurns"`
+}
+
+// assembleInFlight builds the transparent list of runs the system is currently working: the one
+// EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
+// limit). Each entry is enriched from its live result document so the overview shows the current
+// repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
+func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+	out := []inFlightRun{}
+	if s.runs == nil {
+		return out
+	}
+	all, err := s.runs.List()
+	if err != nil {
+		all = nil
+	}
+	byID := make(map[string]runs.Run, len(all))
+	for _, r := range all {
+		byID[r.ID] = r
+	}
+
+	// 1) The run executing right now (at most one — the scheduler runs runs serially).
+	if active != nil {
+		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
+		st := active.StartedAt
+		e.StartedAt = &st
+		if run, ok := byID[active.RunID]; ok {
+			e.RunName = run.Name
+			e.Type = string(runs.NormalizeType(run.Type))
+			e.ReposTotal = todoRepoTotal(run)
+		}
+		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		out = append(out, e)
+	}
+
+	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
+	//    double-count the executing one (a run cannot be both).
+	for _, run := range all {
+		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+			continue
+		}
+		e := inFlightRun{
+			RunID: run.ID, RunName: run.Name, State: "suspended",
+			Type:       string(runs.NormalizeType(run.Type)),
+			ResultID:   run.Suspended.ResultID,
+			Attempts:   run.Suspended.Attempts,
+			ReposTotal: todoRepoTotal(run),
+		}
+		resume := run.Suspended.ResumeAt
+		e.ResumeAt = &resume
+		s.enrichInFlight(&e, run.ID, run.Suspended.ResultID)
+		out = append(out, e)
+	}
+	return out
+}
+
+// todoRepoTotal is the exact destination-repo count for a ToDo (its Targets). An automatic run's repo set
+// is derived at execution time and not cheaply known here, so it returns 0 (unknown) and the UI shows
+// only the completed count rather than a fabricated denominator.
+func todoRepoTotal(run runs.Run) int {
+	if run.IsTodo() {
+		return len(run.TodoTargets())
+	}
+	return 0
+}
+
+// enrichInFlight fills an entry from its live result document: the repo currently in flight and its
+// running step, how many repos are already done, and the running token/cost totals. A missing or
+// unreadable result is non-fatal — the entry keeps its base fields so the overview still lists the run.
+func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
+	if s.runResults == nil || resultID == "" {
+		return
+	}
+	res, ok, err := s.runResults.Get(runID, resultID)
+	if err != nil || !ok {
+		return
+	}
+	e.ReposDone = len(res.Repos)
+	e.InputTokens, e.OutputTokens = res.InputTokens, res.OutputTokens
+	e.CostUSD, e.NumTurns = res.CostUSD, res.NumTurns
+	if res.Live != nil {
+		e.CurrentRepo = res.Live.Repo
+		// The step running right now is the last one still marked Running.
+		for i := len(res.Live.Steps) - 1; i >= 0; i-- {
+			if res.Live.Steps[i].Running {
+				e.CurrentStep = res.Live.Steps[i].Name
+				break
+			}
+		}
+	}
 }
 
 // runCancel aborts the run in progress (kill-switch).

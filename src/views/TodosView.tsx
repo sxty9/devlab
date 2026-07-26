@@ -6,7 +6,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -252,10 +252,10 @@ export default function TodosView() {
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
   const [refreshing, setRefreshing] = useState(false);
 
-  // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
-  // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
+  // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
+  // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
+  // affordance lives in that overview.
+  const { active, inflight, refetch: refetchActive } = useActiveRun();
   const [cancelling, setCancelling] = useState(false);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
@@ -420,16 +420,7 @@ export default function TodosView() {
                     <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
                   </Button>
                 </div>
-                {running && (
-                  <div className="flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5">
-                    <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-                    </span>
-                    <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-                      {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-                    </Button>
-                  </div>
-                )}
+                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} />
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
