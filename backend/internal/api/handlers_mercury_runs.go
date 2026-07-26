@@ -849,10 +849,10 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
 }
 
-// mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the
-// implementation rules, the Laufregeln, the runs and the ToDos, answers questions about any of them,
-// and — only when asked to create/change runs — embeds a run-plan the caller surfaces as a reviewable
-// proposal.
+// mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the implementation
+// rules, the Laufregeln, the meta-axioms, the runs and the ToDos, answers questions about any of them,
+// and — when asked to create/change something — embeds ONE action the caller surfaces as a reviewable
+// proposal (applied through the same access points the UI uses; see mercury/action.go).
 func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Messages []mercury.ChatMessage `json:"messages"`
@@ -865,7 +865,7 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	ctx, status, err := s.chatContext(r.Context(), cookie)
+	ctx, status, err := s.chatContext(r, cookie)
 	if err != nil {
 		mercuryError(w, status, err)
 		return
@@ -876,21 +876,20 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
-	known := make([]string, 0, len(ctx.Axiome))
-	for _, a := range ctx.Axiome {
-		known = append(known, a.ID)
-	}
-	plan, cleaned, ok := mercury.ExtractRunPlan(result.Output, known)
+	action, cleaned, ok := mercury.ExtractChatAction(result.Output, ctx.ActionContext())
 	resp := map[string]any{"reply": cleaned}
 	if ok {
-		resp["proposal"] = plan
+		resp["action"] = action
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // chatContext gathers everything the Mercury-wide assistant knows: one scheme scan (axioms, rules,
-// Laufregeln) plus the runs and ToDos.
-func (s *Server) chatContext(ctx context.Context, cookie string) (mercury.ChatContext, int, error) {
+// Laufregeln, meta-axioms — each with its path and id), the runs and ToDos (each with its id), and the
+// existing repos (as possible ToDo targets). Every actionable entity carries the addressing an action
+// needs, so a proposed action can only reference things that exist.
+func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContext, int, error) {
+	ctx := r.Context()
 	paths, status, err := aigentic.GraveList(ctx, cookie, "")
 	if err != nil {
 		return mercury.ChatContext{}, status, err
@@ -900,32 +899,59 @@ func (s *Server) chatContext(ctx context.Context, cookie string) (mercury.ChatCo
 		if !strings.HasSuffix(p, ".md") {
 			continue
 		}
+		section := chatSection(p)
+		if section == "" {
+			continue
+		}
 		rec, ok := s.fetchRecord(ctx, cookie, p)
 		if !ok {
 			continue
 		}
-		a := mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}
-		switch {
-		case strings.HasPrefix(p, mercury.NsAxiome+"/"):
-			c.Axiome = append(c.Axiome, a)
-		case strings.HasPrefix(p, mercury.NsRegeln+"/"):
-			c.Regeln = append(c.Regeln, a)
-		case strings.HasPrefix(p, mercury.NsLaeufe+"/"):
-			c.Laufregeln = append(c.Laufregeln, a)
-		}
+		c.Records = append(c.Records, mercury.ChatRecord{
+			Section: section, Path: p, ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body,
+		})
 	}
 	if s.runs != nil {
 		if all, err := s.runs.List(); err == nil {
 			for _, run := range all {
+				cr := mercury.ChatRun{ID: run.ID, Name: run.Name, Todo: run.IsTodo()}
 				if run.IsTodo() {
-					c.Todos = append(c.Todos, run.Name+" — "+targetsLabel(run)+" — "+mercury.Snippet(run.Task, 120))
-					continue
+					cr.Task = run.Task
+					cr.Targets = chatTargets(run.TodoTargets())
+				} else {
+					cr.Schedule = fromSchedule(run.Schedule)
+					cr.AxiomIDs = run.AxiomIDs
 				}
-				c.Runs = append(c.Runs, mercury.PlannedRun{Name: run.Name, AxiomIDs: run.AxiomIDs, Schedule: fromSchedule(run.Schedule)})
+				c.Runs = append(c.Runs, cr)
 			}
 		}
 	}
+	// Existing repos as possible ToDo targets — best-effort: a GitHub hiccup must not break the chat.
+	if repos, ok := s.userRepos(r); ok {
+		for _, rp := range repos {
+			c.Repos = append(c.Repos, mercury.ChatRepo{ID: rp.ID, Name: rp.Name})
+		}
+	}
 	return c, http.StatusOK, nil
+}
+
+// chatSection maps a record path to its Mercury section, or "" if it is not under a known namespace.
+func chatSection(path string) string {
+	for _, ns := range []string{mercury.NsAxiome, mercury.NsRegeln, mercury.NsLaeufe, mercury.NsMeta} {
+		if strings.HasPrefix(path, ns+"/") {
+			return ns
+		}
+	}
+	return ""
+}
+
+// chatTargets converts a ToDo's stored targets to the chat action shape.
+func chatTargets(ts []runs.Target) []mercury.ActionTarget {
+	out := make([]mercury.ActionTarget, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, mercury.ActionTarget{Repo: t.Repo, NewRepo: t.NewRepo})
+	}
+	return out
 }
 
 // --- small helpers -----------------------------------------------------------
@@ -963,21 +989,6 @@ func scheduleSummary(sc runs.Schedule) string {
 	default:
 		return sc.TimeOfDay
 	}
-}
-
-// targetsLabel renders a ToDo's destinations for the Mercury-wide assistant context — each target as
-// its repo id, a to-be-created one prefixed "neu:", joined by commas.
-func targetsLabel(run runs.Run) string {
-	targets := run.TodoTargets()
-	parts := make([]string, 0, len(targets))
-	for _, t := range targets {
-		if t.NewRepo != "" {
-			parts = append(parts, "neu: "+t.NewRepo)
-			continue
-		}
-		parts = append(parts, t.Repo)
-	}
-	return strings.Join(parts, ", ")
 }
 
 func actor(r *http.Request) string {

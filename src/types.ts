@@ -548,10 +548,29 @@ export interface RunChatMessage {
   content: string;
 }
 
-/** A chat reply, optionally carrying a reviewable run-plan the model proposed. */
+/** One destination of a proposed ToDo action: exactly an existing repo id OR a new repo name. */
+export interface ActionTarget {
+  repo?: string;
+  newRepo?: string;
+}
+
+/** A single mutating operation the Mercury-wide assistant proposes for the user to review and apply.
+ *  Each kind mirrors one operation of the Mercury UI and is applied through the SAME data-source method
+ *  the UI uses — the chat opens no parallel path. Discriminated on `kind`. */
+export type MercuryAction =
+  | { kind: 'create_todo'; name: string; task: string; targets: ActionTarget[]; dueAt?: string }
+  | { kind: 'create_run'; name: string; axiomIds: string[]; schedule: RunSchedule }
+  | { kind: 'add_record'; section: 'axiome' | 'regeln' | 'laeufe' | 'meta'; titel: string; body: string }
+  | { kind: 'edit_record'; path: string; titel: string; body: string }
+  | { kind: 'delete_record'; path: string }
+  | { kind: 'delete_run'; runId: string }
+  | { kind: 'run_now'; runId: string }
+  | { kind: 'plan_runs'; mode: 'fill' | 'replace'; runs: PlannedRun[] };
+
+/** A chat reply, optionally carrying ONE reviewable action the model proposed. */
 export interface RunChatReply {
   reply: string;
-  proposal?: RunPlan;
+  action?: MercuryAction;
 }
 
 // ── Atlas — the deployed Holistic landscape ──────────────────────────────────

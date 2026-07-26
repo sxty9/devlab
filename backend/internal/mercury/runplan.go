@@ -82,45 +82,11 @@ func ValidateRunPlan(p *RunPlan, knownAxiomIDs []string) error {
 				return fmt.Errorf("%w: Lauf %q referenziert unbekanntes Axiom %q", ErrInvalidPlacement, r.Name, id)
 			}
 		}
-		if !runTimeOfDayRe.MatchString(r.Schedule.TimeOfDay) {
-			return fmt.Errorf("%w: Lauf %q hat ungültige timeOfDay %q (HH:MM)", ErrInvalidPlacement, r.Name, r.Schedule.TimeOfDay)
-		}
-		switch r.Schedule.Kind {
-		case "daily":
-			if len(r.Schedule.Weekdays) != 0 {
-				return fmt.Errorf("%w: Lauf %q (daily) darf keine Wochentage haben", ErrInvalidPlacement, r.Name)
-			}
-		case "weekly":
-			if len(r.Schedule.Weekdays) == 0 {
-				return fmt.Errorf("%w: Lauf %q (weekly) braucht Wochentage", ErrInvalidPlacement, r.Name)
-			}
-			for _, d := range r.Schedule.Weekdays {
-				if d < 0 || d > 6 {
-					return fmt.Errorf("%w: Lauf %q hat ungültigen Wochentag %d (0=So..6=Sa)", ErrInvalidPlacement, r.Name, d)
-				}
-			}
-		default:
-			return fmt.Errorf("%w: Lauf %q hat schedule.kind %q (erwartet daily|weekly)", ErrInvalidPlacement, r.Name, r.Schedule.Kind)
+		if err := validatePlanSchedule(r.Name, r.Schedule); err != nil {
+			return err
 		}
 	}
 	return nil
-}
-
-// ExtractRunPlan pulls a valid run-plan JSON object out of free-form chat text (if present) and
-// returns the text with that JSON removed, so the chat reply reads cleanly. found is false when there
-// is no embedded plan or it does not validate.
-func ExtractRunPlan(text string, knownAxiomIDs []string) (plan RunPlan, cleaned string, found bool) {
-	raw, ok := firstJSONObject(text)
-	if !ok {
-		return RunPlan{}, text, false
-	}
-	if json.Unmarshal([]byte(raw), &plan) != nil {
-		return RunPlan{}, text, false
-	}
-	if ValidateRunPlan(&plan, knownAxiomIDs) != nil {
-		return RunPlan{}, text, false
-	}
-	return plan, strings.TrimSpace(strings.Replace(text, raw, "", 1)), true
 }
 
 // RunPlanFillPrompt asks the model to plan the given UNCOVERED axioms into runs with recurring
