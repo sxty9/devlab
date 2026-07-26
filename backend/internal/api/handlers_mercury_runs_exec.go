@@ -40,9 +40,9 @@ const (
 	deployWrapper = "/usr/local/sbin/devlab-deploy"
 	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
 	// no deploy target at all — see hasDeployTarget.
-	deployScriptDir = "/etc/devlab/deploy.d"
-	runAgentTimeout = 60 * time.Minute // a full implement pass can be long
-	runnerPreamble  = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
+	deployScriptDir     = "/etc/devlab/deploy.d"
+	defaultAgentTimeout = 60 * time.Minute // a full implement pass can be long
+	runnerPreamble      = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
 		"unresolved operational gaps follow the Laufregeln (log a non-blocking skip, do not stop). Make " +
 		"focused, correct, well-tested changes and summarise precisely what you did."
@@ -60,6 +60,19 @@ const (
 	// runAgentTimeout: even 19 repos each just under 60m would otherwise run ~19h. 0 via env = off.
 	defaultMaxRunDuration = 4 * time.Hour
 )
+
+// agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
+// service from nothing — that hit the ceiling and was killed mid-implement, leaving an empty repo, no
+// PR and no usable output. So the cap is configurable (DEVLAB_RUNS_AGENT_TIMEOUT); an explicit "0"
+// removes it entirely, leaving the whole-sweep duration cap as the only bound.
+func runAgentTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return defaultAgentTimeout
+}
 
 // maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
 // (remaining repos are left for the next scheduled run). 0 (the default) = no ceiling.
@@ -621,7 +634,11 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Base = head
 	}
 
-	actx, cancel := context.WithTimeout(ctx, runAgentTimeout)
+	actx, cancel := context.WithCancel(ctx)
+	if d := runAgentTimeout(); d > 0 {
+		cancel()
+		actx, cancel = context.WithTimeout(ctx, d)
+	}
 	defer cancel()
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
