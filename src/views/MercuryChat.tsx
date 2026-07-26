@@ -3,7 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
-import { SendIcon } from '@/ui/icons';
+import { LightbulbIcon, SendIcon } from '@/ui/icons';
 import type { RunChatMessage, RunPlan } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
@@ -31,17 +31,18 @@ function scheduleSummary(s: RunPlan['runs'][number]['schedule']): string {
  *  und ToDos). It sends the whole transcript each turn; when the model answers with a reviewable
  *  run-plan, an inline "Vorschlag übernehmen" applies it (mode `replace`) and closes.
  *
- *  It renders as a docked, resizable right sidebar (IDE-assistant style) — the parent lays it out as
- *  a flex sibling so opening it narrows the Mercury content rather than covering it. The conversation
- *  lives INSIDE this component: the parent keeps it mounted and only toggles `open`, so the history
- *  survives closing and reopening. */
+ *  It owns the right edge of the Mercury view: collapsed it is a slim vertical "KI-Chat" tab, open it
+ *  is a docked, resizable right sidebar (IDE-assistant style). The parent lays it out as a flex
+ *  sibling either way, so the toggle symbol and the panel share the same (right) side. The
+ *  conversation lives INSIDE this component and the parent keeps it mounted, so the history survives
+ *  collapsing and reopening. */
 export default function MercuryChat({
   open,
-  onClose,
+  onOpenChange,
   onApplied,
 }: {
   open: boolean;
-  onClose: () => void;
+  onOpenChange: (open: boolean) => void;
   onApplied?: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
@@ -105,7 +106,7 @@ export default function MercuryChat({
       toast({ title: 'Läufe übernommen', variant: 'success' });
       setPendingPlan(null);
       onApplied?.();
-      onClose();
+      onOpenChange(false);
     } catch (e) {
       toast({ title: 'Übernehmen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
@@ -113,7 +114,23 @@ export default function MercuryChat({
     }
   };
 
-  if (!open) return null;
+  // Collapsed: a slim vertical tab docked at the same right edge the panel opens on, so the KI-Chat
+  // symbol and its sidebar live on one side. Clicking it expands into the full panel below.
+  if (!open) {
+    return (
+      <aside className="flex shrink-0 border-l border-separator bg-surface-sidebar">
+        <button
+          type="button"
+          onClick={() => onOpenChange(true)}
+          aria-label="KI-Chat öffnen"
+          className="flex w-10 flex-col items-center gap-2.5 py-3 text-text-secondary transition duration-fast hover:bg-fill/10 hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/50"
+        >
+          <LightbulbIcon className="h-5 w-5 shrink-0 text-accent" />
+          <span className="text-caption font-medium tracking-wide [writing-mode:vertical-rl]">KI-Chat</span>
+        </button>
+      </aside>
+    );
+  }
 
   return (
     <aside
@@ -135,7 +152,7 @@ export default function MercuryChat({
         </div>
         <button
           type="button"
-          onClick={onClose}
+          onClick={() => onOpenChange(false)}
           aria-label="Chat schließen"
           className="shrink-0 rounded-md px-2 py-1 text-body text-text-tertiary transition duration-fast hover:bg-fill/10 hover:text-text-primary"
         >
