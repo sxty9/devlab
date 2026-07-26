@@ -1,0 +1,380 @@
+package workspace
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// devTestRepo builds a bare origin with a seeded main and a workspace clone, returning both paths and a
+// hermetic Executor. It also neutralises any global/system git config so a developer's ~/.gitconfig
+// (signing, merge defaults, identity) can never perturb the assertions.
+func devTestRepo(t *testing.T) (origin, wt string, e Executor) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+	root := t.TempDir()
+	origin = filepath.Join(root, "origin.git")
+	gitT(t, "", "init", "--bare", "-b", "main", origin)
+
+	seed := filepath.Join(root, "seed")
+	gitT(t, "", "clone", origin, seed)
+	writeF(t, filepath.Join(seed, "README.md"), "v1\n")
+	gitT(t, seed, "add", "-A")
+	gitCommit(t, seed, "seed")
+	gitT(t, seed, "push", "origin", "main")
+
+	wt = filepath.Join(root, "work")
+	gitT(t, "", "clone", origin, wt)
+	return origin, wt, Executor{PerUser: false}
+}
+
+// pushSeedMain advances origin/main from the seed clone with a new file (an external change the dev
+// state must be able to fold in).
+func advanceMain(t *testing.T, origin, name, content string) {
+	t.Helper()
+	seed := filepath.Join(t.TempDir(), "advance")
+	gitT(t, "", "clone", origin, seed)
+	writeF(t, filepath.Join(seed, name), content)
+	gitT(t, seed, "add", "-A")
+	gitCommit(t, seed, "advance main: "+name)
+	gitT(t, seed, "push", "origin", "main")
+}
+
+func exists(wt, rel string) bool {
+	_, err := os.Stat(filepath.Join(wt, rel))
+	return err == nil
+}
+
+// TestDevBranchGrows is req 1 + 7a/7b: the work of a previous run is present in the state of the next.
+// Run 1 creates mercury-dev from main, adds a file, and publishes it. A later run — even from a wiped
+// workspace — must sit on THAT accumulated state (the file present), NEVER be reset back to main.
+func TestDevBranchGrows(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+
+	// Run 1: establish mercury-dev from main (first time → created), do work, publish mercury-dev.
+	created, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	if err != nil {
+		t.Fatalf("EnsureDevBranch run1: %v", err)
+	}
+	if !created {
+		t.Errorf("first EnsureDevBranch must report created=true")
+	}
+	if err := e.CleanWorktree(ctx, wt); err != nil {
+		t.Fatalf("CleanWorktree: %v", err)
+	}
+	writeF(t, filepath.Join(wt, "run1.txt"), "built by run 1\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "run1 work")
+	if _, err := e.PushRefs(ctx, wt, "", false, dev); err != nil {
+		t.Fatalf("push dev run1: %v", err)
+	}
+
+	// A brand-new workspace clone (simulating a wiped/recreated workspace) must recover the grown state.
+	wt2 := filepath.Join(t.TempDir(), "work2")
+	gitT(t, "", "clone", origin, wt2)
+	created, err = e.EnsureDevBranch(ctx, wt2, "", "main", dev)
+	if err != nil {
+		t.Fatalf("EnsureDevBranch run2: %v", err)
+	}
+	if created {
+		t.Errorf("second EnsureDevBranch must report created=false (mercury-dev already exists)")
+	}
+	if !exists(wt2, "run1.txt") {
+		t.Errorf("run1's work missing after preparing the next run — the state was reset, not grown")
+	}
+	if branch := e.CurrentBranch(ctx, wt2); branch != dev {
+		t.Errorf("workspace on %q, want %q", branch, dev)
+	}
+}
+
+// TestCleanWorktreeKeepsHistory is req 4: hygiene removes an aborted run's half-changes (uncommitted
+// tracked edits + untracked files) WITHOUT touching history — the accumulated commits and the branch
+// pointer are untouched.
+func TestCleanWorktreeKeepsHistory(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "committed.txt"), "keep me\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "accumulated work")
+	before, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	// An aborted run's leftovers: an uncommitted edit to a tracked file and an untracked file.
+	writeF(t, filepath.Join(wt, "committed.txt"), "half-edited\n")
+	writeF(t, filepath.Join(wt, "stray.txt"), "orphan\n")
+
+	if err := e.CleanWorktree(ctx, wt); err != nil {
+		t.Fatalf("CleanWorktree: %v", err)
+	}
+	if got := readF(t, filepath.Join(wt, "committed.txt")); got != "keep me\n" {
+		t.Errorf("tracked edit not reverted: got %q", got)
+	}
+	if exists(wt, "stray.txt") {
+		t.Errorf("untracked stray.txt survived hygiene")
+	}
+	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	if before != after {
+		t.Errorf("HEAD moved (%s → %s) — hygiene must not touch history", before, after)
+	}
+	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
+		t.Errorf("worktree not clean: %q", out)
+	}
+}
+
+// TestFoldInBranch is req 1: the default branch is folded INTO the dev state. An external change on main
+// must appear on the dev branch after the fold, while the dev branch's own work is retained. An
+// already-contained default branch is a clean no-op.
+func TestFoldInBranch(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "dev-only.txt"), "dev work\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "dev work")
+
+	// No divergence yet → folding main is a clean no-op (main is an ancestor).
+	if err := e.FoldInBranch(ctx, wt, "main"); err != nil {
+		t.Fatalf("fold (up to date) must succeed: %v", err)
+	}
+
+	// main advances externally; fetch + fold brings it in without losing the dev-only work.
+	advanceMain(t, origin, "from-main.txt", "hotfix on main\n")
+	if err := e.Fetch(ctx, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.FoldInBranch(ctx, wt, "main"); err != nil {
+		t.Fatalf("fold (advanced main): %v", err)
+	}
+	if !exists(wt, "from-main.txt") {
+		t.Errorf("main's change not folded into the dev state")
+	}
+	if !exists(wt, "dev-only.txt") {
+		t.Errorf("dev-only work lost by the fold")
+	}
+}
+
+// TestFoldInBranchConflict pins the non-fatal conflict path: a divergent change to the same file aborts
+// the merge cleanly (ErrMergeConflict), leaving the dev branch exactly as before.
+func TestFoldInBranchConflict(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "README.md"), "dev version\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "dev edits README")
+	head, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	advanceMain(t, origin, "README.md", "main version\n") // conflicting edit to the same file
+	if err := e.Fetch(ctx, wt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.FoldInBranch(ctx, wt, "main"); !errors.Is(err, ErrMergeConflict) {
+		t.Fatalf("expected ErrMergeConflict, got %v", err)
+	}
+	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	if head != after {
+		t.Errorf("conflicting fold moved HEAD (%s → %s) — must abort cleanly", head, after)
+	}
+	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
+		t.Errorf("aborted fold left the tree dirty: %q", out)
+	}
+}
+
+// TestResetDevToDefault is req 5: the explicit way back discards the accumulated dev state and moves the
+// dev branch back onto the default branch — an explicit action, never automatic.
+func TestResetDevToDefault(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "discardme.txt"), "accumulated\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "work to be discarded")
+
+	if err := e.ResetDevToDefault(ctx, wt, "", "main", dev); err != nil {
+		t.Fatalf("ResetDevToDefault: %v", err)
+	}
+	if exists(wt, "discardme.txt") {
+		t.Errorf("accumulated work survived an explicit reset to the default branch")
+	}
+	// The dev branch now equals origin/main exactly.
+	devTip, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	mainTip, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "origin/main"))
+	if devTip != mainTip {
+		t.Errorf("after reset dev tip %s != origin/main %s", devTip, mainTip)
+	}
+}
+
+// TestRevertRangeCounterBooks is req 10 + 13b: a counter-booking removes a delivery's effect from the dev
+// state through a NEW reversing commit — history is not rewritten (the original commit remains and the
+// commit count grows, never shrinks).
+func TestRevertRangeCounterBooks(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	from, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	writeF(t, filepath.Join(wt, "feature.txt"), "delivered feature\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery: add feature")
+	to, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	countBefore := commitCount(t, e, ctx, wt)
+
+	conflicted, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery: add feature")
+	if err != nil {
+		t.Fatalf("RevertRange: %v", err)
+	}
+	if conflicted {
+		t.Fatalf("clean revert reported a conflict")
+	}
+	if exists(wt, "feature.txt") {
+		t.Errorf("counter-booking did not remove the delivery's effect (feature.txt still present)")
+	}
+	// History untouched: the original delivery commit is still reachable, and a reverting commit was ADDED.
+	if !commitReachable(t, e, ctx, wt, to) {
+		t.Errorf("original delivery commit %s no longer reachable — history was rewritten", to)
+	}
+	if got := commitCount(t, e, ctx, wt); got != countBefore+1 {
+		t.Errorf("commit count = %d, want %d (exactly one reversing commit added)", got, countBefore+1)
+	}
+}
+
+// TestRevertRangeConflict is req 12 + 13c: when later work built on the delivery and touched the same
+// lines, the counter-booking makes no guess — it reports a conflict and leaves the branch untouched, so
+// the caller can raise a ToDo instead of committing a mangled revert.
+func TestRevertRangeConflict(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	from, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	writeF(t, filepath.Join(wt, "shared.txt"), "line from delivery A\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery A")
+	to, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	// Later work builds on delivery A and rewrites the same line.
+	writeF(t, filepath.Join(wt, "shared.txt"), "delivery B rewrote this line\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery B on top of A")
+	head, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	conflicted, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery A")
+	if err != nil {
+		t.Fatalf("RevertRange returned a hard error: %v", err)
+	}
+	if !conflicted {
+		t.Fatalf("expected a conflict (later work touched the same lines)")
+	}
+	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	if head != after {
+		t.Errorf("a conflicting counter-booking moved HEAD (%s → %s) — it must leave the branch untouched", head, after)
+	}
+	if got := readF(t, filepath.Join(wt, "shared.txt")); got != "delivery B rewrote this line\n" {
+		t.Errorf("later work was clobbered by an aborted revert: %q", got)
+	}
+	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
+		t.Errorf("aborted revert left the tree dirty: %q", out)
+	}
+}
+
+// TestStackedDeliveryDiff is req 9 + 13a: a delivery's PR base is the previous delivery's branch, so the
+// diff shows ONLY that delivery's own changes even though it sits on the prior work.
+func TestStackedDeliveryDiff(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	// Delivery 1 on the dev branch.
+	writeF(t, filepath.Join(wt, "a.txt"), "delivery one\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery 1")
+	if err := e.BranchAt(ctx, wt, "mercury-run/r1", "HEAD"); err != nil {
+		t.Fatalf("BranchAt d1: %v", err)
+	}
+	// Delivery 2 stacks on top (same dev branch keeps growing).
+	writeF(t, filepath.Join(wt, "b.txt"), "delivery two\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery 2")
+	if err := e.BranchAt(ctx, wt, "mercury-run/r2", "HEAD"); err != nil {
+		t.Fatalf("BranchAt d2: %v", err)
+	}
+
+	// The PR of delivery 2 (base = delivery 1's branch) shows ONLY b.txt — not a.txt.
+	diff, _ := runGit(e.gitIn(ctx, wt, "", "diff", "--name-only", "mercury-run/r1", "mercury-run/r2"))
+	if diff != "b.txt" {
+		t.Errorf("stacked PR diff = %q, want only %q — the PR must show only its own changes", diff, "b.txt")
+	}
+	// The full branch still CONTAINS the prior work (req 3 — it carries the not-yet-merged prior work).
+	both, _ := runGit(e.gitIn(ctx, wt, "", "ls-tree", "--name-only", "mercury-run/r2"))
+	if !contains(both, "a.txt") || !contains(both, "b.txt") {
+		t.Errorf("delivery 2 branch must carry both a.txt and b.txt, got tree: %q", both)
+	}
+}
+
+func commitCount(t *testing.T, e Executor, ctx context.Context, wt string) int {
+	t.Helper()
+	n, err := e.CommitsAhead(ctx, wt, "origin/main")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	return n
+}
+
+func commitReachable(t *testing.T, e Executor, ctx context.Context, wt, sha string) bool {
+	t.Helper()
+	_, err := runGit(e.gitIn(ctx, wt, "", "merge-base", "--is-ancestor", sha, "HEAD"))
+	return err == nil
+}
+
+func contains(haystack, needle string) bool {
+	for _, line := range splitLines(haystack) {
+		if line == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func splitLines(s string) []string {
+	var out []string
+	cur := ""
+	for _, r := range s {
+		if r == '\n' {
+			out = append(out, cur)
+			cur = ""
+			continue
+		}
+		cur += string(r)
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
+}
