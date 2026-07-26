@@ -132,7 +132,9 @@ func RunPlanFillPrompt(uncovered []RunAxiom, existingRuns []string, correction s
 	b.WriteString("zugeordneten Axiome thematisch sinnvoll in Läufe und weise jedem Lauf einen ")
 	b.WriteString("wiederkehrenden Zeitplan zu.\n\n")
 	if len(existingRuns) > 0 {
-		b.WriteString("Bereits bestehende Läufe (du darfst einen gleichnamigen erweitern):\n")
+		b.WriteString("Bereits bestehende Läufe: Ordne ein Axiom BEVORZUGT einem thematisch passenden ")
+		b.WriteString("bestehenden Lauf zu — nenne dann exakt dessen Namen, damit er erweitert wird. Lege nur ")
+		b.WriteString("dann einen neuen Lauf an, wenn kein bestehender thematisch passt.\n")
 		for _, n := range existingRuns {
 			b.WriteString("  " + n + "\n")
 		}
