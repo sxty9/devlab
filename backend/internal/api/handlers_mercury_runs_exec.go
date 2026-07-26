@@ -1473,7 +1473,8 @@ func clip(s string) string {
 }
 
 // runNow triggers a run immediately, detached from this request (it can take a long time). Returns at
-// once; the UI polls the run's results. 503 when unconfigured, 409 when a run is already in progress.
+// once; the UI polls the run's results. 503 when unconfigured, 409 when it cannot start right now (the
+// concurrency cap is reached, an exclusive auto run holds the floor, or a target repo is already busy).
 func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert (DEVLAB_RUNS_MODE/DEVLAB_RUNS_USER)")
@@ -1485,33 +1486,33 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.scheduler.FireNow(id, actor(r)) {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
+		writeErr(w, http.StatusConflict, "Kann gerade nicht starten — Auslastung erreicht oder ein Ziel-Repository ist belegt; bitte warten")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
-// runActive reports the run executing in THIS process right now — its id, the live result id (once the
-// executor mints it), and when it started — or null when nothing runs. It is the single source of truth
-// the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
-// mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
-// scheme scan), so it is safe to poll frequently.
+// runActive reports EVERY run executing in THIS process right now — each with its id, name, live result
+// id (once the executor mints it), and start time — or an empty list when nothing runs. It is the single
+// source of truth the UI reads on mount (so running runs survive a page reload) and polls to follow them
+// live: it mirrors actually-alive goroutines, hence correct across reloads and empty after a restart.
+// Cheap (no scheme scan), so it is safe to poll frequently.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
+	active := []runs.Activity{}
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"active": active})
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts ONE specific run in progress (kill-switch) by id — the others keep running.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
