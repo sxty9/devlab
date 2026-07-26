@@ -111,6 +111,12 @@ func NewResultID(t time.Time) string {
 // when the execution was last worked (used by FindStranded to bound resume by recency of activity).
 func (r *Results) Save(res Result) error {
 	res.UpdatedAt = time.Now().UTC()
+	// A nil slice marshals to JSON null, which the UI iterates directly and crashes on (a black screen on
+	// a failed/husk execution that completed no repo). Persist an empty slice instead — same guarantee the
+	// aggregate listings already make (see All/ListForRun).
+	if res.Repos == nil {
+		res.Repos = []RepoResult{}
+	}
 	dir := filepath.Join(r.dir, res.RunID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
