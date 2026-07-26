@@ -281,12 +281,12 @@ func TestRevertRangeCounterBooks(t *testing.T) {
 	to, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
 	countBefore := commitCount(t, e, ctx, wt)
 
-	conflicted, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery: add feature")
+	conflicted, changed, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery: add feature")
 	if err != nil {
 		t.Fatalf("RevertRange: %v", err)
 	}
-	if conflicted {
-		t.Fatalf("clean revert reported a conflict")
+	if conflicted || !changed {
+		t.Fatalf("clean revert: conflicted=%v changed=%v, want false/true", conflicted, changed)
 	}
 	if exists(wt, "feature.txt") {
 		t.Errorf("counter-booking did not remove the delivery's effect (feature.txt still present)")
@@ -322,12 +322,12 @@ func TestRevertRangeConflict(t *testing.T) {
 	gitCommit(t, wt, "delivery B on top of A")
 	head, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
 
-	conflicted, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery A")
+	conflicted, changed, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert delivery A")
 	if err != nil {
 		t.Fatalf("RevertRange returned a hard error: %v", err)
 	}
-	if !conflicted {
-		t.Fatalf("expected a conflict (later work touched the same lines)")
+	if !conflicted || changed {
+		t.Fatalf("expected a conflict (later work touched the same lines): conflicted=%v changed=%v", conflicted, changed)
 	}
 	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
 	if head != after {
@@ -338,6 +338,47 @@ func TestRevertRangeConflict(t *testing.T) {
 	}
 	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
 		t.Errorf("aborted revert left the tree dirty: %q", out)
+	}
+}
+
+// TestRevertRangeAlreadyReverted pins idempotency: counter-booking a delivery whose effect is already
+// gone (a repeated rollback, or later work removed it) is a clean no-op — changed=false, no error, no new
+// commit — never a spurious error or a re-application of the change.
+func TestRevertRangeAlreadyReverted(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	from, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	writeF(t, filepath.Join(wt, "feature.txt"), "delivered\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "delivery")
+	to, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	// First counter-booking removes the effect.
+	if _, changed, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert 1"); err != nil || !changed {
+		t.Fatalf("first revert: changed=%v err=%v", changed, err)
+	}
+	countAfterFirst := commitCount(t, e, ctx, wt)
+
+	// A second counter-booking of the same range is a clean no-op (the effect is already gone).
+	conflicted, changed, err := e.RevertRange(ctx, wt, from, to, "tester", 1, "Revert 2")
+	if err != nil {
+		t.Fatalf("repeated revert must not error, got %v", err)
+	}
+	if conflicted || changed {
+		t.Errorf("repeated revert: conflicted=%v changed=%v, want false/false (idempotent no-op)", conflicted, changed)
+	}
+	if exists(wt, "feature.txt") {
+		t.Errorf("repeated revert re-applied the delivery — feature.txt came back")
+	}
+	if got := commitCount(t, e, ctx, wt); got != countAfterFirst {
+		t.Errorf("repeated revert added a commit (count %d → %d) — it must be a no-op", countAfterFirst, got)
+	}
+	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
+		t.Errorf("repeated revert left the tree dirty: %q", out)
 	}
 }
 
