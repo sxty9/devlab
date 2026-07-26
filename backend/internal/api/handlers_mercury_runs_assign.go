@@ -58,7 +58,7 @@ const assignPassTimeout = 10 * time.Minute
 func newAutoAssigner(s *Server) *autoAssigner {
 	a := &autoAssigner{s: s, delay: assignDelay()}
 	a.catalog = func(ctx context.Context, cookie string) (map[string]mercury.RunAxiom, []mercury.RunAxiom, error) {
-		byID, _, laufregeln, _, err := s.runCatalog(ctx, cookie)
+		byID, _, laufregeln, err := s.runCatalog(ctx, cookie)
 		return byID, laufregeln, err
 	}
 	a.plan = func(ctx context.Context, cookie, csrf string, uncovered []mercury.RunAxiom, existing, known []string) (mercury.RunPlan, error) {

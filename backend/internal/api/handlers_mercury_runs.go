@@ -24,10 +24,10 @@ import (
 // runCatalog scans the scheme store once: every axiom by its stable id (as the RunAxiom shape used for
 // composition), the id→path index (coverage badges), and all global Laufregeln. Mirrors
 // buildRolloutBlock's scan; reuses fetchRecord.
-func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, idPath map[string]string, laufregeln []mercury.RunAxiom, status int, err error) {
-	paths, status, err := aigentic.GraveList(ctx, cookie, "")
+func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, idPath map[string]string, laufregeln []mercury.RunAxiom, err error) {
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
-		return nil, nil, nil, status, err
+		return nil, nil, nil, err
 	}
 	byID = map[string]mercury.RunAxiom{}
 	idPath = map[string]string{}
@@ -44,7 +44,7 @@ func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string
 			}
 		}
 	}
-	return byID, idPath, laufregeln, http.StatusOK, nil
+	return byID, idPath, laufregeln, nil
 }
 
 // todoAttachmentDescriptors maps a ToDo's stored attachment metadata to the lean descriptors the prompt
@@ -126,9 +126,9 @@ func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
 		return
 	}
-	byID, _, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -146,9 +146,9 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
 		return
 	}
-	byID, idPath, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, idPath, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -184,9 +184,9 @@ func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	byID, _, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -207,9 +207,9 @@ func (s *Server) runPromptPreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	axs := axiomsFor(run.AxiomIDs, byID)
@@ -359,9 +359,9 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -406,9 +406,9 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -506,9 +506,9 @@ func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -552,9 +552,9 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -653,9 +653,9 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	// Re-validate the (possibly user-edited) plan against the current axiom set.
@@ -736,9 +736,9 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 	// A snapshot carries each run's prompt as it was composed then; the axioms may have moved on since.
 	// Recompose from the CURRENT scheme so a restored config comes back correct, never stale (staleness
 	// is structurally unreachable — there is no longer a badge to surface it).
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	now := time.Now()
@@ -968,9 +968,9 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	ctx, status, err := s.chatContext(r, cookie)
+	ctx, err := s.chatContext(r, cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	prompt := mercury.MercuryChatPrompt(ctx, body.Messages)
@@ -991,11 +991,11 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 // Laufregeln, meta-axioms — each with its path and id), the runs and ToDos (each with its id), and the
 // existing repos (as possible ToDo targets). Every actionable entity carries the addressing an action
 // needs, so a proposed action can only reference things that exist.
-func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContext, int, error) {
+func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContext, error) {
 	ctx := r.Context()
-	paths, status, err := aigentic.GraveList(ctx, cookie, "")
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
-		return mercury.ChatContext{}, status, err
+		return mercury.ChatContext{}, err
 	}
 	var c mercury.ChatContext
 	for _, p := range paths {
@@ -1035,7 +1035,7 @@ func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContex
 			c.Repos = append(c.Repos, mercury.ChatRepo{ID: rp.ID, Name: rp.Name})
 		}
 	}
-	return c, http.StatusOK, nil
+	return c, nil
 }
 
 // chatSection maps a record path to its Mercury section, or "" if it is not under a known namespace.

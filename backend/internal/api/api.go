@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
@@ -41,6 +42,7 @@ type Server struct {
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
+	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
 	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
@@ -84,6 +86,10 @@ func New(v *auth.Verifier) *Server {
 		axiomChecks: runs.NewAxiomChecks(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
+	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
+	// identity the autonomous pipeline commits with — so an edit works whether or not the person making
+	// it has linked GitHub themselves.
+	s.axioms = axiomrepo.New(axiomsDir(), axiomsRepo(), func() (string, error) { return s.links.Token(axiomsTokenUser()) })
 	s.autoRollout = newAutoRollout(s)
 	// The auto-assigner runs on a caller's forwarded session (like the AI-fill button), so it needs no
 	// scheduler-style provisioning — arm it whenever the run store exists.

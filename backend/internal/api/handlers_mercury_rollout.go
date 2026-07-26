@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/runs"
@@ -186,7 +185,7 @@ func rolloutMergeAfter() time.Duration {
 
 // buildRolloutBlock reads every axiom and rule from the store, parses each, and renders the block.
 func (s *Server) buildRolloutBlock(ctx context.Context, cookie string) (string, error) {
-	paths, _, err := aigentic.GraveList(ctx, cookie, "")
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
 		return "", err
 	}
@@ -207,7 +206,7 @@ func (s *Server) buildRolloutBlock(ctx context.Context, cookie string) (string, 
 }
 
 func (s *Server) fetchRecord(ctx context.Context, cookie, path string) (mercury.Record, bool) {
-	data, found, _, err := aigentic.GraveGet(ctx, cookie, path)
+	data, found, err := s.axioms.Get(ctx, path)
 	if err != nil || !found {
 		return mercury.Record{}, false
 	}

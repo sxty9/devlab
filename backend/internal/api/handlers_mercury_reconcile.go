@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/runs"
 )
@@ -43,7 +42,7 @@ func (s *Server) reconcileAfterWrite(ctx context.Context, cookie string, touched
 // as Records for the rollout block. NsAxiome records feed both forms from a single fetch. Reuses
 // fetchRecord — the same read primitive every other Mercury handler uses.
 func (s *Server) scanForReconcile(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, axiome, regeln []mercury.Record, err error) {
-	paths, _, err := aigentic.GraveList(ctx, cookie, "")
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}

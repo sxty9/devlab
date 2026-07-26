@@ -25,7 +25,6 @@ type migrateResult struct {
 func (s *Server) mercuryMigrate(w http.ResponseWriter, r *http.Request) {
 	apply := r.URL.Query().Get("apply") == "true"
 	cookie := r.Header.Get("Cookie")
-	csrf := csrfFrom(r)
 
 	atoms := mercury.Decompose()
 	results := make([]migrateResult, 0, len(atoms))
@@ -38,7 +37,7 @@ func (s *Server) mercuryMigrate(w http.ResponseWriter, r *http.Request) {
 
 		if apply {
 			ax := mercury.Axiom{ID: mintID(), Titel: atom.SeedTitle, Quelle: atom.Quelle, Body: atom.Body}
-			placed, perr := s.putAxiom(r.Context(), cookie, csrf, path, firstLine(atom.Body), mercury.Render(ax))
+			placed, perr := s.putAxiom(r.Context(), "Migration", path, firstLine(atom.Body), mercury.Render(ax))
 			if perr != nil {
 				mr.Path = "FEHLER: " + perr.Error()
 			} else {

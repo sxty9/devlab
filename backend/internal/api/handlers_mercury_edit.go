@@ -1,11 +1,13 @@
 package api
 
 import (
+	"errors"
+
+	"devlab/backend/internal/axiomrepo"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/mercury"
 )
 
@@ -36,12 +38,11 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cookie := r.Header.Get("Cookie")
-	csrf := csrfFrom(r)
 
 	// Read the existing record so the stable id and quelle survive the edit.
-	data, found, status, err := aigentic.GraveGet(r.Context(), cookie, body.Path)
+	data, found, err := s.axioms.Get(r.Context(), body.Path)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	if !found {
@@ -60,17 +61,17 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	// record (same category) before writing. A body-only edit leaves the slug unchanged and never moves.
 	newPath := reslugLeaf(body.Path, body.Titel)
 	if newPath != body.Path {
-		if status, err := aigentic.GraveMove(r.Context(), cookie, csrf, body.Path, newPath); err != nil {
-			if status == http.StatusConflict {
+		if err := s.axioms.Move(r.Context(), body.Path, newPath, "Axiom umbenannt: "+body.Titel, actor(r)); err != nil {
+			if errors.Is(err, axiomrepo.ErrExists) {
 				writeErr(w, http.StatusConflict, "In dieser Kategorie existiert bereits ein Axiom mit diesem Titel")
 				return
 			}
-			mercuryError(w, status, err)
+			mercuryError(w, http.StatusBadGateway, err)
 			return
 		}
 	}
-	if _, status, err := aigentic.GravePut(r.Context(), cookie, csrf, newPath, firstLine(body.Body), content, true); err != nil {
-		mercuryError(w, status, err)
+	if err := s.axioms.Put(r.Context(), newPath, string(content), firstLine(body.Body), actor(r), true); err != nil {
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
@@ -97,13 +98,13 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	status, err := aigentic.GraveMove(r.Context(), cookie, csrfFrom(r), body.From, body.To)
+	err := s.axioms.Move(r.Context(), body.From, body.To, "Verschoben: "+body.From+" → "+body.To, actor(r))
 	if err != nil {
-		if status == http.StatusConflict {
+		if errors.Is(err, axiomrepo.ErrExists) {
 			writeErr(w, http.StatusConflict, "Am Zielpfad liegt bereits ein Axiom")
 			return
 		}
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
@@ -118,8 +119,8 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	if status, err := aigentic.GraveDelete(r.Context(), cookie, csrfFrom(r), path); err != nil {
-		mercuryError(w, status, err)
+	if err := s.axioms.Delete(r.Context(), path, "Gelöscht: "+path, actor(r)); err != nil {
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(path))
@@ -148,12 +149,11 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cookie := r.Header.Get("Cookie")
-	csrf := csrfFrom(r)
 	// List by the bare prefix (scheme's list rejects a trailing slash), then keep only records
 	// genuinely UNDER this category — "axiome/ui" must not sweep up a sibling "axiome/ui-native".
-	all, status, err := aigentic.GraveList(r.Context(), cookie, body.From)
+	all, err := s.axioms.List(r.Context(), body.From)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	prefix := body.From + "/"
@@ -163,7 +163,7 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		dest := body.To + strings.TrimPrefix(leaf, body.From)
-		if _, err := aigentic.GraveMove(r.Context(), cookie, csrf, leaf, dest); err != nil {
+		if err := s.axioms.Move(r.Context(), leaf, dest, "Kategorie verschoben: "+leaf+" → "+dest, actor(r)); err != nil {
 			writeErr(w, http.StatusConflict, "Konnte "+leaf+" nicht verschieben (Ziel belegt?); "+strconv.Itoa(moved)+" bereits verschoben")
 			return
 		}

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"errors"
+
 	"context"
 	"crypto/rand"
+	"devlab/backend/internal/axiomrepo"
 	"encoding/base32"
 	"net/http"
 	"strings"
@@ -48,9 +51,9 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	csrf := csrfFrom(r)
 
-	paths, status, err := aigentic.GraveList(r.Context(), cookie, "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	categories, members := s.classifyContext(r.Context(), cookie, ns, paths)
@@ -101,7 +104,7 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	ax := mercury.Axiom{ID: mintID(), Titel: titel, Body: body.Body}
 	content := mercury.Render(ax)
 
-	placed, err := s.putAxiom(r.Context(), cookie, csrf, path, desc, content)
+	placed, err := s.putAxiom(r.Context(), actor(r), path, desc, content)
 	if err != nil {
 		mercuryError(w, http.StatusBadGateway, err)
 		return
@@ -167,7 +170,7 @@ func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	// For an axiom, fold the meta-axioms into the polish so it comes out already conforming.
 	var metas []mercury.RunAxiom
 	if ns == mercury.NsAxiome {
-		if paths, _, err := aigentic.GraveList(r.Context(), cookie, ""); err == nil {
+		if paths, err := s.axioms.List(r.Context(), ""); err == nil {
 			metas = s.metaAxioms(r.Context(), cookie, paths)
 		}
 	}
@@ -203,9 +206,9 @@ func (s *Server) conformRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	paths, status, err := aigentic.GraveList(r.Context(), cookie, "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	metas := s.metaAxioms(r.Context(), cookie, paths)
@@ -296,14 +299,14 @@ func (s *Server) classifyContext(ctx context.Context, cookie, ns string, paths [
 
 // putAxiom writes the record, disambiguating a slug clash once (409 → append -2) so a new axiom can
 // never silently overwrite an existing one.
-func (s *Server) putAxiom(ctx context.Context, cookie, csrf, path, desc, content string) (string, error) {
-	_, status, err := aigentic.GravePut(ctx, cookie, csrf, path, desc, []byte(content), false)
+func (s *Server) putAxiom(ctx context.Context, actorName, path, desc, content string) (string, error) {
+	err := s.axioms.Put(ctx, path, content, desc, actorName, false)
 	if err == nil {
 		return path, nil
 	}
-	if status == http.StatusConflict {
+	if errors.Is(err, axiomrepo.ErrExists) {
 		alt := strings.TrimSuffix(path, ".md") + "-2.md"
-		if _, _, err2 := aigentic.GravePut(ctx, cookie, csrf, alt, desc, []byte(content), false); err2 == nil {
+		if err2 := s.axioms.Put(ctx, alt, content, desc, actorName, false); err2 == nil {
 			return alt, nil
 		}
 	}
