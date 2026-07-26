@@ -7,6 +7,7 @@ import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -251,6 +252,7 @@ export default function TodosView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
   const [refreshing, setRefreshing] = useState(false);
+  const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
   // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
   // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
@@ -352,6 +354,11 @@ export default function TodosView() {
     );
   }
 
+  // The list carries only NEVER-executed ToDos; once a ToDo has fired (lastFiredAt set) its record lives
+  // in the History tab instead, so list ∩ history = ∅. selectedTodo still resolves against the full set,
+  // so a ToDo you just ran keeps showing its result in the detail pane before it drops out of the list.
+  const openTodos = todos.filter((t) => !t.lastFiredAt);
+  const shownTodos = applyRunFilter(openTodos, filter);
   const selectedTodo = selectedId ? todos.find((t) => t.id === selectedId) ?? null : null;
 
   let rightPane: ReactNode;
@@ -420,6 +427,7 @@ export default function TodosView() {
                     <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
                   </Button>
                 </div>
+                {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
                 {running && (
                   <div className="flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5">
                     <span className="flex items-center gap-1.5 text-caption text-text-secondary">
@@ -437,9 +445,13 @@ export default function TodosView() {
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine ToDos. Lege eins an für einen Ad-hoc-Fix oder einen neuen Service.
                   </p>
+                ) : openTodos.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">All ToDos have run — see the History tab.</p>
+                ) : shownTodos.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">No ToDos match the current filter.</p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {todos.map((todo) => (
+                    {shownTodos.map((todo) => (
                       <TodoRow
                         key={todo.id}
                         todo={todo}
@@ -467,7 +479,8 @@ export default function TodosView() {
   );
 }
 
-/** One row in the left list: name, target, due date, plus done/disabled pills. */
+/** One row in the left list: name, target, due date, plus a disabled pill. The list holds only
+ *  never-run ToDos, so no "done" state appears here — executed ToDos live in the History tab. */
 function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; onSelect: () => void }) {
   return (
     <button
@@ -482,11 +495,6 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {todo.name}
         </span>
-        {todo.done && (
-          <span className="flex shrink-0 items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 text-caption font-medium text-success">
-            <CheckIcon className="h-3 w-3" /> Erledigt
-          </span>
-        )}
         {!todo.enabled && (
           <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">deaktiviert</span>
         )}
