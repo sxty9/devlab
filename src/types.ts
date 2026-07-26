@@ -128,6 +128,24 @@ export interface AiMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: string;
+  /** A structured question the assistant posed (interactive turns); rendered as clickable options. */
+  ask?: AiAsk;
+}
+
+/** A structured multiple-choice question the AI posed, answerable by clicking options in the chat
+ * bubble (à la Claude Code). Mirrors aigentic's interactive protocol, surfaced verbatim. */
+export interface AiAskOption {
+  label: string;
+  description?: string;
+}
+export interface AiAskQuestion {
+  header?: string;
+  question: string;
+  options: AiAskOption[];
+  multiSelect?: boolean;
+}
+export interface AiAsk {
+  questions: AiAskQuestion[];
 }
 
 /** What the AI assistant returns after a run (proxied from aigentic). */
@@ -136,6 +154,8 @@ export interface AssistantReply {
   engine: string;
   model: string;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number; truncated: boolean };
+  /** Set when the model replied with a structured question instead of (or alongside) prose. */
+  ask?: AiAsk;
 }
 
 /** The payload for one AI turn. */
