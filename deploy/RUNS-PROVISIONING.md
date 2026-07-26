@@ -100,11 +100,12 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 
 | Env | Default | Bedeutung |
 |---|---|---|
+| `DEVLAB_RUNS_MAX_CONCURRENT` | `2` | Obergrenze **gleichzeitig** laufender Läufe. Schützt Abo-Kontingent, Rechenzeit und Arbeitsspeicher vor einem Schwung ToDos. Zwei Läufe bearbeiten nie dasselbe Repo; ein automatischer Lauf (fegt alle Repos) läuft exklusiv, also allein. Ein Lauf, dessen Ziele belegt sind oder der über der Grenze liegt, wird zurückgestellt (belegt keinen Slot). Werte `< 1` werden ignoriert (Default greift). |
 | `DEVLAB_RUNS_MAX_DURATION` | `4h` | Obergrenze Wall-Clock **pro Lauf-Versuch**. Reststrecke wird auf den nächsten Termin übertragen (nicht neu begonnen). **`0` = AUS (unbegrenzt)** — nicht „keine Läufe"; Läufe stoppt man mit `MODE=off`. |
-| `DEVLAB_RUNS_MAX_COST_USD` | `0` (aus) | Kosten­deckel **pro Versuch** (nicht kumulativ). Weicher Deckel: der laufende Repo überschreitet ggf. um seine eigenen Kosten. Reststrecke wird übertragen. Nur wirksam, wenn der Claude-CLI `total_cost_usd` liefert (bei Abo-Auth ggf. `0` → dann wirkungslos; einmal prüfen). |
-| `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
+| `DEVLAB_RUNS_MAX_COST_USD` | `0` (aus) | Kosten­deckel über **alle gleichzeitig laufenden** Ausführungen zusammen (in Summe, nicht je Lauf). Weicher Deckel: der laufende Repo überschreitet ggf. um seine eigenen Kosten; die Reststrecke wird übertragen. Ein beendeter Lauf gibt seinen Anteil frei. Nur wirksam, wenn der Claude-CLI `total_cost_usd` liefert (bei Abo-Auth ggf. `0` → dann wirkungslos; einmal prüfen). |
+| `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). Trifft das Abo-Limit, pausieren alle gleichzeitig laufenden Ausführungen gemeinsam und setzen gemeinsam fort. |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
-| `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
+| `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus einem laufenden Lauf heraus deployt wird, solange Läufe aktiv sind (Neustart würde alle laufenden Ausführungen killen). Groß/klein egal. |
 
 > **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
 > klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.
