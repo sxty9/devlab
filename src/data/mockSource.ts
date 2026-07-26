@@ -354,8 +354,19 @@ export const mockSource: DataSource = {
   async mercuryRunExecutions(_type?: import('@/types').RunType) {
     return { executions: [] };
   },
-  async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
-    return { reply: 'Mock-Antwort' };
+  async mercuryChat(messages: import('@/types').RunChatMessage[]) {
+    // Offline stand-in: infer a plausible action from the last message so the review-and-apply flow is
+    // demonstrable without the backend. The real assistant derives the action from the model.
+    const last = messages[messages.length - 1]?.content.toLowerCase() ?? '';
+    let action: import('@/types').MercuryAction | undefined;
+    if (/todo|aufgabe|bug/.test(last)) {
+      action = { kind: 'create_todo', name: 'Neues ToDo', task: last.slice(0, 200) || 'Beschreibung', targets: [{ repo: DEFAULT_REPO_ID }] };
+    } else if (/axiom|regel/.test(last)) {
+      action = { kind: 'add_record', section: 'axiome', titel: 'Neues Axiom', body: last.slice(0, 200) || 'Ein Satz.' };
+    } else if (/lauf|läufe|plan/.test(last)) {
+      action = { kind: 'create_run', name: 'Neuer Lauf', axiomIds: ['ax_mock'], schedule: { kind: 'daily', timeOfDay: '03:00' } };
+    }
+    return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
   },
   async mercuryRunNow(_id: string) {
     return { started: true };

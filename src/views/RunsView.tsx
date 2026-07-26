@@ -194,7 +194,13 @@ export default function RunsView() {
     );
   }
 
-  const selectedRun = selectedId ? list.runs.find((r) => r.id === selectedId) ?? null : null;
+  // Konkrete ToDos share the run store but belong to the ToDos-Ansicht, not here. The Automatischen
+  // Läufe list shows ONLY auto runs (type absent = auto, mirroring TodosView's `type === 'todo'`).
+  // Without this filter a ToDo appears here and selecting it renders the auto-run detail against
+  // todo-shaped data — a blank screen.
+  const autoRuns = list.runs.filter((r) => r.type !== 'todo');
+
+  const selectedRun = selectedId ? autoRuns.find((r) => r.id === selectedId) ?? null : null;
 
   let rightPane: ReactNode;
   if (mode === 'create') {
@@ -272,13 +278,13 @@ export default function RunsView() {
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
-                {list.runs.length === 0 ? (
+                {autoRuns.length === 0 ? (
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine Läufe. Lege einen an oder nutze „Mit KI auffüllen“.
                   </p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {list.runs.map((run) => (
+                    {autoRuns.map((run) => (
                       <RunRow
                         key={run.id}
                         run={run}
@@ -794,7 +800,9 @@ function CalendarView({ dataVersion }: { dataVersion: number }) {
     let cancelled = false;
     const load = async () => {
       try {
-        const c = await source.mercuryRunCalendar(30);
+        // Auto runs only — this is the Automatische-Läufe calendar; ToDos have their own (the global
+        // calendar unites both). Mirrors the History tab's type="auto".
+        const c = await source.mercuryRunCalendar(30, 'auto');
         if (!cancelled) {
           setCal(c);
           gotDataRef.current = true;

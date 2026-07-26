@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
+import type { DataSource } from '@/data/source';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { SendIcon } from '@/ui/icons';
-import type { RunChatMessage, RunPlan } from '@/types';
+import type { ActionTarget, MercuryAction, RunChatMessage, RunSchedule } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
@@ -20,16 +21,99 @@ const WEEKDAYS: { num: number; label: string }[] = [
   { num: 0, label: 'So' },
 ];
 
-function scheduleSummary(s: RunPlan['runs'][number]['schedule']): string {
+function scheduleSummary(s: RunSchedule): string {
   if (s.kind === 'daily') return `täglich ${s.timeOfDay}`;
   const days = WEEKDAYS.filter((w) => s.weekdays?.includes(w.num)).map((w) => w.label);
   if (days.length === 0) return `wöchentlich · ${s.timeOfDay}`;
   return `wöchentlich ${days.join(', ')} · ${s.timeOfDay}`;
 }
 
+const SECTION_LABEL: Record<'axiome' | 'regeln' | 'laeufe' | 'meta', string> = {
+  axiome: 'Axiom',
+  regeln: 'Implementierungsregel',
+  laeufe: 'Laufregel',
+  meta: 'Meta-Axiom',
+};
+
+function targetsSummary(ts: ActionTarget[]): string {
+  return ts.map((t) => (t.newRepo ? `neu: ${t.newRepo}` : t.repo)).filter(Boolean).join(', ') || '—';
+}
+
+/** Whether an action removes something — its confirm button reads "Löschen" and is styled as danger. */
+function isDestructive(a: MercuryAction): boolean {
+  return a.kind === 'delete_run' || a.kind === 'delete_record';
+}
+
+/** The card headline for a proposed action — a plain-language description of what will happen. */
+function actionTitle(a: MercuryAction): string {
+  switch (a.kind) {
+    case 'create_todo':
+      return `ToDo anlegen: ${a.name}`;
+    case 'create_run':
+      return `Automatischen Lauf anlegen: ${a.name}`;
+    case 'add_record':
+      return `${SECTION_LABEL[a.section]} hinzufügen: ${a.titel}`;
+    case 'edit_record':
+      return `Eintrag bearbeiten: ${a.titel}`;
+    case 'delete_record':
+      return 'Eintrag löschen';
+    case 'delete_run':
+      return 'Lauf / ToDo löschen';
+    case 'run_now':
+      return 'Jetzt ausführen';
+    case 'plan_runs':
+      return `${a.runs.length} ${a.runs.length === 1 ? 'Lauf' : 'Läufe'} übernehmen`;
+  }
+}
+
+/** Apply an accepted action through the SAME data-source method the Mercury UI uses — the chat opens no
+ *  parallel path. add_record can bounce on the classifier's duplicate/conformance gate; `force` re-runs
+ *  it past that gate (the "trotzdem anlegen" choice the UI offers). */
+async function dispatchAction(source: DataSource, a: MercuryAction, force = false): Promise<void> {
+  switch (a.kind) {
+    case 'create_todo':
+      await source.mercuryCreateRun({ name: a.name, type: 'todo', enabled: true, task: a.task, targets: a.targets, dueAt: a.dueAt ?? null });
+      return;
+    case 'create_run':
+      await source.mercuryCreateRun({ name: a.name, type: 'auto', enabled: true, schedule: a.schedule, axiomIds: a.axiomIds });
+      return;
+    case 'add_record': {
+      const res = await source.mercuryAddAxiom(a.titel, a.body, a.section, force);
+      if (!force && res.duplicate) {
+        throw new NeedsForceError('Ein sehr ähnlicher Eintrag existiert bereits.');
+      }
+      if (!force && res.nonconform) {
+        const first = res.nonconform.violations[0]?.meta;
+        throw new NeedsForceError(first ? `Verstößt gegen das Meta-Axiom „${first}".` : 'Verstößt gegen ein Meta-Axiom.');
+      }
+      return;
+    }
+    case 'edit_record':
+      await source.mercuryEditAxiom(a.path, a.titel, a.body);
+      return;
+    case 'delete_record':
+      await source.mercuryDeleteAxiom(a.path);
+      return;
+    case 'delete_run':
+      await source.mercuryDeleteRun(a.runId);
+      return;
+    case 'run_now':
+      await source.mercuryRunNow(a.runId);
+      return;
+    case 'plan_runs':
+      await source.mercuryApplyRunProposal(a.mode, { runs: a.runs });
+      return;
+  }
+}
+
+/** Thrown by dispatchAction when adding a record hit the duplicate/conformance gate — the caller offers
+ *  a "trotzdem anlegen" (force) retry instead of a plain failure. */
+class NeedsForceError extends Error {}
+
 /** MercuryChat — the KI-Chat for ALL of Mercury (Axiome, Implementierungsregeln, Laufregeln, Läufe
- *  und ToDos). It sends the whole transcript each turn; when the model answers with a reviewable
- *  run-plan, an inline "Vorschlag übernehmen" applies it (mode `replace`) and closes.
+ *  und ToDos). It sends the whole transcript each turn; when the model proposes a reviewable action
+ *  (create a ToDo or Lauf, add/edit/delete an axiom or rule, run something now, replan the runs), an
+ *  inline "Übernehmen" applies it through the same access point the UI uses.
  *
  *  It renders as a docked, resizable right sidebar (IDE-assistant style) — the parent lays it out as
  *  a flex sibling so opening it narrows the Mercury content rather than covering it. The conversation
@@ -50,7 +134,8 @@ export default function MercuryChat({
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [pendingPlan, setPendingPlan] = useState<RunPlan | null>(null);
+  const [pendingAction, setPendingAction] = useState<MercuryAction | null>(null);
+  const [forceHint, setForceHint] = useState<string | null>(null);
   const [width, setWidth] = useState(400);
   const resizing = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -86,10 +171,11 @@ export default function MercuryChat({
     setMessages(next);
     setInput('');
     setBusy(true);
+    setForceHint(null);
     try {
       const r = await source.mercuryChat(next);
       setMessages([...next, { role: 'assistant', content: r.reply }]);
-      setPendingPlan(r.proposal ?? null);
+      setPendingAction(r.action ?? null);
     } catch (e) {
       toast({ title: 'KI-Chat fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
@@ -97,17 +183,21 @@ export default function MercuryChat({
     }
   };
 
-  const applyPlan = async () => {
-    if (!pendingPlan || applying) return;
+  const applyAction = async (force = false) => {
+    if (!pendingAction || applying) return;
     setApplying(true);
     try {
-      await source.mercuryApplyRunProposal('replace', pendingPlan);
-      toast({ title: 'Läufe übernommen', variant: 'success' });
-      setPendingPlan(null);
+      await dispatchAction(source, pendingAction, force);
+      toast({ title: 'Übernommen', variant: 'success' });
+      setPendingAction(null);
+      setForceHint(null);
       onApplied?.();
-      onClose();
     } catch (e) {
-      toast({ title: 'Übernehmen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      if (e instanceof NeedsForceError) {
+        setForceHint(msg(e));
+      } else {
+        toast({ title: 'Übernehmen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      }
     } finally {
       setApplying(false);
     }
@@ -146,8 +236,8 @@ export default function MercuryChat({
         <div className="dl-scroll flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto rounded-card border border-separator bg-surface p-3">
           {messages.length === 0 && !busy ? (
             <p className="m-auto max-w-xs text-center text-caption text-text-tertiary">
-              Frag die KI zu Axiomen, Implementierungsregeln, Laufregeln, Läufen oder ToDos — sie kann auch einen ganzen
-              Vorschlag für die Läufe zurückgeben.
+              Frag die KI zu Axiomen, Implementierungsregeln, Laufregeln, Läufen oder ToDos — oder bitte sie, etwas
+              anzulegen, zu ändern oder auszuführen. Jede Aktion wird dir zur Bestätigung gezeigt.
             </p>
           ) : (
             messages.map((m, i) => (
@@ -170,29 +260,27 @@ export default function MercuryChat({
           <div ref={bottomRef} />
         </div>
 
-        {pendingPlan && (
+        {pendingAction && (
           <div className="flex flex-col gap-2 rounded-card border border-accent/30 bg-accent/10 px-3 py-2">
             <div className="flex items-center justify-between gap-3">
-              <span className="text-caption text-text-secondary">
-                Die KI hat einen Vorschlag mit {pendingPlan.runs.length} {pendingPlan.runs.length === 1 ? 'Lauf' : 'Läufen'}{' '}
-                erstellt — er ersetzt die aktuellen Läufe.
-              </span>
-              <Button variant="primary" size="sm" disabled={applying || pendingPlan.runs.length === 0} onClick={applyPlan}>
-                {applying ? 'Übernehme…' : 'Vorschlag übernehmen'}
+              <span className="min-w-0 text-caption font-medium text-text-secondary">{actionTitle(pendingAction)}</span>
+              <Button
+                variant={isDestructive(pendingAction) ? 'danger' : 'primary'}
+                size="sm"
+                disabled={applying}
+                onClick={() => void applyAction()}
+              >
+                {applying ? 'Übernehme…' : isDestructive(pendingAction) ? 'Löschen' : 'Übernehmen'}
               </Button>
             </div>
-            {pendingPlan.runs.length > 0 && (
-              <ul className="flex flex-col gap-1">
-                {pendingPlan.runs.map((r, i) => (
-                  <li key={i} className="flex items-center gap-2 text-caption text-text-tertiary">
-                    <span className="min-w-0 flex-1 truncate text-text-secondary">{r.name}</span>
-                    <span className="shrink-0">
-                      {r.axiomIds.length} {r.axiomIds.length === 1 ? 'Axiom' : 'Axiome'}
-                    </span>
-                    <span className="shrink-0">· {scheduleSummary(r.schedule)}</span>
-                  </li>
-                ))}
-              </ul>
+            <ActionDetail action={pendingAction} />
+            {forceHint && (
+              <div className="flex items-center justify-between gap-3 border-t border-accent/20 pt-2">
+                <span className="min-w-0 text-caption text-text-tertiary">{forceHint} Trotzdem anlegen?</span>
+                <Button variant="secondary" size="sm" disabled={applying} onClick={() => void applyAction(true)}>
+                  Trotzdem anlegen
+                </Button>
+              </div>
             )}
           </div>
         )}
@@ -208,7 +296,7 @@ export default function MercuryChat({
               }
             }}
             rows={2}
-            placeholder="Frag mich zu Axiomen, Regeln, Läufen oder ToDos… (Enter zum Senden, Shift+Enter für Zeilenumbruch)"
+            placeholder="Frag mich — oder bitte mich, ein ToDo/Axiom/einen Lauf anzulegen… (Enter zum Senden, Shift+Enter für Zeilenumbruch)"
             className="dl-scroll flex-1 resize-none rounded-md border border-separator bg-surface px-3 py-2 text-footnote text-text-primary outline-none focus:border-accent/50"
           />
           <Button variant="primary" size="sm" disabled={busy || !input.trim()} onClick={send}>
@@ -218,4 +306,50 @@ export default function MercuryChat({
       </div>
     </aside>
   );
+}
+
+/** The per-kind detail lines under an action's headline — a compact preview of what it will do. */
+function ActionDetail({ action: a }: { action: MercuryAction }) {
+  const line = 'text-caption text-text-tertiary';
+  switch (a.kind) {
+    case 'create_todo':
+      return (
+        <div className={cn('flex flex-col gap-0.5', line)}>
+          <span className="truncate">Ziel: {targetsSummary(a.targets)}</span>
+          <span className="line-clamp-2 text-text-secondary">{a.task}</span>
+        </div>
+      );
+    case 'create_run':
+      return (
+        <div className={cn('flex items-center gap-2', line)}>
+          <span>
+            {a.axiomIds.length} {a.axiomIds.length === 1 ? 'Axiom' : 'Axiome'}
+          </span>
+          <span>· {scheduleSummary(a.schedule)}</span>
+        </div>
+      );
+    case 'add_record':
+    case 'edit_record':
+      return <p className={cn('line-clamp-3', line)}>{a.body}</p>;
+    case 'delete_record':
+      return <p className={cn('truncate font-mono', line)}>{a.path}</p>;
+    case 'delete_run':
+    case 'run_now':
+      return <p className={cn('truncate font-mono', line)}>{a.runId}</p>;
+    case 'plan_runs':
+      return (
+        <ul className="flex flex-col gap-1">
+          <li className={line}>{a.mode === 'replace' ? 'Ersetzt die aktuellen Läufe.' : 'Ergänzt die bestehenden Läufe.'}</li>
+          {a.runs.map((r, i) => (
+            <li key={i} className={cn('flex items-center gap-2', line)}>
+              <span className="min-w-0 flex-1 truncate text-text-secondary">{r.name}</span>
+              <span className="shrink-0">
+                {r.axiomIds.length} {r.axiomIds.length === 1 ? 'Axiom' : 'Axiome'}
+              </span>
+              <span className="shrink-0">· {scheduleSummary(r.schedule)}</span>
+            </li>
+          ))}
+        </ul>
+      );
+  }
 }
