@@ -62,10 +62,19 @@ type Result struct {
 type RepoResult struct {
 	Repo string `json:"repo"`
 	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
-	Running      bool    `json:"running,omitempty"`
-	OK           bool    `json:"ok"`
-	Deployed     bool    `json:"deployed"`
-	PRUrl        string  `json:"prUrl,omitempty"`
+	Running  bool `json:"running,omitempty"`
+	OK       bool `json:"ok"`
+	Deployed bool `json:"deployed"`
+	PRUrl    string `json:"prUrl,omitempty"`
+	// DevBranch/DevCommit NAME the delivered dev state (req 2): the persistent integration branch the run
+	// grew (mercury-dev) and the exact commit dev serves. PRBase is this delivery's stacked PR base — the
+	// previous open delivery's branch, else the default branch (req 9). DeliveryID points at the recorded
+	// delivery. All empty when the run made no delivery for this repo (and DevBranch/DevCommit still name
+	// the unchanged state).
+	DevBranch    string  `json:"devBranch,omitempty"`
+	DevCommit    string  `json:"devCommit,omitempty"`
+	PRBase       string  `json:"prBase,omitempty"`
+	DeliveryID   string  `json:"deliveryId,omitempty"`
 	Steps        []Step  `json:"steps"`
 	Error        string  `json:"error,omitempty"`
 	InputTokens  int     `json:"inputTokens,omitempty"`
