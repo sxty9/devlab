@@ -38,7 +38,14 @@ type Result struct {
 	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
 	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
 	Mode string `json:"mode,omitempty"`
-	OK   bool   `json:"ok"`
+	// Model + Effort record which Claude engine drove THIS execution: the resolved model and the selected
+	// effort tier ("" = the runner default max, "ultracode" = the maximal tier). Stamped when the execution
+	// is minted and re-stamped on resume to track the run's current tuning, so the report can label the
+	// answer with its model — a Holistic requirement now that the model is chosen per run — and the History
+	// shows how each run was tuned. Empty on older results.
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	OK     bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`

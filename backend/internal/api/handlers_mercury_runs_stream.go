@@ -25,15 +25,16 @@ func streamEnabled() bool {
 // streamAgentArgs is agentArgs in streaming form: stream-json needs --verbose in -p mode so every event
 // is emitted as it happens. Everything else matches agentArgs so behaviour is identical bar the wire
 // format.
-func streamAgentArgs(prompt, mode string) []string {
+func streamAgentArgs(prompt, mode string, t agentTuning) []string {
+	model, effort, preamble := t.resolve()
 	return []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
 		"--verbose",
 		"--permission-mode", mode,
-		"--model", "opus",
-		"--effort", "max",
-		"--append-system-prompt", runnerPreamble,
+		"--model", model,
+		"--effort", effort,
+		"--append-system-prompt", preamble,
 	}
 }
 

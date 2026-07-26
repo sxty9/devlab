@@ -40,6 +40,17 @@ export function TokenStat({ input, output, cost }: { input?: number; output?: nu
   );
 }
 
+/** The Claude engine that drove an execution — the model (a Holistic requirement: every AI answer is
+ *  labelled with its model) and, when it differs from the default, the effort tier. */
+export function ModelStat({ model, effort }: { model: string; effort?: string }) {
+  return (
+    <span className="flex items-center gap-1.5 text-caption text-text-tertiary" title="Model · Effort">
+      <span className="font-medium text-text-secondary">{model}</span>
+      {effort && <span>· {effort}</span>}
+    </span>
+  );
+}
+
 /** A green/red status pill. */
 export function OkPill({ ok }: { ok: boolean }) {
   return (
@@ -504,6 +515,7 @@ function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?:
 
       <div className={cn('flex flex-wrap items-center justify-between gap-3', !hideHeader && 'mt-4')}>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
+          {res.model && <ModelStat model={res.model} effort={res.effort} />}
           <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
           <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
         </div>
@@ -689,6 +701,7 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
           {fmtDateTime(res.startedAt)}
           {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
         </span>
+        {res.model && <ModelStat model={res.model} effort={res.effort} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
@@ -846,6 +859,7 @@ export function LiveExecution({
           <span className={cn('h-2 w-2 rounded-full', dotLive ? 'animate-pulse bg-warning' : 'bg-text-tertiary')} /> {label}
         </span>
         <span className="text-caption text-text-tertiary">seit {fmtDateTime(res.startedAt)}</span>
+        {res.model && <ModelStat model={res.model} effort={res.effort} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
