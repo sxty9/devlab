@@ -648,14 +648,14 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
   );
 }
 
-/** Poll the server for the run executing right now (its id + live result id), or null. This is the
- *  single source of truth for "a run is live": read on mount it RESTORES the running state after a page
- *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
- *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
- *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; refetch: () => void } {
+/** Poll the server for EVERY run executing right now (each run's id, name + live result id). Runs are
+ *  concurrent, so this is a list — the single source of truth for "which runs are live": read on mount
+ *  it RESTORES the running state after a page reload, and it drives the live-follow views. refetch()
+ *  forces an immediate re-check — e.g. right after starting or cancelling a run — so the UI reacts
+ *  without waiting for the next tick. Reflects actually-running processes: empty again after a restart. */
+export function useActiveRun(): { active: RunActive[]; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
+  const [active, setActive] = useState<RunActive[]>([]);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -664,7 +664,7 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
     const poll = async () => {
       try {
         const r = await source.mercuryRunActive();
-        if (!cancelled) setActive(r.active);
+        if (!cancelled) setActive(r.active ?? []);
       } catch {
         /* transient — keep the last known state */
       }
@@ -681,6 +681,64 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
   }, [source, bump]);
 
   return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** The overview of runs executing RIGHT NOW — one entry per active run, each showing its live execution
+ *  (its repository, its current step and its consumption via LiveExecution) and a kill-switch that
+ *  aborts exactly that run. Empty (renders nothing) when nothing is live. Shared by the Läufe and ToDos
+ *  surfaces so both name every run in flight, not one. */
+export function ActiveRunsOverview({
+  active,
+  onCancel,
+  cancellingId,
+  onSelect,
+}: {
+  active: RunActive[];
+  onCancel: (runId: string) => void;
+  cancellingId: string | null;
+  /** Optional: clicking a run's name selects it in the surrounding list. */
+  onSelect?: (runId: string) => void;
+}) {
+  if (active.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="flex items-center gap-1.5 text-footnote font-medium text-text-primary">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+        {active.length === 1 ? 'Aktiver Lauf' : `Aktive Läufe (${active.length})`}
+      </p>
+      {active.map((a) => (
+        <div key={a.runId} className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onSelect ? () => onSelect(a.runId) : undefined}
+              disabled={!onSelect}
+              className={cn(
+                'min-w-0 truncate text-left text-caption font-medium text-text-secondary',
+                onSelect && 'hover:text-accent',
+              )}
+            >
+              {a.runName || a.runId}
+            </button>
+            <Button
+              variant="danger"
+              size="sm"
+              className="ml-auto shrink-0"
+              disabled={cancellingId === a.runId}
+              onClick={() => onCancel(a.runId)}
+            >
+              {cancellingId === a.runId ? 'Bricht ab…' : 'Abbrechen'}
+            </Button>
+          </div>
+          {a.resultId ? (
+            <LiveExecution runId={a.runId} resultId={a.resultId} live />
+          ) : (
+            <p className="text-caption text-text-tertiary">Der Lauf startet…</p>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already

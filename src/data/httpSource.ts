@@ -301,8 +301,8 @@ export const httpSource: DataSource = {
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
-  async mercuryCancelRun() {
-    await json<void>(await post('/api/mercury/runs/cancel', {}));
+  async mercuryCancelRun(runId) {
+    await json<void>(await post(`/api/mercury/runs/${enc(runId)}/cancel`, {}));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(

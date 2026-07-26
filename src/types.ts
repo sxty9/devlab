@@ -502,11 +502,13 @@ export interface RunResult {
   numTurns: number;
 }
 
-/** The run executing right now, as the server sees it: its id, the live result id, and when it started
- *  — or null when nothing runs. Read on mount (so a running run survives a page reload) and polled to
- *  follow a live run. Reflects an actually-running process, so it is empty again after a server restart. */
+/** One run executing right now, as the server sees it: its id, name, the live result id, and when it
+ *  started. The server reports EVERY active run (they run concurrently); read on mount so running runs
+ *  survive a page reload, and polled to follow them live. Reflects actually-running processes, so the
+ *  list is empty again after a server restart. */
 export interface RunActive {
   runId: string;
+  runName?: string;
   resultId: string;
   startedAt: string;
 }

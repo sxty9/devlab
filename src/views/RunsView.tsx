@@ -6,7 +6,7 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionHistory, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import type {
   Run,
   RunActive,
@@ -79,12 +79,11 @@ export default function RunsView() {
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
-  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
-  // live-follow view — survive a page reload instead of living only in this component. The global cancel
-  // shows whenever a run is live.
+  // The runs executing right now are SERVER truth (via useActiveRun), so the active-runs overview — and
+  // the live-follow views — survive a page reload instead of living only in this component. Runs are
+  // concurrent, so this is a list; cancel targets one specific run by id.
   const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
-  const [cancelling, setCancelling] = useState(false);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
   const reload = useCallback(async () => {
@@ -98,11 +97,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When any run finishes (its id leaves the active set), refresh the list so lastResult/next-fire/
+  // ToDo-done update. Compares the previous active id set to the current one.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -125,19 +125,22 @@ export default function RunsView() {
     };
   }, [source]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
+  const cancelRun = useCallback(
+    async (runId: string) => {
+      if (cancellingId) return;
+      setCancellingId(runId);
+      try {
+        await source.mercuryCancelRun(runId);
+        toast({ title: 'Lauf abgebrochen', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setCancellingId(null);
+      }
+    },
+    [cancellingId, source, toast, refetchActive],
+  );
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -210,7 +213,7 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={active.find((a) => a.runId === selectedRun.id) ?? null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRecomposed={reload}
@@ -241,17 +244,19 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        {running && (
-          <div className="ml-auto flex items-center gap-2">
-            <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-            </span>
-            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
-          </div>
+        {active.length > 0 && (
+          <span className="ml-auto flex items-center gap-1.5 text-caption text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+            {active.length === 1 ? '1 Lauf aktiv' : `${active.length} Läufe aktiv`}
+          </span>
         )}
       </header>
+
+      {active.length > 0 && (
+        <div className="dl-scroll max-h-[40vh] shrink-0 overflow-y-auto border-b border-separator bg-surface px-3 py-3">
+          <ActiveRunsOverview active={active} onCancel={cancelRun} cancellingId={cancellingId} onSelect={setSelectedId} />
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {tab === 'laeufe' && (
@@ -568,16 +573,16 @@ function RunDetail({
 
       <section className="mt-6 border-t border-separator pt-4">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ausführungen</p>
-        {isLive && active?.resultId && (
-          <div className="mb-3">
-            <LiveExecution runId={run.id} resultId={active.resultId} live />
-          </div>
+        {isLive && (
+          <p className="mb-3 flex items-center gap-1.5 text-footnote text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Läuft gerade – siehe die Übersicht oben.
+          </p>
         )}
         {results === null ? (
           <p className="text-footnote text-text-tertiary">Lädt…</p>
         ) : results.length === 0 ? (
           <p className="text-footnote text-text-tertiary">
-            {isLive ? 'Läuft gerade – siehe oben.' : 'Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.'}
+            {isLive ? 'Läuft gerade – siehe die Übersicht oben.' : 'Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.'}
           </p>
         ) : (
           <ul className="flex flex-col gap-1.5">
