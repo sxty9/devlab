@@ -150,6 +150,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 		tokenUser = user
 	}
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
+	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
 		mode, user, tokenUser, autoMerge, tick)
@@ -188,6 +189,15 @@ type runExecutor struct {
 	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
 	// /etc that a test can neither create nor rely on.
 	deployTargetFn func(repoName string) bool
+
+	// Rollback/reset seams — the git counter-booking runs against a real per-user workspace (sudo), and
+	// the PR ops hit GitHub; both are stubbed in tests so the rollback DECISION logic (conflict → ToDo,
+	// merged → reversing PR, open → close PR) is exercised deterministically.
+	counterBookFn func(ctx context.Context, token string, d runs.Delivery, reversalBranch string) (counterBookResult, error)
+	createPRFn    func(ctx context.Context, token, fullName, head, base, title, body string) (github.PullRequest, error)
+	closePRFn     func(ctx context.Context, token, fullName string, number int) error
+	commentPRFn   func(ctx context.Context, token, fullName string, number int, body string) error
+	resetRepoFn   func(ctx context.Context, token string, repo model.Repo) (string, error)
 }
 
 // token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real

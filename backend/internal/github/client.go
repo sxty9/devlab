@@ -329,6 +329,31 @@ func MergePullRequest(ctx context.Context, token, fullName string, number int) e
 	return nil
 }
 
+// ClosePullRequest closes a PR without merging it (PATCH state=closed) — used when a delivery is rolled
+// back while its PR is still open (req 11): the work is withdrawn, so the PR is closed with a prior
+// justification comment (see AddPullRequestComment).
+func ClosePullRequest(ctx context.Context, token, fullName string, number int) error {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return fmt.Errorf("github: bad repo %q", fullName)
+	}
+	_, err := doMethod(ctx, http.MethodPatch, token, fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number),
+		map[string]any{"state": "closed"}, nil)
+	return err
+}
+
+// AddPullRequestComment posts a comment on a PR (via the issues endpoint — a PR is an issue). Used to
+// record the justification for closing a rolled-back PR before it is closed.
+func AddPullRequestComment(ctx context.Context, token, fullName string, number int, body string) error {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return fmt.Errorf("github: bad repo %q", fullName)
+	}
+	_, err := doPost(ctx, token, fmt.Sprintf("%s/repos/%s/%s/issues/%d/comments", apiBase, owner, name, number),
+		map[string]any{"body": body}, nil)
+	return err
+}
+
 // ListOpenPullRequests returns the open PRs on fullName (newest first, first page — up to 100).
 // Each PR carries its Head.Ref, so the caller can tell a Mercury run branch from a human one. Used by
 // the dedup guard: a repo whose Mercury work is still an open PR must not be re-implemented into a
