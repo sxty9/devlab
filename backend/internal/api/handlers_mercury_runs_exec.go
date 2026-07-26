@@ -821,7 +821,7 @@ func (x *runExecutor) foldPendingForDeploy(ctx context.Context, ex workspace.Exe
 	if !run.IsTodo() {
 		return noop
 	}
-	heads := x.openMercuryPRHeads(ctx, token, repo.FullName)
+	heads := x.openPRHeads(ctx, token, repo.FullName)
 	var others []string
 	for _, h := range heads {
 		if h != runBranch {
@@ -845,7 +845,7 @@ func (x *runExecutor) foldPendingForDeploy(ctx context.Context, ex workspace.Exe
 		}
 		merged++
 	}
-	step("dev-deploy", fmt.Sprintf("dev-Stand = diese Arbeit + %d offene(r) Mercury-PR(s)", merged), true)
+	step("dev-deploy", fmt.Sprintf("dev-Stand = diese Arbeit + %d offene(r) PR(s)", merged), true)
 	return func() {
 		if err := ex.Checkout(ctx, wt, runBranch); err != nil {
 			log.Printf("devlabd: run %s could not return to %s after the deploy build: %v", run.ID, runBranch, err)
@@ -1060,6 +1060,24 @@ func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName st
 // fallback to the legacy branch prefix for PRs created before branches moved to <kind>/<description>.
 func isMercuryPR(pr github.PullRequest) bool {
 	return strings.Contains(pr.Body, mercuryPRMarker) || strings.HasPrefix(pr.Head.Ref, "mercury-run/")
+}
+
+// openPRHeads returns the head branch of EVERY open pull request on fullName — Mercury's own and the
+// ones a human raised alike. The dev box should show the sum of what is pending, whoever wrote it: a
+// deploy that folds in only Mercury's branches silently reinstalls over a person's un-merged work, which
+// is exactly how a hand-built change vanished from dev minutes after it was deployed. The base of a RUN
+// stays Mercury-only (openMercuryPRHeads) — that is about not redoing the agent's own work — while the
+// DEPLOY, which decides what is live, takes everything.
+func (x *runExecutor) openPRHeads(ctx context.Context, token, fullName string) []string {
+	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
+	if err != nil {
+		return nil
+	}
+	heads := make([]string, 0, len(prs))
+	for _, pr := range prs {
+		heads = append(heads, pr.Head.Ref)
+	}
+	return heads
 }
 
 // resolveTodoTargets resolves every target of a ToDo to a concrete repo. A to-be-created target is
