@@ -280,6 +280,7 @@ export default function RunsView() {
                         key={run.id}
                         run={run}
                         selected={mode !== 'create' && selectedId === run.id}
+                        live={activeFor(run.id) != null}
                         onSelect={() => {
                           setSelectedId(run.id);
                           setMode('view');
@@ -327,7 +328,7 @@ export default function RunsView() {
 }
 
 /** One row in the left list: name, schedule, next fire, plus disabled/stale pills. */
-function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSelect: () => void }) {
+function RunRow({ run, selected, live, onSelect }: { run: Run; selected: boolean; live: boolean; onSelect: () => void }) {
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
   return (
     <button
@@ -339,6 +340,7 @@ function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSe
       )}
     >
       <div className="flex items-center gap-1.5">
+        {live && <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" title="läuft gerade" />}
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {run.name}
         </span>

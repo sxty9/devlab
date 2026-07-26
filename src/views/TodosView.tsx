@@ -432,6 +432,7 @@ export default function TodosView() {
                         todo={todo}
                         repos={repos}
                         selected={mode !== 'create' && selectedId === todo.id}
+                        live={activeFor(todo.id) != null}
                         onSelect={() => {
                           setSelectedId(todo.id);
                           setMode('view');
@@ -455,7 +456,7 @@ export default function TodosView() {
 }
 
 /** One row in the left list: name, target, due date, plus done/disabled pills. */
-function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; onSelect: () => void }) {
+function TodoRow({ todo, repos, selected, live, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; live: boolean; onSelect: () => void }) {
   return (
     <button
       type="button"
@@ -466,6 +467,7 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
       )}
     >
       <div className="flex items-center gap-1.5">
+        {live && <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" title="läuft gerade" />}
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {todo.name}
         </span>
