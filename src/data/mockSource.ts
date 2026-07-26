@@ -349,9 +349,9 @@ export const mockSource: DataSource = {
     return { started: true };
   },
   async mercuryRunActive() {
-    return { active: null };
+    return { active: [] as import('@/types').RunActive[] };
   },
-  async mercuryCancelRun() {
+  async mercuryCancelRun(_id: string) {
     /* mock: no-op */
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {

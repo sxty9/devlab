@@ -6,7 +6,7 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRuns } from './MercuryExecutions';
 import type {
   Run,
   RunActive,
@@ -79,12 +79,12 @@ export default function RunsView() {
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
-  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
-  // live-follow view — survive a page reload instead of living only in this component. The global cancel
-  // shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
-  const [cancelling, setCancelling] = useState(false);
+  // The runs executing right now are SERVER truth (via useActiveRuns), so the "Läufe aktiv" state — and
+  // the live-follow view — survive a page reload instead of living only in this component. Several runs
+  // can be live at once; each run's own detail carries its own kill-switch (Abbruch trifft einen Lauf).
+  const { active, refetch: refetchActive } = useActiveRuns();
+  const running = active.length > 0;
+  const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
   const reload = useCallback(async () => {
@@ -98,11 +98,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When any run finishes (its id drops out of the active set), refresh the list so lastResult/next-fire/
+  // ToDo-done update — even while other runs keep going.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -124,20 +125,6 @@ export default function RunsView() {
       cancelled = true;
     };
   }, [source]);
-
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -210,11 +197,12 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={activeFor(selectedRun.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRecomposed={reload}
         onRunStarted={refetchActive}
+        onCancelled={refetchActive}
       />
     );
   } else {
@@ -244,11 +232,9 @@ export default function RunsView() {
         {running && (
           <div className="ml-auto flex items-center gap-2">
             <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
+              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+              {active.length === 1 ? 'Lauf aktiv' : `${active.length} Läufe aktiv`}
             </span>
-            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
           </div>
         )}
       </header>
@@ -382,6 +368,7 @@ function RunDetail({
   onDeleted,
   onRecomposed,
   onRunStarted,
+  onCancelled,
 }: {
   run: Run;
   axioms: Record<string, string>;
@@ -390,11 +377,13 @@ function RunDetail({
   onDeleted: () => void | Promise<void>;
   onRecomposed: () => void | Promise<void>;
   onRunStarted: () => void;
+  onCancelled: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [prompt, setPrompt] = useState<string | null>(null);
   const [promptLoading, setPromptLoading] = useState(false);
@@ -486,6 +475,21 @@ function RunDetail({
     }
   };
 
+  // Abort THIS run (kill-switch), named by id — other concurrent runs keep going.
+  const cancel = async () => {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await source.mercuryCancelRun(run.id);
+      toast({ title: 'Lauf abgebrochen', variant: 'default' });
+      onCancelled();
+    } catch (e) {
+      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
 
   return (
@@ -496,9 +500,15 @@ function RunDetail({
           <p className="mt-1 text-footnote text-text-secondary">{scheduleSummary(run.schedule)}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-          <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
-            <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
-          </Button>
+          {isLive ? (
+            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancel}>
+              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+            </Button>
+          ) : (
+            <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
+              <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
+            </Button>
+          )}
           {run.stale && (
             <Button variant="secondary" size="sm" disabled={busy} onClick={recompose}>
               <RefreshIcon className="h-4 w-4" /> Neu komponieren

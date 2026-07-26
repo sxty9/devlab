@@ -176,11 +176,11 @@ export interface DataSource {
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
-  /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. */
-  mercuryRunActive(): Promise<{ active: RunActive | null }>;
-  /** Abort the run currently in progress (kill-switch). */
-  mercuryCancelRun(): Promise<void>;
+  /** EVERY run executing right now (server truth) — read on mount so running runs survive a page reload,
+   *  and polled to follow them live. Empty when nothing runs; several at once when runs are concurrent. */
+  mercuryRunActive(): Promise<{ active: RunActive[] }>;
+  /** Abort ONE run in progress (kill-switch), named by id — other concurrent runs keep going. */
+  mercuryCancelRun(id: string): Promise<void>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */

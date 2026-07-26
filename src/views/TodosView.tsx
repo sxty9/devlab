@@ -6,7 +6,7 @@ import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRuns } from './MercuryExecutions';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -252,11 +252,12 @@ export default function TodosView() {
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
   const [refreshing, setRefreshing] = useState(false);
 
-  // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
-  // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
-  const [cancelling, setCancelling] = useState(false);
+  // The ToDos executing right now are SERVER truth (via useActiveRuns) — so the "aktiv" state and the
+  // live-follow view survive a page reload. Several can be live at once; each ToDo's own detail carries
+  // its own kill-switch (Abbruch trifft einen bestimmten Lauf).
+  const { active, refetch: refetchActive } = useActiveRuns();
+  const running = active.length > 0;
+  const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
   const reload = useCallback(async () => {
@@ -269,11 +270,12 @@ export default function TodosView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh so the ToDo's done/last-result state updates.
-  const prevActiveRef = useRef<string | null>(null);
+  // When any run finishes (its id drops out of the active set), refresh so the ToDo's done/last-result
+  // state updates — even while other runs keep going.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -300,20 +302,6 @@ export default function TodosView() {
       cancelled = true;
     };
   }, [source, toast]);
-
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
 
   const refresh = useCallback(async () => {
     if (refreshing) return;
@@ -367,10 +355,11 @@ export default function TodosView() {
         key={`${selectedTodo.id}:${selectedTodo.updatedAt}`}
         todo={selectedTodo}
         repos={repos}
-        active={active && active.runId === selectedTodo.id ? active : null}
+        active={activeFor(selectedTodo.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
+        onCancelled={refetchActive}
         onExecuted={reload}
       />
     );
@@ -421,13 +410,11 @@ export default function TodosView() {
                   </Button>
                 </div>
                 {running && (
-                  <div className="flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5">
+                  <div className="flex items-center gap-2 rounded-md bg-warning/10 px-2 py-1.5">
                     <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+                      {active.length === 1 ? 'Lauf aktiv' : `${active.length} Läufe aktiv`}
                     </span>
-                    <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-                      {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-                    </Button>
                   </div>
                 )}
               </div>
@@ -506,6 +493,7 @@ function TodoDetail({
   onEdit,
   onDeleted,
   onRunStarted,
+  onCancelled,
   onExecuted,
 }: {
   todo: Run;
@@ -514,12 +502,14 @@ function TodoDetail({
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRunStarted: () => void;
+  onCancelled: () => void;
   onExecuted: () => void | Promise<void>;
 }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [results, setResults] = useState<RunResultRef[] | null>(null);
   const isLive = active?.runId === todo.id;
@@ -597,6 +587,21 @@ function TodoDetail({
     }
   };
 
+  // Abort THIS ToDo's run (kill-switch), named by id — other concurrent runs keep going.
+  const cancel = async () => {
+    if (cancelling) return;
+    setCancelling(true);
+    try {
+      await source.mercuryCancelRun(todo.id);
+      toast({ title: 'Lauf abgebrochen', variant: 'default' });
+      onCancelled();
+    } catch (e) {
+      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
       <div className="flex items-start justify-between gap-4">
@@ -605,9 +610,15 @@ function TodoDetail({
           <p className="mt-1 text-footnote text-text-secondary">{targetLabel(todo, repos)}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-          <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
-            <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
-          </Button>
+          {isLive ? (
+            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancel}>
+              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+            </Button>
+          ) : (
+            <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
+              <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
+            </Button>
+          )}
           <Button variant="secondary" size="sm" onClick={onEdit}>
             Bearbeiten
           </Button>
