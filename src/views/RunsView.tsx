@@ -9,6 +9,7 @@ import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from
 import { MercuryCalendar } from './MercuryCalendar';
 import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
+import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
   Run,
   RunActive,
@@ -81,6 +82,7 @@ export default function RunsView() {
   const [aiBusy, setAiBusy] = useState<'fill' | 'finetune' | null>(null);
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
@@ -202,6 +204,7 @@ export default function RunsView() {
   // Without this filter a ToDo appears here and selecting it renders the auto-run detail against
   // todo-shaped data — a blank screen.
   const autoRuns = list.runs.filter((r) => r.type !== 'todo');
+  const shownRuns = applyRunFilter(autoRuns, filter);
 
   const selectedRun = selectedId ? autoRuns.find((r) => r.id === selectedId) ?? null : null;
 
@@ -278,6 +281,7 @@ export default function RunsView() {
                     Verlauf
                   </Button>
                 </div>
+                {autoRuns.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} />}
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
@@ -285,9 +289,11 @@ export default function RunsView() {
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine Läufe. Lege einen an oder nutze „Mit KI auffüllen“.
                   </p>
+                ) : shownRuns.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">No runs match the current filter.</p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {autoRuns.map((run) => (
+                    {shownRuns.map((run) => (
                       <RunRow
                         key={run.id}
                         run={run}
