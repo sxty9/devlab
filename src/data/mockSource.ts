@@ -323,13 +323,38 @@ export const mockSource: DataSource = {
     return { results: [] };
   },
   async mercuryRunResult(id: string, resultId: string) {
+    const at = new Date().toISOString();
     return {
       runId: id,
       resultId,
-      startedAt: new Date().toISOString(),
+      startedAt: at,
       ok: true,
       prompt: '# Konkretes ToDo: Beispiel\n\n## Aufgabe\n\nBeispielhafte Promptstellung dieser Ausführung.',
-      repos: [],
+      // One repo showing the growing dev state: the delivered state is named (mercury-dev@<sha>) and the
+      // delivery's stacked PR sits on the previous open delivery's branch.
+      repos: [
+        {
+          repo: 'holistic/example',
+          ok: true,
+          deployed: true,
+          prUrl: 'https://example.invalid/pull/42',
+          devBranch: 'mercury-dev',
+          devCommit: '1a2b3c4d5e6f7a8b',
+          prBase: 'mercury-run/run_example/dlv_prev',
+          deliveryId: 'dlv_example',
+          steps: [
+            { name: 'fold', ok: true, log: 'Standard-Branch main eingefaltet', at },
+            { name: 'implement', ok: true, log: 'Feature umgesetzt und committet.', at },
+            { name: 'dev-deploy', ok: true, log: 'Ausgelieferter Stand: mercury-dev@1a2b3c4d', at },
+            { name: 'push', ok: true, log: 'mercury-dev, mercury-run/run_example/dlv_example', at },
+            { name: 'pr', ok: true, log: 'https://example.invalid/pull/42 (Basis: mercury-run/run_example/dlv_prev)', at },
+          ],
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsd: 0,
+          numTurns: 0,
+        },
+      ],
       inputTokens: 0,
       outputTokens: 0,
       costUsd: 0,
