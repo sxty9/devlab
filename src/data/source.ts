@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -144,8 +144,14 @@ export interface DataSource {
   mercuryRun(id: string): Promise<{ run: Run; axioms: Record<string, string> }>;
   /** Live-compose a run's prompt from the current scheme (does not persist). */
   mercuryRunPrompt(id: string): Promise<{ prompt: string }>;
-  /** Which axioms are already covered by a run (+ id→path, id→title). */
+  /** Which axioms are already covered by a run (+ id→path, id→title, and whether an auto-assignment is pending). */
   mercuryRunCoverage(): Promise<RunCoverage>;
+  /** The automatic axiom→run assignment feed (newest first, portioned). */
+  mercuryRunNotices(): Promise<{ notices: RunNotice[] }>;
+  /** Dismiss one acknowledged assignment notice. */
+  mercuryDismissRunNotice(id: string): Promise<void>;
+  /** Clear the whole assignment feed. */
+  mercuryClearRunNotices(): Promise<void>;
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;
