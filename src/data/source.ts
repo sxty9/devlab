@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -177,8 +177,9 @@ export interface DataSource {
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. */
-  mercuryRunActive(): Promise<{ active: RunActive | null }>;
+   *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
+   *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
+  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
 

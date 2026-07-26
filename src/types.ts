@@ -511,6 +511,29 @@ export interface RunActive {
   startedAt: string;
 }
 
+/** One run the system is currently working, for the transparent "Aktive Läufe" overview: either
+ *  EXECUTING right now or SUSPENDED on the usage limit mid-execution (paused, waiting to resume). Enough
+ *  to render a list row — which run, on which repo/step, how far, how much spent — without a per-run
+ *  fetch. Server-assembled from the live Activity + the run's result document; purely observational. */
+export interface RunInFlight {
+  runId: string;
+  runName: string;
+  type: RunType; // auto | todo
+  state: 'executing' | 'suspended';
+  resultId?: string;
+  startedAt?: string; // execution start (executing)
+  resumeAt?: string; // when a suspended run resumes
+  attempts?: number; // suspended: resume attempts so far
+  currentRepo?: string; // the repo in flight (executing)
+  currentStep?: string; // the step running right now (executing)
+  reposDone: number; // repos already completed this execution
+  reposTotal?: number; // known only for ToDos (exact target count); omitted for automatic runs
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  numTurns: number;
+}
+
 /** One entry in the calendar — the union of past and upcoming runs. `type` separates automatic runs
  *  from ToDos (colour). A FUTURE firing carries its `schedule`; a completed (PAST) execution carries
  *  `resultId` and status (`ok`/`suspended`) instead. The presence of `resultId` marks an occurrence as
