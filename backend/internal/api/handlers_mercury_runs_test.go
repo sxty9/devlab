@@ -99,10 +99,10 @@ func TestNormalizeTargets(t *testing.T) {
 	// A single target still works (parity with the old one-target ToDo).
 	ok([]runs.Target{{Repo: "a"}}, 1)
 
-	bad(nil)                                        // no target at all
-	bad([]runs.Target{})                            // empty
-	bad([]runs.Target{{}})                          // neither repo nor newRepo
-	bad([]runs.Target{{Repo: "a", NewRepo: "b"}})   // both set on one target
-	bad([]runs.Target{{NewRepo: "in valid/name"}})  // illegal new-repo name
-	bad([]runs.Target{{Repo: "ok"}, {}})            // one good, one empty → whole set rejected
+	bad(nil)                                       // no target at all
+	bad([]runs.Target{})                           // empty
+	bad([]runs.Target{{}})                         // neither repo nor newRepo
+	bad([]runs.Target{{Repo: "a", NewRepo: "b"}})  // both set on one target
+	bad([]runs.Target{{NewRepo: "in valid/name"}}) // illegal new-repo name
+	bad([]runs.Target{{Repo: "ok"}, {}})           // one good, one empty → whole set rejected
 }
