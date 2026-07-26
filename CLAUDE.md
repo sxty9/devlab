@@ -30,6 +30,7 @@ _Automatisch aus Mercury ausgerollt. Nicht direkt bearbeiten; ändere die Axiome
 
 ### environment
 - **Account-Löschung** — Der Account-Löschvorgang bündelt seine Optionen an einer Stelle und legt explizit fest, wie verbleibende Userdaten behandelt werden.
+- **Einfügen aus der Zwischenablage** — An jedem Knotenpunkt, an dem Dateien zum Erfüllen einer Aufgabe unmittelbar hochgeladen werden können, wird zusätzlich das Einfügen aus der Zwischenablage bereitgestellt. Datei-Dialog und Zwischenablage sind gleichwertige Eingabewege desselben Zugangspunkts.
 - **Mehrsprachigkeit** — Alle sprachlichen Inhalte werden zeitnah in sämtliche unterstützten Holistic-Sprachen übersetzt. Die Sprache ist im UI jederzeit wählbar.
 - **Rechtelose Dienste verborgen** — Dienste, zu denen ein User keine Rechte besitzt, werden ihm im Dashboard nicht angezeigt.
 - **Rechtsklick-Menüs** — Wo ein Kontextmenü sinnvoll ist, wird es bereitgestellt — mit zweckmäßigen, nicht überflüssigen Einträgen, im Einklang mit dem Minimalism-Maxim.

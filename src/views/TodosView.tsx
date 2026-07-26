@@ -3,7 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
-import { humanSize, toBase64 } from '@/lib/file';
+import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
@@ -154,7 +154,7 @@ function MediaField({
   existing: RunAttachment[];
   pending: PendingAttachment[];
   rawUrl: (attachmentId: string) => string | undefined;
-  onPick: (files: FileList) => void;
+  onPick: (files: File[]) => void;
   onRemoveExisting: (id: string) => void;
   onRemovePending: (index: number) => void;
 }) {
@@ -192,7 +192,7 @@ function MediaField({
           accept="image/*,application/pdf,text/*,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
           className="hidden"
           onChange={(e) => {
-            if (e.target.files?.length) onPick(e.target.files);
+            if (e.target.files?.length) onPick(Array.from(e.target.files));
             e.target.value = ''; // allow re-picking the same file
           }}
         />
@@ -749,11 +749,11 @@ function TodoEditor({
   const visibleAtts = useMemo(() => existingAtts.filter((a) => !removedIds.has(a.id)), [existingAtts, removedIds]);
 
   const pickFiles = useCallback(
-    async (files: FileList) => {
+    async (files: File[]) => {
       const taken = new Set([...visibleAtts.map((a) => a.filename.toLowerCase()), ...pending.map((p) => p.name.toLowerCase())]);
       let count = visibleAtts.length + pending.length;
       const added: PendingAttachment[] = [];
-      for (const file of Array.from(files)) {
+      for (const file of files) {
         if (count >= MAX_ATTACHMENTS) {
           toast({ title: 'Zu viele Anhänge', description: `Höchstens ${MAX_ATTACHMENTS} Dateien je ToDo.`, variant: 'danger' });
           break;
@@ -856,7 +856,18 @@ function TodoEditor({
   };
 
   return (
-    <div className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7">
+    // A paste anywhere in the editor attaches its clipboard files — the same pipeline as the dialog,
+    // so the clipboard is an equal upload path. Text pastes carry no files and fall through to the
+    // focused field untouched.
+    <div
+      className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7"
+      onPaste={(e) => {
+        const files = filesFromClipboard(e);
+        if (files.length === 0) return;
+        e.preventDefault();
+        void pickFiles(files);
+      }}
+    >
       <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{base ? 'ToDo bearbeiten' : 'Neues ToDo'}</h1>
 
       <div>
