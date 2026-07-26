@@ -7,6 +7,7 @@ import { IconButton } from '@/ui/Button';
 import { FileIcon, FileTextIcon, PlusIcon, RefreshIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
+import { usePasteFiles } from '@/lib/usePasteFiles';
 import type { VisionFile } from '@/types';
 
 /** The Vision Catalog: idea deposits (images, PDFs, specs, notes) from the repo's /vision folder,
@@ -47,22 +48,40 @@ export function VisionPanel() {
     }
   };
 
-  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ''; // allow re-picking the same file
-    if (!file) return;
-    setBusy(true);
-    try {
-      const b64 = await toBase64(file);
-      const updated = await source.uploadVision(activeRepo.id, `vision/${file.name}`, b64);
-      setFiles(updated);
-      toast({ title: 'Attached', description: `vision/${file.name} — commit & push to share it`, variant: 'success' });
-    } catch (err) {
-      toast({ title: 'Upload failed', description: String((err as Error)?.message ?? err), variant: 'danger' });
-    } finally {
-      setBusy(false);
-    }
-  };
+  // One deposit path for both the file dialog and a clipboard paste: attach each file to /vision.
+  const uploadFiles = useCallback(
+    async (files: File[]) => {
+      if (!canWrite || files.length === 0) return;
+      setBusy(true);
+      try {
+        let latest: VisionFile[] | null = null;
+        const done: string[] = [];
+        for (const file of files) {
+          try {
+            const b64 = await toBase64(file);
+            latest = await source.uploadVision(activeRepo.id, `vision/${file.name}`, b64);
+            done.push(file.name);
+          } catch (err) {
+            toast({ title: 'Upload failed', description: `${file.name}: ${String((err as Error)?.message ?? err)}`, variant: 'danger' });
+          }
+        }
+        if (latest) setFiles(latest);
+        if (done.length) {
+          toast({
+            title: done.length === 1 ? 'Attached' : `${done.length} attached`,
+            description: `${done.map((n) => `vision/${n}`).join(', ')} — commit & push to share`,
+            variant: 'success',
+          });
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [canWrite, source, activeRepo.id, toast],
+  );
+
+  // A clipboard paste while the Vision panel is open deposits its files — equal to the dialog.
+  usePasteFiles(uploadFiles, canWrite);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -79,7 +98,17 @@ export function VisionPanel() {
           </>
         }
       />
-      <input ref={fileInput} type="file" className="hidden" onChange={onPick} />
+      <input
+        ref={fileInput}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          const picked = e.target.files ? Array.from(e.target.files) : [];
+          e.target.value = ''; // allow re-picking the same file
+          void uploadFiles(picked);
+        }}
+      />
 
       <p className="dl-no-select px-3 pb-1 pt-0.5 text-caption text-text-tertiary">
         {loading ? 'Loading…' : `${files.length} in ${activeRepo.name}/vision`}
