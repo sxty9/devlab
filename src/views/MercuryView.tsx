@@ -121,8 +121,9 @@ export function MercuryView() {
   // The "Axiome" section holds two things: the axioms themselves and the Meta-Axiome that bindingly
   // govern how an axiom must be formulated. A sub-tab switches the tree's namespace between them.
   const [axiomeTab, setAxiomeTab] = useState<'axiome' | 'meta'>('axiome');
-  // The KI-Chat acts for ALL of Mercury, so it lives here rather than inside a section. Kept mounted
-  // so the conversation survives closing.
+  // The KI-Chat acts for ALL of Mercury, so it lives here rather than inside a section. Its toggle and
+  // its panel share the right edge (MercuryChat renders a collapsed tab when closed); kept mounted so
+  // the conversation survives closing.
   const [chatOpen, setChatOpen] = useState(false);
   // A record + text handed to the detail pane so it opens in edit pre-filled — used when the user
   // resolves a duplicate by extending or adjusting the existing record.
@@ -257,20 +258,6 @@ export function MercuryView() {
           })}
         </nav>
 
-        <div className="border-b border-separator px-2 py-1.5">
-          <button
-            type="button"
-            onClick={() => setChatOpen((o) => !o)}
-            className={cn(
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote transition duration-fast hover:bg-fill/10 hover:text-text-primary',
-              chatOpen ? 'bg-fill/[0.07] text-text-primary' : 'text-text-secondary',
-            )}
-          >
-            <LightbulbIcon className="h-4 w-4 text-accent" />
-            KI-Chat
-          </button>
-        </div>
-
         {section === 'laeufe' && (
           <div className="flex gap-1 border-b border-separator p-2">
             {(['laufregeln', 'laeufe'] as const).map((t) => (
@@ -400,7 +387,7 @@ export function MercuryView() {
         )}
       </main>
 
-      <MercuryChat open={chatOpen} onClose={() => setChatOpen(false)} onApplied={() => void reload()} />
+      <MercuryChat open={chatOpen} onOpenChange={setChatOpen} onApplied={() => void reload()} />
     </div>
     </MercuryDnD.Provider>
   );
