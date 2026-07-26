@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
@@ -288,21 +289,24 @@ function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onS
 /** The whole execution rendered as a GitLab-style pipeline: repos (rows) × stages (columns). */
 export function ExecutionPipeline({ result }: { result: RunResult }) {
   const [sel, setSel] = useState<{ repo: number; stage: number } | null>(null);
+  // repos is null when the execution failed before any repo completed (Go marshals the empty slice as
+  // null) — iterating it directly would throw and blank the whole view, so normalize to [] up front.
+  const repos = result.repos ?? [];
   // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This
   // must NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps)
   // as "report" — that would collapse to a single Analyze stage and hide the failures. Such a run has no
   // analyze step anywhere, so it correctly falls through to the pipeline, where the failure shows as
   // implement=failed.
-  const hasAnalyze = result.repos.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
-  const hasRunStep = result.repos.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
+  const hasAnalyze = repos.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
+  const hasRunStep = repos.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
   const isReport = hasAnalyze && !hasRunStep;
   const stages = isReport ? REPORT_STAGES : PIPELINE_STAGES;
 
-  if (result.repos.length === 0) {
+  if (repos.length === 0) {
     return <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>;
   }
 
-  const selJob = sel ? deriveJobs(result.repos[sel.repo], stages)[sel.stage] : null;
+  const selJob = sel ? deriveJobs(repos[sel.repo], stages)[sel.stage] : null;
 
   return (
     <div className="flex flex-col gap-3">
@@ -326,7 +330,7 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
             ))}
           </div>
 
-          {result.repos.map((repo, ri) => {
+          {repos.map((repo, ri) => {
             const jobs = deriveJobs(repo, stages);
             return (
               <div key={`${repo.repo}:${ri}`} className="flex items-center border-b border-separator px-3 py-2.5 last:border-0">
@@ -356,7 +360,7 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
         <div className="rounded-card border border-separator bg-bg-base p-3">
           <div className="mb-1.5 flex items-center justify-between gap-2">
             <span className="text-caption font-semibold uppercase tracking-wide text-text-tertiary">
-              {result.repos[sel!.repo].repo} · {stages[sel!.stage].label}
+              {repos[sel!.repo].repo} · {stages[sel!.stage].label}
             </span>
             {selJob.href && (
               <a href={selJob.href} target="_blank" rel="noreferrer" className="shrink-0 text-caption font-medium text-accent hover:underline">
@@ -449,10 +453,10 @@ function ExecutionDetailBody({ res }: { res: RunResult }) {
           <ExecutionPipeline result={res} />
         ) : (
           <div className="flex flex-col gap-4">
-            {res.repos.length === 0 ? (
+            {(res.repos ?? []).length === 0 ? (
               <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
             ) : (
-              res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+              (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
             )}
           </div>
         )}
@@ -559,11 +563,15 @@ export function ExecutionHistory({ type }: { type: RunType }) {
       </div>
 
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
-        {sel ? (
-          <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
-        ) : (
-          <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
-        )}
+        {/* A single unreadable/partial execution must not blank the surface — contain it to this pane and
+            let picking another (healthy) execution recover via resetKeys. */}
+        <ErrorBoundary resetKeys={[sel?.runId, sel?.resultId]}>
+          {sel ? (
+            <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
+          ) : (
+            <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
+          )}
+        </ErrorBoundary>
       </div>
     </>
   );
@@ -603,10 +611,10 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
       <PromptDisclosure prompt={res.prompt} />
-      {res.repos.length === 0 ? (
+      {(res.repos ?? []).length === 0 ? (
         <p className="text-caption text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
       ) : (
-        res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+        (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
       )}
     </div>
   );
