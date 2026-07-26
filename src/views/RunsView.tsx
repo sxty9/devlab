@@ -470,7 +470,7 @@ function RunDetail({
       toast({ title: 'Lauf gestartet', variant: 'success' });
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
-      // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
+      // 503 "nicht konfiguriert" / 409 "kann gerade nicht starten" (läuft schon, Grenze erreicht, oder Repos belegt) surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setRunningNow(false);

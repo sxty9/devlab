@@ -1586,7 +1586,9 @@ func clip(s string) string {
 }
 
 // runNow triggers a run immediately, detached from this request (it can take a long time). Returns at
-// once; the UI polls the run's results. 503 when unconfigured, 409 when a run is already in progress.
+// once; the UI polls the run's results. 503 when unconfigured, 409 when the run cannot start right now —
+// it is already running, the concurrency ceiling is reached, or its target repos are busy (an auto run:
+// any other run active).
 func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert (DEVLAB_RUNS_MODE/DEVLAB_RUNS_USER)")
@@ -1598,7 +1600,7 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.scheduler.FireNow(id, actor(r)) {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
+		writeErr(w, http.StatusConflict, "Lauf kann gerade nicht starten — er läuft bereits, die Nebenläufigkeitsgrenze ist erreicht, oder seine Ziel-Repos sind belegt")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
