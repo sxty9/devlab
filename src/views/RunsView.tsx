@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
@@ -36,7 +37,8 @@ const WEEKDAYS: { num: number; label: string }[] = [
 ];
 
 /** A human schedule line: `täglich 03:00` or `wöchentlich Mo, Do · 03:00`. */
-function scheduleSummary(s: RunSchedule): string {
+function scheduleSummary(s: RunSchedule | undefined | null): string {
+  if (!s) return '—';
   if (s.kind === 'daily') return `täglich ${s.timeOfDay}`;
   const days = WEEKDAYS.filter((w) => s.weekdays?.includes(w.num)).map((w) => w.label);
   if (days.length === 0) return `wöchentlich · ${s.timeOfDay}`;
@@ -300,8 +302,11 @@ export default function RunsView() {
               </div>
             </div>
 
-            {/* RIGHT — detail, editor, or placeholder */}
-            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">{rightPane}</div>
+            {/* RIGHT — detail, editor, or placeholder. Boundary-wrapped so a single dead/partial run only
+                fails its own pane (recovering when another is picked, via resetKeys) while the list stays live. */}
+            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
+              <ErrorBoundary resetKeys={[selectedId, mode]}>{rightPane}</ErrorBoundary>
+            </div>
           </>
         )}
 
@@ -466,6 +471,9 @@ function RunDetail({
   };
 
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
+  // A legacy/damaged run can carry no axioms at all (Go marshals the empty slice as null); guard so the
+  // detail pane counts and lists them safely instead of throwing on null.
+  const axiomIds = run.axiomIds ?? [];
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
@@ -503,12 +511,12 @@ function RunDetail({
       </div>
 
       <section className="mt-6">
-        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({run.axiomIds.length})</p>
-        {run.axiomIds.length === 0 ? (
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({axiomIds.length})</p>
+        {axiomIds.length === 0 ? (
           <p className="text-footnote text-text-tertiary">Keine Axiome zugeordnet.</p>
         ) : (
           <div className="flex flex-wrap gap-1.5">
-            {run.axiomIds.map((id) => (
+            {axiomIds.map((id) => (
               <span key={id} className="rounded-md bg-fill/10 px-2 py-0.5 text-caption text-text-secondary">
                 {axioms[id] ?? id}
               </span>

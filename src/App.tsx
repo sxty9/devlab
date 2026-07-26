@@ -4,6 +4,7 @@ import { ToastProvider } from '@/ui/Toast';
 import { TopBar } from '@/shell/TopBar';
 import { ViewHost } from '@/views/ViewHost';
 import { Overlays } from '@/shell/Overlays';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 
 /** The chrome: one top bar over whichever view is active — Dashboard, IDE, Mercury or Atlas.
  *
@@ -28,8 +29,13 @@ export default function App() {
   return (
     <SessionProvider>
       <ToastProvider>
-        <Shell />
-        <Overlays />
+        {/* The outermost net: finer boundaries (per view, per detail pane) catch first and keep more of
+            the UI alive, so this only ever fires for a crash in the chrome itself (top bar, modals). Even
+            then the page shows a recoverable notice rather than going black. */}
+        <ErrorBoundary>
+          <Shell />
+          <Overlays />
+        </ErrorBoundary>
       </ToastProvider>
     </SessionProvider>
   );

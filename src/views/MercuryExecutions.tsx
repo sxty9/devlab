@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
@@ -310,7 +311,7 @@ function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onS
  *  picks a job themselves. */
 export function ExecutionPipeline({ result }: { result: RunResult }) {
   // Finished repos, then the one in flight (if any) as the trailing, live row.
-  const rows = useMemo(() => [...result.repos, ...(result.live ? [result.live] : [])], [result.repos, result.live]);
+  const rows = useMemo(() => [...(result.repos ?? []), ...(result.live ? [result.live] : [])], [result.repos, result.live]);
 
   // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This must
   // NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps) as
@@ -534,10 +535,10 @@ function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?:
           <ExecutionPipeline result={res} />
         ) : (
           <div className="flex flex-col gap-4">
-            {res.repos.length === 0 ? (
+            {(res.repos ?? []).length === 0 ? (
               <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
             ) : (
-              res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+              (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
             )}
           </div>
         )}
@@ -644,11 +645,15 @@ export function ExecutionHistory({ type }: { type: RunType }) {
       </div>
 
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
-        {sel ? (
-          <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
-        ) : (
-          <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
-        )}
+        {/* A single unreadable/partial execution must not blank the surface — contain it to this pane and
+            let picking another (healthy) execution recover via resetKeys. */}
+        <ErrorBoundary resetKeys={[sel?.runId, sel?.resultId]}>
+          {sel ? (
+            <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
+          ) : (
+            <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
+          )}
+        </ErrorBoundary>
       </div>
     </>
   );
@@ -688,10 +693,10 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
       <PromptDisclosure prompt={res.prompt} />
-      {res.repos.length === 0 ? (
+      {(res.repos ?? []).length === 0 ? (
         <p className="text-caption text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
       ) : (
-        res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+        (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
       )}
     </div>
   );
