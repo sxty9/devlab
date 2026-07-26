@@ -74,6 +74,13 @@ type Run struct {
 	DueAt       *time.Time   `json:"dueAt,omitempty"`       // optional one-time due date; nil = run it manually
 	Done        bool         `json:"done,omitempty"`        // set after a successful execution — a ToDo fires once
 
+	// BranchDesc is an optional, AI-optimized description for this run's git branch (both run types push
+	// branches). It is set at create/update time ONLY when Name does not slugify into something usable on
+	// its own (see BranchDescGoodEnough); the executor prefers it over Name when naming the run branch, and
+	// empty means "the name was good enough, slug that". Display metadata, never a path segment as stored —
+	// the executor slugifies it.
+	BranchDesc string `json:"branchDesc,omitempty"`
+
 	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
 	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
 	Repo        string     `json:"repo,omitempty"`
