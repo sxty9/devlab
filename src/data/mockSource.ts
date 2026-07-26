@@ -255,6 +255,9 @@ export const mockSource: DataSource = {
   async mercuryReorder(_category: string, _order: string[]) {
     /* mock: no-op */
   },
+  async mercuryRolloutStatus() {
+    return { last: null };
+  },
   async mercuryRuns() {
     // Fresh copies so setList always sees a new reference (and can't mutate the store by ref).
     return { runs: runStore.map((r) => ({ ...r })), axioms: {} };
@@ -300,9 +303,6 @@ export const mockSource: DataSource = {
   async mercuryDeleteRun(id: string) {
     const idx = runStore.findIndex((r) => r.id === id);
     if (idx >= 0) runStore.splice(idx, 1);
-  },
-  async mercuryRecomposeRun(_id: string) {
-    /* mock: no-op */
   },
   async mercuryRunAiFill() {
     return { proposal: { runs: [] }, axioms: {} };

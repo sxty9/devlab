@@ -370,8 +370,8 @@ export interface RunAttachment {
 }
 
 /** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
- *  axioms + all Laufregeln (`stale` = that snapshot drifted from the store); a todo's prompt is just
- *  its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
+ *  axioms + all Laufregeln and kept current by every scheme write (so it never drifts); a todo's prompt
+ *  is just its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
 export interface Run {
   id: string;
   name: string;
@@ -395,7 +395,6 @@ export interface Run {
   nextFireAt?: string;
   lastFiredAt?: string;
   lastResult?: RunResultRef;
-  stale?: boolean;
   // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
   suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
 }
@@ -415,6 +414,24 @@ export interface RunInput {
 export interface RunList {
   runs: Run[];
   axioms: Record<string, string>; // axiom id → title, for display
+}
+
+/** One repo the last automatic rollout could not update, with a short reason (not a raw log). */
+export interface RolloutSkip {
+  repo: string;
+  reason: string;
+}
+
+/** The portioned outcome of the last automatic CLAUDE.md rollout: when it ran, which repos received a
+ *  new commit, how many were already current, and which were skipped. `error` is a whole-rollout
+ *  failure (e.g. no runner token). Absent (`last: null`) until the first rollout since startup. */
+export interface RolloutReport {
+  at: string;
+  repos: number;
+  changed: string[];
+  unchanged: number;
+  skipped?: RolloutSkip[];
+  error?: string;
 }
 
 /** Which axioms are already backed by a run (badges), plus id→path and id→title lookups. */

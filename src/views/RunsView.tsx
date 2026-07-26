@@ -213,7 +213,6 @@ export default function RunsView() {
         active={active && active.runId === selectedRun.id ? active : null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
-        onRecomposed={reload}
         onRunStarted={refetchActive}
       />
     );
@@ -362,7 +361,6 @@ function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSe
         {run.suspended && (
           <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-caption font-medium text-accent">pausiert</span>
         )}
-        {run.stale && <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">veraltet</span>}
       </div>
       <span className="text-caption text-text-tertiary">{scheduleSummary(run.schedule)}</span>
       <span className="text-caption text-text-tertiary">
@@ -380,7 +378,6 @@ function RunDetail({
   active,
   onEdit,
   onDeleted,
-  onRecomposed,
   onRunStarted,
 }: {
   run: Run;
@@ -388,7 +385,6 @@ function RunDetail({
   active: RunActive | null;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
-  onRecomposed: () => void | Promise<void>;
   onRunStarted: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
@@ -458,19 +454,6 @@ function RunDetail({
     }
   };
 
-  const recompose = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await source.mercuryRecomposeRun(run.id);
-      toast({ title: 'Prompt neu komponiert', variant: 'success' });
-      await onRecomposed();
-    } catch (e) {
-      toast({ title: 'Neu komponieren fehlgeschlagen', description: msg(e), variant: 'danger' });
-      setBusy(false);
-    }
-  };
-
   const runNow = async () => {
     if (runningNow) return;
     setRunningNow(true);
@@ -499,11 +482,6 @@ function RunDetail({
           <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
             <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
           </Button>
-          {run.stale && (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={recompose}>
-              <RefreshIcon className="h-4 w-4" /> Neu komponieren
-            </Button>
-          )}
           <Button variant="secondary" size="sm" onClick={onEdit}>
             Bearbeiten
           </Button>
@@ -525,7 +503,6 @@ function RunDetail({
         {run.suspended && (
           <span className="rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent">pausiert · Abo-Limit</span>
         )}
-        {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
 

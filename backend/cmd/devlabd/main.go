@@ -42,9 +42,11 @@ func main() {
 
 	// Mercury's run scheduler runs in the background for the process lifetime; it stays dormant
 	// unless DEVLAB_RUNS_MODE + DEVLAB_RUNS_USER are configured. Cancelled on shutdown so an
-	// in-flight run drains before the process exits.
+	// in-flight run drains before the process exits. The auto-rollout worker shares that lifetime:
+	// axiom/rule edits debounce into one CLAUDE.md rollout, pushed with the same runner token.
 	schedCtx, schedCancel := context.WithCancel(context.Background())
 	server.StartScheduler(schedCtx)
+	server.StartRolloutWorker(schedCtx)
 
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {

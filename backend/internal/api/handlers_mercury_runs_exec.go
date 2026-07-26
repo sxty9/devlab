@@ -144,11 +144,9 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	}
 	// The OS identity that executes and the GitHub identity that pushes are separate concerns: the
 	// runner should be a powerless Linux account while the token belongs to a real linked account.
-	// Defaults to user so an existing single-account setup keeps working untouched.
-	tokenUser := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_TOKEN_USER"))
-	if tokenUser == "" {
-		tokenUser = user
-	}
+	// runnerTokenUser resolves DEVLAB_RUNS_TOKEN_USER, falling back to DEVLAB_RUNS_USER — shared with
+	// the background rollout so both agree on which account pushes.
+	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",

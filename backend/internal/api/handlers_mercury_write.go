@@ -106,6 +106,8 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
+	// Recompose the affected run snapshots and, for a CLAUDE.md-carried namespace, trigger the rollout.
+	s.reconcileAfterWrite(r.Context(), cookie, ns == mercury.NsAxiome || ns == mercury.NsRegeln)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
 		"id":         ax.ID,
