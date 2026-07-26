@@ -36,6 +36,7 @@ type Server struct {
 	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
@@ -75,6 +76,7 @@ func New(v *auth.Verifier) *Server {
 		runs:        runs.NewStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
+		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
