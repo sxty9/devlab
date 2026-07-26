@@ -178,6 +178,10 @@ type runExecutor struct {
 	tokenUser      string
 	autoMergeAfter time.Duration
 
+	// wave is shared by every concurrent Execute so the spend ceiling and the subscription-limit pause
+	// apply in aggregate across all runs, not per run (task point 5).
+	wave runWave
+
 	// IO seams — nil in production (the real GitHub client and deploy pipeline are used). Kept as
 	// fields so the Maintain orchestration (throttled merge-detection → prod-deploy → untrack) can be
 	// exercised in tests without a real GitHub token, real network, or a real root deploy wrapper.
@@ -229,6 +233,12 @@ func (x *runExecutor) deployable(repoName string) bool {
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(resultID string)) (runs.ResultRef, error) {
+	// Join the concurrency wave so the spend ceiling and the subscription-limit pause are shared across
+	// all runs executing right now (task point 5). enter() resets the aggregate budget/limit gate when
+	// this is the first run of a wave; leave() releases it when the run ends.
+	x.wave.enter()
+	defer x.wave.leave()
+
 	// Resume an execution suspended on the usage limit (same ResultID, skip the repos already done), or
 	// start a fresh one. A resume that can't find its open result silently starts fresh.
 	res, resuming := x.resumeOrNew(run)
@@ -335,10 +345,6 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		save()
 	}
 
-	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
-	// since this attempt began, so a carried-over run resumes with a fresh budget and always makes
-	// progress (a cumulative cap would re-trip forever on the loaded res.CostUSD and deadlock).
-	attemptStartCost := res.CostUSD
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
@@ -346,15 +352,25 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		if done[repo.ID] {
 			continue // completed in an earlier attempt of this same execution
 		}
-		// Spend ceiling for THIS attempt: stop before starting another expensive repo. Carry over — the
-		// remaining repos continue on the next scheduled run, not redone-from-scratch (which would
-		// duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by its
-		// own cost (soft cap).
-		if costCeiling > 0 && res.CostUSD-attemptStartCost >= costCeiling {
-			log.Printf("devlabd: run %s hit the per-run cost ceiling ($%.2f this attempt ≥ $%.2f) after %d repos — carrying the rest to the next run",
-				run.ID, res.CostUSD-attemptStartCost, costCeiling, len(res.Repos))
+		// AGGREGATE spend ceiling (task point 5): stop before starting another expensive repo once the
+		// SUM of what all runs in this wave have cost reaches the ceiling — not each run separately. Carry
+		// over so the remaining repos continue on the next run rather than being redone (which would
+		// duplicate PRs and raise spend). Measured per wave, so a carried-over run resumes with a fresh
+		// aggregate budget and always makes progress. Soft cap: a repo already in flight may overshoot.
+		if x.wave.overBudget(costCeiling) {
+			log.Printf("devlabd: run %s stopping — aggregate spend across active runs reached the ceiling ($%.2f ≥ $%.2f) after %d repos — carrying the rest to the next run",
+				run.ID, x.wave.spendSnapshot(), costCeiling, len(res.Repos))
 			carriedOver = true
 			break
+		}
+		// AGGREGATE subscription-limit pause (task point 5): if ANY concurrent run already hit the usage
+		// limit, pause this one too at the shared reset instant instead of calling Claude and re-hitting
+		// the exhausted account. All paused runs get the same ResumeAt, so they resume together.
+		if resumeEnabled() {
+			if tripped, resumeAt := x.wave.limitTripped(); tripped {
+				log.Printf("devlabd: run %s pausing with the wave on the subscription limit — resuming at %s", run.ID, resumeAt.Format(time.RFC3339))
+				return x.suspend(run, &res, resumeAt, save)
+			}
 		}
 		if ctx.Err() != nil {
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
@@ -375,8 +391,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
-			// do NOT hammer the rest — suspend the whole execution until the window resets.
-			return x.suspend(run, &res, lim, save)
+			// do NOT hammer the rest — suspend the whole execution until the window resets. Trip the wave
+			// gate first so every OTHER concurrent run pauses at the same reset instant and resumes with
+			// this one, rather than each re-hitting the limit on its own (task point 5).
+			resumeAt := limitResumeAt(lim)
+			x.wave.tripLimit(resumeAt)
+			return x.suspend(run, &res, resumeAt, save)
 		}
 		if lim.infra {
 			// Infrastructure failure (DNS/network) — NOT this repo's fault, and a sign the rest will fail
@@ -407,6 +427,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.InputTokens += rr.InputTokens
 		res.OutputTokens += rr.OutputTokens
 		res.CostUSD += rr.CostUSD
+		x.wave.addSpend(rr.CostUSD) // count this repo toward the wave's AGGREGATE spend ceiling
 		res.NumTurns += rr.NumTurns
 		if !rr.OK {
 			overallOK = false
@@ -495,17 +516,23 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 	log.Printf("devlabd: reaped husk %s/%s — %s", res.RunID, res.ResultID, reason)
 }
 
-// suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
-// budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
-// the scheduler clears the suspension and stops retrying).
-func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
+// limitResumeAt is when a run paused on the subscription usage limit should resume: a small cushion past
+// the reset instant the CLI reported, or a plain backoff when it gave no reset time. Shared by the run
+// that hit the limit and (via the wave gate) every other run pausing with it, so they resume together.
+func limitResumeAt(lim repoSignal) time.Time {
+	if lim.hasReset && lim.resetAt.After(time.Now()) {
+		return lim.resetAt.Add(1 * time.Minute) // a small cushion past the reported reset
+	}
+	return time.Now().Add(limitBackoff())
+}
+
+// suspend persists the partial execution as paused (resuming at resumeAt) and returns a suspended
+// ResultRef — UNLESS the resume budget is exhausted, in which case it finalizes the execution as failed
+// and returns a normal ref (so the scheduler clears the suspension and stops retrying).
+func (x *runExecutor) suspend(run runs.Run, res *runs.Result, resumeAt time.Time, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
 		attempts = run.Suspended.Attempts
-	}
-	resumeAt := time.Now().Add(limitBackoff())
-	if lim.hasReset && lim.resetAt.After(time.Now()) {
-		resumeAt = lim.resetAt.Add(1 * time.Minute) // a small cushion past the reported reset
 	}
 	if attempts+1 > maxResumes() {
 		res.Suspended, res.ResumeAt = false, nil
@@ -1322,11 +1349,19 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
+			name := repoNameOf(p.Repo)
 			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
 			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
-			if name := repoNameOf(p.Repo); !x.deployable(name) {
+			if !x.deployable(name) {
 				_ = x.s.runPRs.Remove(p.Repo, p.Number)
 				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
+				continue
+			}
+			// DEFERRED RESTART (task point 4): deploying the self repo restarts devlabd, which would kill
+			// every run still executing IN THIS process. While any run is active, hold the self-deploy off
+			// and keep the PR tracked — the next eligible tick deploys it once the last run has finished.
+			if isSelfRepo(name) && x.s.scheduler != nil && x.s.scheduler.ActiveCount() > 0 {
+				log.Printf("devlabd: self-deploy of %s#%d deferred — %d run(s) active (a restart would kill them)", p.Repo, p.Number, x.s.scheduler.ActiveCount())
 				continue
 			}
 			depLog, derr := x.runProdDeploy(ctx, token, p)
