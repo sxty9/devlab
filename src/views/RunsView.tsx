@@ -6,7 +6,7 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import type {
   Run,
   RunActive,
@@ -79,11 +79,10 @@ export default function RunsView() {
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
-  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
-  // live-follow view — survive a page reload instead of living only in this component. The global cancel
-  // shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
+  // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
+  // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
+  // cancel lives in that overview.
+  const { active, inflight, refetch: refetchActive } = useActiveRun();
   const [cancelling, setCancelling] = useState(false);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
@@ -241,16 +240,7 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        {running && (
-          <div className="ml-auto flex items-center gap-2">
-            <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-            </span>
-            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
-          </div>
-        )}
+        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
       </header>
 
       <div className="flex min-h-0 flex-1">
