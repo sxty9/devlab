@@ -95,6 +95,30 @@ func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []m
 	run.PromptHash = mercury.RunInputsHash(axs, laufregeln)
 }
 
+// upsertPlannedRun folds one planned auto run into out: if an auto run of the same name (case-insensitive)
+// already exists, its axioms are extended (deduped), its snapshot recomposed and its schedule re-armed;
+// otherwise np is appended as a new run. It returns the resulting list, a copy of the affected run (so the
+// caller can name it / link to it) and whether a new run was created. Only auto runs are matched — a ToDo
+// that happens to share a name is never turned into an axiom carrier. Shared by the interactive
+// fill-apply and the background auto-assigner so the merge semantics have a single definition.
+func upsertPlannedRun(out []runs.Run, np runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) ([]runs.Run, runs.Run, bool) {
+	for i := range out {
+		if out[i].IsTodo() || !strings.EqualFold(out[i].Name, np.Name) {
+			continue
+		}
+		out[i].AxiomIDs = dedupStrings(append(out[i].AxiomIDs, np.AxiomIDs...))
+		out[i].UpdatedAt = now
+		composeInto(&out[i], byID, laufregeln, now)
+		if out[i].Enabled {
+			if nf, e := out[i].Schedule.Next(now); e == nil {
+				out[i].NextFireAt = &nf
+			}
+		}
+		return out, out[i], false
+	}
+	return append(out, np), np, true
+}
+
 // runsList returns every run plus an id→title legend for the axioms in play. Snapshots are kept current
 // by every scheme write (reconcileAfterWrite), so there is no staleness flag to compute or surface.
 func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
@@ -138,7 +162,12 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 			covered[id] = append(covered[id], run.ID)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"covered": covered, "index": idPath, "axioms": titleLegend(byID)})
+	// pending: an automatic assignment is scheduled or running, so a currently-uncovered axiom is only
+	// TEMPORARILY uncovered. Coverage stays honest (the axiom is reported uncovered until the assignment
+	// actually lands); pending merely lets the UI show the state as transient rather than permanent.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"covered": covered, "index": idPath, "axioms": titleLegend(byID), "pending": s.assignPending(),
+	})
 }
 
 func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
@@ -430,6 +459,8 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gespeichert werden")
 		return
 	}
+	// Editing a run may have removed axioms from it, leaving them uncovered; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -463,6 +494,8 @@ func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 	if s.attachments != nil {
 		_ = s.attachments.DeleteAll(id)
 	}
+	// Deleting a run may have orphaned its axioms; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -648,34 +681,18 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		if body.Mode == "replace" {
 			return planned, nil
 		}
-		// fill: extend a run of the same name (append axioms), else append the new run.
+		// fill: extend an auto run of the same name (append axioms), else append the new run.
 		out := append([]runs.Run(nil), cur...)
 		for _, np := range planned {
-			idx := -1
-			for i := range out {
-				if strings.EqualFold(out[i].Name, np.Name) {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
-				out = append(out, np)
-				continue
-			}
-			out[idx].AxiomIDs = dedupStrings(append(out[idx].AxiomIDs, np.AxiomIDs...))
-			out[idx].UpdatedAt = now.UTC()
-			composeInto(&out[idx], byID, laufregeln, now.UTC())
-			if out[idx].Enabled {
-				if nf, e := out[idx].Schedule.Next(now); e == nil {
-					out[idx].NextFireAt = &nf
-				}
-			}
+			out, _, _ = upsertPlannedRun(out, np, byID, laufregeln, now.UTC())
 		}
 		return out, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Vorschlag konnte nicht gespeichert werden")
 		return
 	}
+	// A replace can strip coverage from axioms the new set omits; cover them again in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -743,6 +760,8 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Wiederherstellung fehlgeschlagen")
 		return
 	}
+	// Restoring an older set can leave axioms added since then uncovered; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": len(restored)})
 }
 

@@ -108,6 +108,12 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	// Recompose the affected run snapshots and, for a CLAUDE.md-carried namespace, trigger the rollout.
 	s.reconcileAfterWrite(r.Context(), cookie, ns == mercury.NsAxiome || ns == mercury.NsRegeln)
+	// A brand-new axiom belongs to no run yet. Assign it to one automatically in the background (the
+	// write does not wait) so it is enforced without a manual step. Only axioms drive run coverage —
+	// a new Laufregel or meta-axiom leaves the covered set unchanged, so it need not kick.
+	if ns == mercury.NsAxiome {
+		s.kickAutoAssign(r)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
 		"id":         ax.ID,

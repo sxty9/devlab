@@ -463,6 +463,23 @@ export interface RunCoverage {
   covered: Record<string, string[]>; // axiom id → run ids
   index: Record<string, string>; // axiom id → scheme path
   axioms: Record<string, string>; // axiom id → title
+  // An automatic assignment is scheduled or running, so a currently-uncovered axiom is only TEMPORARILY
+  // uncovered. Coverage itself stays honest; this merely lets the UI show the state as transient.
+  pending?: boolean;
+}
+
+/** One entry in the automatic axiom→run assignment feed: either an assignment happened (`assigned`) or
+ *  it could not be carried out (`failed`). Portioned, and free of any raw log. */
+export interface RunNotice {
+  id: string;
+  at: string;
+  kind: 'assigned' | 'failed';
+  runId?: string; // assigned only — the run the axioms landed in (click-through to adjust it)
+  runName?: string; // assigned only
+  newRun?: boolean; // assigned only — a fresh run was created (vs. an existing one extended)
+  axiomIds: string[];
+  axioms: string[]; // title snapshot, so the feed reads without a live lookup
+  reason?: string; // failed only — a short human reason
 }
 
 /** One proposed run from an AI-planning button (reviewable before it is applied). */
