@@ -385,6 +385,10 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
 	composeInto(&run, byID, laufregeln, now.UTC())
+	// Optimise the branch description with AI only when the raw name is too thin to slugify; best-effort,
+	// so a miss just leaves the executor to slug the name itself. Done here (outside Mutate) so the store
+	// lock is never held across the aigentic round-trip.
+	run.BranchDesc = s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), run.Name, run.Task)
 	// Only a recurring auto run has a NextFireAt; a ToDo fires once at its optional DueAt (or manually).
 	if run.Enabled && !run.IsTodo() {
 		if nf, err := run.Schedule.Next(now); err == nil {
@@ -421,6 +425,10 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	// Recompute the AI-optimized branch description for the edited name (outside Mutate so the store lock
+	// is never held across the aigentic round-trip). Recomputing on every edit keeps it consistent: a name
+	// that is now good enough clears it (""), a still-thin one refreshes it.
+	branchDesc := s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), body.Name, body.Task)
 	var updated runs.Run
 	if _, err := s.runs.Mutate("update", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
 		idx := indexOfRun(cur, id)
@@ -434,6 +442,7 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].AxiomIDs = body.AxiomIDs
 		cur[idx].Task = body.Task
 		cur[idx].Targets = body.Targets
+		cur[idx].BranchDesc = branchDesc
 		// Drop any legacy single-target fields so a record edited after the upgrade keeps Targets as its
 		// only source of truth (TodoTargets prefers Targets, but leaving stale fields is untidy).
 		cur[idx].Repo, cur[idx].NewRepo = "", ""
@@ -629,6 +638,40 @@ func (s *Server) planRuns(ctx context.Context, cookie, csrf string, knownIDs []s
 		lastErr = mercury.ErrNoJSON
 	}
 	return mercury.RunPlan{}, lastErr
+}
+
+// aiBranchDesc supplies the "otherwise optimise with ai" half of the run-branch naming convention: when a
+// run's own name is too thin to slugify into a readable branch (see runs.BranchDescGoodEnough), it asks
+// aigentic for a concise English description instead. It is deliberately best-effort and non-blocking —
+// a short timeout and ANY error (aigentic down, missing right/key, junk output) yield "", so creating or
+// editing a run never hangs on or fails because of the AI service; the executor then slugifies the name
+// (or its "change" fallback) directly. It returns "" without spending a round-trip when the name is
+// already good enough, and only ever runs in a request handler, where the caller's cookie authorises the
+// aigentic proxy — the background executor has no session and so relies on the deterministic slug.
+func (s *Server) aiBranchDesc(ctx context.Context, cookie, csrf, name, task string) string {
+	if runs.BranchDescGoodEnough(name) {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	prompt := "Name a git branch for the following software task. Reply with ONLY a concise English " +
+		"description of 2 to 5 words, all lowercase, words separated by single spaces, no punctuation and " +
+		"no surrounding quotes.\n\nTask title: " + name + "\n"
+	if strings.TrimSpace(task) != "" {
+		prompt += "Task detail: " + task + "\n"
+	}
+	result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
+	if err != nil || result == nil {
+		return ""
+	}
+	desc := strings.TrimSpace(result.Output)
+	if i := strings.IndexByte(desc, '\n'); i >= 0 {
+		desc = strings.TrimSpace(desc[:i]) // keep only the first line if the model added prose
+	}
+	if !runs.BranchDescGoodEnough(desc) {
+		return "" // unusable answer — fall back to the deterministic name slug
+	}
+	return desc
 }
 
 // runsApplyProposal persists a (possibly user-edited) reviewed proposal. mode "fill" creates/extends

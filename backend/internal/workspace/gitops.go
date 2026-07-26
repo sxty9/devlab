@@ -549,15 +549,20 @@ func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) 
 	return strings.TrimSpace(s), err
 }
 
-// mergeRefRe restricts MergeRef to Mercury run branches on origin — the only refs the autonomous runner
-// ever folds into a run's base (the still-open pending PRs). A hostile branch name cannot reach git.
-var mergeRefRe = regexp.MustCompile(`^origin/mercury-run/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+// mergeRefRe restricts MergeRef to a well-formed origin/ branch ref — the shape the autonomous runner
+// folds into a run's base (the still-open pending Mercury PRs, whose heads now follow the human
+// <kind>/<description> convention rather than a fixed prefix). The caller has already vetted these as
+// Mercury's OWN PRs (hidden body marker); this regex is the structural safety net: it demands the origin/
+// prefix and an alphanumeric first segment character, so a hostile or malformed branch name cannot reach
+// git (path traversal is additionally blocked by the ".." check in MergeRef).
+var mergeRefRe = regexp.MustCompile(`^origin/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
 
 // MergeRef merges ref into the current branch (default merge; a merge commit is authored as the runner
 // identity when the histories diverge). On conflict it ABORTS the merge and returns an error, leaving the
 // branch exactly as before — the caller then proceeds without that pending PR in the base. Restricted to
-// origin/mercury-run/* refs. This is how the runner bases a run on "main + pending PRs" so it never redoes
-// not-yet-merged work while still implementing what a (possibly different-axiom) run still needs.
+// well-formed origin/* refs (see mergeRefRe). This is how the runner bases a run on "main + pending PRs"
+// so it never redoes not-yet-merged work while still implementing what a (possibly different-axiom) run
+// still needs.
 func (e Executor) MergeRef(ctx context.Context, wt, ref string) error {
 	if strings.Contains(ref, "..") || !mergeRefRe.MatchString(ref) {
 		return fmt.Errorf("invalid merge ref %q", ref)

@@ -371,7 +371,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			carriedOver = true
 			break
 		}
-		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
+		rr, lim := x.executeRepo(ctx, run, repo, newRepoName[repo.ID] != "", x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
@@ -556,7 +556,7 @@ type repoSignal struct {
 	infraErr string
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, isNewRepo bool, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
 	rr := runs.RepoResult{Repo: repo.ID, Running: true}
 	res.Live = &rr // publish this repo as the in-flight one; the caller clears Live once it settles
 	saver.force()
@@ -643,8 +643,16 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	// PR / FULL: implement on a fresh run branch.
-	runBranch := "mercury-run/" + run.ID + "/" + runs.NewResultID(time.Now())
+	// PR / FULL: implement on a fresh run branch. The name follows Mercury's uniform convention
+	// <kind>/<description> (e.g. feature/dark_mode-k3f9a2): kind is fix, or feature for a newly planned
+	// service; description is the run's own name (its AI-optimized form when the raw name was too thin),
+	// slugified. A short token keeps each firing's branch unique — the workspace is reused and the push is
+	// non-forced, so a stable name would collide on switch -c and on a non-fast-forward push.
+	branchDesc := run.Name
+	if run.BranchDesc != "" {
+		branchDesc = run.BranchDesc
+	}
+	runBranch := runs.BranchName(runs.BranchKindFor(isNewRepo), branchDesc, runs.NewBranchToken())
 	if err := ex.CreateBranch(ctx, wt, runBranch, "origin/"+branch); err != nil {
 		rr.Error = "branch: " + err.Error()
 		return rr, repoSignal{}
@@ -976,10 +984,13 @@ func retryInfra(ctx context.Context, attempts int, backoff time.Duration, op fun
 	return err
 }
 
-// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName (prefix
-// "mercury-run/") — the still-pending, not-yet-merged work the run must BASE ON (main + pending), so it
-// neither redoes it nor skips the repo. A lookup error yields no heads (the run then bases on plain main;
-// a genuine outage is caught as an infra carry-over at the clone step).
+// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName — the still-
+// pending, not-yet-merged work the run must BASE ON (main + pending), so it neither redoes it nor skips
+// the repo. A Mercury PR is recognised by its hidden body marker (mercuryPRMarker), which is stable and
+// language-independent now that the branch itself follows the human <kind>/<description> convention; the
+// legacy "mercury-run/" branch prefix is still matched so a PR opened before the rename folds in too. A
+// lookup error yields no heads (the run then bases on plain main; a genuine outage is caught as an infra
+// carry-over at the clone step).
 func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName string) []string {
 	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
 	if err != nil {
@@ -987,11 +998,17 @@ func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName st
 	}
 	var heads []string
 	for _, pr := range prs {
-		if strings.HasPrefix(pr.Head.Ref, "mercury-run/") {
+		if isMercuryPR(pr) {
 			heads = append(heads, pr.Head.Ref)
 		}
 	}
 	return heads
+}
+
+// isMercuryPR reports whether pr was opened by a Mercury run: primarily by the hidden body marker, with a
+// fallback to the legacy branch prefix for PRs created before branches moved to <kind>/<description>.
+func isMercuryPR(pr github.PullRequest) bool {
+	return strings.Contains(pr.Body, mercuryPRMarker) || strings.HasPrefix(pr.Head.Ref, "mercury-run/")
 }
 
 // resolveTodoTargets resolves every target of a ToDo to a concrete repo. A to-be-created target is
@@ -1593,8 +1610,14 @@ func agentArgs(prompt, mode string) []string {
 func runPRBody(run runs.Run) string {
 	return "Automatisch erzeugt vom Mercury-Lauf **" + run.Name + "**. Dieser PR bündelt die vom autonomen " +
 		"Runner implementierten Änderungen gegen die Axiome dieses Laufs. Merge jederzeit möglich; ohne Merge " +
-		"innerhalb der Frist wird automatisch gemergt.\n\n🤖 Mercury"
+		"innerhalb der Frist wird automatisch gemergt.\n\n🤖 Mercury\n" + mercuryPRMarker
 }
+
+// mercuryPRMarker is the stable, language-independent fingerprint of a Mercury-created PR. It sits in the
+// PR body as an HTML comment (invisible when rendered, untouched by the nightly translation pass), so a
+// run can recognise its own still-open PRs WITHOUT relying on the branch name — the branch now follows the
+// human <kind>/<description> convention and no longer carries a distinguishing prefix.
+const mercuryPRMarker = "<!-- holistic-mercury-run -->"
 
 func clip(s string) string {
 	const max = 20000
