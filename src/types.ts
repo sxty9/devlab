@@ -457,7 +457,40 @@ export interface RunResultRef {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
+  /** How far delivery got. A finished execution is not "done" — it sits on a rung: implemented →
+   *  dev-deployed → PR offen → gemergt → prod-live. The server attests each rung (the executor the
+   *  first two, the PR maintenance the last two); `runStage` turns them into the label. */
+  deployed?: boolean;
+  prUrl?: string;
+  merged?: boolean;
+  prodDeployed?: boolean;
 }
+
+/** The delivery ladder, mirroring runs.Stage on the server: the furthest rung actually reached.
+ *  Deliberately NOT a green "Erledigt" — a run whose PR is still open has delivered nothing yet. */
+export type RunStage = 'failed' | 'suspended' | 'implemented' | 'dev-deployed' | 'pr-open' | 'merged' | 'prod-deployed';
+
+/** Derives the stage from a result reference (most-advanced rung first). */
+export function runStage(ref: RunResultRef | null | undefined): RunStage | null {
+  if (!ref) return null;
+  if (ref.prodDeployed) return 'prod-deployed';
+  if (ref.merged) return 'merged';
+  if (!ref.ok) return 'failed';
+  if (ref.prUrl) return 'pr-open';
+  if (ref.deployed) return 'dev-deployed';
+  return 'implemented';
+}
+
+/** The German label + tint for each rung, so every surface names a stage identically. */
+export const RUN_STAGE_LABEL: Record<RunStage, { label: string; tint: 'success' | 'accent' | 'warning' | 'danger' }> = {
+  'prod-deployed': { label: 'prod-live', tint: 'success' },
+  merged: { label: 'main-merged', tint: 'success' },
+  'pr-open': { label: 'PR offen', tint: 'accent' },
+  'dev-deployed': { label: 'dev-deployed', tint: 'accent' },
+  implemented: { label: 'implementiert', tint: 'warning' },
+  suspended: { label: 'pausiert', tint: 'warning' },
+  failed: { label: 'fehlgeschlagen', tint: 'danger' },
+};
 
 export interface RunStep {
   name: string; // analyze | implement | push | pr | deploy

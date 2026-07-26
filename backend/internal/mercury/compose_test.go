@@ -76,3 +76,35 @@ func TestRunInputsHash(t *testing.T) {
 		t.Error("hash depends on axiom order")
 	}
 }
+
+// TestRepoScopeSection pins the incremental scope: an axiom with a recorded stand is scoped to the
+// commits after it, one without a record is named explicitly as full-repository work (silence would
+// leave the agent guessing), and the misleading word "Checkpoint" appears nowhere.
+func TestRepoScopeSection(t *testing.T) {
+	axioms := []RunAxiom{{ID: "ax_a", Titel: "Passive Speicher"}, {ID: "ax_b", Titel: "Atomare Zugriffe"}}
+	out := RepoScopeSection(axioms, map[string]LastCheck{"ax_a": {Commit: "abc1234", At: "2026-07-20"}})
+
+	for _, want := range []string{"Passive Speicher", "abc1234", "2026-07-20", "Atomare Zugriffe", "GESAMTE Repository"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scope section is missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(strings.ToLower(out), "checkpoint") {
+		t.Errorf("the scope section must not use the misleading term 'Checkpoint':\n%s", out)
+	}
+	if RepoScopeSection(nil, nil) != "" {
+		t.Error("a run without axioms must add no scope section")
+	}
+}
+
+// TestComposeRunPromptHasNoCheckpointClaim pins that the preamble no longer asserts a record that
+// nothing writes: it points at the scope section this package actually renders.
+func TestComposeRunPromptHasNoCheckpointClaim(t *testing.T) {
+	p := ComposeRunPrompt("Lauf", []RunAxiom{{ID: "ax_a", Titel: "A", Body: "b"}}, nil)
+	if strings.Contains(strings.ToLower(p), "checkpoint") {
+		t.Errorf("run prompt still claims a 'Checkpoint' record:\n%s", p)
+	}
+	if !strings.Contains(p, "Zuletzt geprüfter Stand") {
+		t.Errorf("run prompt should point at the scope section:\n%s", p)
+	}
+}

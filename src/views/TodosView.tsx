@@ -7,6 +7,7 @@ import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { runStage, RUN_STAGE_LABEL } from '@/types';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -82,6 +83,27 @@ function defaultDueLocalInput(): string {
   const d = new Date();
   d.setHours(d.getHours() + 1, 0, 0, 0);
   return isoToLocalInput(d.toISOString());
+}
+
+/** The delivery badge: the furthest rung this ToDo actually reached — implementiert → dev-deployed →
+ *  PR offen → main-merged → prod-live. A plain green "Erledigt" was actively misleading: a ToDo whose
+ *  PR is still waiting for its auto-merge has shipped nothing, yet read as finished. */
+function StageBadge({ todo, className }: { todo: Run; className?: string }) {
+  const stage = runStage(todo.lastResult);
+  if (!stage) return null;
+  const { label, tint } = RUN_STAGE_LABEL[stage];
+  const tone = {
+    success: 'bg-success/15 text-success',
+    accent: 'bg-accent/15 text-accent',
+    warning: 'bg-warning/15 text-warning',
+    danger: 'bg-danger/15 text-danger',
+  }[tint];
+  return (
+    <span className={cn('flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium', tone, className)}>
+      {stage === 'prod-deployed' && <CheckIcon className="h-3 w-3" />}
+      {label}
+    </span>
+  );
 }
 
 /** One attachment tile: an image thumbnail or a file glyph, with the name and size. `href` (when set)
@@ -482,11 +504,7 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {todo.name}
         </span>
-        {todo.done && (
-          <span className="flex shrink-0 items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 text-caption font-medium text-success">
-            <CheckIcon className="h-3 w-3" /> Erledigt
-          </span>
-        )}
+        <StageBadge todo={todo} />
         {!todo.enabled && (
           <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">deaktiviert</span>
         )}
@@ -621,11 +639,7 @@ function TodoDetail({
         <span className={cn('rounded px-1.5 py-0.5 font-medium', todo.enabled ? 'bg-success/15 text-success' : 'bg-fill/15 text-text-tertiary')}>
           {todo.enabled ? 'Aktiv' : 'Deaktiviert'}
         </span>
-        {todo.done && (
-          <span className="flex items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 font-medium text-success">
-            <CheckIcon className="h-3 w-3" /> Erledigt
-          </span>
-        )}
+        <StageBadge todo={todo} />
         <span>Termin: {dueLabel(todo)}</span>
       </div>
 

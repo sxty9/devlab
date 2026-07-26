@@ -58,9 +58,32 @@ type Result struct {
 	NumTurns     int     `json:"numTurns"`
 }
 
+// Ref projects an execution to the lightweight reference stored on the run — including how far the
+// work got (dev-deploy, PR), so the surface can name the stage reached instead of a bare tick. One
+// definition for every return path of an execution; Maintain later adds the merge/prod rungs.
+func (r Result) Ref() ResultRef {
+	ref := ResultRef{
+		ResultID: r.ResultID, At: r.StartedAt, OK: r.OK, RepoCount: len(r.Repos),
+		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens, CostUSD: r.CostUSD,
+		Suspended: r.Suspended, ResumeAt: r.ResumeAt,
+	}
+	for _, rr := range r.Repos {
+		if rr.Deployed {
+			ref.Deployed = true
+		}
+		if ref.PRUrl == "" && rr.PRUrl != "" {
+			ref.PRUrl = rr.PRUrl
+		}
+	}
+	return ref
+}
+
 // RepoResult is the outcome of a run against one repository.
 type RepoResult struct {
 	Repo string `json:"repo"`
+	// Base is the commit this repo stood at when the agent examined it — the stand recorded per axiom so
+	// the NEXT run only has to look at what came after it.
+	Base string `json:"base,omitempty"`
 	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
 	Running      bool    `json:"running,omitempty"`
 	OK           bool    `json:"ok"`
