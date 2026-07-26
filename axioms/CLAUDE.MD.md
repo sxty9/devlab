@@ -65,6 +65,7 @@ Spezifische Implementierungsrichtlinien für die Holistic Services-Umgebung:
 - Konfiguration: Jeder Service stellt eine Konfigurationsschnittstelle bereit. Sämtliche Konfiguration und Einstellung (insbesondere durch Admins) erfolgt gebündelt im Holistic Dashboard in einem eigenen Tab, analog zur zentralen Rechteverwaltung (Privilege Service), jedoch für Konfigurationen statt Rechte. Falsch eingeordnete Konfiguration ist umgehend nach diesem Prinzip umzuordnen. In den Service-Tabs steht die User-Experience im Zentrum; sie dürfen nicht mit Konfiguration überflutet werden
 - Zustandserhalt beim Reload: Lädt der User eine Website neu, ist der zuvor gewählte Tab bzw. die zuvor gewählte Ansicht wiederherzustellen, damit er an derselben Stelle weiterarbeiten kann
 - Rechtsklick-Menüs: Wo ein Kontextmenü sich sinnvoll anbietet, ist es auch zu implementieren — mit sinnvollen, aber nicht überflüssigen Auswahlmöglichkeiten und Funktionen (im Einklang mit der Minimalism-Maxime)
+- Einfügen aus der Zwischenablage: An jedem Knotenpunkt, an dem Dateien zum Erfüllen einer Aufgabe unmittelbar hochgeladen werden können, ist zusätzlich das Einfügen aus der Zwischenablage bereitzustellen, sodass Datei-Dialog und Zwischenablage gleichwertige Eingabewege desselben Zugangspunkts sind
 - Server-Umgebung: Passwordless sudo ist für Claude auf dem Server aktiviert; dies ist beim Implementieren generell vorauszusetzen
 </holistic_umgebung_guidelines>
 
