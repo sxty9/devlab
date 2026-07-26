@@ -511,13 +511,23 @@ export interface RunActive {
   startedAt: string;
 }
 
-/** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */
+/** One entry in the calendar — the union of past and upcoming runs. `type` separates automatic runs
+ *  from ToDos (colour). A FUTURE firing carries its `schedule`; a completed (PAST) execution carries
+ *  `resultId` and status (`ok`/`suspended`) instead. The presence of `resultId` marks an occurrence as
+ *  past — the calendar shows its outcome and opens the full report on click. */
 export interface RunOccurrence {
   runId: string;
   runName: string;
   type: RunType;
   at: string;
-  schedule: string;
+  /** Future firing: how the run recurs. Absent on a past execution. */
+  schedule?: string;
+  /** Past execution: its result id — opens the full status/report via mercuryRunResult. */
+  resultId?: string;
+  /** Past execution: pass/fail outcome. */
+  ok?: boolean;
+  /** Past execution: paused on the Claude usage limit. */
+  suspended?: boolean;
 }
 
 export interface RunCalendar {

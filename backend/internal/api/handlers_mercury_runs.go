@@ -740,8 +740,11 @@ func (s *Server) runResultGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// runsCalendar returns the upcoming run occurrences over a window (default 30 days) — the data for
-// the auto-updating Laufkalender, sorted chronologically.
+// runsCalendar returns the calendar for a window — the union of past executions and upcoming firings,
+// sorted chronologically. The upcoming side expands each enabled run's schedule up to `days` ahead
+// (default 30); the past side folds in every completed execution (all of history, so a run that fired
+// long ago stays reachable), each carrying its resultId and status so the calendar can show the outcome
+// and open the full report. This is the one calendar access point behind every Mercury calendar surface.
 func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
@@ -763,12 +766,17 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	want := strings.TrimSpace(r.URL.Query().Get("type"))
 	now := time.Now()
 	horizon := now.Add(time.Duration(days) * 24 * time.Hour)
+	// One dot on the calendar. A FUTURE firing carries its schedule; a PAST execution carries its
+	// resultId and status instead (schedule empty) — the presence of resultId tells the two apart.
 	type occ struct {
-		RunID    string    `json:"runId"`
-		RunName  string    `json:"runName"`
-		Type     runs.Type `json:"type"` // auto | todo — drives the colour separation
-		At       time.Time `json:"at"`
-		Schedule string    `json:"schedule"`
+		RunID     string    `json:"runId"`
+		RunName   string    `json:"runName"`
+		Type      runs.Type `json:"type"` // auto | todo — drives the colour separation
+		At        time.Time `json:"at"`
+		Schedule  string    `json:"schedule,omitempty"`  // future firing: how it recurs
+		ResultID  string    `json:"resultId,omitempty"`  // past execution: opens its full report
+		OK        bool      `json:"ok,omitempty"`        // past execution: outcome
+		Suspended bool      `json:"suspended,omitempty"` // past execution: paused on the usage limit
 	}
 	occs := []occ{} // never nil: a nil slice marshals to JSON null and hangs the UI
 	for _, run := range all {
@@ -781,7 +789,8 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		if run.IsTodo() {
 			// A ToDo is a single point in time; an overdue-but-unfinished one still belongs on the
-			// calendar. Without a due date it only ever runs manually — nothing to show.
+			// calendar. Without a due date it only ever runs manually — nothing to show. A done ToDo's
+			// outcome returns below as its past execution instead.
 			if run.Done || run.DueAt == nil || run.DueAt.After(horizon) {
 				continue
 			}
@@ -798,25 +807,53 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 			t = next
 		}
 	}
-	sort.Slice(occs, func(i, j int) bool { return occs[i].At.Before(occs[j].At) })
-	writeJSON(w, http.StatusOK, map[string]any{"from": now, "to": horizon, "occurrences": occs})
-}
-
-// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
-// Includes executions of runs that were since deleted (persistent logs). ?type=auto|todo scopes it to
-// one surface (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the
-// global log. Each execution's kind is resolved from the stamp on the result, falling back to the live
-// run's kind for older (unstamped) results, and to auto for an orphan with neither (the "" == auto
-// convention). The resolved kind is returned so the caller sees a definite auto|todo.
-func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
-	if s.runResults == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"executions": []any{}})
-		return
-	}
-	execs, err := s.runResults.All()
+	// Past side: every completed execution, type-resolved exactly like the History (the shared source),
+	// so the calendar is the union of done and upcoming runs and each past run's status is reachable from
+	// it. All of history is included, so the window's start stretches back to the earliest execution.
+	execs, err := s.resolvedExecutions(want)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
 		return
+	}
+	from := now
+	for _, e := range execs {
+		occs = append(occs, occ{
+			RunID: e.RunID, RunName: e.RunName, Type: e.Type, At: e.At,
+			ResultID: e.ResultID, OK: e.OK, Suspended: e.Suspended,
+		})
+		if e.At.Before(from) {
+			from = e.At
+		}
+	}
+	sort.Slice(occs, func(i, j int) bool { return occs[i].At.Before(occs[j].At) })
+	writeJSON(w, http.StatusOK, map[string]any{"from": from, "to": horizon, "occurrences": occs})
+}
+
+// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
+// Includes executions of runs since deleted (persistent logs). ?type=auto|todo scopes it to one surface
+// (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the global log.
+// Kind resolution and type filtering live in the shared resolvedExecutions, which the calendar reuses.
+func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
+	out, err := s.resolvedExecutions(r.URL.Query().Get("type"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
+}
+
+// resolvedExecutions returns every stored execution (newest first) with its kind resolved — a stamped
+// result is trusted, an unstamped one falls back to its still-existing run's kind, an orphan with
+// neither reads as auto — filtered to `typeParam` (auto|todo, or ""/all for both). It is the single
+// source of past-execution truth shared by the execution History (runsExecutions) and the calendar's
+// past side (runsCalendar), so the two can never diverge. Empty (never nil) when no result store is wired.
+func (s *Server) resolvedExecutions(typeParam string) ([]runs.ExecutionSummary, error) {
+	if s.runResults == nil {
+		return []runs.ExecutionSummary{}, nil
+	}
+	execs, err := s.runResults.All()
+	if err != nil {
+		return nil, err
 	}
 	// runID → kind, so an unstamped result inherits the type of its still-existing run.
 	kindByRun := map[string]runs.Type{}
@@ -836,7 +873,7 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 		}
 		return runs.TypeAuto
 	}
-	want := strings.TrimSpace(r.URL.Query().Get("type"))
+	want := strings.TrimSpace(typeParam)
 	out := make([]runs.ExecutionSummary, 0, len(execs))
 	for _, e := range execs {
 		kind := resolve(e)
@@ -846,7 +883,7 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 		e.Type = kind // hand back the resolved kind, never an empty one
 		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
+	return out, nil
 }
 
 // mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the
