@@ -1,4 +1,4 @@
-import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -279,7 +279,17 @@ export const mockSource: DataSource = {
     return { prompt: '# Mock-Prompt' };
   },
   async mercuryRunCoverage() {
-    return { covered: {}, index: {}, axioms: {} };
+    return { covered: {}, index: {}, axioms: {}, pending: false };
+  },
+  async mercuryRunNotices() {
+    return { notices: noticeStore.map((n) => ({ ...n })) };
+  },
+  async mercuryDismissRunNotice(id: string) {
+    const idx = noticeStore.findIndex((n) => n.id === id);
+    if (idx >= 0) noticeStore.splice(idx, 1);
+  },
+  async mercuryClearRunNotices() {
+    noticeStore.length = 0;
   },
   async mercuryCreateRun(body: RunInput) {
     const run: Run = { id: mockId('run'), ...mockRun(body) };
@@ -396,6 +406,21 @@ const mockId = (prefix: string) => `${prefix}_mock${(mockSeq += 1)}`;
 /** ToDos + Läufe, discriminated by `type` — the one store the backend keeps in runs.json. Starts empty,
  *  like a fresh instance; create/update/delete below keep it in sync so the list reflects every change. */
 const runStore: Run[] = [];
+
+/** The automatic axiom→run assignment feed — seeded with one believable entry so the panel is visible in
+ *  preview; dismiss/clear mutate it. The real feed is written by the backend's background assigner. */
+const noticeStore: RunNotice[] = [
+  {
+    id: 'ntc_mock1',
+    at: new Date(Date.now() - 90_000).toISOString(),
+    kind: 'assigned',
+    runId: 'run_mock_seed',
+    runName: 'Architektur & Minimalismus',
+    newRun: true,
+    axiomIds: ['ax_mock_seed'],
+    axioms: ['Portionierte Daten'],
+  },
+];
 
 /** The axiom / Implementierungsregeln / Läufe / Meta tree the sidebar renders — seeded with a believable
  *  sample, then mutated by add/delete so the sidebar reflects changes live. Mirrors the backend, which
