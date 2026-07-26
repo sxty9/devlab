@@ -596,13 +596,15 @@ func (e Executor) BranchAt(ctx context.Context, wt, name, at string) error {
 	return err
 }
 
-// PushRefs pushes the named branches to origin in one invocation. force uses --force (for the explicit
-// dev reset only); normal growth pushes fast-forward. The token stays in ENV, never on argv.
+// PushRefs pushes the named branches to origin in one invocation. --atomic makes a multi-ref push
+// all-or-nothing, so the dev branch never advances without its delivery snapshot branch (or vice versa).
+// force uses --force (for the explicit dev reset only); normal growth pushes fast-forward. The token
+// stays in ENV, never on argv.
 func (e Executor) PushRefs(ctx context.Context, wt, token string, force bool, branches ...string) (string, error) {
 	if len(branches) == 0 {
 		return "", errors.New("no branches to push")
 	}
-	args := []string{"push"}
+	args := []string{"push", "--atomic"}
 	if force {
 		args = append(args, "--force")
 	}
