@@ -61,9 +61,10 @@ func TestRunInputsHash(t *testing.T) {
 	if h1 != RunInputsHash(a, r) {
 		t.Error("hash not stable across calls")
 	}
-	// a pure re-title must NOT change the hash (identity + body only)
-	if RunInputsHash([]RunAxiom{{ID: "ax_1", Titel: "New Title", Body: "x"}}, r) != h1 {
-		t.Error("title change changed the hash")
+	// a pure re-title MUST change the hash: the title is the axiom's heading in the composed prompt,
+	// so a rename genuinely changes the prompt and must not go unnoticed.
+	if RunInputsHash([]RunAxiom{{ID: "ax_1", Titel: "New Title", Body: "x"}}, r) == h1 {
+		t.Error("title change did not change the hash")
 	}
 	// a body change MUST change the hash (staleness)
 	if RunInputsHash([]RunAxiom{{ID: "ax_1", Body: "z"}}, r) == h1 {

@@ -21,12 +21,6 @@ import (
 // AI-planning buttons with review/apply, config history). Execution (the scheduler) is a separate,
 // gated phase; the stored results are read here but written there.
 
-// runView is a run plus a derived staleness flag (its snapshot no longer matches the scheme inputs).
-type runView struct {
-	runs.Run
-	Stale bool `json:"stale"`
-}
-
 // runCatalog scans the scheme store once: every axiom by its stable id (as the RunAxiom shape used for
 // composition), the id→path index (coverage badges), and all global Laufregeln. Mirrors
 // buildRolloutBlock's scan; reuses fetchRecord.
@@ -101,14 +95,14 @@ func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []m
 	run.PromptHash = mercury.RunInputsHash(axs, laufregeln)
 }
 
-// runsList returns every run with a staleness flag, plus an id→title legend for the axioms in play.
+// runsList returns every run plus an id→title legend for the axioms in play. Snapshots are kept current
+// by every scheme write (reconcileAfterWrite), so there is no staleness flag to compute or surface.
 func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
 		return
 	}
-	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, status, err)
 		return
@@ -118,12 +112,7 @@ func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
 		return
 	}
-	views := make([]runView, 0, len(all))
-	for _, run := range all {
-		cur := mercury.RunInputsHash(axiomsFor(run.AxiomIDs, byID), laufregeln)
-		views = append(views, runView{Run: run, Stale: run.PromptHash != "" && run.PromptHash != cur})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": views, "axioms": titleLegend(byID)})
+	writeJSON(w, http.StatusOK, map[string]any{"runs": orEmptyRuns(all), "axioms": titleLegend(byID)})
 }
 
 // runsCoverage reports which axioms are already backed by a run (badges in the picker) + the id→path
@@ -166,14 +155,13 @@ func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, status, err)
 		return
 	}
-	cur := mercury.RunInputsHash(axiomsFor(run.AxiomIDs, byID), laufregeln)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":    runView{Run: run, Stale: run.PromptHash != "" && run.PromptHash != cur},
+		"run":    run,
 		"axioms": titleLegend(byID),
 	})
 }
@@ -429,39 +417,6 @@ func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) runRecompose(w http.ResponseWriter, r *http.Request) {
-	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
-		return
-	}
-	id := r.PathValue("id")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
-	if err != nil {
-		mercuryError(w, status, err)
-		return
-	}
-	now := time.Now().UTC()
-	// Patch, not Mutate: recomposing only refreshes the derived prompt snapshot from the current
-	// scheme — it is not a user config edit, so it must not flood the restore history.
-	if _, err := s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
-		idx := indexOfRun(cur, id)
-		if idx < 0 {
-			return nil, runs.ErrNotFound
-		}
-		composeInto(&cur[idx], byID, laufregeln, now)
-		cur[idx].UpdatedAt = now
-		return cur, nil
-	}); err != nil {
-		if errors.Is(err, runs.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht aktualisiert werden")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
 // runsAiFill proposes runs for the not-yet-covered axioms (reviewable; writes nothing).
 func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
@@ -678,11 +633,20 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Snapshot mit diesem Zeitstempel")
 		return
 	}
+	// A snapshot carries each run's prompt as it was composed then; the axioms may have moved on since.
+	// Recompose from the CURRENT scheme so a restored config comes back correct, never stale (staleness
+	// is structurally unreachable — there is no longer a badge to surface it).
+	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	if err != nil {
+		mercuryError(w, status, err)
+		return
+	}
 	now := time.Now()
 	restored := make([]runs.Run, len(snap.Runs))
 	copy(restored, snap.Runs)
-	for i := range restored { // recompute NextFireAt forward so a restore doesn't fire the past immediately
-		if restored[i].Enabled {
+	for i := range restored {
+		composeInto(&restored[i], byID, laufregeln, now.UTC())
+		if restored[i].Enabled { // recompute NextFireAt forward so a restore doesn't fire the past immediately
 			if nf, e := restored[i].Schedule.Next(now); e == nil {
 				restored[i].NextFireAt = &nf
 			}
@@ -1031,6 +995,15 @@ func indexOfRun(list []runs.Run, id string) int {
 		}
 	}
 	return -1
+}
+
+// orEmptyRuns guarantees a non-nil slice: a nil marshals to JSON null, and the client reads .length off
+// it and blanks the list. Every run list this API returns is a list.
+func orEmptyRuns(r []runs.Run) []runs.Run {
+	if r == nil {
+		return []runs.Run{}
+	}
+	return r
 }
 
 func dedupStrings(in []string) []string {

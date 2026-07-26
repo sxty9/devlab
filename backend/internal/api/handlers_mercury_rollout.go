@@ -88,6 +88,17 @@ func (s *Server) mercuryRollout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// mercuryRolloutStatus reports the last automatic rollout — when it ran, which repos changed, how many
+// were already current, and which were skipped — portioned for the Mercury surface, not a raw log. It
+// returns null until the first background rollout completes. Read-only: the worker owns the writing.
+func (s *Server) mercuryRolloutStatus(w http.ResponseWriter, r *http.Request) {
+	var last *RolloutReport
+	if s.autoRollout != nil {
+		last = s.autoRollout.report()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"last": last})
+}
+
 // rolloutOne clones/updates a repo and syncs its CLAUDE.md. Never fatal: any failure becomes a
 // skipped entry so the rollout is per-repo independent.
 func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token string, splice func(string) string, apply bool) rolloutRepo {

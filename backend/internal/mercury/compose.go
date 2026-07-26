@@ -97,16 +97,19 @@ func ComposeTodoPrompt(name, task, newRepo string, attachments []TodoAttachment)
 	return b.String()
 }
 
-// RunInputsHash is a stable fingerprint of the scheme inputs a run's prompt was composed from, so the
-// UI can flag a stored snapshot as stale once the underlying axioms/Laufregeln have changed. It hashes
-// only identity + body (not titles or ordering), so a pure re-title doesn't spuriously mark stale.
+// RunInputsHash is a stable fingerprint of the scheme inputs a run's prompt was composed from, so a
+// write can tell whether a run's snapshot has drifted from the store and recompose exactly the affected
+// runs. It hashes identity + title + body of each record: the title is the heading each axiom/Laufregel
+// gets in the composed prompt, so a pure rename genuinely changes the prompt and must change the hash.
+// Ordering is normalized away (sorted), because composition order follows the run's own axiom list, not
+// the store's — a store re-order does not change any run's prompt.
 func RunInputsHash(axioms, laufregeln []RunAxiom) string {
 	lines := make([]string, 0, len(axioms)+len(laufregeln))
 	for _, a := range axioms {
-		lines = append(lines, "a\t"+a.ID+"\t"+strings.TrimSpace(a.Body))
+		lines = append(lines, "a\t"+a.ID+"\t"+RunAxiomTitle(a)+"\t"+strings.TrimSpace(a.Body))
 	}
 	for _, r := range laufregeln {
-		lines = append(lines, "r\t"+r.ID+"\t"+strings.TrimSpace(r.Body))
+		lines = append(lines, "r\t"+r.ID+"\t"+RunAxiomTitle(r)+"\t"+strings.TrimSpace(r.Body))
 	}
 	sort.Strings(lines)
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))

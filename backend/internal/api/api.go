@@ -38,6 +38,7 @@ type Server struct {
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -65,7 +66,7 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: chat store disabled: %v", err)
 		chatStore = nil
 	}
-	return &Server{
+	s := &Server{
 		v:           v,
 		reposBase:   base,
 		links:       store,
@@ -78,6 +79,8 @@ func New(v *auth.Verifier) *Server {
 		attachments: runs.NewAttachmentStore(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
+	s.autoRollout = newAutoRollout(s)
+	return s
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -193,7 +196,9 @@ func (s *Server) Handler() http.Handler {
 	// Mercury level (not inside a section), and may return a reviewable run-plan proposal.
 	mux.HandleFunc("POST /api/mercury/chat", s.guardCSRF(s.mercuryChat))
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
-	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
+	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account). The
+	// automatic rollout (on axiom/rule writes) runs in the background; GET reports its last result.
+	mux.HandleFunc("GET /api/mercury/rollout", s.guard(s.mercuryRolloutStatus))
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
 	// One-time constitution migration: decompose the original axiom document into atoms and file
 	// each via aigentic. Dry-run by default (?apply=true writes). Store authority, not GitHub.
@@ -217,7 +222,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs", s.guardCSRF(s.runCreate))
 	mux.HandleFunc("PUT /api/mercury/runs/{id}", s.guardCSRF(s.runUpdate))
 	mux.HandleFunc("DELETE /api/mercury/runs/{id}", s.guardCSRF(s.runDelete))
-	mux.HandleFunc("POST /api/mercury/runs/{id}/recompose", s.guardCSRF(s.runRecompose))
 	mux.HandleFunc("POST /api/mercury/runs/ai-fill", s.guardCSRF(s.runsAiFill))
 	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))

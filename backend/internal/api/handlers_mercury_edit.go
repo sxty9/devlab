@@ -73,6 +73,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, status, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
 	writeJSON(w, http.StatusOK, map[string]any{"path": newPath, "axiom": ax})
 }
 
@@ -95,7 +96,8 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 		return
 	}
-	status, err := aigentic.GraveMove(r.Context(), r.Header.Get("Cookie"), csrfFrom(r), body.From, body.To)
+	cookie := r.Header.Get("Cookie")
+	status, err := aigentic.GraveMove(r.Context(), cookie, csrfFrom(r), body.From, body.To)
 	if err != nil {
 		if status == http.StatusConflict {
 			writeErr(w, http.StatusConflict, "Am Zielpfad liegt bereits ein Axiom")
@@ -104,6 +106,7 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, status, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
@@ -114,10 +117,12 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Ungültiger Pfad")
 		return
 	}
-	if status, err := aigentic.GraveDelete(r.Context(), r.Header.Get("Cookie"), csrfFrom(r), path); err != nil {
+	cookie := r.Header.Get("Cookie")
+	if status, err := aigentic.GraveDelete(r.Context(), cookie, csrfFrom(r), path); err != nil {
 		mercuryError(w, status, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(path))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -163,6 +168,9 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		moved++
+	}
+	if moved > 0 {
+		s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

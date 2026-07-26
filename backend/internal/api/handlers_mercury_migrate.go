@@ -48,6 +48,12 @@ func (s *Server) mercuryMigrate(w http.ResponseWriter, r *http.Request) {
 		results = append(results, mr)
 	}
 
+	// The migration is a write to axiome/**: bring the runs' snapshots and the rolled-out CLAUDE.md up
+	// to date exactly as any other axiom write does.
+	if apply {
+		s.reconcileAfterWrite(r.Context(), cookie, true)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"applied": apply,
 		"atoms":   len(atoms),
