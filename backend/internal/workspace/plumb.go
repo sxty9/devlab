@@ -46,6 +46,7 @@ func (e Executor) plumb(ctx context.Context, wt, token string, stdin []byte, arg
 type RolloutResult struct {
 	Changed bool   `json:"changed"` // false when the block was already current (idempotent)
 	Commit  string `json:"commit,omitempty"`
+	Branch  string `json:"branch,omitempty"` // where the commit was pushed (a PR branch, or the default branch)
 	OldFile string `json:"-"` // the pre-rollout CLAUDE.md content (for a dry-run diff)
 	NewFile string `json:"-"` // the post-rollout content
 }
@@ -56,7 +57,12 @@ type RolloutResult struct {
 // dryRun does everything except the push, so a caller can preview the exact change. It also drops a
 // second file at the root (oldPath, e.g. CLAUDE.MD) if present — the case-rename that a working-tree
 // checkout could not do.
-func (e Executor) SyncFile(ctx context.Context, wt, token, branch, path, oldPath string, splice func(old string) string, dryRun bool) (RolloutResult, error) {
+//
+// pushBranch decides WHERE the new commit lands: empty pushes onto `branch` itself (the historical
+// direct-to-default-branch rollout), a branch name pushes there instead so the caller can raise a pull
+// request. The latter is what makes a protected default branch possible — the constitution then reaches
+// a repo the same way every other change does.
+func (e Executor) SyncFile(ctx context.Context, wt, token, branch, path, oldPath string, splice func(old string) string, dryRun bool, pushBranch string) (RolloutResult, error) {
 	if err := e.Fetch(ctx, wt, token); err != nil {
 		return RolloutResult{}, fmt.Errorf("fetch: %w", err)
 	}
@@ -119,9 +125,14 @@ func (e Executor) SyncFile(ctx context.Context, wt, token, branch, path, oldPath
 		return res, fmt.Errorf("commit-tree: %w", err)
 	}
 	res.Commit = commit
-	if _, err := e.plumb(ctx, wt, token, nil, "push", "origin", commit+":refs/heads/"+branch); err != nil {
+	target := branch
+	if pushBranch != "" {
+		target = pushBranch
+	}
+	if _, err := e.plumb(ctx, wt, token, nil, "push", "--force", "origin", commit+":refs/heads/"+target); err != nil {
 		return res, fmt.Errorf("push: %w", err)
 	}
+	res.Branch = target
 	if lerr := assertNoLeak(wt, token); lerr != nil {
 		return res, lerr
 	}
