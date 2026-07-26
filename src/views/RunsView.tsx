@@ -7,6 +7,7 @@ import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
   Run,
   RunActive,
@@ -80,6 +81,7 @@ export default function RunsView() {
   const [aiBusy, setAiBusy] = useState<'fill' | 'finetune' | null>(null);
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
   // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
   // live-follow view — survive a page reload instead of living only in this component. The global cancel
@@ -239,7 +241,11 @@ export default function RunsView() {
     );
   }
 
-  const selectedRun = selectedId ? list.runs.find((r) => r.id === selectedId) ?? null : null;
+  // The Läufe surface owns ONLY automatic runs; ToDos (type 'todo') are TodosView's — filter them out
+  // so a one-time task never renders as a broken schedule row or crashes the axiom detail pane.
+  const autoRuns = list.runs.filter((r) => r.type !== 'todo');
+  const shownRuns = applyRunFilter(autoRuns, filter);
+  const selectedRun = selectedId ? autoRuns.find((r) => r.id === selectedId) ?? null : null;
 
   let rightPane: ReactNode;
   if (mode === 'create') {
@@ -331,18 +337,21 @@ export default function RunsView() {
                     Verlauf
                   </Button>
                 </div>
+                {autoRuns.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} />}
               </div>
 
               <NoticesPanel notices={notices} onOpenRun={openRun} onDismiss={dismissNotice} onClear={clearNotices} />
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
-                {list.runs.length === 0 ? (
+                {autoRuns.length === 0 ? (
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine Läufe. Lege einen an oder nutze „Mit KI auffüllen“.
                   </p>
+                ) : shownRuns.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">No runs match the current filter.</p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {list.runs.map((run) => (
+                    {shownRuns.map((run) => (
                       <RunRow
                         key={run.id}
                         run={run}
