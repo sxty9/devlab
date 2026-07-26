@@ -26,9 +26,10 @@ func ComposeRunPrompt(runName string, axioms, laufregeln []RunAxiom) string {
 	b.WriteString("vollständig, gründlich und eigenständig gegen die unten stehenden Axiome durch: ")
 	b.WriteString("analysiere den Ist-Zustand, implementiere die nötigen Änderungen und halte dich dabei ")
 	b.WriteString("strikt an die Laufregeln.\n\n")
-	b.WriteString("Arbeite inkrementell: beachte die in der CLAUDE.md des Repositories hinterlegten Axiome ")
-	b.WriteString("und den dort dokumentierten Checkpoint-Stand, und betrachte je Axiom nur die Änderungen ")
-	b.WriteString("seit dessen letzter Prüfung (nie geprüft ⇒ das gesamte Repository).\n\n")
+	b.WriteString("Arbeite inkrementell: betrachte je Axiom nur die Commits, die seit der letzten Prüfung ")
+	b.WriteString("dieses Axioms in diesem Repository hinzugekommen sind. Wurde ein Axiom hier noch nie ")
+	b.WriteString("geprüft, prüfst du das gesamte Repository. Welcher Stand je Axiom zuletzt geprüft wurde, ")
+	b.WriteString("steht im Abschnitt „Zuletzt geprüfter Stand\" am Ende dieses Prompts.\n\n")
 
 	if len(laufregeln) > 0 {
 		b.WriteString("## Laufregeln (gelten für den gesamten Lauf)\n\n")
@@ -44,6 +45,56 @@ func ComposeRunPrompt(runName string, axioms, laufregeln []RunAxiom) string {
 		b.WriteString(strings.TrimSpace(a.Body) + "\n\n")
 	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+// LastCheck is one axiom's last examination of the repository about to be worked: the commit the
+// repository stood at, and when. Mirrors runs.AxiomCheck without importing it (the runs package
+// already depends on this one).
+type LastCheck struct {
+	Titel  string
+	Commit string
+	At     string // preformatted for the prompt; "" when unknown
+}
+
+// RepoScopeSection renders the per-repo addendum appended to a run's snapshot at execution time: for
+// each axiom of the run, the commit this repository was last examined against. It is per REPO, so it
+// cannot live in the stored snapshot (which is shared across every repo of a sweep).
+//
+// Axioms with no entry are named explicitly rather than silently omitted — "not listed" would leave the
+// agent guessing, while "never examined here ⇒ full repository" is an instruction it can follow.
+func RepoScopeSection(axioms []RunAxiom, checked map[string]LastCheck) string {
+	if len(axioms) == 0 {
+		return ""
+	}
+	var known, fresh []string
+	for _, a := range axioms {
+		if c, ok := checked[a.ID]; ok && c.Commit != "" {
+			line := "- " + titleOr(a.Titel, a.ID) + ": zuletzt geprüft bei Commit " + c.Commit
+			if c.At != "" {
+				line += " (" + c.At + ")"
+			}
+			known = append(known, line)
+			continue
+		}
+		fresh = append(fresh, "- "+titleOr(a.Titel, a.ID))
+	}
+
+	var b strings.Builder
+	b.WriteString("\n## Zuletzt geprüfter Stand (für dieses Repository)\n\n")
+	if len(known) > 0 {
+		b.WriteString("Für die folgenden Axiome ist ein geprüfter Stand vermerkt. Betrachte je Axiom NUR die ")
+		b.WriteString("Commits seit dem genannten Commit (`git log <commit>..HEAD`, `git diff <commit>..HEAD`):\n")
+		b.WriteString(strings.Join(known, "\n") + "\n")
+	}
+	if len(fresh) > 0 {
+		if len(known) > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString("Für die folgenden Axiome liegt keine frühere Prüfung dieses Repositories vor — prüfe sie ")
+		b.WriteString("gegen das GESAMTE Repository:\n")
+		b.WriteString(strings.Join(fresh, "\n") + "\n")
+	}
+	return b.String()
 }
 
 // TodoAttachmentDir is the workspace-relative directory into which the executor materializes a ToDo's

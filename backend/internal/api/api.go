@@ -37,6 +37,7 @@ type Server struct {
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
@@ -77,6 +78,7 @@ func New(v *auth.Verifier) *Server {
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
 		attachments: runs.NewAttachmentStore(),
+		axiomChecks: runs.NewAxiomChecks(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 	s.autoRollout = newAutoRollout(s)

@@ -10,7 +10,7 @@ import GlobalCalendarView from './GlobalCalendarView';
 import MercuryChat from './MercuryChat';
 import { fmtDateTime } from './MercuryExecutions';
 import { cn } from '@/lib/cn';
-import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon, LightbulbIcon } from '@/ui/icons';
+import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon } from '@/ui/icons';
 import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation, RolloutReport } from '@/types';
 
 type SectionId = 'axiome' | 'regeln' | 'laeufe' | 'todos' | 'kalender';
