@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"devlab/backend/internal/discover"
@@ -202,6 +203,67 @@ type runExecutor struct {
 	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
 	// /etc that a test can neither create nor rely on.
 	deployTargetFn func(repoName string) bool
+
+	// coord coordinates the limits that apply to all concurrent runs TOGETHER (a single runExecutor is
+	// shared across every run's goroutine, so this is the natural home). The spend ceiling counts the
+	// aggregate cost of the runs live right now; the subscription-limit pause is shared so a limit one run
+	// hits pauses the others too, instead of driving them all into repeated failing calls.
+	coord runCoord
+}
+
+// runCoord is the shared, mutex-guarded coordination state across concurrently-executing runs.
+type runCoord struct {
+	mu         sync.Mutex
+	spendUSD   float64   // aggregate cost of the runs live RIGHT NOW (each adds as it spends, removes on exit)
+	limitUntil time.Time // when in the future, every run pauses until then (shared subscription-limit reset)
+}
+
+// addSpend adds delta to the aggregate live spend and returns the new total. A finishing run passes the
+// negative of its own contribution so the pool always reflects only currently-active runs; clamped at 0
+// against float drift.
+func (x *runExecutor) addSpend(delta float64) float64 {
+	x.coord.mu.Lock()
+	defer x.coord.mu.Unlock()
+	x.coord.spendUSD += delta
+	if x.coord.spendUSD < 0 {
+		x.coord.spendUSD = 0
+	}
+	return x.coord.spendUSD
+}
+
+// aggregateSpend is the cost incurred by all runs live right now, summed — the quantity the spend ceiling
+// bounds (in Summe, not je Lauf).
+func (x *runExecutor) aggregateSpend() float64 {
+	x.coord.mu.Lock()
+	defer x.coord.mu.Unlock()
+	return x.coord.spendUSD
+}
+
+// noteLimit records that a run hit the subscription limit and shares the resume time with the others,
+// keeping the latest so a later, further-out reset wins.
+func (x *runExecutor) noteLimit(until time.Time) {
+	x.coord.mu.Lock()
+	defer x.coord.mu.Unlock()
+	if until.After(x.coord.limitUntil) {
+		x.coord.limitUntil = until
+	}
+}
+
+// limitedUntil is the shared subscription-limit reset time; a zero or past value means no active pause.
+func (x *runExecutor) limitedUntil() time.Time {
+	x.coord.mu.Lock()
+	defer x.coord.mu.Unlock()
+	return x.coord.limitUntil
+}
+
+// resumeAtFor is when an execution that just hit the usage limit should resume: a small cushion past the
+// CLI-reported reset if it gave one, else a fixed backoff. Shared by the run that detected the limit and
+// (via noteLimit) by the concurrent runs that pause alongside it, so they all resume together.
+func resumeAtFor(lim repoSignal) time.Time {
+	if lim.hasReset && lim.resetAt.After(time.Now()) {
+		return lim.resetAt.Add(1 * time.Minute)
+	}
+	return time.Now().Add(limitBackoff())
 }
 
 // token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real
@@ -349,10 +411,14 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		save()
 	}
 
-	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
-	// since this attempt began, so a carried-over run resumes with a fresh budget and always makes
-	// progress (a cumulative cap would re-trip forever on the loaded res.CostUSD and deadlock).
-	attemptStartCost := res.CostUSD
+	// Aggregate spend budget. The ceiling bounds the cost of all runs live RIGHT NOW together (in Summe,
+	// nicht je Lauf): this run contributes each repo's cost to the shared pool as it spends, and removes
+	// its own contribution on exit, so the pool only ever reflects currently-active runs. A carried-over
+	// run therefore resumes with the shared pool cleared of its finished siblings, always making progress
+	// (a cumulative per-run cap would re-trip forever on the loaded res.CostUSD and deadlock). For a solo
+	// run the aggregate equals its own this-attempt spend, so behaviour is unchanged without concurrency.
+	contributed := 0.0
+	defer func() { x.addSpend(-contributed) }()
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
@@ -360,15 +426,22 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		if done[repo.ID] {
 			continue // completed in an earlier attempt of this same execution
 		}
-		// Spend ceiling for THIS attempt: stop before starting another expensive repo. Carry over — the
-		// remaining repos continue on the next scheduled run, not redone-from-scratch (which would
-		// duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by its
-		// own cost (soft cap).
-		if costCeiling > 0 && res.CostUSD-attemptStartCost >= costCeiling {
-			log.Printf("devlabd: run %s hit the per-run cost ceiling ($%.2f this attempt ≥ $%.2f) after %d repos — carrying the rest to the next run",
-				run.ID, res.CostUSD-attemptStartCost, costCeiling, len(res.Repos))
+		// Spend ceiling across all concurrent runs: stop before starting another expensive repo. Carry
+		// over — the remaining repos continue on the next scheduled run, not redone-from-scratch (which
+		// would duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by
+		// its own cost (soft cap).
+		if costCeiling > 0 && x.aggregateSpend() >= costCeiling {
+			log.Printf("devlabd: run %s stopping — aggregate spend across concurrent runs ($%.2f ≥ $%.2f) after %d repos; carrying the rest to the next run",
+				run.ID, x.aggregateSpend(), costCeiling, len(res.Repos))
 			carriedOver = true
 			break
+		}
+		// Shared subscription-limit pause: if a concurrent run hit the usage limit, pause this one too —
+		// resuming together when the window resets — rather than driving another failing call into it.
+		if until := x.limitedUntil(); !until.IsZero() && time.Now().Before(until) {
+			log.Printf("devlabd: run %s pausing with its siblings on the shared usage limit until %s",
+				run.ID, until.Format(time.RFC3339))
+			return x.suspend(run, &res, until, save)
 		}
 		if ctx.Err() != nil {
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
@@ -389,8 +462,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
-			// do NOT hammer the rest — suspend the whole execution until the window resets.
-			return x.suspend(run, &res, lim, save)
+			// do NOT hammer the rest — suspend the whole execution until the window resets. Share the reset
+			// time so the OTHER concurrent runs pause with it and resume together, instead of each hammering
+			// the same exhausted window into repeated failures.
+			until := resumeAtFor(lim)
+			x.noteLimit(until)
+			return x.suspend(run, &res, until, save)
 		}
 		if lim.infra {
 			// Infrastructure failure (DNS/network) — NOT this repo's fault, and a sign the rest will fail
@@ -422,6 +499,8 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.OutputTokens += rr.OutputTokens
 		res.CostUSD += rr.CostUSD
 		res.NumTurns += rr.NumTurns
+		x.addSpend(rr.CostUSD) // count this repo toward the aggregate live spend…
+		contributed += rr.CostUSD
 		if !rr.OK {
 			overallOK = false
 		}
@@ -509,17 +588,14 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 	log.Printf("devlabd: reaped husk %s/%s — %s", res.RunID, res.ResultID, reason)
 }
 
-// suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
-// budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
-// the scheduler clears the suspension and stops retrying).
-func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
+// suspend persists the partial execution as paused (until resumeAt, computed by the caller so the run
+// that hit the limit and the siblings that pause alongside it share one reset time) and returns a
+// suspended ResultRef — UNLESS the resume budget is exhausted, in which case it finalizes the execution
+// as failed and returns a normal ref (so the scheduler clears the suspension and stops retrying).
+func (x *runExecutor) suspend(run runs.Run, res *runs.Result, resumeAt time.Time, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
 		attempts = run.Suspended.Attempts
-	}
-	resumeAt := time.Now().Add(limitBackoff())
-	if lim.hasReset && lim.resetAt.After(time.Now()) {
-		resumeAt = lim.resetAt.Add(1 * time.Minute) // a small cushion past the reported reset
 	}
 	if attempts+1 > maxResumes() {
 		res.Suspended, res.ResumeAt = false, nil
