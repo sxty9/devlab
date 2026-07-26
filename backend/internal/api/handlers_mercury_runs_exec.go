@@ -142,6 +142,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 			tick = pd
 		}
 	}
+	maxConcurrent := maxConcurrentRuns()
 	// The OS identity that executes and the GitHub identity that pushes are separate concerns: the
 	// runner should be a powerless Linux account while the token belongs to a real linked account.
 	// Defaults to user so an existing single-account setup keeps working untouched.
@@ -150,10 +151,23 @@ func (s *Server) StartScheduler(ctx context.Context) {
 		tokenUser = user
 	}
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
-	s.scheduler = runs.NewScheduler(s.runs, x, tick)
-	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
-		mode, user, tokenUser, autoMerge, tick)
+	s.scheduler = runs.NewScheduler(s.runs, x, tick, maxConcurrent)
+	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s maxConcurrent=%d",
+		mode, user, tokenUser, autoMerge, tick, maxConcurrent)
 	go s.scheduler.Run(ctx)
+}
+
+// maxConcurrentRuns is the ceiling on how many runs execute at once. DEVLAB_RUNS_MAX_CONCURRENT overrides
+// the conservative built-in default; a value below 1 is ignored (the scheduler falls back to its default),
+// so the ceiling can never be misconfigured to zero and stall every run. The ceiling guards the
+// subscription quota, CPU and memory against a burst of ToDos all firing together.
+func maxConcurrentRuns() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_CONCURRENT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return n
+		}
+	}
+	return 0 // 0 → NewScheduler applies its conservative default
 }
 
 // runExecutor implements runs.Executor: the per-repo pipeline + auto-merge maintenance.
@@ -784,18 +798,41 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 }
 
 // shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
-// full mode, only while dev-deploy is enabled, and NEVER for the self repo (Finding B — dev-deploying
-// devlab restarts THIS devlabd, killing the running sweep). report/pr never dev-deploy at all.
+// full mode, only while dev-deploy is enabled, and NEVER for the self repo while any run is active
+// (Finding B — dev-deploying devlab restarts THIS devlabd, killing EVERY in-flight run, not just this
+// one). report/pr never dev-deploy at all.
 func (x *runExecutor) shouldDevDeploy(repoID string) bool {
-	return x.mode == "full" && devDeployEnabled() && !isSelfRepo(repoID)
+	if x.mode != "full" || !devDeployEnabled() {
+		return false
+	}
+	// Defer the self-repo deploy while the run-activity marker is set. The marker is a COUNT (set when the
+	// first run begins, cleared only when the last ends), so it never releases while a second run is still
+	// working — a plain boolean would clear as soon as one run finished and let a deploy restart devlabd
+	// out from under the others. In-run the marker is always set, so the self repo deploys out-of-band.
+	if isSelfRepo(repoID) && x.selfDeployDeferred() {
+		return false
+	}
+	return true
+}
+
+// selfDeployDeferred reports whether a self-repo dev-deploy must be held back right now: it restarts
+// devlabd and would kill EVERY in-flight run, not just this one. It reads the scheduler's active-run
+// marker — the COUNT of runs executing — and defers while any run is active. When the scheduler is not
+// wired (the marker is unavailable, e.g. in a unit test), it defaults to deferring: never restart on an
+// unknown, and there is nothing to gain from self-deploying with no scheduler present.
+func (x *runExecutor) selfDeployDeferred() bool {
+	if x.s == nil || x.s.scheduler == nil {
+		return true
+	}
+	return x.s.scheduler.RunsActive()
 }
 
 // devDeploySkipReason explains, for the recorded step, why shouldDevDeploy said no in full mode — the
-// self-repo guard (Finding B) or the kill switch. It never invents a third reason: any other "no" comes
-// from the deploy target, which hasDeployTarget/noDeployTargetReason report.
+// self-repo marker deferral (Finding B) or the kill switch. It never invents a third reason: any other
+// "no" comes from the deploy target, which hasDeployTarget/noDeployTargetReason report.
 func devDeploySkipReason(repoID string) string {
 	if isSelfRepo(repoID) {
-		return "Selbst-Deploy übersprungen — " + repoID + " wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)"
+		return "Selbst-Deploy zurückgestellt — " + repoID + " wird nicht neugestartet, solange Läufe aktiv sind (Marker); PR steht, Deploy out-of-band"
 	}
 	return "dev-deploy abgeschaltet (DEVLAB_RUNS_DEV_DEPLOY) — nur der prod-Deploy bei Merge ist scharf"
 }
@@ -1491,27 +1528,27 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
-// runActive reports the run executing in THIS process right now — its id, the live result id (once the
-// executor mints it), and when it started — or null when nothing runs. It is the single source of truth
-// the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
-// mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
+// runActive reports EVERY run executing in THIS process right now — each with its id, live result id
+// (once the executor mints it), and start time; an empty list when nothing runs. It is the single source
+// of truth the UI reads on mount (so running runs survive a page reload) and polls to follow live runs: it
+// mirrors actually-alive goroutines, hence correct across reloads and empty after a restart. Cheap (no
 // scheme scan), so it is safe to poll frequently.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
+	active := []runs.Activity{}
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"active": active})
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts ONE run in progress (kill-switch), named by id — other concurrent runs keep going.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

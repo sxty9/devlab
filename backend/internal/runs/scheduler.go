@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -14,58 +15,113 @@ import (
 // rather than redoing every repo into duplicate PRs.
 var ErrRunAborted = errors.New("run aborted by kill-switch")
 
+// defaultMaxConcurrent caps how many runs execute at once when DEVLAB_RUNS_MAX_CONCURRENT is unset. A
+// conservative default: runs are expensive (each drives a Claude session across repos), so the ceiling
+// protects the subscription quota, CPU and memory from a burst of ToDos all firing together. Repos are
+// still mutually exclusive on top of this (see footprint), so two runs never touch the same workspace.
+const defaultMaxConcurrent = 2
+
 // Executor runs a run end-to-end (across all target repos) and performs periodic maintenance
 // (auto-merging overdue PRs). It is injected by the api layer so the runs package never imports it —
 // the runs package owns scheduling + persistence, the api layer owns side effects.
 type Executor interface {
 	// Execute runs a run end-to-end. report is invoked as soon as the execution's result id is known
-	// (freshly minted or resumed) so the scheduler can publish it as the live Activity — the UI locates
-	// the in-flight result document by that id. The scheduler always passes a non-nil report; it may go
-	// uncalled if the run fails before a result exists.
+	// (freshly minted or resumed) so the scheduler can publish it on the run's live Activity — the UI
+	// locates the in-flight result document by that id. The scheduler always passes a non-nil report; it
+	// may go uncalled if the run fails before a result exists.
 	Execute(ctx context.Context, run Run, report func(resultID string)) (ResultRef, error)
 	Maintain(ctx context.Context)
 }
 
-// Activity is a snapshot of the run currently executing: its id, the live result id (once the executor
-// reports it), and when this attempt started. Held in memory only — it exists exactly while a run's
-// goroutine is alive, so it is the honest "is a run live right now" signal: a restart clears it because
-// the goroutine dies with the process. The UI reads it (via the /active endpoint) to restore the
-// "Lauf aktiv" state after a reload and to follow the live result.
+// Activity is a snapshot of ONE executing run: its id, the live result id (once the executor reports it),
+// and when this attempt started. Held in memory only — it exists exactly while a run's goroutine is
+// alive, so it is the honest "is this run live right now" signal: a restart clears it because the
+// goroutine dies with the process. The UI reads the set of them (via the /active endpoint) to restore
+// the "Läufe aktiv" state after a reload and to follow each live result.
 type Activity struct {
 	RunID     string    `json:"runId"`
 	ResultID  string    `json:"resultId,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
 }
 
-// Scheduler fires due runs on a ticker, one at a time, and advances each run's schedule forward from
-// now (so downtime never causes a storm of missed firings). It also drives run-now and cancel.
-type Scheduler struct {
-	store *Store
-	exec  Executor
-	tick  time.Duration
-	logf  func(string, ...any)
-
-	runMu sync.Mutex // held for the duration of ONE run — guarantees one run at a time
-
-	curMu       sync.Mutex
-	curID       string
-	curStop     context.CancelCauseFunc
-	curActivity *Activity
+// footprint is a run's claim on the box: the set of repos it will touch, or exclusive for an auto run
+// (which sweeps EVERY Holistic repo and therefore must run alone). The scheduler reserves a footprint
+// before launching a run and only starts a run whose footprint does not collide with any already active
+// one — so two runs never work the same repo, and an auto run never overlaps anything.
+type footprint struct {
+	exclusive bool                // auto run: conflicts with every other run
+	repos     map[string]struct{} // todo: the target-repo keys it will touch
 }
 
-// NewScheduler builds a scheduler. tick defaults to 30s.
-func NewScheduler(store *Store, exec Executor, tick time.Duration) *Scheduler {
+// footprintFor derives a run's footprint from its model alone (no network): an auto run is exclusive; a
+// ToDo claims exactly its declared targets. Keying on the target string (repo id/name, or new-repo name)
+// matches how the executor resolves targets; the per-repo workspace lock is the ultimate backstop, so an
+// imperfect key can at worst make one repo serialize when it need not, never let two runs collide.
+func footprintFor(r Run) footprint {
+	if !r.IsTodo() {
+		return footprint{exclusive: true}
+	}
+	repos := map[string]struct{}{}
+	for _, t := range r.TodoTargets() {
+		switch {
+		case t.Repo != "":
+			repos["repo:"+t.Repo] = struct{}{}
+		case t.NewRepo != "":
+			repos["new:"+t.NewRepo] = struct{}{}
+		}
+	}
+	return footprint{repos: repos}
+}
+
+// activeRun is the scheduler's live record of one executing run: its published Activity, the footprint it
+// reserved, and its kill-switch. The map of these IS the concurrency state — its size is the active-run
+// count (the marker: set when the first run begins, cleared when the last ends), its keys the busy runs,
+// its footprints the busy repos.
+type activeRun struct {
+	activity  Activity
+	footprint footprint
+	stop      context.CancelCauseFunc
+}
+
+// Scheduler fires due runs on a ticker and runs several at once — bounded by maxConcurrent, never two on
+// the same repo, and an auto run strictly alone. A run whose repos are busy (or that cannot fit under the
+// ceiling) is left due and retried on a later tick: it is DEFERRED, never blocked, so a waiting run holds
+// no concurrency slot. The scheduler advances each fired run's schedule forward from now (so downtime
+// never causes a storm of missed firings) and drives run-now and per-run cancel.
+type Scheduler struct {
+	store         *Store
+	exec          Executor
+	tick          time.Duration
+	maxConcurrent int
+	logf          func(string, ...any)
+
+	mu     sync.Mutex
+	active map[string]*activeRun // runID → its live state; len is the active-run marker
+}
+
+// NewScheduler builds a scheduler. tick defaults to 30s; maxConcurrent to defaultMaxConcurrent.
+func NewScheduler(store *Store, exec Executor, tick time.Duration, maxConcurrent int) *Scheduler {
 	if tick <= 0 {
 		tick = 30 * time.Second
 	}
-	return &Scheduler{store: store, exec: exec, tick: tick, logf: log.Printf}
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrent
+	}
+	return &Scheduler{
+		store:         store,
+		exec:          exec,
+		tick:          tick,
+		maxConcurrent: maxConcurrent,
+		logf:          log.Printf,
+		active:        map[string]*activeRun{},
+	}
 }
 
 // Run blocks until ctx is done: each tick it auto-merges overdue PRs and fires any due runs.
 func (s *Scheduler) Run(ctx context.Context) {
 	t := time.NewTicker(s.tick)
 	defer t.Stop()
-	s.logf("devlabd: runs scheduler started (tick %s)", s.tick)
+	s.logf("devlabd: runs scheduler started (tick %s, max concurrent %d)", s.tick, s.maxConcurrent)
 	for {
 		select {
 		case <-ctx.Done():
@@ -114,42 +170,95 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 		if !r.Enabled || !isDue(r, now) {
 			continue
 		}
-		if !s.runMu.TryLock() {
-			return // a run is already in progress; the rest stay due and are caught next tick
-		}
-		func(id string) {
-			defer s.runMu.Unlock()
-			rctx, cancel := context.WithCancelCause(ctx)
-			defer cancel(nil)
-			s.setCurrent(id, cancel)
-			defer s.clearCurrent()
-			s.runOnce(rctx, id, "scheduler", true) // scheduled: advance the schedule
-		}(r.ID)
+		// tryStart is non-blocking: it launches the run if a slot is free and its repos are idle, else it
+		// returns false and the run stays due — caught on a later tick. A deferred run holds no slot.
+		s.tryStart(ctx, r.ID, "scheduler", true)
 	}
 }
 
 // FireNow triggers a run immediately (manual "Jetzt ausführen"), detached from the caller's request
-// so the HTTP handler returns at once. Returns false if a run is already in progress. A manual run
-// does NOT advance the schedule (it is out of band).
+// so the HTTP handler returns at once. Returns false if the run cannot start right now — already running,
+// the concurrency ceiling is reached, or its target repos are busy (an auto run: any other run active). A
+// manual run does NOT advance the schedule (it is out of band).
 func (s *Scheduler) FireNow(id, actor string) bool {
-	if !s.runMu.TryLock() {
+	return s.tryStart(context.Background(), id, actor, false)
+}
+
+// tryStart reserves a run's footprint and launches it in its own goroutine, or returns false if it may
+// not start now (duplicate, over the ceiling, or a colliding footprint). Reserving BEFORE the goroutine
+// is scheduled means a Cancel arriving immediately after cannot miss the run's kill-switch.
+func (s *Scheduler) tryStart(ctx context.Context, id, actor string, advance bool) bool {
+	run, ok, err := s.store.Get(id)
+	if err != nil || !ok {
 		return false
 	}
-	// Register the run BEFORE returning: otherwise a Cancel arriving between this return and the
-	// goroutine being scheduled would find curStop nil and silently do nothing.
-	ctx, cancel := context.WithCancelCause(context.Background())
-	s.setCurrent(id, cancel)
+	fp := footprintFor(run)
+
+	s.mu.Lock()
+	if _, dup := s.active[id]; dup {
+		s.mu.Unlock()
+		return false // this run is already executing
+	}
+	if len(s.active) >= s.maxConcurrent {
+		s.mu.Unlock()
+		return false // at the concurrency ceiling — deferred to a later tick
+	}
+	if s.conflictsLocked(fp) {
+		s.mu.Unlock()
+		return false // its repos are busy, or an exclusive run holds the box — deferred
+	}
+	rctx, cancel := context.WithCancelCause(ctx)
+	s.active[id] = &activeRun{
+		activity:  Activity{RunID: id, StartedAt: time.Now().UTC()},
+		footprint: fp,
+		stop:      cancel,
+	}
+	s.mu.Unlock()
+
 	go func() {
-		defer s.runMu.Unlock()
-		defer cancel(nil)
-		defer s.clearCurrent()
-		s.runOnce(ctx, id, actor, false)
+		defer func() {
+			cancel(nil)
+			s.release(id)
+		}()
+		s.runOnce(rctx, id, actor, advance)
 	}()
 	return true
 }
 
-// runOnce advances the schedule (if scheduled), executes the run, and attaches the result. No locking
-// here — the caller holds runMu.
+// conflictsLocked reports whether a footprint may NOT start given the current reservations. An auto run
+// (exclusive) collides with any active run, and any active exclusive run collides with everything; two
+// ToDos collide iff they share a target repo. The caller holds s.mu.
+func (s *Scheduler) conflictsLocked(fp footprint) bool {
+	for _, ar := range s.active {
+		if fp.exclusive || ar.footprint.exclusive {
+			return true
+		}
+		for k := range fp.repos {
+			if _, busy := ar.footprint.repos[k]; busy {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) release(id string) {
+	s.mu.Lock()
+	delete(s.active, id)
+	s.mu.Unlock()
+}
+
+// reportResult publishes the live result id on the run's Activity the instant the executor mints it.
+func (s *Scheduler) reportResult(id, resultID string) {
+	s.mu.Lock()
+	if ar := s.active[id]; ar != nil {
+		ar.activity.ResultID = resultID
+	}
+	s.mu.Unlock()
+}
+
+// runOnce advances the schedule (if scheduled), executes the run, and attaches the result. No locking of
+// the scheduler here — the run already holds its reservation for the duration of this call.
 func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool) {
 	// An autonomous run must never take the process down. Both call paths are goroutines (the ticker
 	// and FireNow's worker), where an unrecovered panic in the injected Executor would crash ALL of
@@ -169,8 +278,8 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 	// and must skip the freshness re-check (it is legitimately "due" via its ResumeAt).
 	resuming := run.Suspended != nil
 	// Re-verify freshness for a SCHEDULED fire: fireDue iterates a snapshot taken at tick start, and a
-	// long-running first run makes it stale, so a run advanced or disabled meanwhile must not fire.
-	// A manual run (advance=false) is an explicit override and skips this check.
+	// concurrent run advancing meanwhile could make it stale, so a run advanced or disabled meanwhile
+	// must not fire. A manual run (advance=false) is an explicit override and skips this check.
 	if advance && !resuming && !isDue(run, now) {
 		return
 	}
@@ -197,16 +306,7 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 		})
 	}
 
-	// Publish the live result id the instant the executor knows it, so /active can point the UI at the
-	// in-flight result document (single source of truth: the scheduler owns "what is live").
-	report := func(resultID string) {
-		s.curMu.Lock()
-		if s.curActivity != nil {
-			s.curActivity.ResultID = resultID
-		}
-		s.curMu.Unlock()
-	}
-	ref, err := s.exec.Execute(ctx, run, report)
+	ref, err := s.exec.Execute(ctx, run, func(resultID string) { s.reportResult(id, resultID) })
 	if err != nil {
 		s.logf("devlabd: run %s execution error: %v", id, err)
 	}
@@ -252,45 +352,48 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 	})
 }
 
-// Cancel aborts the run currently in progress, if any (kill-switch).
-func (s *Scheduler) Cancel() bool {
-	s.curMu.Lock()
-	defer s.curMu.Unlock()
-	if s.curStop == nil {
+// Cancel aborts a specific run in progress (kill-switch). Returns false if that run is not currently
+// executing. The abort targets exactly the named run — other concurrent runs keep going.
+func (s *Scheduler) Cancel(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ar := s.active[id]
+	if ar == nil || ar.stop == nil {
 		return false
 	}
-	s.curStop(ErrRunAborted) // deliberate abort → the executor finalises rather than carrying over
+	ar.stop(ErrRunAborted) // deliberate abort → the executor finalises rather than carrying over
 	return true
 }
 
-// Current returns the id of the run in progress, or "".
-func (s *Scheduler) Current() string {
-	s.curMu.Lock()
-	defer s.curMu.Unlock()
-	return s.curID
-}
-
-// Active returns a snapshot of the run currently executing (id, live result id, start), or nil when
-// nothing runs. Copied out under the lock so callers can read it freely.
-func (s *Scheduler) Active() *Activity {
-	s.curMu.Lock()
-	defer s.curMu.Unlock()
-	if s.curActivity == nil {
-		return nil
+// Active returns a snapshot of EVERY run currently executing (each with its id, live result id and start),
+// ordered by start time so the UI list is stable. Copied out under the lock so callers can read freely.
+func (s *Scheduler) Active() []Activity {
+	s.mu.Lock()
+	out := make([]Activity, 0, len(s.active))
+	for _, ar := range s.active {
+		out = append(out, ar.activity)
 	}
-	a := *s.curActivity
-	return &a
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.Equal(out[j].StartedAt) {
+			return out[i].RunID < out[j].RunID
+		}
+		return out[i].StartedAt.Before(out[j].StartedAt)
+	})
+	return out
 }
 
-func (s *Scheduler) setCurrent(id string, cancel context.CancelCauseFunc) {
-	s.curMu.Lock()
-	s.curID, s.curStop = id, cancel
-	s.curActivity = &Activity{RunID: id, StartedAt: time.Now().UTC()}
-	s.curMu.Unlock()
+// ActiveCount is the active-run marker as a number: how many runs execute right now. It rises from 0 to 1
+// when the first run begins and falls to 0 only when the last one ends — so a caller that must hold off a
+// disruptive action (e.g. a self-deploy that would restart devlabd and kill every in-flight run) waits on
+// the COUNT, never on a single boolean that would clear while a second run is still working.
+func (s *Scheduler) ActiveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.active)
 }
 
-func (s *Scheduler) clearCurrent() {
-	s.curMu.Lock()
-	s.curID, s.curStop, s.curActivity = "", nil, nil
-	s.curMu.Unlock()
+// RunsActive reports whether any run is executing right now (the marker as a boolean view of the count).
+func (s *Scheduler) RunsActive() bool {
+	return s.ActiveCount() > 0
 }
