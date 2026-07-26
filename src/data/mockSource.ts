@@ -327,7 +327,7 @@ export const mockSource: DataSource = {
       runId: id,
       resultId,
       startedAt: new Date().toISOString(),
-      ok: true,
+      ok: !resultId.includes('fail'), // keep the preview coherent with the calendar's status pill
       prompt: '# Konkretes ToDo: Beispiel\n\n## Aufgabe\n\nBeispielhafte Promptstellung dieser Ausführung.',
       repos: [],
       inputTokens: 0,
@@ -336,8 +336,20 @@ export const mockSource: DataSource = {
       numTurns: 0,
     };
   },
-  async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {
-    return { from: new Date().toISOString(), to: new Date().toISOString(), occurrences: [] };
+  async mercuryRunCalendar(days?: number, type?: import('@/types').RunType) {
+    const dayMs = 86400000;
+    const iso = (offsetDays: number) => new Date(Date.now() + offsetDays * dayMs).toISOString();
+    // A representative union so the offline preview shows past executions (each with a status pill and
+    // openable via mercuryRunResult) beside upcoming firings. resultId present ⇒ past; absent ⇒ upcoming.
+    const all: import('@/types').RunOccurrence[] = [
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(-3), resultId: 'res_demo_1', ok: true },
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(-1), resultId: 'res_demo_fail', ok: false },
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(1), schedule: 'täglich 03:00' },
+      { runId: 'run_todo_demo', runName: 'ToDo: Kalender-Union', type: 'todo', at: iso(-2), resultId: 'res_demo_3', ok: true },
+      { runId: 'run_todo_demo', runName: 'ToDo: Kalender-Union', type: 'todo', at: iso(2), schedule: 'einmalig' },
+    ];
+    const occurrences = type ? all.filter((o) => o.type === type) : all;
+    return { from: iso(-3), to: iso(days ?? 30), occurrences };
   },
   async mercuryRunExecutions(_type?: import('@/types').RunType) {
     return { executions: [] };
