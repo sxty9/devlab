@@ -45,6 +45,11 @@ func historyDir() string {
 }
 
 // snapshot writes the resulting config; best-effort (a history write must never fail a mutation).
+// The write is atomic (tmp + rename, 0600) like every sibling store: List/Get read the history
+// directory without holding the runs-store mutex, so a plain truncating write could let a concurrent
+// reader observe a half-written snapshot, and a crash mid-write could leave a torn file at the final
+// path. The tmp sits in the same directory (rename stays on one filesystem) and carries a ".json.tmp"
+// suffix, so List — which matches only ".json" — never picks it up.
 func (h *History) snapshot(action, actor string, runs []Run) {
 	if h == nil {
 		return
@@ -58,7 +63,14 @@ func (h *History) snapshot(action, actor string, runs []Run) {
 	if os.MkdirAll(h.dir, 0o700) != nil {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(h.dir, stem(ts)+".json"), b, 0o600)
+	final := filepath.Join(h.dir, stem(ts)+".json")
+	tmp := final + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) != nil {
+		return
+	}
+	if os.Rename(tmp, final) != nil {
+		_ = os.Remove(tmp)
+	}
 }
 
 // List returns snapshot metadata, newest first.
