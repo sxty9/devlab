@@ -70,6 +70,13 @@ Sudoers (eigene Datei, `visudo -f`):
 devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-deploy
 ```
 
+**Dienst bewusst NICHT ausliefern.** Ein Repo, dessen Dienst auf dem Ziel absichtlich nicht betrieben
+wird, gehört ausdrücklich als „nicht auszuliefern" geführt — sonst löst jeder gemergte PR einen
+Deploy-Versuch aus, der dauerhaft scheitert. Trage die betroffenen **Bare-Repo-Namen** in
+`DEVLAB_RUNS_NO_DEPLOY` ein (komma-/leerzeichengetrennt, Groß/klein egal). Ein gemergter PR für ein so
+geführtes Repo wird sofort **ohne** Deploy-Versuch abgehakt — kein Fehlversuch entsteht. Dies ist
+Laufzeit-Konfiguration (eine Betreiber-Entscheidung) und steht bewusst NICHT im Repo (Instanz-Neutralität).
+
 ## 5. Scheduler scharfschalten (systemd-Drop-in)
 
 `DEVLAB_RUNS_MODE` ist die Sicherheitsleiter — **schrittweise** hochstufen:
@@ -105,6 +112,9 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
+| `DEVLAB_RUNS_NO_DEPLOY` | (leer) | Bare-Repo-Namen, die **nicht** nach prod ausgeliefert werden (komma-/leerzeichengetrennt, Groß/klein egal). Ein gemergter PR dafür löst gar keinen Deploy-Versuch aus. Siehe §4. |
+| `DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS` | `3` | Wie oft ein dauerhaft scheiternder prod-Deploy erneut versucht wird, bevor die Auslieferung **blockiert** wird. Vorübergehende Störungen zählen nicht mit. Siehe „Auslieferung: blockieren…". |
+| `DEVLAB_RUNS_PROD_TARGET_NAME` | `prod` | Anzeigename des Auslieferungsziels in der Blockier-Begründung. Der echte Host bleibt server-seitig (`/etc/devlab/prod-target`) und wird dem Runner nie genannt. |
 
 > **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
 > klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.
@@ -136,8 +146,34 @@ fehlt. Vor dem Hochstufen zu erledigen:
 1. `sudo install -o root -g root -m 0755 deploy/devlab-deploy /usr/local/sbin/devlab-deploy`
 2. Je Repo ein geprüftes Deploy-Skript nach `/etc/devlab/deploy.d/<repo>` (Vorlage:
    `deploy/deploy.d.example-devlab`). Ohne Eintrag überspringt der Wrapper das Repo (Exit 3).
+3. Dienste, die auf dem Ziel **nicht** betrieben werden, in `DEVLAB_RUNS_NO_DEPLOY` führen (§4) — sonst
+   scheitert ihr Deploy dauerhaft. Falls doch mal ein Deploy dauerhaft scheitert, wird er nach wenigen
+   Versuchen blockiert statt endlos wiederholt (siehe „Auslieferung: blockieren…").
+
+## Auslieferung: blockieren statt endlos wiederholen (`full`-Modus)
+
+Ein gemergter PR löst im `full`-Modus einen prod-Deploy aus. Schlägt der fehl, unterscheidet der
+Scheduler **zwei Fälle**, statt blind weiter zu versuchen:
+
+- **Vorübergehend** (Netz, VPS kurz nicht erreichbar — `connection refused`, `timed out`, `no route to
+  host`): wird beim nächsten Tick **erneut** versucht. Solche Störungen zählen nicht mit.
+- **Dauerhaft** (Dienst auf dem Ziel nicht eingerichtet — fehlende Unit, fehlende prod-Config, kein
+  Deploy-Skript): nach `DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS` (Default 3) Versuchen wird die Auslieferung
+  **blockiert** — mit einer verständlichen Begründung (Dienst + Ziel benannt) und Zeitpunkt — und **nicht**
+  weiter versucht. Ein blockiertes Repo hält die anderen nicht auf; deren Auslieferung läuft normal weiter.
+
+Blockierte Auslieferungen sind **im UI sichtbar** (Banner über „Automatische Läufe" und „Konkrete ToDos":
+Repository, Grund, Zahl der Versuche) — nicht nur im Journal. `GET /api/mercury/runs/deploys` liefert sie
+maschinenlesbar.
+
+**Wiederaufnahme:** Ist die Ursache behoben (Dienst auf dem Ziel eingerichtet), im UI „Wiederaufnehmen"
+klicken oder `POST /api/mercury/runs/deploys/resume {repo, number}` — der Block wird aufgehoben und der
+nächste Tick versucht den Deploy erneut (Versuchszähler zurückgesetzt). Soll das Repo dauerhaft nicht
+ausgeliefert werden, gehört es stattdessen in `DEVLAB_RUNS_NO_DEPLOY` (§4).
 
 ## Kill-Switch / Rückbau
 - `DEVLAB_RUNS_MODE=off` (oder Drop-in entfernen) + `systemctl restart devlabd` → Scheduler aus.
 - Laufender Lauf: „Abbrechen" im UI (`POST /api/mercury/runs/cancel`).
 - Auto-Merge stoppen: PRs in `runs-prs.json` sind nachvollziehbar; Datei leeren stoppt Auto-Merges.
+- Endlose Deploy-Fehlversuche: gibt es nicht mehr — ein dauerhaft scheiternder Deploy blockiert nach
+  wenigen Versuchen (siehe oben); ein bewusst nicht auszulieferndes Repo gehört in `DEVLAB_RUNS_NO_DEPLOY`.
