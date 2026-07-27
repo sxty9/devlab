@@ -98,9 +98,9 @@ type RepoResult struct {
 	// the NEXT run only has to look at what came after it.
 	Base string `json:"base,omitempty"`
 	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
-	Running  bool `json:"running,omitempty"`
-	OK       bool `json:"ok"`
-	Deployed bool `json:"deployed"`
+	Running  bool   `json:"running,omitempty"`
+	OK       bool   `json:"ok"`
+	Deployed bool   `json:"deployed"`
 	PRUrl    string `json:"prUrl,omitempty"`
 	// DevBranch/DevCommit NAME the delivered dev state (req 2): the persistent integration branch the run
 	// grew (mercury-dev) and the exact commit dev serves. PRBase is this delivery's stacked PR base — the
