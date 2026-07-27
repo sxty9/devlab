@@ -783,7 +783,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// REPORT: read-only plan against the dev state; no push, no deploy, no delivery.
 	if x.mode == "report" {
-		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
+		lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
 		if lim.limited {
 			return rr, lim
 		}
@@ -791,7 +791,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			rr.Error = "analyze: " + err.Error()
 			return rr, repoSignal{}
 		}
-		applyUsage(&rr, final) // the agent's report already streamed into the analyze step
+		// tokens were already settled onto rr inside runAgentLive (climbing live during the analyze step)
 		if tip, e := ex.RevParse(ctx, wt, "HEAD"); e == nil {
 			rr.DevCommit = tip
 		}
@@ -800,7 +800,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 
 	// PR / FULL: implement ON the dev branch (it already carries the accumulated work).
-	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
+	lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
 	}
@@ -809,7 +809,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		recordNotExecuted(&rr, x.mode, "implement", saver)
 		return rr, repoSignal{}
 	}
-	applyUsage(&rr, final) // the agent's report already streamed into the implement step
+	// tokens were already settled onto rr inside runAgentLive (climbing live during the implement step)
 
 	// The agent usually commits its own work — Claude Code does that routinely. Judging by the
 	// WORKING TREE alone therefore misses a finished implementation entirely: the tree is clean, the
@@ -1491,20 +1491,72 @@ type agentStep struct {
 	saver *liveSaver
 	idx   int
 	tr    transcript
+	// Live token accounting for THIS agent invocation. Claude streams per-turn usage on its assistant
+	// events (repeated once per content block, all under one message id — see streamUsage), so byMsg
+	// dedupes by id and the live total is the sum over distinct messages, folded into rr as it climbs.
+	// applied is exactly what this invocation has already added to rr, so settle() can swap the live
+	// estimate for the authoritative result-event total without double-counting.
+	byMsg   map[string]usage
+	applied usage
 }
 
 func beginAgentStep(rr *runs.RepoResult, saver *liveSaver, name string) *agentStep {
 	rr.Steps = append(rr.Steps, runs.Step{Name: name, Running: true, At: time.Now().UTC()})
 	saver.force()
-	return &agentStep{rr: rr, saver: saver, idx: len(rr.Steps) - 1}
+	return &agentStep{rr: rr, saver: saver, idx: len(rr.Steps) - 1, byMsg: map[string]usage{}}
 }
 
-// onProgress folds one line of streamed agent output into the running step's transcript (throttled save).
+// onProgress folds one line of streamed agent output into the running step — both its transcript and its
+// live token counters — and re-saves (throttled) whenever either moved, so a watcher sees the tokens climb.
 func (a *agentStep) onProgress(line []byte) {
-	if a.tr.push(line) {
+	changed := a.tr.push(line)
+	if changed {
 		a.rr.Steps[a.idx].Log = a.tr.clipped()
+	}
+	if a.foldUsage(line) {
+		changed = true
+	}
+	if changed {
 		a.saver.throttled()
 	}
+}
+
+// foldUsage climbs the repo result's token/turn counters from one streamed assistant event, so the
+// Tokenverbrauch updates live during the run rather than jumping only when the agent finishes. Usage is
+// deduped by message id (each turn recurs once per content block with identical usage), and rr is moved
+// by the delta over what this invocation already applied. Cost is not carried per-turn — it lands in
+// settle() from the final result event. Returns true when the live total actually moved.
+func (a *agentStep) foldUsage(line []byte) bool {
+	id, u, ok := streamUsage(line)
+	if !ok {
+		return false
+	}
+	a.byMsg[id] = u // overwrite, never add: the same id repeats once per content block
+	sum := usage{turns: len(a.byMsg)}
+	for _, v := range a.byMsg {
+		sum.in += v.in
+		sum.out += v.out
+	}
+	if sum == a.applied {
+		return false
+	}
+	a.rr.InputTokens += sum.in - a.applied.in
+	a.rr.OutputTokens += sum.out - a.applied.out
+	a.rr.NumTurns += sum.turns - a.applied.turns
+	a.applied = sum
+	return true
+}
+
+// settle reconciles the repo result's token/cost totals to the AUTHORITATIVE figures from the final
+// result event, replacing whatever live estimate foldUsage accumulated for this invocation (so the two
+// never double-count) and bringing in cost, which the per-turn stream does not carry.
+func (a *agentStep) settle(final []byte) {
+	u := parseClaudeUsage(final)
+	a.rr.InputTokens += u.in - a.applied.in
+	a.rr.OutputTokens += u.out - a.applied.out
+	a.rr.NumTurns += u.turns - a.applied.turns
+	a.rr.CostUSD += u.cost - a.applied.cost
+	a.applied = u
 }
 
 func (a *agentStep) finish(report string) {
@@ -1519,22 +1571,28 @@ func (a *agentStep) fail(logtxt string) {
 	a.saver.force()
 }
 
-// runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
-// (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
-// (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
+// runAgentLive runs the agent as a live step `name` on rr, streaming its transcript AND its climbing
+// token counters into rr as it works, then settling the token/cost totals to the authoritative final
+// result event. On a usage-limit stop it leaves the step running and the repo unrecorded (it retries on
+// resume); on error it fails the step; on success it finalizes the step to the report.
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
 	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
-	final = resultEvent(out)
+	final := resultEvent(out)
 	if l := detectLimit(final, aerr); l.limited {
-		return final, l, aerr // leave the step running; the repo is not recorded
+		// Leave the step running; the repo is not recorded (it retries on resume) — so the live token
+		// estimate folded so far is discarded with it, not settled, and never double-counts on resume.
+		return l, aerr
 	}
+	// settle FIRST so the forced save in finish/fail persists the authoritative token/cost totals, not
+	// the mid-stream estimate. On error the tokens actually spent on the failed invocation are recorded.
+	ag.settle(final)
 	if aerr != nil {
 		ag.fail(agentError(aerr))
-		return final, repoSignal{}, aerr
+		return repoSignal{}, aerr
 	}
 	ag.finish(parseClaudeResult(final).Output)
-	return final, repoSignal{}, nil
+	return repoSignal{}, nil
 }
 
 // deploy hands a PREBUILT artifact to the root wrapper, which INSTALLS ONLY — it never builds (Finding
@@ -1812,15 +1870,6 @@ func (x *runExecutor) runnerIdentity() (string, int64) {
 	return l.GHLogin, l.GHID
 }
 
-// applyUsage folds the Claude CLI's token/cost usage into a repo result.
-func applyUsage(rr *runs.RepoResult, out []byte) {
-	u := parseClaudeUsage(out)
-	rr.InputTokens += u.in
-	rr.OutputTokens += u.out
-	rr.CostUSD += u.cost
-	rr.NumTurns += u.turns
-}
-
 type usage struct {
 	in, out int
 	cost    float64
@@ -2074,6 +2123,12 @@ func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
 	e.InputTokens, e.OutputTokens = res.InputTokens, res.OutputTokens
 	e.CostUSD, e.NumTurns = res.CostUSD, res.NumTurns
 	if res.Live != nil {
+		// The repo in flight has not settled into the execution totals yet, so add its live spend — the
+		// overview then climbs as the current repo works, not only when it finishes and rolls up.
+		e.InputTokens += res.Live.InputTokens
+		e.OutputTokens += res.Live.OutputTokens
+		e.CostUSD += res.Live.CostUSD
+		e.NumTurns += res.Live.NumTurns
 		e.CurrentRepo = res.Live.Repo
 		// The step running right now is the last one still marked Running.
 		for i := len(res.Live.Steps) - 1; i >= 0; i-- {
