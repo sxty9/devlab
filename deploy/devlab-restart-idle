@@ -20,6 +20,11 @@
 set -euo pipefail
 
 MARKER="${DEVLAB_MERCURY_BUSY:-/var/lib/devlab/mercury/run-active}"
+# The MIRROR of the busy marker: while we wait, devlabd reads this to learn "a restart is pending" and
+# holds off starting new runs (the mutual exclusion of restart and run-start). We write our own PID as
+# field 1 so devlabd ignores it if we crash, and remove it right before the restart. It sits beside
+# run-active, in the same mercury dir devlabd owns; devlabd may override the path with the same env.
+PENDING="${DEVLAB_MERCURY_RESTART_PENDING:-$(dirname "$MARKER")/restart-pending}"
 UNIT="${DEVLAB_UNIT:-devlabd}"
 POLL="${DEVLAB_RESTART_POLL:-10}"      # seconds between checks
 MAX_WAIT="${DEVLAB_RESTART_MAXWAIT:-21600}"  # 6h — beyond any capped run
@@ -35,10 +40,15 @@ busy() {
   kill -0 "$pid" 2>/dev/null                  # dead writer → stale marker → free
 }
 
+# Announce the pending restart to devlabd, and always clear it on exit (even on error) so a start can
+# never be wedged by a stale pending marker we left behind.
+printf '%d %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$PENDING" 2>/dev/null || true
+trap 'rm -f "$PENDING" 2>/dev/null || true' EXIT
+
 waited=0
 while busy; do
   if (( waited == 0 )); then
-    log "run in flight ($(cat "$MARKER" 2>/dev/null | tr -d '\n')) — deferring restart of $UNIT"
+    log "run in flight ($(cat "$MARKER" 2>/dev/null | tr -d '\n')) — deferring restart of $UNIT (new runs queue meanwhile)"
   fi
   if (( waited >= MAX_WAIT )); then
     log "waited ${waited}s (max ${MAX_WAIT}s) — restarting $UNIT anyway"
@@ -48,6 +58,9 @@ while busy; do
   waited=$(( waited + POLL ))
 done
 
+# Clear the pending marker BEFORE the restart so the freshly-started devlabd never sees a phantom pending
+# restart (the trap also covers an early error exit).
+rm -f "$PENDING" 2>/dev/null || true
 log "restarting $UNIT after ${waited}s wait"
 systemctl restart "$UNIT"
 log "done"

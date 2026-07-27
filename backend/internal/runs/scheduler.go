@@ -284,6 +284,9 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) 
 	if _, ok := s.active[r.ID]; ok {
 		return false // already running — never double-start the same run
 	}
+	if RestartPending() {
+		return false // a devlabd restart is queued and waiting for the slot — don't start a new run into it
+	}
 	if !overload && len(s.active) >= s.maxConc {
 		return false // cap reached (overload takes a temporary extra slot past it)
 	}
@@ -330,10 +333,11 @@ type AdmitBlock struct {
 
 // Admission block reasons.
 const (
-	AdmitRunning   = "running"   // this run is already live
-	AdmitExclusive = "exclusive" // an auto run holds the whole floor
-	AdmitRepoBusy  = "repo-busy" // a target repository is occupied by another run
-	AdmitCap       = "cap"       // every slot is taken (but no repo/exclusivity conflict)
+	AdmitRunning        = "running"         // this run is already live
+	AdmitRestartPending = "restart-pending" // a devlabd restart is queued — new starts are held (mutual exclusion)
+	AdmitExclusive      = "exclusive"       // an auto run holds the whole floor
+	AdmitRepoBusy       = "repo-busy"       // a target repository is occupied by another run
+	AdmitCap            = "cap"             // every slot is taken (but no repo/exclusivity conflict)
 )
 
 // Admissibility reports whether r could start now and, if not, why — WITHOUT reserving anything. It
@@ -344,6 +348,9 @@ func (s *Scheduler) Admissibility(r Run) AdmitBlock {
 	defer s.mu.Unlock()
 	if _, ok := s.active[r.ID]; ok {
 		return AdmitBlock{Reason: AdmitRunning}
+	}
+	if RestartPending() {
+		return AdmitBlock{Reason: AdmitRestartPending}
 	}
 	if s.exclusiveHeld {
 		var holder []string

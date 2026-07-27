@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -96,8 +97,9 @@ func seedStore(t *testing.T, runsIn []Run) *Store {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
-	// Keep the deferred-restart marker inside the temp dir so a test never touches a real one.
+	// Keep the deferred-restart + restart-pending markers inside the temp dir so a test never touches a real one.
 	t.Setenv("DEVLAB_MERCURY_BUSY", filepath.Join(dir, "run-active"))
+	t.Setenv("DEVLAB_MERCURY_RESTART_PENDING", filepath.Join(dir, "restart-pending"))
 	s := NewStore()
 	if _, err := s.Mutate("seed", "t", func([]Run) ([]Run, error) { return runsIn, nil }); err != nil {
 		t.Fatal(err)
@@ -845,6 +847,56 @@ func TestOverloadRefusedUnderExclusiveAuto(t *testing.T) {
 
 	be.release("auto")
 	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "auto to finish")
+}
+
+// ── restart / run-start mutual exclusion (NACHZUHOLEN) ───────────────────────────────────────────────
+
+// While a devlabd restart is pending (the deferred-restart helper holds the restart-pending marker), no
+// new run may start — it is held (queued) until the restart happens. A stale marker (writer gone) is
+// ignored, so a crashed helper never wedges the scheduler.
+func TestRestartPendingHoldsNewStarts(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	pend := RestartPendingPath()
+	// A marker with THIS (alive) process's PID → a restart is pending.
+	if err := os.WriteFile(pend, []byte(strconv.Itoa(os.Getpid())+" 2026-07-27T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !RestartPending() {
+		t.Fatal("a marker with a live PID must read as pending")
+	}
+	if _, ok := s.FireNow("t1", "user", false); ok {
+		t.Fatal("no run may start while a restart is pending")
+	}
+	r, _, _ := store.Get("t1")
+	if b := s.Admissibility(r); b.Reason != AdmitRestartPending {
+		t.Fatalf("want a restart-pending block, got %q", b.Reason)
+	}
+	expectNoStart(t, be, 120*time.Millisecond)
+
+	// Clearing the marker lets the run start.
+	_ = os.Remove(pend)
+	if RestartPending() {
+		t.Fatal("removing the marker must clear the pending state")
+	}
+	if _, ok := s.FireNow("t1", "user", false); !ok {
+		t.Fatal("the run must start once no restart is pending")
+	}
+	recvWithin(t, be.started, time.Second)
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t1 to finish")
+
+	// A stale marker (dead PID, far above any real one) is ignored — never wedges the scheduler.
+	if err := os.WriteFile(pend, []byte("2147480000 stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if RestartPending() {
+		t.Error("a marker whose writer is gone must be treated as not pending")
+	}
+	_ = os.Remove(pend)
 }
 
 // Admissibility classifies exactly WHY a run cannot start, and names the runs that must stand down to

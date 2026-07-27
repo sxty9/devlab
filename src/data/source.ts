@@ -189,7 +189,14 @@ export interface DataSource {
   mercuryRunNow(
     id: string,
     opts?: { fresh?: boolean; strategy?: 'queue' | 'overload' | 'defer'; deferRunId?: string },
-  ): Promise<{ started?: boolean; plan?: RunResumePlan; decision?: RunStartDecision; queued?: boolean; overloaded?: boolean }>;
+  ): Promise<{
+    started?: boolean;
+    plan?: RunResumePlan;
+    decision?: RunStartDecision;
+    queued?: boolean;
+    overloaded?: boolean;
+    restartPending?: boolean; // queued because a devlabd restart is pending
+  }>;
   /** The full slot overview (server truth): capacity, used/free slots, running overloads, the live runs,
    *  and the enriched inflight list (executing + suspended + deferred). Read on mount so running/deferred
    *  state survives a reload, and polled to follow live. */

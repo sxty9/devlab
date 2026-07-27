@@ -7,7 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, RestartPendingBanner, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -326,6 +326,7 @@ export default function RunsView() {
         <ActiveRunsOverview slots={slots} onCancel={cancelRun} onDefer={deferRun} busyId={busyId} className="ml-auto max-w-xs" />
       </header>
 
+      <RestartPendingBanner slots={slots} />
       <BlockedDeploysPanel />
 
       <div className="flex min-h-0 flex-1">

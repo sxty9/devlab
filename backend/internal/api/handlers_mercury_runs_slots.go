@@ -28,6 +28,10 @@ type SlotOverview struct {
 	Overload int             `json:"overload"` // runs beyond the cap right now (temporary, self-healing)
 	Active   []runs.Activity `json:"active"`   // each with its exclusive/overload flags (slot occupancy)
 	Inflight []inFlightRun   `json:"inflight"` // executing + suspended + deferred, enriched for the overview
+	// RestartPending is true while a devlabd restart is queued and waiting for the run slot to clear. New
+	// starts are held (queued) until the restart happens — the mutual exclusion of restart and run-start.
+	// Surfaced so the UI shows the pending restart and marks a start requested meanwhile as eingereiht.
+	RestartPending bool `json:"restartPending,omitempty"`
 }
 
 // StartDecision is returned when a run cannot start because the slots are full: it names WHY, the ways
@@ -76,6 +80,11 @@ func (s *Server) slotOverview() SlotOverview {
 	// A Rundumlauf holds the WHOLE floor — no other run can start beside it, so no slot is truly free
 	// however few are nominally occupied. Report it honestly rather than dangling an unusable "frei".
 	if exclusive {
+		ov.Free = 0
+	}
+	ov.RestartPending = runs.RestartPending()
+	// While a devlabd restart is pending, no new run may start (they queue) — so nothing is truly free.
+	if ov.RestartPending {
 		ov.Free = 0
 	}
 	ov.Inflight = s.assembleInFlight(active)
@@ -253,6 +262,16 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		block := s.scheduler.Admissibility(run)
 		if block.Reason == runs.AdmitRunning {
 			writeErr(w, http.StatusConflict, "Dieser Lauf läuft bereits")
+			return
+		}
+		if block.Reason == runs.AdmitRestartPending {
+			// A devlabd restart is queued and waiting for the slot; defer/overload cannot help. Queue this
+			// start so it fires once the restart has happened — a start requested meanwhile is eingereiht.
+			if fresh {
+				s.scheduler.DiscardResumable(id)
+			}
+			s.markRunDueNow(id)
+			writeJSON(w, http.StatusOK, map[string]any{"queued": true, "restartPending": true})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"started": false, "decision": s.buildStartDecision(run, block)})

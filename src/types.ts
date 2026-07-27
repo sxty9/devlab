@@ -707,6 +707,9 @@ export interface RunSlotOverview {
   overload: number;
   active: RunActive[];
   inflight: RunInFlight[];
+  /** True while a devlabd restart is pending (queued, waiting for the run slot to clear). New starts are
+   *  held until the restart happens — the mutual exclusion of restart and run-start. */
+  restartPending?: boolean;
 }
 
 /** The system's own pick of which run to stand down to free a slot — the one whose interruption loses the

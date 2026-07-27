@@ -1,9 +1,13 @@
 package runs
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -55,3 +59,51 @@ func markActive(n int) {
 // clearBusy removes the marker unconditionally — used at scheduler start-up, where no run can yet be in
 // flight so any marker left by a killed predecessor is provably stale. Safe when it does not exist.
 func clearBusy() { markActive(0) }
+
+// ─── restart-pending marker (the mirror direction) ──────────────────────────
+//
+// The busy marker tells the deferred-restart helper "a run is active, hold the restart". THIS marker is
+// the mirror: the (root) helper holds it while a devlabd restart is QUEUED and waiting for the run slot
+// to clear, and devlabd reads it to know "a restart is pending, don't start new runs" — the two-way
+// mutual exclusion of restart and run-start. The helper writes its own PID as field 1 (so a marker left
+// by a crashed helper is recognised as stale, never wedging the scheduler forever) and removes it right
+// before it restarts devlabd.
+
+// RestartPendingPath is the file the deferred-restart helper holds while a devlabd restart is pending.
+// DEVLAB_MERCURY_RESTART_PENDING overrides; it sits beside runs.json by default.
+func RestartPendingPath() string {
+	if p := os.Getenv("DEVLAB_MERCURY_RESTART_PENDING"); p != "" {
+		return p
+	}
+	return filepath.Join(filepath.Dir(runsPath()), "restart-pending")
+}
+
+// RestartPending reports whether a devlabd restart is currently pending (the helper is waiting for the
+// run slot). A marker whose writing process is gone is treated as absent (stale → not pending), so a
+// crashed helper can never wedge the scheduler into refusing every run forever.
+func RestartPending() bool {
+	b, err := os.ReadFile(RestartPendingPath())
+	if err != nil {
+		return false // no marker (or unreadable) → no restart pending
+	}
+	fields := strings.Fields(string(b))
+	if len(fields) == 0 {
+		return false
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return false
+	}
+	return processAlive(pid)
+}
+
+// processAlive reports whether a process with pid exists — signal 0 probes without delivering anything.
+// EPERM means it exists but is owned by another user (the root helper), which still counts as alive.
+func processAlive(pid int) bool {
+	p, err := os.FindProcess(pid) // always non-nil on Unix
+	if err != nil {
+		return false
+	}
+	err = p.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}

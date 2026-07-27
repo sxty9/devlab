@@ -6,7 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,6 +65,7 @@ func seedSlotServer(t *testing.T, cap string, runsIn []runs.Run) (*Server, *bloc
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "res"))
 	t.Setenv("DEVLAB_MERCURY_BUSY", filepath.Join(dir, "run-active"))
+	t.Setenv("DEVLAB_MERCURY_RESTART_PENDING", filepath.Join(dir, "restart-pending"))
 	t.Setenv("DEVLAB_RUNS_MAX_CONCURRENCY", cap)
 	store, results := runs.NewStore(), runs.NewResults()
 	if _, err := store.Mutate("seed", "t", func([]runs.Run) ([]runs.Run, error) { return runsIn, nil }); err != nil {
@@ -219,6 +222,29 @@ func TestRunNowStrategiesOverAndDefer(t *testing.T) {
 
 	close(be.gate)
 	slotWaitFor(t, 2*time.Second, func() bool { return s.scheduler.ActiveCount() == 0 }, "runs to finish")
+}
+
+// TestRunNowQueuesDuringRestartPending pins the NACHZUHOLEN: while a devlabd restart is pending the
+// overview reports it and a start requested meanwhile is QUEUED (eingereiht), not actually started.
+func TestRunNowQueuesDuringRestartPending(t *testing.T) {
+	s, _ := seedSlotServer(t, "2", []runs.Run{todoRun("a", "repo-a")})
+	pend := runs.RestartPendingPath()
+	if err := os.WriteFile(pend, []byte(strconv.Itoa(os.Getpid())+" 2026-07-27T00:00:00Z\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(pend)
+
+	if ov := s.slotOverview(); !ov.RestartPending || ov.Free != 0 {
+		t.Fatalf("overview must report the pending restart and no free slot: %+v", ov)
+	}
+
+	rec := runNowReq(t, s, "a", `{}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"queued":true`) {
+		t.Fatalf("a start during a pending restart must be queued, got %d %s", rec.Code, rec.Body.String())
+	}
+	if s.scheduler.ActiveCount() != 0 {
+		t.Fatalf("nothing may actually start while a restart is pending, active=%d", s.scheduler.ActiveCount())
+	}
 }
 
 func hasOption(opts []string, want string) bool {

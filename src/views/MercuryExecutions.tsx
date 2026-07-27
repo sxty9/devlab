@@ -104,7 +104,11 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
   const announce = (res: RunNowResult): boolean => {
     if (res.decision) return false;
     if (res.queued) {
-      toast({ title: `${noun} eingereiht`, description: 'Startet, sobald ein Platz frei wird.', variant: 'default' });
+      toast({
+        title: `${noun} eingereiht`,
+        description: res.restartPending ? 'Ein Neustart steht aus — startet danach automatisch.' : 'Startet, sobald ein Platz frei wird.',
+        variant: 'default',
+      });
     } else if (res.overloaded) {
       toast({ title: `${noun} gestartet (Überladung)`, description: 'Läuft in einem zusätzlichen Platz.', variant: 'success' });
     } else {
@@ -1298,6 +1302,20 @@ export function SlotsBadge({ slots, className }: { slots: RunSlotOverview; class
   if (slots.free > 0) parts.push(`${slots.free} frei`);
   if (slots.overload > 0) parts.push(`+${slots.overload} Überladung`);
   return <span className={cn('text-caption text-text-tertiary', className)}>Plätze: {parts.join(' · ')}</span>;
+}
+
+/** A banner shown while a devlabd restart is pending — queued and waiting for the running slot to clear
+ *  (the mutual exclusion of restart and run-start). It makes the pending restart visible (NACHZUHOLEN)
+ *  and explains that a start requested meanwhile is eingereiht and runs afterward. Renders nothing
+ *  otherwise, so it appears exactly when it matters. Shared by the Läufe and ToDos surfaces. */
+export function RestartPendingBanner({ slots }: { slots: RunSlotOverview }) {
+  if (!slots.restartPending) return null;
+  return (
+    <div className="border-b border-accent/40 bg-accent/10 px-4 py-2 text-caption text-text-secondary" role="status">
+      <span className="font-semibold text-accent">Neustart steht aus.</span> Der Dienst wird neu gestartet, sobald der laufende
+      Vorgang endet — neue Läufe werden so lange eingereiht und starten danach automatisch.
+    </div>
+  );
 }
 
 const stateWord = (s: RunInFlight['state']) => (s === 'executing' ? 'Läuft' : s === 'deferred' ? 'Zurückgestellt' : 'Pausiert');

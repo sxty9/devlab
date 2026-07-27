@@ -7,7 +7,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, RestartPendingBanner, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
@@ -460,6 +460,7 @@ export default function TodosView() {
         </div>
       </header>
 
+      <RestartPendingBanner slots={slots} />
       <BlockedDeploysPanel />
 
       <div className="flex min-h-0 flex-1">
