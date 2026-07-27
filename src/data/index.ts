@@ -92,6 +92,7 @@ export const dataSource: DataSource = {
   mercuryRunNow: (id, opts) => impl.mercuryRunNow(id, opts),
   mercuryRunActive: () => impl.mercuryRunActive(),
   mercuryCancelRun: (id) => impl.mercuryCancelRun(id),
+  mercuryDeferRun: (id) => impl.mercuryDeferRun(id),
   mercuryBlockedDeploys: () => impl.mercuryBlockedDeploys(),
   mercuryResumeDeploy: (repo, number) => impl.mercuryResumeDeploy(repo, number),
   mercuryUploadAttachment: (id, filename, contentB64) => impl.mercuryUploadAttachment(id, filename, contentB64),

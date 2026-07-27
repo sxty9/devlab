@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -468,5 +469,178 @@ func TestFireNowReturnsResumePlan(t *testing.T) {
 	if p, ok := fire("plain", false); !ok || p.Action != ResumeFresh {
 		t.Errorf("a run with nothing interrupted must report a fresh start: ok=%v plan=%+v", ok, p)
 	}
+	settle(t, s)
+}
+
+// ─── Slot management: defer / overload / admissibility ───────────────────────
+
+// deferExec blocks the first execution on ctx; a defer (ErrRunDeferred) makes it return an immediately-due
+// deferred suspension. Once finishNow is set, later executions complete straight away (the resume path).
+type deferExec struct {
+	mu        sync.Mutex
+	calls     []Run
+	finishNow bool
+}
+
+func (d *deferExec) Execute(ctx context.Context, run Run, report func(string)) (ResultRef, error) {
+	d.mu.Lock()
+	d.calls = append(d.calls, run)
+	finish := d.finishNow
+	d.mu.Unlock()
+	report("res_1")
+	if finish {
+		return ResultRef{ResultID: "res_1", OK: true}, nil
+	}
+	<-ctx.Done()
+	if errors.Is(context.Cause(ctx), ErrRunDeferred) {
+		now := time.Now()
+		return ResultRef{ResultID: "res_1", ResumeAt: &now, Suspended: true, Reason: ReasonDeferred}, nil
+	}
+	return ResultRef{ResultID: "res_1", OK: false}, nil
+}
+func (d *deferExec) Maintain(context.Context)        {}
+func (d *deferExec) PlanResume(Run, bool) ResumePlan { return ResumePlan{Action: ResumeFresh} }
+func (d *deferExec) handed(i int) Run                { d.mu.Lock(); defer d.mu.Unlock(); return d.calls[i] }
+func (d *deferExec) nCalls() int                     { d.mu.Lock(); defer d.mu.Unlock(); return len(d.calls) }
+func (d *deferExec) setFinish()                      { d.mu.Lock(); d.finishNow = true; d.mu.Unlock() }
+
+// TestDeferReArmsRunAsResumable: Defer frees the slot and re-arms the run as an immediately-due deferred
+// suspension; a re-fire resumes the SAME execution and finishes it. Reuses the ONE suspension mechanism.
+func TestDeferReArmsRunAsResumable(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{todoRun("t1", "r1", past)})
+	de := &deferExec{}
+	s := quiet(NewScheduler(store, de, time.Second, 2))
+
+	if !s.FireNowStart("t1") {
+		t.Fatal("t1 should start")
+	}
+	waitFor(t, "t1 executing", func() bool { return de.nCalls() == 1 })
+
+	if s.Defer("nope") {
+		t.Error("Defer of a non-active run must be false")
+	}
+	if !s.Defer("t1") {
+		t.Fatal("Defer(t1) should stand the running run down")
+	}
+	waitFor(t, "slot freed", func() bool { return s.ActiveCount() == 0 })
+	waitFor(t, "re-armed as deferred", func() bool {
+		r, _, _ := store.Get("t1")
+		return r.Suspended != nil && r.Suspended.IsDeferred()
+	})
+	r, _, _ := store.Get("t1")
+	if r.Suspended.ResumeAt.After(time.Now()) {
+		t.Error("a deferred suspension must be immediately due")
+	}
+
+	// Resume: it must be handed a Suspended run (a continuation), not a fresh start, and finish.
+	de.setFinish()
+	s.fireDue(context.Background())
+	waitFor(t, "resumed & done", func() bool { r, _, _ := store.Get("t1"); return r.Suspended == nil && r.Done })
+	if de.nCalls() != 2 || de.handed(1).Suspended == nil {
+		t.Errorf("resume must continue the same execution (Suspended run), calls=%d", de.nCalls())
+	}
+	settle(t, s)
+}
+
+// FireNowStart is a tiny test convenience: start a run, ignoring the resume plan.
+func (s *Scheduler) FireNowStart(id string) bool { _, ok := s.FireNow(id, "t", false); return ok }
+
+// TestOverloadAdmitsPastCapAndSelfHeals: an overload runs past the cap in an extra slot that vanishes on
+// release — repeated overloads never raise the standing ceiling.
+func TestOverloadAdmitsPastCapAndSelfHeals(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{todoRun("a", "r1", past), todoRun("b", "r2", past), todoRun("c", "r3", past)})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 1)) // cap 1
+
+	if !s.FireNowStart("a") {
+		t.Fatal("a should take the single slot")
+	}
+	waitFor(t, "a live", func() bool { return s.ActiveCount() == 1 })
+	if _, ok := s.StartOverload("b", "t", false); !ok {
+		t.Fatal("overload b should admit past the cap")
+	}
+	waitFor(t, "overloaded", func() bool { return s.ActiveCount() == 2 })
+
+	ge.release("b")
+	waitFor(t, "overload ended", func() bool { return s.ActiveCount() == 1 })
+	// The extra slot vanished: with cap 1 and a still running, c must NOT start.
+	s.fireDue(context.Background())
+	time.Sleep(30 * time.Millisecond)
+	if s.ActiveCount() != 1 {
+		t.Fatalf("the ceiling must be back to 1 (overload self-healed), ActiveCount=%d", s.ActiveCount())
+	}
+	ge.release("a")
+	waitFor(t, "a done", func() bool { return s.ActiveCount() == 0 })
+	s.fireDue(context.Background())
+	waitFor(t, "c starts in the freed slot", func() bool { return s.ActiveCount() == 1 })
+	ge.release("c")
+	settle(t, s)
+}
+
+// TestOverloadRespectsHardLimits: overload never crosses a busy repo or an exclusive floor (req 7).
+func TestOverloadRespectsHardLimits(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	t.Run("refused on repo conflict", func(t *testing.T) {
+		store := seedStore(t, []Run{todoRun("a", "shared", past), todoRun("b", "shared", past), todoRun("c", "free", past)})
+		ge := newGateExec()
+		s := quiet(NewScheduler(store, ge, time.Second, 1))
+		s.FireNowStart("a")
+		waitFor(t, "a live", func() bool { return s.ActiveCount() == 1 })
+		if _, ok := s.StartOverload("b", "t", false); ok {
+			t.Error("overload onto a claimed repo must be refused")
+		}
+		if _, ok := s.StartOverload("c", "t", false); !ok {
+			t.Error("overload onto a free repo must be allowed")
+		}
+		ge.release("a")
+		ge.release("c")
+		settle(t, s)
+	})
+	t.Run("refused under an exclusive auto run", func(t *testing.T) {
+		store := seedStore(t, []Run{autoRun("auto", past), todoRun("t", "r1", past)})
+		ge := newGateExec()
+		s := quiet(NewScheduler(store, ge, time.Second, 4))
+		s.FireNowStart("auto")
+		waitFor(t, "auto holds the floor", func() bool { return s.ActiveCount() == 1 })
+		if _, ok := s.StartOverload("t", "t", false); ok {
+			t.Error("overload must be refused while an exclusive auto run holds the floor")
+		}
+		ge.release("auto")
+		settle(t, s)
+	})
+}
+
+// TestAdmissibilityClassifiesBlocks: the classifier names the block and the conflicting run-ids.
+func TestAdmissibilityClassifiesBlocks(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{
+		todoRun("a", "shared", past), todoRun("b", "shared", past), todoRun("c", "free", past),
+		autoRun("auto", past),
+	})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 2))
+
+	// Nothing running → admissible.
+	aRun, _, _ := store.Get("a")
+	if blk := s.Admissibility(aRun); blk.Reason != AdmitOK {
+		t.Fatalf("an idle floor must admit, got %+v", blk)
+	}
+	s.FireNowStart("a")
+	waitFor(t, "a live", func() bool { return s.ActiveCount() == 1 })
+
+	if blk := s.Admissibility(aRun); blk.Reason != AdmitRunning {
+		t.Errorf("a live run must classify as running, got %+v", blk)
+	}
+	bRun, _, _ := store.Get("b")
+	if blk := s.Admissibility(bRun); blk.Reason != AdmitRepoBusy || len(blk.Conflicts) != 1 || blk.Conflicts[0] != "a" {
+		t.Errorf("a same-repo ToDo must be repo-busy conflicting with a, got %+v", blk)
+	}
+	autoR, _, _ := store.Get("auto")
+	if blk := s.Admissibility(autoR); blk.Reason != AdmitExclusive || len(blk.Conflicts) == 0 {
+		t.Errorf("a fresh auto run needs an empty floor → exclusive, got %+v", blk)
+	}
+	ge.release("a")
 	settle(t, s)
 }

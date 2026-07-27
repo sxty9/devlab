@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, SlotOverview, StartResult, StartStrategy, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -185,13 +185,15 @@ export interface DataSource {
    *  exists (skipping its done repos); `fresh` discards it and starts over. The returned `plan` reports
    *  which happened and why, so the trigger can show "fortgesetzt" vs "neu begonnen". 503 if the executor
    *  is unconfigured, 409 if one is running. */
-  mercuryRunNow(id: string, opts?: { fresh?: boolean }): Promise<{ started: boolean; plan?: RunResumePlan }>;
+  mercuryRunNow(id: string, opts?: { fresh?: boolean; strategy?: StartStrategy; deferRunId?: string }): Promise<StartResult>;
   /** Every run executing right now (server truth) — several run concurrently. Read on mount so live runs
    *  survive a page reload, and polled to follow them. `inflight` is the transparent list of every run
    *  currently being worked (executing + suspended) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[] }>;
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview }>;
   /** Abort a SPECIFIC run in progress by id (kill-switch) — other concurrent runs keep going. */
   mercuryCancelRun(id: string): Promise<void>;
+  /** Stand a SPECIFIC run down to free its slot — it keeps its progress and resumes at the next free slot. */
+  mercuryDeferRun(id: string): Promise<void>;
   /** The deliveries blocked on a permanent prod-deploy failure — waiting for an explicit resume. */
   mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;
   /** Clear the block on one delivery so its prod-deploy is retried (full attempt budget again). */

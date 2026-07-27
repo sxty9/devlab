@@ -409,6 +409,114 @@ func (s *Scheduler) Cancel(id string) bool {
 	return true
 }
 
+// ErrRunDeferred is the cancellation cause Defer attaches. Unlike ErrRunAborted (stop for good), it tells
+// the executor to stand the run down WITHOUT finalising it — re-armed as an immediately-due deferred
+// suspension that keeps its progress and reclaims the next free slot.
+var ErrRunDeferred = errors.New("run deferred to free a slot")
+
+// Defer stands a running run down to free its slot (req 4): it cancels with ErrRunDeferred, and the
+// executor re-arms the execution as a deferred suspension — same progress, resumes at the next free slot.
+// Returns false if the run is not executing. It reuses the ONE suspension mechanism: no second pause.
+func (s *Scheduler) Defer(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ar := s.active[id]
+	if ar == nil || ar.stop == nil {
+		return false
+	}
+	ar.stop(ErrRunDeferred)
+	return true
+}
+
+// StartOverload starts a run in a temporary EXTRA slot past the concurrency cap (req 5) — a slot that
+// vanishes when the run ends (never a silent permanent bump: the cap is never mutated, so release
+// self-heals the floor). It still honours the two limits above any urgency (req 7): never two runs on the
+// same repo, and the exclusive floor stays exclusive. Returns the resume plan like FireNow.
+func (s *Scheduler) StartOverload(id, actor string, fresh bool) (ResumePlan, bool) {
+	return s.start(id, actor, fresh, true)
+}
+
+// AdmitBlock classifies why a run cannot start right now, naming the conflicting run-ids so the UI can
+// offer a targeted defer. Reason is "" when the run is admissible.
+type AdmitBlock struct {
+	Reason    string   `json:"reason"`
+	Conflicts []string `json:"conflicts,omitempty"`
+}
+
+// Admission-block reasons.
+const (
+	AdmitOK        = ""          // admissible right now
+	AdmitRunning   = "running"   // this run is already executing
+	AdmitExclusive = "exclusive" // an exclusive auto run holds the floor, or a fresh auto needs an empty one
+	AdmitRepoBusy  = "repo-busy" // a target repo is claimed by a live run
+	AdmitCap       = "cap"       // the concurrency ceiling is reached (the only block an overload can cross)
+)
+
+// Admissibility reports why run r cannot start now (or AdmitOK). Priority mirrors admit: an uncrossable
+// block (running / exclusive / repo-busy) is reported ABOVE the cap, because only the cap can be
+// overloaded past — the UI must not offer "overload" when a repo is genuinely busy.
+func (s *Scheduler) Admissibility(r Run) AdmitBlock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.active[r.ID]; ok {
+		return AdmitBlock{Reason: AdmitRunning}
+	}
+	if s.exclusiveHeld {
+		return AdmitBlock{Reason: AdmitExclusive, Conflicts: s.exclusiveHolderLocked()}
+	}
+	if r.IsTodo() {
+		if busy := s.repoConflictsLocked(claimKeys(r)); len(busy) > 0 {
+			return AdmitBlock{Reason: AdmitRepoBusy, Conflicts: busy}
+		}
+	} else if len(s.active) > 0 {
+		return AdmitBlock{Reason: AdmitExclusive, Conflicts: s.activeIDsLocked()} // a fresh auto needs an empty floor
+	}
+	if len(s.active) >= s.maxConc {
+		return AdmitBlock{Reason: AdmitCap}
+	}
+	return AdmitBlock{Reason: AdmitOK}
+}
+
+// exclusiveHolderLocked / repoConflictsLocked / activeIDsLocked name conflicting live run-ids. Callers
+// hold s.mu.
+func (s *Scheduler) exclusiveHolderLocked() []string {
+	var out []string
+	for id, ar := range s.active {
+		if ar.exclusive {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Scheduler) repoConflictsLocked(keys []string) []string {
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[k] = true
+	}
+	var out []string
+	for id, ar := range s.active {
+		for _, k := range ar.claims {
+			if want[k] {
+				out = append(out, id)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (s *Scheduler) activeIDsLocked() []string {
+	out := make([]string, 0, len(s.active))
+	for id := range s.active {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Active returns a snapshot of EVERY run currently executing, ordered by start time so the UI list is
 // stable. Copied out under the lock so callers read freely.
 func (s *Scheduler) Active() []Activity {

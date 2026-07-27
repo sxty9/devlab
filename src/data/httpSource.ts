@@ -305,13 +305,20 @@ export const httpSource: DataSource = {
     return json(await post('/api/mercury/chat', { messages }));
   },
   async mercuryRunNow(id, opts) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run${opts?.fresh ? '?fresh=1' : ''}`, {}));
+    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {
+      fresh: !!opts?.fresh,
+      strategy: opts?.strategy,
+      deferRunId: opts?.deferRunId,
+    }));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
   async mercuryCancelRun(id: string) {
     await json<void>(await post(`/api/mercury/runs/${enc(id)}/cancel`, {}));
+  },
+  async mercuryDeferRun(id: string) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
   },
   async mercuryBlockedDeploys() {
     return json(await request('/api/mercury/runs/deploys'));

@@ -7,7 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -89,8 +89,9 @@ export default function RunsView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
+  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
   const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
@@ -158,6 +159,20 @@ export default function RunsView() {
       setCancellingId(null);
     }
   }, [cancellingId, source, toast, refetchActive]);
+
+  const deferRun = useCallback(async (id: string) => {
+    if (deferringId) return;
+    setDeferringId(id);
+    try {
+      await source.mercuryDeferRun(id);
+      toast({ title: 'Lauf zurückgestellt', description: 'Setzt am nächsten freien Platz fort.', variant: 'default' });
+      refetchActive();
+    } catch (e) {
+      toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setDeferringId(null);
+    }
+  }, [deferringId, source, toast, refetchActive]);
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -304,10 +319,15 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} className="ml-auto max-w-xs" />
+        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} className="ml-auto max-w-xs" />
       </header>
 
       <BlockedDeploysPanel />
+      {slots && (slots.deferred.length > 0 || slots.overload > 0) && (
+        <div className="border-b border-separator px-3 py-2">
+          <SlotsOverview slots={slots} />
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {tab === 'laeufe' && (

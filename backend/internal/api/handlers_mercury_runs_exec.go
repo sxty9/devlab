@@ -383,6 +383,11 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			continue // completed in an earlier attempt of this same execution
 		}
 		if ctx.Err() != nil {
+			// A DEFER (freeing a slot) re-arms the run as an immediately-due deferred suspension — it keeps
+			// its progress and resumes at the next free slot. Checked first: it is a stand-down, not a stop.
+			if deferredNow(ctx) {
+				return x.suspendDeferred(&res, save)
+			}
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
 			// ErrRunAborted as the cause) finalises the run — "abort" means stop, not resume. Our own
 			// sweep-duration cap (DeadlineExceeded) and a process shutdown (a plain cancel with no abort
@@ -423,6 +428,19 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		//     wastefully, a pr/full repo into a DUPLICATE PR);
 		//   • a failed repo that already opened a PR (full-mode deploy-fail leaves rr.PRUrl set) must be
 		//     recorded so resume skips it — dropping it would re-open a duplicate PR.
+		if deferredNow(ctx) {
+			// Deferred mid-repo: record the repo only if it durably completed (opened a PR / succeeded), so
+			// resume skips it; otherwise drop it (retries clean on resume). Then re-arm as deferred.
+			if rr.OK || rr.PRUrl != "" {
+				rr.Running = false
+				res.Repos = append(res.Repos, rr)
+				res.InputTokens += rr.InputTokens
+				res.OutputTokens += rr.OutputTokens
+				res.CostUSD += rr.CostUSD
+				res.NumTurns += rr.NumTurns
+			}
+			return x.suspendDeferred(&res, save)
+		}
 		if !rr.OK && rr.PRUrl == "" && ctx.Err() != nil && !errors.Is(context.Cause(ctx), runs.ErrRunAborted) {
 			log.Printf("devlabd: run %s interrupted mid-repo %s (%v) — carrying over", run.ID, repo.ID, ctx.Err())
 			carriedOver = true
@@ -577,6 +595,28 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 // suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
 // budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
 // the scheduler clears the suspension and stops retrying).
+// deferredNow reports whether the context was cancelled by a Defer (freeing a slot) rather than an abort
+// or a shutdown.
+func deferredNow(ctx context.Context) bool {
+	return ctx.Err() != nil && errors.Is(context.Cause(ctx), runs.ErrRunDeferred)
+}
+
+// suspendDeferred re-arms the execution as an IMMEDIATELY-DUE deferred suspension (Reason=deferred,
+// ResumeAt=now): it keeps all progress and reclaims the next free slot, resuming the SAME execution and
+// skipping the repos already done. It reuses the ONE suspension mechanism — no second pause concept — and
+// never consumes a usage-limit attempt (the scheduler only counts attempts for a real usage-limit pause).
+func (x *runExecutor) suspendDeferred(res *runs.Result, save func()) (runs.ResultRef, error) {
+	now := time.Now().UTC()
+	res.Suspended = true
+	res.ResumeAt = &now
+	save()
+	ref := res.Ref() // copies Suspended + ResumeAt from res
+	ref.Reason = runs.ReasonDeferred
+	ref.OK = false
+	log.Printf("devlabd: run %s deferred to free a slot — resumes at the next free slot", res.RunID)
+	return ref, nil
+}
+
 func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
@@ -2150,21 +2190,65 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok, err := s.runs.Get(id); err != nil || !ok {
+	run, ok, err := s.runs.Get(id)
+	if err != nil || !ok {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	// ?fresh=1 explicitly discards any interrupted execution and starts over (req 4); the default (no flag)
-	// continues an interrupted execution if one exists (req 1). Either way the returned plan says which
-	// happened and why, so the difference is visible to whoever triggered the run (req 2).
+	// ?fresh=1 (or {"fresh":true}) explicitly discards any interrupted execution and starts over (req 4);
+	// the default continues an interrupted execution if one exists (req 1). The optional body carries a
+	// slot strategy (req 5): queue (einreihen) / defer (einen Vorgang zurückstellen) / overload (ein
+	// zusätzlicher Platz nur für diese Ausführung).
+	strategy, deferRunID, bodyFresh := decodeRunNowBody(r)
 	q := r.URL.Query().Get("fresh")
-	fresh := q == "1" || strings.EqualFold(q, "true")
-	plan, started := s.scheduler.FireNow(id, actor(r), fresh)
-	if !started {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
-		return
+	fresh := bodyFresh || q == "1" || strings.EqualFold(q, "true")
+	who := actor(r)
+
+	switch strategy {
+	case "", "start":
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
+			return
+		}
+		// Blocked. A run already executing is a plain conflict; anything else (cap / repo-busy / exclusive)
+		// returns a decision the caller can act on — einreihen, zurückstellen, or überladen.
+		block := s.scheduler.Admissibility(run)
+		if block.Reason == runs.AdmitRunning {
+			writeErr(w, http.StatusConflict, "Dieser Lauf läuft bereits")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"started": false, "decision": s.buildStartDecision(block)})
+	case "queue":
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
+			return
+		}
+		s.markRunDueNow(id) // leave it due → the scheduler starts it at the next free slot
+		writeJSON(w, http.StatusOK, map[string]any{"queued": true})
+	case "overload":
+		if plan, started := s.scheduler.StartOverload(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "overloaded": true, "plan": plan})
+			return
+		}
+		writeErr(w, http.StatusConflict, "Überladen nicht möglich — zwei Vorgänge im selben Repository oder ein exklusiver Lauf bleiben ausgeschlossen")
+	case "defer":
+		if strings.TrimSpace(deferRunID) == "" {
+			writeErr(w, http.StatusBadRequest, "deferRunId ist für die Strategie 'defer' erforderlich")
+			return
+		}
+		if !s.scheduler.Defer(deferRunID) {
+			writeErr(w, http.StatusConflict, "Der zurückzustellende Lauf ist nicht aktiv")
+			return
+		}
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "deferred": deferRunID, "plan": plan})
+			return
+		}
+		s.markRunDueNow(id) // the freed slot may be reclaimed by the deferred run's immediate resume; queue then
+		writeJSON(w, http.StatusOK, map[string]any{"queued": true, "deferred": deferRunID})
+	default:
+		writeErr(w, http.StatusBadRequest, "unbekannte Strategie")
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
 }
 
 // runActive reports the run executing in THIS process right now — its id, the live result id (once the
@@ -2183,7 +2267,11 @@ func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":   active,
+		"inflight": s.assembleInFlight(active),
+		"slots":    s.slotOverview(active), // capacity/used/free/overload + deferred runs with resume points
+	})
 }
 
 // inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,

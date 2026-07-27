@@ -7,7 +7,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, SlotsOverview, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
@@ -281,8 +281,9 @@ export default function TodosView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
   // affordance lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
+  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
   const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
@@ -341,6 +342,20 @@ export default function TodosView() {
       setCancellingId(null);
     }
   }, [cancellingId, source, toast, refetchActive]);
+
+  const deferRun = useCallback(async (id: string) => {
+    if (deferringId) return;
+    setDeferringId(id);
+    try {
+      await source.mercuryDeferRun(id);
+      toast({ title: 'Lauf zurückgestellt', description: 'Setzt am nächsten freien Platz fort.', variant: 'default' });
+      refetchActive();
+    } catch (e) {
+      toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setDeferringId(null);
+    }
+  }, [deferringId, source, toast, refetchActive]);
 
   const refresh = useCallback(async () => {
     if (refreshing) return;
@@ -464,8 +479,10 @@ export default function TodosView() {
                   </Button>
                 </div>
                 {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
-                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} />
+                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} />
               </div>
+
+              {slots && (slots.deferred.length > 0 || slots.overload > 0) && <SlotsOverview slots={slots} className="mx-1.5" />}
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
                 {todos.length === 0 ? (
