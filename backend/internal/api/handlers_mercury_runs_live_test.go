@@ -71,7 +71,7 @@ func TestAgentStepLifecycle(t *testing.T) {
 
 	ag.finish("Done: implemented X.")
 	s := rr.Steps[0]
-	if s.Running || !s.OK || s.Log != "Done: implemented X." {
+	if s.Running || s.Status != runs.StepOK || s.Log != "Done: implemented X." {
 		t.Fatalf("finish did not finalize the step: %+v", s)
 	}
 }
@@ -81,7 +81,7 @@ func TestAgentStepFail(t *testing.T) {
 	ag := beginAgentStep(rr, &liveSaver{do: func() {}}, "analyze")
 	ag.fail("boom")
 	s := rr.Steps[0]
-	if s.Running || s.OK || s.Log != "boom" {
+	if s.Running || s.Status != runs.StepFailed || s.Log != "boom" {
 		t.Fatalf("fail did not finalize the step as failed: %+v", s)
 	}
 }

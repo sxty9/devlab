@@ -585,8 +585,8 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	saver.force()
 	// step records a COMPLETED stage and re-saves, so the fast git stages (push/pr/deploy) also surface
 	// live as they land. The long agent stages instead use runAgentLive (a running step that streams).
-	step := func(name, logtxt string, ok bool) {
-		rr.Steps = append(rr.Steps, runs.Step{Name: name, OK: ok, Log: clip(logtxt), At: time.Now().UTC()})
+	step := func(name, logtxt string, status runs.StepStatus) {
+		rr.Steps = append(rr.Steps, runs.Step{Name: name, Status: status, Log: clip(logtxt), At: time.Now().UTC()})
 		saver.force()
 	}
 
@@ -668,7 +668,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// non-fatal: the state simply keeps going without the very newest default until a run resolves it.
 	if err := ex.FoldInBranch(ctx, wt, branch); err != nil {
 		if errors.Is(err, workspace.ErrMergeConflict) {
-			step("fold", "Standard-Branch "+branch+" nicht konfliktfrei einfaltbar — dev-Stand ohne die neuesten "+branch+"-Änderungen fortgeführt", false)
+			step("fold", "Standard-Branch "+branch+" nicht konfliktfrei einfaltbar — dev-Stand ohne die neuesten "+branch+"-Änderungen fortgeführt", runs.StepFailed)
 		} else {
 			rr.Error = "Standard-Branch einfalten: " + err.Error()
 			return rr, repoSignal{}
@@ -760,7 +760,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	devAdvanced := devCreated || finalTip != startTip
 
 	if !devAdvanced {
-		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", true)
+		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", runs.StepOK)
 		rr.OK = true
 		return rr, repoSignal{}
 	}
@@ -778,19 +778,19 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	case x.mode != "full":
 		// report/pr never deploy at all — no step, as before.
 	case !x.shouldDevDeploy(repo.ID):
-		step("dev-deploy", devDeploySkipReason(repo.ID), true)
+		step("dev-deploy", devDeploySkipReason(repo.ID), runs.StepOK)
 	case !x.deployable(repo.Name):
-		step("dev-deploy", noDeployTargetReason(repo.Name), true)
+		step("dev-deploy", noDeployTargetReason(repo.Name), runs.StepOK)
 	default:
 		// No folding of open PRs any more: the dev branch IS the accumulated state, so what is built here
 		// is by construction the sum of everything delivered so far. Assembling a state per deploy — the
 		// old approach — is what let features disappear whenever one PR did not merge cleanly.
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
-			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
+			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), runs.StepFailed)
 		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
-			step("dev-deploy", depLog+"\n"+derr.Error(), false)
+			step("dev-deploy", depLog+"\n"+derr.Error(), runs.StepFailed)
 		} else {
-			step("dev-deploy", depLog+"\nAusgelieferter Stand: "+devBranch+"@"+short(finalTip), true)
+			step("dev-deploy", depLog+"\nAusgelieferter Stand: "+devBranch+"@"+short(finalTip), runs.StepOK)
 			rr.Deployed = true
 		}
 	}
@@ -815,12 +815,12 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Error = "push: " + err.Error()
 		return rr, repoSignal{}
 	}
-	step("push", strings.Join(pushRefs, ", "), true)
+	step("push", strings.Join(pushRefs, ", "), runs.StepOK)
 
 	if !hasDelivery {
 		// The dev branch advanced only by folding in the default branch — dev now serves it, but there is
 		// no PR-worthy unit of the runner's OWN work, so no delivery and no PR.
-		step("implement", "nur Standard-Branch eingefaltet — dev-Stand aktualisiert ("+devBranch+"@"+short(finalTip)+"), kein eigener Beitrag", true)
+		step("implement", "nur Standard-Branch eingefaltet — dev-Stand aktualisiert ("+devBranch+"@"+short(finalTip)+"), kein eigener Beitrag", runs.StepOK)
 		rr.OK = true
 		return rr, repoSignal{}
 	}
@@ -837,7 +837,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		if found, ok := github.FindOpenPullRequest(ctx, token, repo.FullName, deliveryBranch); ok {
 			pr = found
 		} else {
-			step("pr", err.Error(), false)
+			step("pr", err.Error(), runs.StepFailed)
 			rr.Error = "pr: " + err.Error()
 			return rr, repoSignal{}
 		}
@@ -845,7 +845,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	rr.PRUrl = pr.HTMLURL
 	rr.PRBase = prBase
 	rr.DeliveryID = deliveryID
-	step("pr", pr.HTMLURL+" (Basis: "+prBase+")", true)
+	step("pr", pr.HTMLURL+" (Basis: "+prBase+")", runs.StepOK)
 	now := time.Now().UTC()
 	_ = x.s.runPRs.Add(runs.PendingPR{
 		Repo: repo.FullName, Number: pr.Number, URL: pr.HTMLURL, RunID: run.ID,
@@ -1371,13 +1371,13 @@ func (a *agentStep) onProgress(line []byte) {
 
 func (a *agentStep) finish(report string) {
 	s := &a.rr.Steps[a.idx]
-	s.Running, s.OK, s.Log = false, true, clip(report)
+	s.Running, s.Status, s.Log = false, runs.StepOK, clip(report)
 	a.saver.force()
 }
 
 func (a *agentStep) fail(logtxt string) {
 	s := &a.rr.Steps[a.idx]
-	s.Running, s.OK, s.Log = false, false, clip(logtxt)
+	s.Running, s.Status, s.Log = false, runs.StepFailed, clip(logtxt)
 	a.saver.force()
 }
 
