@@ -75,6 +75,13 @@ type Run struct {
 	PromptHash  string     `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
 	CreatedAt   time.Time  `json:"createdAt"`
 	UpdatedAt   time.Time  `json:"updatedAt"`
+	// CreatedBy and UpdatedBy are the Holistic usernames of who first created this run/ToDo and who last
+	// changed it — kept SEPARATE so the creator stays visible even after someone else edits it. They are
+	// stamped from the same actor already flowing into Store.Mutate, so no second author signal is
+	// introduced. Empty on records written before authorship was tracked: surfaced as "unknown", never
+	// back-filled to a person (no invented history).
+	CreatedBy   string     `json:"createdBy,omitempty"`
+	UpdatedBy   string     `json:"updatedBy,omitempty"`
 	NextFireAt  *time.Time `json:"nextFireAt,omitempty"`  // nil = not scheduled (disabled); persisted → survives a restart
 	LastFiredAt *time.Time `json:"lastFiredAt,omitempty"` // nil = never fired
 	LastResult  *ResultRef `json:"lastResult,omitempty"`

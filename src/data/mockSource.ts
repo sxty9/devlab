@@ -292,6 +292,9 @@ export const mockSource: DataSource = {
       id,
       createdAt: idx >= 0 ? runStore[idx].createdAt : new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      // Preserve the original creator across an edit; only the last editor changes.
+      createdBy: idx >= 0 ? runStore[idx].createdBy : MOCK_ACTOR,
+      updatedBy: MOCK_ACTOR,
     };
     if (idx >= 0) runStore[idx] = run;
     else runStore.push(run);
@@ -377,8 +380,13 @@ function mockRun(body: import('@/types').RunInput) {
     prompt: '',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    createdBy: MOCK_ACTOR,
+    updatedBy: MOCK_ACTOR,
   };
 }
+
+/** The mock's signed-in user (mirrors getUser) — the author stamped on runs/ToDos created offline. */
+const MOCK_ACTOR = 'dev';
 
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};

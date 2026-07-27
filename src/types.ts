@@ -392,6 +392,11 @@ export interface Run {
   promptHash?: string;
   createdAt: string;
   updatedAt: string;
+  /** Holistic username of who first created this run/ToDo and who last changed it — kept separate so
+   *  the creator stays visible after someone else edits. Empty on records predating authorship (shown
+   *  as "unknown", never back-filled). */
+  createdBy?: string;
+  updatedBy?: string;
   nextFireAt?: string;
   lastFiredAt?: string;
   lastResult?: RunResultRef;

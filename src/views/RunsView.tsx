@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
+import { Authorship } from '@/ui/Authorship';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
@@ -528,6 +529,8 @@ function RunDetail({
         {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
+
+      <Authorship className="mt-3" createdBy={run.createdBy} updatedBy={run.updatedBy} />
 
       <section className="mt-6">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({run.axiomIds.length})</p>

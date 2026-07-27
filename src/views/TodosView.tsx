@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Authorship } from '@/ui/Authorship';
+import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
@@ -94,6 +96,7 @@ function AttachmentCard({
   preview,
   href,
   onRemove,
+  uploadedBy,
 }: {
   name: string;
   mime?: string;
@@ -101,6 +104,8 @@ function AttachmentCard({
   preview?: string;
   href?: string;
   onRemove?: () => void;
+  /** Who uploaded this medium (already carried on the attachment) — surfaced, not a second field. */
+  uploadedBy?: string;
 }) {
   const body = (
     <>
@@ -113,7 +118,15 @@ function AttachmentCard({
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-footnote text-text-secondary">{name}</span>
-        <span className="text-caption text-text-tertiary">{humanSize(size)}</span>
+        <span className="flex items-center gap-1.5 text-caption text-text-tertiary">
+          {humanSize(size)}
+          {uploadedBy && (
+            <>
+              <span aria-hidden>·</span>
+              <Person username={uploadedBy} size="sm" />
+            </>
+          )}
+        </span>
       </span>
     </>
   );
@@ -224,6 +237,7 @@ function DetailMedia({ todoId, attachments }: { todoId: string; attachments: Run
             size={a.size}
             preview={isImageMime(a.mime) ? source.mercuryAttachmentRawUrl(todoId, a.id) : undefined}
             href={source.mercuryAttachmentRawUrl(todoId, a.id)}
+            uploadedBy={a.uploadedBy}
           />
         ))}
       </div>
@@ -628,6 +642,8 @@ function TodoDetail({
         )}
         <span>Termin: {dueLabel(todo)}</span>
       </div>
+
+      <Authorship className="mt-3" createdBy={todo.createdBy} updatedBy={todo.updatedBy} />
 
       <section className="mt-6">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Aufgabe</p>
