@@ -323,8 +323,8 @@ export const httpSource: DataSource = {
   async mercuryRunConfig() {
     return json(await request('/api/mercury/runs/config'));
   },
-  async mercurySetRunConfig(maxConcurrent: number) {
-    return json(await post('/api/mercury/runs/config', { maxConcurrent }, 'PUT'));
+  async mercurySetRunConfig(patch: { maxConcurrent?: number; timeBudget?: string }) {
+    return json(await post('/api/mercury/runs/config', patch, 'PUT'));
   },
   async mercuryBlockedDeploys() {
     return json(await request('/api/mercury/runs/deploys'));

@@ -25,6 +25,22 @@ const mockResumedDeploys = new Set<string>();
 
 /** Mock execution-slot count so the config control is exercisable offline (default mirrors the backend). */
 let mockRunSlots = 2;
+/** Mock configured time-budget default ('' = not set → the 3h seed), so the budget config is exercisable
+ *  offline the same way the slot count is. */
+let mockRunBudget = '';
+
+/** The mock runs configuration, mirroring the backend contract: both knobs report the value in force, the
+ *  seed a reset falls back to, and whether a UI value is set. */
+function mockRunConfig() {
+  return {
+    maxConcurrent: mockRunSlots,
+    maxConcurrentSeed: 2,
+    configured: mockRunSlots !== 2,
+    timeBudget: mockRunBudget || '3h',
+    timeBudgetSeed: '3h',
+    timeBudgetConfigured: mockRunBudget !== '',
+  };
+}
 
 /** Fabricate a believable "before" for a modified file with no explicit diff content. */
 function synthBefore(after: string): string {
@@ -489,11 +505,12 @@ export const mockSource: DataSource = {
     /* mock: no-op */
   },
   async mercuryRunConfig() {
-    return { maxConcurrent: mockRunSlots, maxConcurrentSeed: 2, configured: mockRunSlots !== 2 };
+    return mockRunConfig();
   },
-  async mercurySetRunConfig(maxConcurrent: number) {
-    mockRunSlots = maxConcurrent < 1 ? 2 : maxConcurrent;
-    return { maxConcurrent: mockRunSlots };
+  async mercurySetRunConfig(patch: { maxConcurrent?: number; timeBudget?: string }) {
+    if (patch.maxConcurrent !== undefined) mockRunSlots = patch.maxConcurrent < 1 ? 2 : patch.maxConcurrent;
+    if (patch.timeBudget !== undefined) mockRunBudget = patch.timeBudget.trim(); // '' clears → the seed
+    return mockRunConfig();
   },
   async mercuryBlockedDeploys() {
     const blocked = MOCK_BLOCKED_DEPLOYS.filter((d) => !mockResumedDeploys.has(`${d.repo}#${d.number}`));

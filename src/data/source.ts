@@ -194,10 +194,12 @@ export interface DataSource {
   mercuryCancelRun(id: string): Promise<void>;
   /** Stand a SPECIFIC run down to free its slot — it keeps its progress and resumes at the next free slot. */
   mercuryDeferRun(id: string): Promise<void>;
-  /** The runs configuration (number of execution slots + the seed it would fall back to). */
+  /** The runs configuration (execution slots + the default time budget, each with its seed). */
   mercuryRunConfig(): Promise<RunConfig>;
-  /** Set the number of execution slots — takes effect immediately, no restart. 0 reverts to the seed. */
-  mercurySetRunConfig(maxConcurrent: number): Promise<{ maxConcurrent: number }>;
+  /** Set the runs configuration — slots and/or the default time budget. Only the fields present change, so
+   *  the two knobs are edited independently. Takes effect immediately, no restart; an empty/0 field reverts
+   *  it to the seed. */
+  mercurySetRunConfig(patch: { maxConcurrent?: number; timeBudget?: string }): Promise<RunConfig>;
   /** The deliveries blocked on a permanent prod-deploy failure — waiting for an explicit resume. */
   mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;
   /** Clear the block on one delivery so its prod-deploy is retried (full attempt budget again). */

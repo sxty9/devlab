@@ -8,7 +8,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { BlockedDeploy, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType, SlotOverview, StartDecision, StartStrategy } from '@/types';
+import type { BlockedDeploy, RunActive, RunConfig, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType, SlotOverview, StartDecision, StartStrategy } from '@/types';
 import {
   deriveJobs,
   isReportExecution,
@@ -18,7 +18,7 @@ import {
   type Job,
   type JobStatus,
 } from './mercuryPipeline';
-import { budgetLabel } from './RunTuning';
+import { budgetLabel, RUN_TIME_BUDGETS } from './RunTuning';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -895,15 +895,22 @@ export function SlotsOverview({ slots, className }: { slots: SlotOverview | null
   );
 }
 
-/** The execution-slot count as an editable setting (req 13): shown in the UI, applied immediately (no
- *  restart — a raise starts waiting runs at once, a lower drains). Self-hides when the scheduler is not
- *  armed. This is the service's slot configuration; the backend exposes the full config interface. */
-export function SlotCapacityConfig({ onChanged }: { onChanged?: () => void }) {
+const runsConfigInput =
+  'w-14 rounded border border-separator bg-surface px-1.5 py-0.5 text-text-primary outline-none focus:border-accent/50';
+const runsConfigEditBtn = 'rounded px-1 font-medium text-text-secondary transition hover:text-text-primary';
+
+/** The runs subsystem configuration (req 13): the number of execution slots AND the default per-repo time
+ *  budget, both shown inline and applied immediately (no restart — a slot raise starts waiting runs at
+ *  once, a budget change is followed by every run that made no own choice). Self-hides when the scheduler
+ *  is not armed. This is the service's central config surface; the backend exposes the full config
+ *  interface, and the two knobs are edited independently so one never clobbers the other. */
+export function RunsConfig({ onChanged }: { onChanged?: () => void }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
-  const [cfg, setCfg] = useState<{ maxConcurrent: number } | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [value, setValue] = useState('');
+  const [cfg, setCfg] = useState<RunConfig | null>(null);
+  const [editing, setEditing] = useState<'slots' | 'budget' | null>(null);
+  const [slots, setSlots] = useState('');
+  const [budget, setBudget] = useState('');
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -919,57 +926,114 @@ export function SlotCapacityConfig({ onChanged }: { onChanged?: () => void }) {
 
   if (!cfg) return null;
 
-  const save = async () => {
-    const n = Number.parseInt(value, 10);
-    if (Number.isNaN(n) || n < 1) {
-      toast({ title: 'Bitte eine Zahl ≥ 1', variant: 'danger' });
-      return;
-    }
+  const commit = async (patch: { maxConcurrent?: number; timeBudget?: string }, title: string, description: string) => {
     setSaving(true);
     try {
-      await source.mercurySetRunConfig(n);
-      toast({ title: `Ausführungsplätze: ${n}`, description: 'Wirkt sofort — wartende Vorgänge laufen an.', variant: 'success' });
-      setEditing(false);
-      await load();
+      setCfg(await source.mercurySetRunConfig(patch));
+      toast({ title, description, variant: 'success' });
+      setEditing(null);
       onChanged?.();
     } catch (e) {
-      toast({ title: 'Konnte die Plätze nicht setzen', description: msg(e), variant: 'danger' });
+      toast({ title: 'Konnte die Einstellung nicht setzen', description: msg(e), variant: 'danger' });
     } finally {
       setSaving(false);
     }
   };
 
+  const saveSlots = async () => {
+    const n = Number.parseInt(slots, 10);
+    if (Number.isNaN(n) || n < 1) {
+      toast({ title: 'Bitte eine Zahl ≥ 1', variant: 'danger' });
+      return;
+    }
+    await commit({ maxConcurrent: n }, `Ausführungsplätze: ${n}`, 'Wirkt sofort — wartende Vorgänge laufen an.');
+  };
+
+  const saveBudget = async () => {
+    await commit(
+      { timeBudget: budget },
+      `Zeitbudget: ${budget ? budgetLabel(budget) : `Standard (${cfg.timeBudgetSeed})`}`,
+      'Gilt für jeden Lauf und jedes ToDo ohne eigene Wahl.',
+    );
+  };
+
+  // Keep a configured value outside the ladder selectable, mirroring the per-run editor, so opening the
+  // editor never silently drops it. "off" and the seed default have their own options.
+  const budgetOptions: string[] = [...RUN_TIME_BUDGETS];
+  if (cfg.timeBudgetConfigured && cfg.timeBudget !== 'off' && !budgetOptions.includes(cfg.timeBudget)) {
+    budgetOptions.push(cfg.timeBudget);
+  }
+
   return (
-    <div className="flex items-center gap-1.5 text-caption text-text-tertiary">
-      <span>Ausführungsplätze</span>
-      {editing ? (
-        <>
-          <input
-            type="number"
-            min={1}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            className="w-14 rounded border border-separator bg-surface px-1.5 py-0.5 text-text-primary outline-none focus:border-accent/50"
-          />
-          <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
-            Speichern
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
-            Abbrechen
-          </Button>
-        </>
-      ) : (
-        <button
-          type="button"
-          className="rounded px-1 font-medium text-text-secondary transition hover:text-text-primary"
-          onClick={() => {
-            setValue(String(cfg.maxConcurrent));
-            setEditing(true);
-          }}
-        >
-          {cfg.maxConcurrent} ✎
-        </button>
-      )}
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-caption text-text-tertiary">
+      <div className="flex items-center gap-1.5">
+        <span>Ausführungsplätze</span>
+        {editing === 'slots' ? (
+          <>
+            <input
+              type="number"
+              min={1}
+              value={slots}
+              onChange={(e) => setSlots(e.target.value)}
+              className={runsConfigInput}
+            />
+            <Button variant="primary" size="sm" disabled={saving} onClick={() => void saveSlots()}>
+              Speichern
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setEditing(null)}>
+              Abbrechen
+            </Button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className={runsConfigEditBtn}
+            onClick={() => {
+              setSlots(String(cfg.maxConcurrent));
+              setEditing('slots');
+            }}
+          >
+            {cfg.maxConcurrent} ✎
+          </button>
+        )}
+      </div>
+      <div className="flex items-center gap-1.5">
+        <span>Zeitbudget</span>
+        {editing === 'budget' ? (
+          <>
+            <select
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              className="rounded border border-separator bg-surface px-1.5 py-0.5 text-text-primary outline-none focus:border-accent/50"
+            >
+              <option value="">Standard ({cfg.timeBudgetSeed})</option>
+              {budgetOptions.map((b) => (
+                <option key={b} value={b}>
+                  {b}
+                </option>
+              ))}
+              <option value="off">Kein Limit</option>
+            </select>
+            <Button variant="primary" size="sm" disabled={saving} onClick={() => void saveBudget()}>
+              Speichern
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setEditing(null)}>
+              Abbrechen
+            </Button>
+          </>
+        ) : (
+          <button
+            type="button"
+            className={runsConfigEditBtn}
+            onClick={() => {
+              setBudget(cfg.timeBudgetConfigured ? cfg.timeBudget : '');
+              setEditing('budget');
+            }}
+          >
+            {budgetLabel(cfg.timeBudget)} ✎
+          </button>
+        )}
+      </div>
     </div>
   );
 }

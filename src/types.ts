@@ -650,12 +650,17 @@ export interface RunActive {
   overload?: boolean; // admitted past the cap in a temporary slot
 }
 
-/** The runs subsystem's live configuration — currently the number of execution slots. `configured` is
- *  false while it runs on the env/default seed (no UI value set yet). */
+/** The runs subsystem's live configuration: the number of execution slots and the default per-repo time
+ *  budget. Each reports the same triple — the value in force, the env/default seed a reset falls back to,
+ *  and whether a UI value is set (vs. running on the seed). `timeBudget` is a canonical budget string
+ *  ('3h', '1h30m', or 'off' = no cap). */
 export interface RunConfig {
   maxConcurrent: number;
   maxConcurrentSeed: number;
   configured: boolean;
+  timeBudget: string;
+  timeBudgetSeed: string;
+  timeBudgetConfigured: boolean;
 }
 
 /** How a start proceeds when all slots are busy. */
