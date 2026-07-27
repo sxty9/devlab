@@ -59,8 +59,8 @@ func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
 	if a := s.Active(); a != nil {
 		t.Fatalf("expected no activity before firing, got %+v", a)
 	}
-	if !s.FireNow("r", "t") {
-		t.Fatal("FireNow returned false")
+	if s.FireNow("r", "t") != StartFired {
+		t.Fatal("FireNow did not fire")
 	}
 	<-be.reported // the run has reported its result id and is now blocked mid-execution
 
@@ -213,7 +213,7 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	s := NewScheduler(store, fe, time.Second)
 	s.logf = func(string, ...any) {}
 
-	if !s.FireNow("m", "tester") {
+	if s.FireNow("m", "tester") != StartFired {
 		t.Fatal("FireNow returned busy on an idle scheduler")
 	}
 	deadline := time.Now().Add(2 * time.Second)
