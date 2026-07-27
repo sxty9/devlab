@@ -679,10 +679,12 @@ export interface RunInFlight {
   runId: string;
   runName: string;
   type: RunType; // auto | todo
-  state: 'executing' | 'suspended';
+  state: 'executing' | 'suspended' | 'deferred'; // executing | paused on the usage limit | stood down to free a slot
+  exclusive?: boolean; // executing: holds the whole floor (an auto sweep)
+  overload?: boolean; // executing: in a temporary extra slot beyond the cap
   resultId?: string;
   startedAt?: string; // execution start (executing)
-  resumeAt?: string; // when a suspended run resumes
+  resumeAt?: string; // when a suspended/deferred run resumes
   attempts?: number; // suspended: resume attempts so far
   currentRepo?: string; // the repo in flight (executing)
   currentStep?: string; // the step running right now (executing)
@@ -692,6 +694,37 @@ export interface RunInFlight {
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+}
+
+/** The full slot picture the /active endpoint returns (task point 8): the standing capacity and how much
+ *  of it is used/free, how many runs overload beyond the cap right now, the live runs (each with its
+ *  exclusive/overload flags), and the enriched inflight list — executing plus suspended and deferred runs,
+ *  the deferred ones carrying their resume point. One read the UI mounts on and polls to follow live. */
+export interface RunSlotOverview {
+  capacity: number;
+  used: number;
+  free: number;
+  overload: number;
+  active: RunActive[];
+  inflight: RunInFlight[];
+}
+
+/** The system's own pick of which run to stand down to free a slot — the one whose interruption loses the
+ *  least and is easiest to resume — with a plain-language justification (task point 6). */
+export interface RunDeferSuggestion {
+  runId: string;
+  runName?: string;
+  reason: string;
+}
+
+/** Returned when a run cannot start because the slots are full: WHY it is blocked, the ways forward
+ *  (task point 5), the automatic suggestion (task point 6), and the current slot state so the dialog needs
+ *  no second request. `options` is a subset of queue | defer | overload. */
+export interface RunStartDecision {
+  blocked: 'running' | 'exclusive' | 'repo-busy' | 'cap';
+  options: Array<'queue' | 'defer' | 'overload'>;
+  suggestion?: RunDeferSuggestion;
+  slots: RunSlotOverview;
 }
 
 /** One entry in the calendar — the union of past and upcoming runs. `type` separates automatic runs

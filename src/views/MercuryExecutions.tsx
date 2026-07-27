@@ -8,7 +8,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { BlockedDeploy, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { BlockedDeploy, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RunSlotOverview, RunStartDecision, RepoResult, RunStep, RunType } from '@/types';
 import {
   deriveJobs,
   isReportExecution,
@@ -32,27 +32,114 @@ const msg = (e: unknown) => String((e as Error)?.message ?? e);
  *  exists (else starts fresh); the caret unifies the second variant — "Neu beginnen", which discards the
  *  interrupted execution and starts over — under the same access point rather than as a rival button. The
  *  resulting toast names which happened (fortgesetzt / neu begonnen) and why, so the decision is visible. */
+/** Response of a run-now call — an immediate start (with its resume-vs-fresh plan), a queued run, an
+ *  overload, or a start DECISION when the slots are full. */
+type RunNowResult = Awaited<ReturnType<ReturnType<typeof getDataSource>['mercuryRunNow']>>;
+
+const BLOCK_TEXT: Record<RunStartDecision['blocked'], string> = {
+  cap: 'Alle Ausführungsplätze sind derzeit belegt.',
+  'repo-busy': 'Ein Ziel-Repository wird gerade von einem anderen Lauf bearbeitet.',
+  exclusive: 'Ein Rundumlauf belegt gerade alle Plätze.',
+  running: 'Dieser Lauf läuft bereits.',
+};
+
+/** When all slots are taken, the ways forward for THIS run (task point 5): einreihen (queue), einen
+ *  vorgeschlagenen Lauf zurückstellen (defer), or überladen (a temporary extra slot). The system's own
+ *  suggestion is offered first, with its reason (task point 6). Overload appears only when it is
+ *  admissible (a plain cap block — never when a repo is busy or a Rundumlauf holds the floor). */
+function StartDecisionDialog({
+  noun,
+  decision,
+  busy,
+  onClose,
+  onChoose,
+}: {
+  noun: string;
+  decision: RunStartDecision;
+  busy: boolean;
+  onClose: () => void;
+  onChoose: (strategy: 'queue' | 'overload' | 'defer', deferRunId?: string) => void;
+}) {
+  const canOverload = decision.options.includes('overload');
+  const s = decision.suggestion;
+  const optClass =
+    'flex flex-col items-start gap-0.5 rounded-md border border-separator bg-surface px-3 py-2 text-left text-footnote transition hover:border-accent/50 disabled:opacity-50';
+  return (
+    <Modal open onClose={onClose} title={`Kein Platz frei für dieses ${noun}`} description={BLOCK_TEXT[decision.blocked]} size="md">
+      <div className="flex flex-col gap-3">
+        <SlotsBadge slots={decision.slots} />
+        <div className="flex flex-col gap-2">
+          <button type="button" className={optClass} disabled={busy} onClick={() => onChoose('queue')}>
+            <span className="font-medium text-text-primary">Einreihen</span>
+            <span className="text-caption text-text-tertiary">Startet automatisch, sobald ein Platz frei wird.</span>
+          </button>
+          {s && (
+            <button type="button" className={optClass} disabled={busy} onClick={() => onChoose('defer', s.runId)}>
+              <span className="font-medium text-text-primary">„{s.runName || s.runId}“ zurückstellen und starten</span>
+              <span className="text-caption text-text-tertiary">{s.reason}</span>
+            </button>
+          )}
+          {canOverload && (
+            <button type="button" className={optClass} disabled={busy} onClick={() => onChoose('overload')}>
+              <span className="font-medium text-text-primary">Überladen</span>
+              <span className="text-caption text-text-tertiary">Ein zusätzlicher Platz nur für diese eine Ausführung — verschwindet mit ihrem Ende.</span>
+            </button>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind: RunType; disabled?: boolean; onStarted: () => void }) {
   const source = useMemo(getDataSource, []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
+  const [decision, setDecision] = useState<RunStartDecision | null>(null);
+  const [freshChoice, setFreshChoice] = useState(false);
   const noun = kind === 'todo' ? 'ToDo' : 'Lauf';
+
+  // Report the outcome of a start that actually happened (a plain start, a queue, or an overload). Returns
+  // false when the response was instead a start DECISION (the caller then opens the dialog).
+  const announce = (res: RunNowResult): boolean => {
+    if (res.decision) return false;
+    if (res.queued) {
+      toast({ title: `${noun} eingereiht`, description: 'Startet, sobald ein Platz frei wird.', variant: 'default' });
+    } else if (res.overloaded) {
+      toast({ title: `${noun} gestartet (Überladung)`, description: 'Läuft in einem zusätzlichen Platz.', variant: 'success' });
+    } else {
+      const resumed = res.plan?.action === 'resume';
+      toast({ title: resumed ? `${noun} fortgesetzt` : `${noun} neu gestartet`, description: res.plan?.reason, variant: 'success' });
+    }
+    onStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
+    return true;
+  };
 
   const trigger = async (fresh: boolean) => {
     if (busy) return;
     setBusy(true);
     try {
-      const { plan } = await source.mercuryRunNow(id, { fresh });
-      const resumed = plan?.action === 'resume';
-      toast({
-        title: resumed ? `${noun} fortgesetzt` : `${noun} neu gestartet`,
-        description: plan?.reason,
-        variant: 'success',
-      });
-      onStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
+      const res = await source.mercuryRunNow(id, { fresh });
+      if (!announce(res) && res.decision) {
+        setFreshChoice(fresh); // remember the resume-vs-fresh intent for the chosen strategy
+        setDecision(res.decision);
+      }
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const choose = async (strategy: 'queue' | 'overload' | 'defer', deferRunId?: string) => {
+    setBusy(true);
+    try {
+      const res = await source.mercuryRunNow(id, { fresh: freshChoice, strategy, deferRunId });
+      announce(res);
+      setDecision(null);
+    } catch (e) {
+      toast({ title: 'Aktion fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setBusy(false);
     }
@@ -75,6 +162,9 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
           />
         )}
       </Dropdown>
+      {decision && (
+        <StartDecisionDialog noun={noun} decision={decision} busy={busy} onClose={() => setDecision(null)} onChoose={choose} />
+      )}
     </div>
   );
 }
@@ -803,10 +893,17 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
+const EMPTY_SLOTS: RunSlotOverview = { capacity: 0, used: 0, free: 0, overload: 0, active: [], inflight: [] };
+
+export function useActiveRun(): {
+  slots: RunSlotOverview;
+  active: RunActive[];
+  inflight: RunInFlight[];
+  activeFor: (runId: string) => RunActive | null;
+  refetch: () => void;
+} {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
-  const [inflight, setInflight] = useState<RunInFlight[]>([]);
+  const [slots, setSlots] = useState<RunSlotOverview>(EMPTY_SLOTS);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -815,10 +912,7 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
     const poll = async () => {
       try {
         const r = await source.mercuryRunActive();
-        if (!cancelled) {
-          setActive(r.active);
-          setInflight(r.inflight ?? []);
-        }
+        if (!cancelled) setSlots({ ...EMPTY_SLOTS, ...r, active: r.active ?? [], inflight: r.inflight ?? [] });
       } catch {
         /* transient — keep the last known state */
       }
@@ -834,7 +928,9 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
     };
   }, [source, bump]);
 
-  return { active, inflight, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  const active = slots.active;
+  const activeFor = useCallback((runId: string): RunActive | null => active.find((a) => a.runId === runId) ?? null, [active]);
+  return { slots, active, inflight: slots.inflight, activeFor, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
 
 /** Poll the blocked deliveries — the deployments the scheduler stopped retrying after repeated
@@ -991,17 +1087,17 @@ export function LiveExecution({
   runId: string;
   resultId: string;
   live: boolean;
-  state?: 'executing' | 'suspended';
+  state?: RunInFlight['state'];
 }) {
   const { res, err } = useLiveResult(runId, resultId, live);
-  const suspended = state === 'suspended';
+  const paused = state === 'suspended' || state === 'deferred';
 
   if (!res) {
     return <p className="text-footnote text-text-tertiary">{err ? 'Live-Ausführung wird vorbereitet…' : 'Lädt…'}</p>;
   }
 
-  const label = suspended ? 'Pausiert' : live ? 'Läuft gerade' : 'Gerade beendet';
-  const dotLive = suspended || live;
+  const label = state === 'deferred' ? 'Zurückgestellt' : state === 'suspended' ? 'Pausiert' : live ? 'Läuft gerade' : 'Gerade beendet';
+  const dotLive = paused || live;
   const hasRows = (res.repos?.length ?? 0) > 0 || !!res.live;
   return (
     <div className={cn('flex flex-col gap-3 rounded-card border p-3', dotLive ? 'border-warning/30 bg-warning/5' : 'border-separator')}>
@@ -1067,9 +1163,34 @@ function StatePill({ state }: { state: RunInFlight['state'] }) {
       </span>
     );
   }
+  if (state === 'deferred') {
+    return (
+      <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-secondary">zurückgestellt</span>
+    );
+  }
   return (
     <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-caption font-medium text-accent">pausiert</span>
   );
+}
+
+/** A small badge for a run holding the whole floor (an auto sweep) or occupying a temporary extra slot
+ *  beyond the cap — so the overview shows at a glance why the slots look as they do (task point 8). */
+function SlotBadge({ row }: { row: RunInFlight }) {
+  if (row.exclusive) {
+    return <span className="shrink-0 rounded bg-accent/10 px-1.5 py-0.5 text-caption font-medium text-accent">Rundumlauf</span>;
+  }
+  if (row.overload) {
+    return <span className="shrink-0 rounded bg-warning/10 px-1.5 py-0.5 text-caption font-medium text-warning">Überladung</span>;
+  }
+  return null;
+}
+
+/** Where a deferred/suspended run will pick up — portioned, never a raw log. A deferred run resumes at
+ *  the next free slot; a usage-limit pause waits out its window. */
+function resumePointText(row: RunInFlight): string {
+  const repos = row.reposTotal ? `${row.reposDone} von ${row.reposTotal} Repos erledigt` : `${row.reposDone} Repos erledigt`;
+  if (row.state === 'deferred') return `${repos} — setzt am nächsten freien Platz fort`;
+  return `${repos} · Fortsetzung ${fmtUntil(row.resumeAt)}${row.attempts ? ` · Versuch ${row.attempts}` : ''}`;
 }
 
 /** One row in the overview list: state, name, kind, and a portioned line of live detail (repo/step for a
@@ -1090,33 +1211,54 @@ function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: 
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {row.runName || 'Lauf'}
         </span>
+        <SlotBadge row={row} />
         <TypeChip type={row.type} />
       </div>
       <span className="truncate text-caption text-text-tertiary">
         {executing
           ? `seit ${fmtSince(row.startedAt)} · ${progressText(row)}${row.currentStep ? ` · ${row.currentStep}` : ''}`
-          : `Fortsetzung ${fmtUntil(row.resumeAt)}${row.attempts ? ` · Versuch ${row.attempts}` : ''}`}
+          : resumePointText(row)}
       </span>
       <TokenStat input={row.inputTokens} output={row.outputTokens} cost={row.costUsd} />
     </button>
   );
 }
 
-/** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
- *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
-function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+/** The right pane of the overview: the focused run as a live session — its title, its slot badge, the
+ *  controls that apply while it executes (Zurückstellen to free its slot, Abbrechen to stop it), and the
+ *  moving pipeline (the agent's live transcript opens in-place). A deferred run shows its resume point. */
+function RunSession({
+  row,
+  onCancel,
+  onDefer,
+  busy,
+}: {
+  row: RunInFlight;
+  onCancel: (id: string) => void;
+  onDefer: (id: string) => void;
+  busy: boolean;
+}) {
   const executing = row.state === 'executing';
   return (
     <div className="flex min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
+        <SlotBadge row={row} />
         <TypeChip type={row.type} />
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-          </Button>
+          <>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onDefer(row.runId)} title="Platz freigeben, Fortschritt behalten">
+              Zurückstellen
+            </Button>
+            <Button variant="danger" size="sm" disabled={busy} onClick={() => onCancel(row.runId)}>
+              {busy ? 'Bricht ab…' : 'Abbrechen'}
+            </Button>
+          </>
         )}
       </div>
+      {!executing && (
+        <p className="rounded-md bg-fill/10 px-3 py-2 text-caption text-text-secondary">{resumePointText(row)}</p>
+      )}
       {row.resultId ? (
         <LiveExecution runId={row.runId} resultId={row.resultId} live={executing} state={row.state} />
       ) : (
@@ -1148,21 +1290,38 @@ function writeWatch(v: { open: boolean; runId: string | null }) {
   }
 }
 
-/** The live "Aktive Läufe" overview: a compact bar (what is running, with a kill-switch) that opens a
- *  list of every in-flight run, each inspectable as a live Claude-Code-style session. `inflight` is server
- *  truth from useActiveRun; `onCancel` aborts the executing run. Renders nothing when nothing is in
- *  flight. Reused identically by the Läufe and ToDos surfaces. */
+/** A one-line "belegt / frei / Überladung" readout of the execution slots (task point 8), so the slot
+ *  situation is legible at a glance. Renders nothing when the executor is not configured (capacity 0). */
+export function SlotsBadge({ slots, className }: { slots: RunSlotOverview; className?: string }) {
+  if (slots.capacity <= 0) return null;
+  const parts = [`${slots.used}/${slots.capacity} belegt`];
+  if (slots.free > 0) parts.push(`${slots.free} frei`);
+  if (slots.overload > 0) parts.push(`+${slots.overload} Überladung`);
+  return <span className={cn('text-caption text-text-tertiary', className)}>Plätze: {parts.join(' · ')}</span>;
+}
+
+const stateWord = (s: RunInFlight['state']) => (s === 'executing' ? 'Läuft' : s === 'deferred' ? 'Zurückgestellt' : 'Pausiert');
+
+/** The live "Aktive Läufe" overview: a compact bar (what is running + the slot situation) that opens a
+ *  list of every in-flight run — executing, paused on the usage limit, or stood down (deferred) — each
+ *  inspectable as a live session. From the session pane a run can be stood down (Zurückstellen, freeing
+ *  its slot) or aborted (per-run, since several may run at once). `slots` is server truth from
+ *  useActiveRun; renders nothing when nothing is in flight. Reused identically by the Läufe and ToDos
+ *  surfaces. */
 export function ActiveRunsOverview({
-  inflight,
+  slots,
   onCancel,
-  cancelling,
+  onDefer,
+  busyId,
   className,
 }: {
-  inflight: RunInFlight[];
-  onCancel: () => void;
-  cancelling: boolean;
+  slots: RunSlotOverview;
+  onCancel: (id: string) => void;
+  onDefer: (id: string) => void;
+  busyId?: string | null;
   className?: string;
 }) {
+  const inflight = slots.inflight;
   const [restored] = useState(readWatch); // lazy: read session storage once, on mount
   const [open, setOpen] = useState(restored.open);
   const [selId, setSelId] = useState<string | null>(restored.runId);
@@ -1186,12 +1345,14 @@ export function ActiveRunsOverview({
 
   if (inflight.length === 0) return null;
 
-  const executing = inflight.some((r) => r.state === 'executing');
   const only = inflight.length === 1 ? inflight[0] : null;
-  const summary = only ? `${only.state === 'executing' ? 'Läuft' : 'Pausiert'}: ${only.runName || 'Lauf'}` : `${inflight.length} Läufe aktiv`;
+  const summary = only ? `${stateWord(only.state)}: ${only.runName || 'Lauf'}` : `${inflight.length} Läufe aktiv`;
   const nExec = inflight.filter((r) => r.state === 'executing').length;
-  const nSusp = inflight.length - nExec;
-  const description = [nExec ? `${nExec} läuft` : '', nSusp ? `${nSusp} pausiert` : ''].filter(Boolean).join(' · ');
+  const nDef = inflight.filter((r) => r.state === 'deferred').length;
+  const nSusp = inflight.length - nExec - nDef;
+  const description = [nExec ? `${nExec} läuft` : '', nSusp ? `${nSusp} pausiert` : '', nDef ? `${nDef} zurückgestellt` : '']
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <>
@@ -1204,14 +1365,11 @@ export function ActiveRunsOverview({
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" />
           <span className="truncate">{summary}</span>
         </button>
-        {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-          </Button>
-        )}
+        <SlotsBadge slots={slots} className="hidden shrink-0 sm:inline" />
       </div>
 
       <Modal open={open} onClose={() => setOpen(false)} title="Aktive Läufe" description={description} size="xl">
+        <SlotsBadge slots={slots} className="mb-3 block" />
         <div className="flex min-h-[55vh] flex-col gap-4 sm:flex-row">
           <div className="dl-scroll flex shrink-0 flex-col gap-0.5 overflow-y-auto sm:w-64 sm:max-h-[60vh]">
             {inflight.map((row) => (
@@ -1220,7 +1378,7 @@ export function ActiveRunsOverview({
           </div>
           <div className="min-w-0 flex-1 border-t border-separator pt-4 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
             {selected ? (
-              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancelling={cancelling} />
+              <RunSession key={selected.runId} row={selected} onCancel={onCancel} onDefer={onDefer} busy={busyId === selected.runId} />
             ) : (
               <EmptyPlaceholder text="Wähle links einen Lauf, um ihn live zu verfolgen." />
             )}

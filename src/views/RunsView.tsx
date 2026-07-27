@@ -86,11 +86,11 @@ export default function RunsView() {
   const [showHistory, setShowHistory] = useState(false);
   const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
-  // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
-  // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
-  // cancel lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  // What is running right now is SERVER truth (via useActiveRun): `activeFor` drives the per-run
+  // live-follow (survives a reload), `slots` is the full overview (running/deferred + capacity) the
+  // Aktive-Läufe overview renders. Per-run cancel/defer live in that overview.
+  const { slots, active, activeFor, refetch: refetchActive } = useActiveRun();
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
   // also pulls the auto-assignment feed, so a background assignment surfaces on the next refresh.
@@ -106,11 +106,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When the set of active runs changes (one finished, deferred, or started), refresh the list so
+  // lastResult / next-fire / ToDo-done update on their own.
+  const prevActiveRef = useRef<string>('');
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId).sort().join(',');
+    if (prevActiveRef.current !== cur && prevActiveRef.current !== '') void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -143,19 +144,39 @@ export default function RunsView() {
     return () => window.clearTimeout(t);
   }, [coverage?.pending, dataVersion, reload]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
+  const cancelRun = useCallback(
+    async (id: string) => {
+      if (busyId) return;
+      setBusyId(id);
+      try {
+        await source.mercuryCancelRun(id);
+        toast({ title: 'Lauf abgebrochen', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [busyId, source, toast, refetchActive],
+  );
+
+  const deferRun = useCallback(
+    async (id: string) => {
+      if (busyId) return;
+      setBusyId(id);
+      try {
+        await source.mercuryDeferRun(id);
+        toast({ title: 'Lauf zurückgestellt', description: 'Der Platz ist frei; der Fortschritt bleibt erhalten.', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [busyId, source, toast, refetchActive],
+  );
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -272,7 +293,7 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={activeFor(selectedRun.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -302,7 +323,7 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
+        <ActiveRunsOverview slots={slots} onCancel={cancelRun} onDefer={deferRun} busyId={busyId} className="ml-auto max-w-xs" />
       </header>
 
       <BlockedDeploysPanel />

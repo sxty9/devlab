@@ -305,13 +305,23 @@ export const httpSource: DataSource = {
     return json(await post('/api/mercury/chat', { messages }));
   },
   async mercuryRunNow(id, opts) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run${opts?.fresh ? '?fresh=1' : ''}`, {}));
+    // Strategy/deferRunId ride in the body; fresh also stays supported as a query flag for the primary trigger.
+    return json(
+      await post(`/api/mercury/runs/${enc(id)}/run`, {
+        fresh: opts?.fresh ?? false,
+        strategy: opts?.strategy,
+        deferRunId: opts?.deferRunId,
+      }),
+    );
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
-  async mercuryCancelRun() {
-    await json<void>(await post('/api/mercury/runs/cancel', {}));
+  async mercuryCancelRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/cancel`, {}));
+  },
+  async mercuryDeferRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
   },
   async mercuryBlockedDeploys() {
     return json(await request('/api/mercury/runs/deploys'));

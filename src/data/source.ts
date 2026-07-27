@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSlotOverview, RunSnapshotMeta, RunStartDecision, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -182,16 +182,24 @@ export interface DataSource {
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
   /** Trigger a run immediately (detached). By default this CONTINUES an interrupted execution if one
-   *  exists (skipping its done repos); `fresh` discards it and starts over. The returned `plan` reports
-   *  which happened and why, so the trigger can show "fortgesetzt" vs "neu begonnen". 503 if the executor
-   *  is unconfigured, 409 if one is running. */
-  mercuryRunNow(id: string, opts?: { fresh?: boolean }): Promise<{ started: boolean; plan?: RunResumePlan }>;
-  /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
-   *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
-  /** Abort the run currently in progress (kill-switch). */
-  mercuryCancelRun(): Promise<void>;
+   *  exists (skipping its done repos); `fresh` discards it and starts over. When the slots are full a plain
+   *  start returns a `decision` (the ways forward + the automatic suggestion) instead of a bare refusal; a
+   *  `strategy` (queue | overload | defer, with `deferRunId` for defer) carries out the chosen way. The
+   *  returned `plan` reports resume-vs-fresh on an immediate start. 503 if the executor is unconfigured. */
+  mercuryRunNow(
+    id: string,
+    opts?: { fresh?: boolean; strategy?: 'queue' | 'overload' | 'defer'; deferRunId?: string },
+  ): Promise<{ started?: boolean; plan?: RunResumePlan; decision?: RunStartDecision; queued?: boolean; overloaded?: boolean }>;
+  /** The full slot overview (server truth): capacity, used/free slots, running overloads, the live runs,
+   *  and the enriched inflight list (executing + suspended + deferred). Read on mount so running/deferred
+   *  state survives a reload, and polled to follow live. */
+  mercuryRunActive(): Promise<RunSlotOverview>;
+  /** Abort ONE specific in-flight run (kill-switch), by id — with several runs concurrent, cancel is
+   *  per-run. */
+  mercuryCancelRun(id: string): Promise<void>;
+  /** Stand ONE in-flight run down to free its slot (task point 4): it keeps its progress and resumes the
+   *  same execution at the next free slot. */
+  mercuryDeferRun(id: string): Promise<void>;
   /** Deliveries the scheduler has blocked after repeated permanent prod-deploy failures — polled so a
    *  stuck delivery is visible in the UI (repo, reason, attempts), not only in the system log. */
   mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;

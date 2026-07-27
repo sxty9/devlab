@@ -469,16 +469,20 @@ export const mockSource: DataSource = {
     }
     return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
   },
-  async mercuryRunNow(_id: string, _opts?: { fresh?: boolean }) {
-    // The mock has no executor, so no resume decision is made — the plan is omitted (consumers guard for it).
+  async mercuryRunNow(_id: string, _opts?: { fresh?: boolean; strategy?: 'queue' | 'overload' | 'defer'; deferRunId?: string }) {
+    // The mock has no executor, so no resume decision is made and nothing is ever full — always a plain
+    // start (the plan is omitted; consumers guard for it).
     return { started: true };
   },
   async mercuryRunActive() {
-    // The mock has no executor, so nothing is ever genuinely in flight — an empty list is the honest
-    // answer (the "Aktive Läufe" overview simply stays quiet in offline/preview mode).
-    return { active: null, inflight: [] };
+    // The mock has no executor, so nothing is ever genuinely in flight — an idle overview is the honest
+    // answer (the "Aktive Läufe" / slot views simply stay quiet in offline/preview mode).
+    return { capacity: 2, used: 0, free: 2, overload: 0, active: [], inflight: [] };
   },
-  async mercuryCancelRun() {
+  async mercuryCancelRun(_id: string) {
+    /* mock: no-op */
+  },
+  async mercuryDeferRun(_id: string) {
     /* mock: no-op */
   },
   async mercuryBlockedDeploys() {
