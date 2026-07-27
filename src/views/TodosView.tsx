@@ -6,8 +6,8 @@ import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionList, ExecutionHistory, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
-import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
+import { ActiveRunsOverview, SlotsOverview, StartDecisionDialog, ExecutionList, ExecutionHistory, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar, StartDecision, StartStrategy } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -255,8 +255,9 @@ export default function TodosView() {
   // The ToDos executing right now are SERVER truth (via useActiveRun) — so the active-runs overview and
   // the live-follow views survive a page reload. Runs are concurrent, so this is a list; cancel targets
   // one specific run by id.
-  const { active, refetch: refetchActive } = useActiveRun();
+  const { active, slots, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
   const reload = useCallback(async () => {
@@ -316,6 +317,23 @@ export default function TodosView() {
       }
     },
     [cancellingId, source, toast, refetchActive],
+  );
+
+  const deferRun = useCallback(
+    async (runId: string) => {
+      if (deferringId) return;
+      setDeferringId(runId);
+      try {
+        await source.mercuryDeferRun(runId);
+        toast({ title: 'Lauf zurückgestellt', description: 'Der Platz ist frei; der Lauf setzt später an derselben Stelle fort.', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setDeferringId(null);
+      }
+    },
+    [deferringId, source, toast, refetchActive],
   );
 
   const refresh = useCallback(async () => {
@@ -408,9 +426,17 @@ export default function TodosView() {
         )}
       </header>
 
-      {active.length > 0 && (
-        <div className="dl-scroll max-h-[40vh] shrink-0 overflow-y-auto border-b border-separator bg-surface px-3 py-3">
-          <ActiveRunsOverview active={active} onCancel={cancelRun} cancellingId={cancellingId} onSelect={setSelectedId} />
+      {(active.length > 0 || (slots !== null && (slots.deferred.length > 0 || slots.overload > 0))) && (
+        <div className="dl-scroll flex max-h-[40vh] shrink-0 flex-col gap-3 overflow-y-auto border-b border-separator bg-surface px-3 py-3">
+          <SlotsOverview slots={slots} />
+          <ActiveRunsOverview
+            active={active}
+            onCancel={cancelRun}
+            cancellingId={cancellingId}
+            onDefer={deferRun}
+            deferringId={deferringId}
+            onSelect={setSelectedId}
+          />
         </div>
       )}
 
@@ -525,6 +551,7 @@ function TodoDetail({
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
+  const [decision, setDecision] = useState<StartDecision | null>(null);
   const [promptOpen, setPromptOpen] = useState(false);
   const [results, setResults] = useState<RunResultRef[] | null>(null);
   const isLive = active?.runId === todo.id;
@@ -587,23 +614,45 @@ function TodoDetail({
     }
   };
 
-  const runNow = async () => {
+  // startWith attempts a start (optionally with a chosen strategy). A plain attempt that finds every slot
+  // full comes back with a `decision` — the ways forward + the system's suggestion — which opens the
+  // dialog instead of failing. A carried-out strategy reports how it landed (started / queued / deferred).
+  const startWith = async (opts?: { strategy: StartStrategy; deferRunId?: string }) => {
     if (runningNow) return;
     setRunningNow(true);
     try {
-      await source.mercuryRunNow(todo.id);
-      toast({ title: 'ToDo gestartet', variant: 'success' });
+      const r = await source.mercuryRunNow(todo.id, opts);
+      if (r.decision) {
+        setDecision(r.decision);
+        return;
+      }
+      setDecision(null);
+      const title = r.queued
+        ? 'ToDo eingereiht — startet am nächsten freien Platz'
+        : r.deferred
+          ? 'Lauf zurückgestellt — das ToDo übernimmt den Platz'
+          : 'ToDo gestartet';
+      toast({ title, variant: 'success' });
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
-      // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
+      // 503 "nicht konfiguriert" / 409 (overload refused, deferred run no longer active) surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setRunningNow(false);
     }
   };
+  const runNow = () => startWith();
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
+      {decision && (
+        <StartDecisionDialog
+          decision={decision}
+          busy={runningNow}
+          onChoose={(strategy, deferRunId) => void startWith({ strategy, deferRunId })}
+          onClose={() => setDecision(null)}
+        />
+      )}
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{todo.name}</h1>

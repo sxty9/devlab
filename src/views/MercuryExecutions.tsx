@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
-import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon, LayersIcon } from '@/ui/icons';
+import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType, SlotOverview, StartDecision, StartStrategy } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -653,9 +654,9 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  it RESTORES the running state after a page reload, and it drives the live-follow views. refetch()
  *  forces an immediate re-check — e.g. right after starting or cancelling a run — so the UI reacts
  *  without waiting for the next tick. Reflects actually-running processes: empty again after a restart. */
-export function useActiveRun(): { active: RunActive[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; slots: SlotOverview | null; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive[]>([]);
+  const [slots, setSlots] = useState<SlotOverview | null>(null);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -664,7 +665,7 @@ export function useActiveRun(): { active: RunActive[]; refetch: () => void } {
     const poll = async () => {
       try {
         const r = await source.mercuryRunActive();
-        if (!cancelled) setActive(r.active ?? []);
+        if (!cancelled) setSlots(r);
       } catch {
         /* transient — keep the last known state */
       }
@@ -680,7 +681,51 @@ export function useActiveRun(): { active: RunActive[]; refetch: () => void } {
     };
   }, [source, bump]);
 
-  return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active: slots?.active ?? [], slots, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** The slot picture at a glance (task point 6): capacity vs used/free, running overloads, and the runs
+ *  standing by (deferred) with their resume points — portioned counts and one-line resume points, never a
+ *  raw log. Renders nothing while everything is idle and nothing is deferred. Shared by both surfaces. */
+export function SlotsOverview({ slots }: { slots: SlotOverview | null }) {
+  if (!slots || slots.capacity === 0) return null;
+  const deferred = slots.deferred ?? []; // guard the Go-nil-slice→JSON-null hazard
+  const hasDeferred = deferred.length > 0;
+  if (slots.used === 0 && slots.overload === 0 && !hasDeferred) return null;
+  return (
+    <div className="flex flex-col gap-2 rounded-card border border-separator bg-surface-sunken/40 px-3 py-2.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-text-secondary">
+        <LayersIcon className="h-3.5 w-3.5 text-text-tertiary" />
+        <span className="font-medium text-text-primary">Plätze</span>
+        <span>
+          {slots.used}/{slots.capacity} belegt
+        </span>
+        <span className="text-text-tertiary">·</span>
+        <span>{slots.free} frei</span>
+        {slots.overload > 0 && (
+          <>
+            <span className="text-text-tertiary">·</span>
+            <span className="rounded-full bg-warning/15 px-1.5 py-0.5 font-medium text-warning">
+              {slots.overload === 1 ? '1 Überladung' : `${slots.overload} Überladungen`}
+            </span>
+          </>
+        )}
+      </div>
+      {hasDeferred && (
+        <div className="flex flex-col gap-1.5 border-t border-separator/60 pt-2">
+          <p className="text-footnote font-medium text-text-secondary">
+            {deferred.length === 1 ? 'Zurückgestellt' : `Zurückgestellt (${deferred.length})`}
+          </p>
+          {deferred.map((d) => (
+            <div key={d.runId} className="flex flex-col">
+              <span className="truncate text-caption font-medium text-text-primary">{d.runName || d.runId}</span>
+              <span className="text-caption text-text-tertiary">{d.resumePoint}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** The overview of runs executing RIGHT NOW — one entry per active run, each showing its live execution
@@ -691,11 +736,16 @@ export function ActiveRunsOverview({
   active,
   onCancel,
   cancellingId,
+  onDefer,
+  deferringId,
   onSelect,
 }: {
   active: RunActive[];
   onCancel: (runId: string) => void;
   cancellingId: string | null;
+  /** Optional: stand a run down to free its slot (task point 1). Absent hides the control. */
+  onDefer?: (runId: string) => void;
+  deferringId?: string | null;
   /** Optional: clicking a run's name selects it in the surrounding list. */
   onSelect?: (runId: string) => void;
 }) {
@@ -720,15 +770,18 @@ export function ActiveRunsOverview({
             >
               {a.runName || a.runId}
             </button>
-            <Button
-              variant="danger"
-              size="sm"
-              className="ml-auto shrink-0"
-              disabled={cancellingId === a.runId}
-              onClick={() => onCancel(a.runId)}
-            >
-              {cancellingId === a.runId ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
+            {a.overload && <SlotBadge tone="warning">Überladung</SlotBadge>}
+            {a.exclusive && <SlotBadge tone="muted">Rundumlauf</SlotBadge>}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+              {onDefer && (
+                <Button variant="secondary" size="sm" disabled={deferringId === a.runId} onClick={() => onDefer(a.runId)}>
+                  {deferringId === a.runId ? 'Stellt zurück…' : 'Zurückstellen'}
+                </Button>
+              )}
+              <Button variant="danger" size="sm" disabled={cancellingId === a.runId} onClick={() => onCancel(a.runId)}>
+                {cancellingId === a.runId ? 'Bricht ab…' : 'Abbrechen'}
+              </Button>
+            </div>
           </div>
           {a.resultId ? (
             <LiveExecution runId={a.runId} resultId={a.resultId} live />
@@ -738,6 +791,100 @@ export function ActiveRunsOverview({
         </div>
       ))}
     </div>
+  );
+}
+
+/** A tiny status chip for a run's slot state (overload / exclusive), kept uniform across the surfaces. */
+function SlotBadge({ tone, children }: { tone: 'warning' | 'muted'; children: ReactNode }) {
+  return (
+    <span
+      className={cn(
+        'shrink-0 rounded-full px-1.5 py-0.5 text-caption font-medium',
+        tone === 'warning' ? 'bg-warning/15 text-warning' : 'bg-fill/10 text-text-tertiary',
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+/** The choice shown when a ToDo cannot start because every slot is taken (task point 2): wait in line,
+ *  stand a specific run down, or overload one extra slot — led by the system's suggestion (task point 3),
+ *  acceptable in one click, while an explicit pick always wins. Overload appears only when the block is a
+ *  plain cap (never when a repo is busy or a Rundumlauf holds the floor). */
+export function StartDecisionDialog({
+  decision,
+  busy,
+  onChoose,
+  onClose,
+}: {
+  decision: StartDecision;
+  busy: boolean;
+  onChoose: (strategy: StartStrategy, deferRunId?: string) => void;
+  onClose: () => void;
+}) {
+  const { slots, suggestion } = decision;
+  const options = decision.options ?? []; // guard the Go-nil-slice→JSON-null hazard
+  const activeRuns = slots.active ?? [];
+  const canOverload = options.includes('overload');
+  const desc =
+    `${slots.used}/${slots.capacity} Plätze laufen` +
+    (slots.overload > 0 ? ` (+${slots.overload} Überladung)` : '') +
+    '. Wie soll es weitergehen?';
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Alle Plätze belegt"
+      description={desc}
+      size="md"
+      footer={
+        <Button variant="secondary" onClick={onClose} disabled={busy}>
+          Abbrechen
+        </Button>
+      }
+    >
+      <div className="flex flex-col gap-4">
+        {suggestion && (
+          <div className="rounded-card border border-accent/30 bg-accent/5 p-3">
+            <p className="text-footnote font-medium text-text-primary">
+              Vorschlag: „{suggestion.runName || suggestion.runId}“ zurückstellen
+            </p>
+            <p className="mt-0.5 text-caption text-text-secondary">{suggestion.reason}</p>
+            <Button variant="primary" size="sm" className="mt-2" disabled={busy} onClick={() => onChoose('defer', suggestion.runId)}>
+              Vorschlag annehmen
+            </Button>
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" disabled={busy} onClick={() => onChoose('queue')}>
+            Einreihen und warten
+          </Button>
+          {canOverload && (
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onChoose('overload')}>
+              Überladen — ein Extra-Platz
+            </Button>
+          )}
+        </div>
+        {activeRuns.length > 0 && (
+          <div className="flex flex-col gap-1.5 border-t border-separator pt-3">
+            <p className="text-footnote font-medium text-text-secondary">Oder gezielt zurückstellen:</p>
+            {activeRuns.map((a) => (
+              <div key={a.runId} className="flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-caption text-text-primary">
+                  {a.runName || a.runId}
+                  {a.overload && <span className="ml-1.5 text-warning">· Überladung</span>}
+                  {a.exclusive && <span className="ml-1.5 text-text-tertiary">· Rundumlauf</span>}
+                </span>
+                <Button variant="ghost" size="sm" disabled={busy} onClick={() => onChoose('defer', a.runId)}>
+                  Zurückstellen
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }
 

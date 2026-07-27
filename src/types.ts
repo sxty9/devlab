@@ -511,6 +511,59 @@ export interface RunActive {
   runName?: string;
   resultId: string;
   startedAt: string;
+  exclusive?: boolean; // an auto (all-repos) run holding the whole floor
+  overload?: boolean; // running in a temporary extra slot beyond the cap (self-healing)
+}
+
+/** One run that stood down to free a slot (task point 1) and is waiting to resume — with its resume
+ *  point so the overview shows, portioned, exactly where it will pick up. */
+export interface DeferredRun {
+  runId: string;
+  runName?: string;
+  resultId?: string;
+  done: number; // repos already completed (kept across the defer)
+  total?: number; // known for a ToDo; absent = an auto sweep
+  resumePoint: string; // "3 von 8 Repos erledigt — setzt am nächsten freien Platz fort"
+}
+
+/** The portioned slot picture (task point 6): standing capacity vs used/free, running overloads, every
+ *  active run (with its flags), and the deferred runs waiting for a free slot. */
+export interface SlotOverview {
+  capacity: number;
+  used: number; // standing (non-overload) slots occupied
+  free: number; // capacity − used
+  overload: number; // runs beyond the cap right now
+  active: RunActive[];
+  deferred: DeferredRun[];
+}
+
+/** The system's own pick of which run to stand down (task point 3) — the one that loses the least and is
+ *  easiest to resume — with a plain-language justification, acceptable in one step. */
+export interface DeferSuggestion {
+  runId: string;
+  runName?: string;
+  reason: string;
+}
+
+/** Returned when a ToDo cannot start because the slots are full (task point 2): why, the ways forward,
+ *  the automatic suggestion, and the current slot state so the dialog needs no second request. */
+export interface StartDecision {
+  blocked: string; // "cap" | "exclusive" | "repo-busy"
+  options: StartStrategy[]; // subset of "queue" | "defer" | "overload"
+  suggestion?: DeferSuggestion;
+  slots: SlotOverview;
+}
+
+/** The way a blocked start is resolved. */
+export type StartStrategy = 'queue' | 'defer' | 'overload';
+
+/** The outcome of a start attempt: it started/queued/overloaded, or it needs a decision. */
+export interface StartResult {
+  started?: boolean;
+  queued?: boolean;
+  overloaded?: boolean;
+  deferred?: string; // the run id that was stood down
+  decision?: StartDecision; // present when the slots are full and a choice is needed
 }
 
 /** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */

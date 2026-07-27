@@ -345,13 +345,16 @@ export const mockSource: DataSource = {
   async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
     return { reply: 'Mock-Antwort' };
   },
-  async mercuryRunNow(_id: string) {
+  async mercuryRunNow(_id: string, _opts?: { strategy?: import('@/types').StartStrategy; deferRunId?: string }) {
     return { started: true };
   },
   async mercuryRunActive() {
-    return { active: [] };
+    return { capacity: 2, used: 0, free: 2, overload: 0, active: [], deferred: [] };
   },
   async mercuryCancelRun(_runId: string) {
+    /* mock: no-op */
+  },
+  async mercuryDeferRun(_runId: string) {
     /* mock: no-op */
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {

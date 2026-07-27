@@ -6,7 +6,7 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionHistory, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, SlotsOverview, StartDecisionDialog, ExecutionHistory, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import type {
   Run,
   RunActive,
@@ -19,6 +19,8 @@ import type {
   RunSnapshotMeta,
   RunResultRef,
   RunCalendar,
+  StartDecision,
+  StartStrategy,
 } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
@@ -82,8 +84,9 @@ export default function RunsView() {
   // The runs executing right now are SERVER truth (via useActiveRun), so the active-runs overview — and
   // the live-follow views — survive a page reload instead of living only in this component. Runs are
   // concurrent, so this is a list; cancel targets one specific run by id.
-  const { active, refetch: refetchActive } = useActiveRun();
+  const { active, slots, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
   const reload = useCallback(async () => {
@@ -140,6 +143,23 @@ export default function RunsView() {
       }
     },
     [cancellingId, source, toast, refetchActive],
+  );
+
+  const deferRun = useCallback(
+    async (runId: string) => {
+      if (deferringId) return;
+      setDeferringId(runId);
+      try {
+        await source.mercuryDeferRun(runId);
+        toast({ title: 'Lauf zurückgestellt', description: 'Der Platz ist frei; der Lauf setzt später an derselben Stelle fort.', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setDeferringId(null);
+      }
+    },
+    [deferringId, source, toast, refetchActive],
   );
 
   const runFill = useCallback(async () => {
@@ -252,9 +272,17 @@ export default function RunsView() {
         )}
       </header>
 
-      {active.length > 0 && (
-        <div className="dl-scroll max-h-[40vh] shrink-0 overflow-y-auto border-b border-separator bg-surface px-3 py-3">
-          <ActiveRunsOverview active={active} onCancel={cancelRun} cancellingId={cancellingId} onSelect={setSelectedId} />
+      {(active.length > 0 || (slots !== null && (slots.deferred.length > 0 || slots.overload > 0))) && (
+        <div className="dl-scroll flex max-h-[40vh] shrink-0 flex-col gap-3 overflow-y-auto border-b border-separator bg-surface px-3 py-3">
+          <SlotsOverview slots={slots} />
+          <ActiveRunsOverview
+            active={active}
+            onCancel={cancelRun}
+            cancellingId={cancellingId}
+            onDefer={deferRun}
+            deferringId={deferringId}
+            onSelect={setSelectedId}
+          />
         </div>
       )}
 
@@ -371,7 +399,11 @@ function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSe
       </div>
       <span className="text-caption text-text-tertiary">{scheduleSummary(run.schedule)}</span>
       <span className="text-caption text-text-tertiary">
-        {run.suspended ? `pausiert (Abo-Limit) — Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}
+        {run.suspended
+          ? run.suspended.reason === 'deferred'
+            ? 'zurückgestellt — Fortsetzung am nächsten freien Platz'
+            : `pausiert (Abo-Limit) — Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}`
+          : `nächster Lauf: ${next}`}
       </span>
     </button>
   );
@@ -400,6 +432,7 @@ function RunDetail({
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
   const [runningNow, setRunningNow] = useState(false);
+  const [decision, setDecision] = useState<StartDecision | null>(null);
   const [promptOpen, setPromptOpen] = useState(false);
   const [prompt, setPrompt] = useState<string | null>(null);
   const [promptLoading, setPromptLoading] = useState(false);
@@ -476,25 +509,47 @@ function RunDetail({
     }
   };
 
-  const runNow = async () => {
+  // startWith attempts a start; if every slot is full it returns a `decision` (the ways forward + the
+  // system's suggestion) that opens the dialog instead of failing. An auto run is a Rundumlauf, so its
+  // decision never offers overload — only queue or standing another run down.
+  const startWith = async (opts?: { strategy: StartStrategy; deferRunId?: string }) => {
     if (runningNow) return;
     setRunningNow(true);
     try {
-      await source.mercuryRunNow(run.id);
-      toast({ title: 'Lauf gestartet', variant: 'success' });
+      const r = await source.mercuryRunNow(run.id, opts);
+      if (r.decision) {
+        setDecision(r.decision);
+        return;
+      }
+      setDecision(null);
+      const title = r.queued
+        ? 'Lauf eingereiht — startet am nächsten freien Platz'
+        : r.deferred
+          ? 'Lauf zurückgestellt — dieser Lauf übernimmt den Platz'
+          : 'Lauf gestartet';
+      toast({ title, variant: 'success' });
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
-      // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
+      // 503 "nicht konfiguriert" / 409 (deferred run no longer active) surface here.
       toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
       setRunningNow(false);
     }
   };
+  const runNow = () => startWith();
 
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
+      {decision && (
+        <StartDecisionDialog
+          decision={decision}
+          busy={runningNow}
+          onChoose={(strategy, deferRunId) => void startWith({ strategy, deferRunId })}
+          onClose={() => setDecision(null)}
+        />
+      )}
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{run.name}</h1>
@@ -528,7 +583,9 @@ function RunDetail({
           {run.enabled ? 'Aktiv' : 'Deaktiviert'}
         </span>
         {run.suspended && (
-          <span className="rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent">pausiert · Abo-Limit</span>
+          <span className="rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent">
+            {run.suspended.reason === 'deferred' ? 'zurückgestellt' : 'pausiert · Abo-Limit'}
+          </span>
         )}
         {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>

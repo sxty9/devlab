@@ -295,14 +295,17 @@ export const httpSource: DataSource = {
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
-  async mercuryRunNow(id) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {}));
+  async mercuryRunNow(id, opts) {
+    return json(await post(`/api/mercury/runs/${enc(id)}/run`, opts ?? {}));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
   async mercuryCancelRun(runId) {
     await json<void>(await post(`/api/mercury/runs/${enc(runId)}/cancel`, {}));
+  },
+  async mercuryDeferRun(runId) {
+    await json<void>(await post(`/api/mercury/runs/${enc(runId)}/defer`, {}));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(

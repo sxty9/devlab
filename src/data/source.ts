@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, SlotOverview, StartResult, StartStrategy, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -174,14 +174,18 @@ export interface DataSource {
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
-  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if it cannot start
-   *  right now (concurrency cap reached, an exclusive auto run holds the floor, or a target repo busy). */
-  mercuryRunNow(id: string): Promise<{ started: boolean }>;
-  /** Every run executing right now (server truth) — read on mount so running runs survive a page reload,
-   *  and polled to follow them live. Empty when nothing runs. */
-  mercuryRunActive(): Promise<{ active: RunActive[] }>;
+  /** Trigger a run immediately (detached). With no options it attempts a plain start and, if all slots
+   *  are full, returns a `decision` (task point 2) instead of failing. `opts` carries the chosen way
+   *  forward: queue (wait for a slot), overload (a temporary extra slot), or defer a named run for it. */
+  mercuryRunNow(id: string, opts?: { strategy?: StartStrategy; deferRunId?: string }): Promise<StartResult>;
+  /** The whole slot picture (task point 6): capacity/used/free, running overloads, every active run, and
+   *  the deferred runs with their resume points. Read on mount (survives a reload) and polled to follow. */
+  mercuryRunActive(): Promise<SlotOverview>;
   /** Abort ONE specific run in progress by id (kill-switch); the others keep running. */
   mercuryCancelRun(runId: string): Promise<void>;
+  /** Stand a specific run down to free its slot (task point 1); it keeps its progress and resumes the
+   *  same execution at the next free slot. 409 if it is not currently running. */
+  mercuryDeferRun(runId: string): Promise<void>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */
