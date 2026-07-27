@@ -74,17 +74,6 @@ func runAgentTimeout() time.Duration {
 	return defaultAgentTimeout
 }
 
-// maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
-// (remaining repos are left for the next scheduled run). 0 (the default) = no ceiling.
-func maxCostUSD() float64 {
-	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_COST_USD")); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			return f
-		}
-	}
-	return 0
-}
-
 // maxRunDuration caps the wall-clock of one whole sweep. DEVLAB_RUNS_MAX_DURATION overrides;
 // an explicit "0" disables the cap.
 func maxRunDuration() time.Duration {
@@ -333,14 +322,17 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		todoAtts = x.loadAttachments(run)
 	}
 
-	// Cap the whole sweep's wall-clock (belt-and-braces beside the per-repo timeout). A resume inherits
-	// the remaining spend budget via the accumulated res.CostUSD, but a fresh duration budget.
+	// Cap the whole sweep's wall-clock (belt-and-braces beside the per-repo timeout). A resume inherits a
+	// fresh duration budget. There is deliberately NO spend ceiling: the only limits that bind are the
+	// subscription usage limit (which pauses the run and resumes it when the window resets) and this
+	// duration bound. A dollar cap measured a cost that does not exist — the flat-rate subscription bills
+	// nothing per run — so it only left paid quota unused; spend is still MEASURED (res.CostUSD below),
+	// just never used to abort.
 	if d := maxRunDuration(); d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
-	costCeiling := maxCostUSD()
 
 	done := res.DoneRepos()          // repos already handled in a previous attempt (resume skips them)
 	overallOK := res.OK || !resuming // seed from the partial result's running state
@@ -366,26 +358,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		save()
 	}
 
-	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
-	// since this attempt began, so a carried-over run resumes with a fresh budget and always makes
-	// progress (a cumulative cap would re-trip forever on the loaded res.CostUSD and deadlock).
-	attemptStartCost := res.CostUSD
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
 	for _, repo := range repos {
 		if done[repo.ID] {
 			continue // completed in an earlier attempt of this same execution
-		}
-		// Spend ceiling for THIS attempt: stop before starting another expensive repo. Carry over — the
-		// remaining repos continue on the next scheduled run, not redone-from-scratch (which would
-		// duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by its
-		// own cost (soft cap).
-		if costCeiling > 0 && res.CostUSD-attemptStartCost >= costCeiling {
-			log.Printf("devlabd: run %s hit the per-run cost ceiling ($%.2f this attempt ≥ $%.2f) after %d repos — carrying the rest to the next run",
-				run.ID, res.CostUSD-attemptStartCost, costCeiling, len(res.Repos))
-			carriedOver = true
-			break
 		}
 		if ctx.Err() != nil {
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
