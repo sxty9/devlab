@@ -1434,8 +1434,10 @@ func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.
 // per-PR reads: an in-window PR is re-fetched at most once per recheck interval (default 5m, tracked
 // via PendingPR.LastChecked), so the sweep never GETs every tracked PR every 30s tick and exhausts the
 // rate budget. A merged PR is shipped to prod; the PR is untracked only on a SUCCESSFUL prod-deploy, so
-// a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
-// success rather than a fragile persisted flag.
+// a TRANSIENT deploy failure simply retries next eligible tick (never re-merges) — idempotent via
+// untrack-on-success rather than a fragile persisted flag. A PERMANENT deploy failure (the service is
+// not set up on the target) is NOT retried forever: after a few attempts the PR is BLOCKED and skipped
+// here until an explicit resume, so one broken repo can never storm the pipeline or hold up the others.
 func (x *runExecutor) Maintain(ctx context.Context) {
 	prs, err := x.s.runPRs.List()
 	if err != nil || len(prs) == 0 {
@@ -1448,6 +1450,12 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 	now := time.Now()
 	recheck := prRecheck()
 	for _, p := range prs {
+		if p.Blocked {
+			// A blocked delivery waits for an EXPLICIT resume — never auto-fetched or retried. Skipping
+			// it here (before any GitHub read) is also what keeps one broken repo from holding up the
+			// others: every other tracked PR is reconciled as usual.
+			continue
+		}
 		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
 			continue // report/pr: within window → not touched. full: throttled between rechecks.
 		}
@@ -1472,24 +1480,59 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
-			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
-			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
-			if name := repoNameOf(p.Repo); !x.deployable(name) {
-				_ = x.s.runPRs.Remove(p.Repo, p.Number)
-				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
-				continue
-			}
-			depLog, derr := x.runProdDeploy(ctx, token, p)
-			if derr != nil {
-				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
-				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
-			}
-			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
-			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			x.deployMergedPR(ctx, token, p, now)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
 		}
 	}
+}
+
+// deployMergedPR ships one MERGED PR to prod (full mode) and reconciles the tracked record accordingly:
+//   - a repo that must NOT be shipped (not-to-be-delivered, or no deploy script) is untracked at once,
+//     WITHOUT a deploy attempt — so it can never produce a failed attempt;
+//   - a successful deploy untracks the PR (idempotent untrack-on-success, never a re-merge);
+//   - a TRANSIENT failure (VPS briefly unreachable) keeps it tracked to retry, and does NOT count
+//     toward the block — only genuine outages retry;
+//   - a PERMANENT failure counts one attempt and, once maxDeployAttempts is reached, BLOCKS the PR with
+//     a service-and-target-naming reason and a timestamp, so it stops retrying and waits for an explicit
+//     resume instead of failing identically forever.
+func (x *runExecutor) deployMergedPR(ctx context.Context, token string, p runs.PendingPR, now time.Time) {
+	name := repoNameOf(p.Repo)
+	if ship, why := x.shipToProd(name); !ship {
+		_ = x.s.runPRs.Remove(p.Repo, p.Number)
+		log.Printf("devlabd: %s#%d gemerged — %s → untracked (kein Deploy-Versuch)", p.Repo, p.Number, why)
+		return
+	}
+	depLog, derr := x.runProdDeploy(ctx, token, p)
+	if derr == nil {
+		_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+		log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+		return
+	}
+	if deployTransient(depLog, derr) {
+		log.Printf("devlabd: prod-deploy %s#%d transient failure (will retry): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
+		return // keep tracked; retry next eligible tick. Does not count toward the block.
+	}
+	// Permanent failure: count this attempt; block once the threshold is reached (unobservable transition
+	// via the pool's atomic Update — the WHEN-to-block decision stays here, outside the passive pool).
+	reason := deployBlockReason(name, depLog, derr)
+	limit := maxDeployAttempts()
+	var attempts int
+	blocked := false
+	_, _ = x.s.runPRs.Update(p.Repo, p.Number, func(pr *runs.PendingPR) {
+		pr.DeployAttempts++
+		attempts = pr.DeployAttempts
+		if pr.DeployAttempts >= limit {
+			pr.Blocked, pr.BlockedReason, pr.BlockedAt = true, reason, now
+			blocked = true
+		}
+	})
+	if blocked {
+		log.Printf("devlabd: prod-deploy %s#%d BLOCKED after %d attempt(s) — %s", p.Repo, p.Number, attempts, reason)
+		return
+	}
+	log.Printf("devlabd: prod-deploy %s#%d permanent failure %d/%d (retry, then block): %v\n%s",
+		p.Repo, p.Number, attempts, limit, derr, clip(depLog))
 }
 
 // prAction is Maintain's decision for one tracked PR after it has been fetched.

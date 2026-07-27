@@ -366,6 +366,162 @@ func TestMaintainFullModeMergedWithoutDeployTargetUntracks(t *testing.T) {
 	}
 }
 
+// TestMaintainPermanentDeployFailureBlocks pins requirement 2: a merged PR whose prod-deploy fails for
+// a PERMANENT reason (service not set up on the target) is attempted only a few times and then BLOCKED —
+// recorded with a service-naming reason + timestamp — instead of being retried on every tick forever.
+func TestMaintainPermanentDeployFailureBlocks(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "3")
+	store := tempPRStore(t)
+	if err := store.Add(runs.PendingPR{Repo: "o/svc", Number: 9, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var deploys int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn: func(context.Context, string, runs.PendingPR) (string, error) {
+			deploys++
+			return "Failed to restart svc.service: Unit svc.service not found.", errors.New("exit status 1")
+		},
+		deployTargetFn: func(string) bool { return true },
+	}
+
+	for i := 0; i < 6; i++ { // more ticks than the threshold
+		x.Maintain(context.Background())
+	}
+
+	if deploys != 3 {
+		t.Errorf("a permanent failure must be attempted exactly maxDeployAttempts (3) times, got %d", deploys)
+	}
+	got, _ := store.List()
+	if len(got) != 1 || !got[0].Blocked {
+		t.Fatalf("the PR must stay tracked AND be blocked, got %+v", got)
+	}
+	if got[0].DeployAttempts != 3 {
+		t.Errorf("expected 3 recorded attempts, got %d", got[0].DeployAttempts)
+	}
+	if got[0].BlockedReason == "" || got[0].BlockedAt.IsZero() {
+		t.Errorf("a blocked PR must carry a reason and a timestamp, got reason=%q at=%v", got[0].BlockedReason, got[0].BlockedAt)
+	}
+	if !strings.Contains(got[0].BlockedReason, "svc") || !strings.Contains(got[0].BlockedReason, "nicht eingerichtet") {
+		t.Errorf("the reason must name the service and the not-set-up cause, got %q", got[0].BlockedReason)
+	}
+}
+
+// TestMaintainTransientDeployFailureRetries pins requirement 2's other half: a TRANSIENT deploy failure
+// (the VPS briefly unreachable) keeps being retried and NEVER blocks — the two cases are distinguished.
+func TestMaintainTransientDeployFailureRetries(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "3")
+	store := tempPRStore(t)
+	if err := store.Add(runs.PendingPR{Repo: "o/svc", Number: 10, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var deploys int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn: func(context.Context, string, runs.PendingPR) (string, error) {
+			deploys++
+			return "ssh: connect to host vps port 22: Connection refused", errors.New("exit status 255")
+		},
+		deployTargetFn: func(string) bool { return true },
+	}
+
+	for i := 0; i < 5; i++ {
+		x.Maintain(context.Background())
+	}
+
+	if deploys != 5 {
+		t.Errorf("a transient failure must keep retrying every tick, got %d attempts across 5 ticks", deploys)
+	}
+	got, _ := store.List()
+	if len(got) != 1 || got[0].Blocked {
+		t.Fatalf("a transient failure must NOT block; PR stays tracked+unblocked, got %+v", got)
+	}
+	if got[0].DeployAttempts != 0 {
+		t.Errorf("transient failures must not count toward the block, got %d", got[0].DeployAttempts)
+	}
+}
+
+// TestMaintainBlockedRepoDoesNotHoldUpOthers pins requirement 4: with a permanently-broken repo blocked,
+// a healthy repo still deploys and untracks in the same sweep, and the broken repo stops being retried.
+func TestMaintainBlockedRepoDoesNotHoldUpOthers(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "1") // block on the first permanent failure
+	store := tempPRStore(t)
+	if err := store.Add(runs.PendingPR{Repo: "o/broken", Number: 1, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(runs.PendingPR{Repo: "o/healthy", Number: 2, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deploys := map[string]int{}
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn: func(_ context.Context, _ string, p runs.PendingPR) (string, error) {
+			deploys[p.Repo]++
+			if p.Repo == "o/broken" {
+				return "Unit broken.service not found.", errors.New("exit status 1")
+			}
+			return "ok", nil
+		},
+		deployTargetFn: func(string) bool { return true },
+	}
+
+	x.Maintain(context.Background()) // pass 1: broken fails+blocks; healthy deploys+untracks
+	x.Maintain(context.Background()) // pass 2: broken is skipped (blocked); healthy already gone
+
+	if deploys["o/healthy"] != 1 {
+		t.Errorf("the healthy repo must deploy despite the blocked one, got %d", deploys["o/healthy"])
+	}
+	if deploys["o/broken"] != 1 {
+		t.Errorf("the broken repo must attempt once then stop (blocked), got %d", deploys["o/broken"])
+	}
+	got, _ := store.List()
+	if len(got) != 1 || got[0].Repo != "o/broken" || !got[0].Blocked {
+		t.Fatalf("only the broken PR must remain, blocked; healthy untracked. got %+v", got)
+	}
+}
+
+// TestMaintainNotToBeDeliveredNeverAttempts pins the concrete case: a repo marked not-to-be-delivered
+// (DEVLAB_RUNS_NO_DEPLOY) has its merged PR untracked WITHOUT any deploy attempt — even with a deploy
+// script present — so no failed attempt is ever produced.
+func TestMaintainNotToBeDeliveredNeverAttempts(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_NO_DEPLOY", "excluded")
+	store := tempPRStore(t)
+	if err := store.Add(runs.PendingPR{Repo: "o/excluded", Number: 3, MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	var deploys int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { deploys++; return "", nil },
+		deployTargetFn: func(string) bool { return true }, // a script exists, but the exclusion wins
+	}
+
+	x.Maintain(context.Background())
+
+	if deploys != 0 {
+		t.Errorf("a not-to-be-delivered repo must trigger NO deploy attempt, got %d", deploys)
+	}
+	if r, _ := store.List(); len(r) != 0 {
+		t.Errorf("a not-to-be-delivered merged PR must be untracked without an attempt, got %+v", r)
+	}
+}
+
 // TestMaintainFullModeThrottlesInWindowRecheck confirms the per-PR throttle: an in-window PR fetched
 // once records LastChecked, so an immediate second Maintain pass does not fetch it again.
 func TestMaintainFullModeThrottlesInWindowRecheck(t *testing.T) {
