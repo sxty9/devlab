@@ -63,6 +63,15 @@ type Run struct {
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
 
+	// TimeBudget is the per-repo agent time cap for THIS run/todo — a peer of Model/Effort, chosen and
+	// stored the same way. It is tri-state: "" (unset) makes the run FOLLOW the service default (see
+	// Config.DefaultTimeBudget) — the default is referenced, never copied in, so a later change to it
+	// moves this run too; "0" is a deliberate "no budget" (only the whole-sweep duration then bounds the
+	// run); any other value is a Go duration string ("3h", "90m") that overrides the default. A non-empty
+	// value is therefore a recognizable deviation from the default. Records predating this field read as
+	// "" and keep following the default.
+	TimeBudget string `json:"timeBudget,omitempty"`
+
 	// auto only
 	Schedule Schedule `json:"schedule"`
 	AxiomIDs []string `json:"axiomIds"`
