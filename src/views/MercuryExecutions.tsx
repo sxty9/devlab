@@ -7,9 +7,8 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunTrigger, RunType } from '@/types';
+import type { RepoResult, ReportDelivery, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RunStep, RunTrigger, RunType } from '@/types';
 import { Person } from '@/ui/Person';
-import type { ReportDelivery, RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
