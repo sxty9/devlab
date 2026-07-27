@@ -1,18 +1,20 @@
 package api
 
 import (
+	"errors"
+
+	"devlab/backend/internal/axiomrepo"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/mercury"
 )
 
 // The edit surface lets a user own the tree by hand: change an axiom's text, re-file it into another
-// category, rename it, or delete it — and rename a whole category. Everything rides the graveyard
-// primitives (put/move/delete): scheme carries a record's content with its path on a move, so a
-// re-file or rename never rewrites the axiom, and the front-matter id stays stable across it.
+// category, rename it, or delete it — and rename a whole category. Everything rides the store
+// primitives (put/move/delete): a move carries a record's content with its path, so a re-file or
+// rename never rewrites the axiom, and the front-matter id stays stable across it.
 
 // editAxiom replaces an axiom's title and body, preserving its id and quelle. The leaf slug is
 // re-derived from the new title so the heading always matches the path — a title change renames the
@@ -36,12 +38,11 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cookie := r.Header.Get("Cookie")
-	csrf := csrfFrom(r)
 
 	// Read the existing record so the stable id and quelle survive the edit.
-	data, found, status, err := aigentic.GraveGet(r.Context(), cookie, body.Path)
+	data, found, err := s.axioms.Get(r.Context(), body.Path)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	if !found {
@@ -60,24 +61,25 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	// record (same category) before writing. A body-only edit leaves the slug unchanged and never moves.
 	newPath := reslugLeaf(body.Path, body.Titel)
 	if newPath != body.Path {
-		if status, err := aigentic.GraveMove(r.Context(), cookie, csrf, body.Path, newPath); err != nil {
-			if status == http.StatusConflict {
+		if err := s.axioms.Move(r.Context(), body.Path, newPath, "Axiom umbenannt: "+body.Titel, actor(r)); err != nil {
+			if errors.Is(err, axiomrepo.ErrExists) {
 				writeErr(w, http.StatusConflict, "In dieser Kategorie existiert bereits ein Axiom mit diesem Titel")
 				return
 			}
-			mercuryError(w, status, err)
+			mercuryError(w, err)
 			return
 		}
 	}
-	if _, status, err := aigentic.GravePut(r.Context(), cookie, csrf, newPath, firstLine(body.Body), content, true); err != nil {
-		mercuryError(w, status, err)
+	if err := s.axioms.Put(r.Context(), newPath, string(content), firstLine(body.Body), actor(r), true); err != nil {
+		mercuryError(w, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
 	writeJSON(w, http.StatusOK, map[string]any{"path": newPath, "axiom": ax})
 }
 
 // moveAxiom re-files or renames an axiom: from and to are full record paths. A category change
-// re-files it; a slug change renames it. The destination must be free (aigentic returns 409).
+// re-files it; a slug change renames it. The destination must be free (the store returns ErrExists).
 func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		From string `json:"from"`
@@ -95,15 +97,17 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 		return
 	}
-	status, err := aigentic.GraveMove(r.Context(), r.Header.Get("Cookie"), csrfFrom(r), body.From, body.To)
+	cookie := r.Header.Get("Cookie")
+	err := s.axioms.Move(r.Context(), body.From, body.To, "Verschoben: "+body.From+" → "+body.To, actor(r))
 	if err != nil {
-		if status == http.StatusConflict {
+		if errors.Is(err, axiomrepo.ErrExists) {
 			writeErr(w, http.StatusConflict, "Am Zielpfad liegt bereits ein Axiom")
 			return
 		}
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
@@ -114,15 +118,17 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "Ungültiger Pfad")
 		return
 	}
-	if status, err := aigentic.GraveDelete(r.Context(), r.Header.Get("Cookie"), csrfFrom(r), path); err != nil {
-		mercuryError(w, status, err)
+	cookie := r.Header.Get("Cookie")
+	if err := s.axioms.Delete(r.Context(), path, "Gelöscht: "+path, actor(r)); err != nil {
+		mercuryError(w, err)
 		return
 	}
+	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(path))
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // moveCategory renames or re-homes a whole category: every record under `from/` is moved to the
-// same suffix under `to/`. Because scheme has no empty folders, moving the leaves IS renaming the
+// same suffix under `to/`. Because git tracks no empty folders, moving the leaves IS renaming the
 // category. Best-effort per record; the first hard failure stops and is reported.
 func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -143,12 +149,11 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cookie := r.Header.Get("Cookie")
-	csrf := csrfFrom(r)
-	// List by the bare prefix (scheme's list rejects a trailing slash), then keep only records
-	// genuinely UNDER this category — "axiome/ui" must not sweep up a sibling "axiome/ui-native".
-	all, status, err := aigentic.GraveList(r.Context(), cookie, body.From)
+	// List by the bare prefix, then keep only records genuinely UNDER this category — the prefix match
+	// alone would let "axiome/ui" sweep up a sibling "axiome/ui-native", so re-check the "/" boundary.
+	all, err := s.axioms.List(r.Context(), body.From)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	prefix := body.From + "/"
@@ -158,11 +163,14 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		dest := body.To + strings.TrimPrefix(leaf, body.From)
-		if _, err := aigentic.GraveMove(r.Context(), cookie, csrf, leaf, dest); err != nil {
+		if err := s.axioms.Move(r.Context(), leaf, dest, "Kategorie verschoben: "+leaf+" → "+dest, actor(r)); err != nil {
 			writeErr(w, http.StatusConflict, "Konnte "+leaf+" nicht verschieben (Ziel belegt?); "+strconv.Itoa(moved)+" bereits verschoben")
 			return
 		}
 		moved++
+	}
+	if moved > 0 {
+		s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

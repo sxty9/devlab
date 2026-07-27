@@ -21,19 +21,13 @@ import (
 // AI-planning buttons with review/apply, config history). Execution (the scheduler) is a separate,
 // gated phase; the stored results are read here but written there.
 
-// runView is a run plus a derived staleness flag (its snapshot no longer matches the scheme inputs).
-type runView struct {
-	runs.Run
-	Stale bool `json:"stale"`
-}
-
 // runCatalog scans the scheme store once: every axiom by its stable id (as the RunAxiom shape used for
 // composition), the id→path index (coverage badges), and all global Laufregeln. Mirrors
 // buildRolloutBlock's scan; reuses fetchRecord.
-func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, idPath map[string]string, laufregeln []mercury.RunAxiom, status int, err error) {
-	paths, status, err := aigentic.GraveList(ctx, cookie, "")
+func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, idPath map[string]string, laufregeln []mercury.RunAxiom, err error) {
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
-		return nil, nil, nil, status, err
+		return nil, nil, nil, err
 	}
 	byID = map[string]mercury.RunAxiom{}
 	idPath = map[string]string{}
@@ -50,7 +44,7 @@ func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string
 			}
 		}
 	}
-	return byID, idPath, laufregeln, http.StatusOK, nil
+	return byID, idPath, laufregeln, nil
 }
 
 // todoAttachmentDescriptors maps a ToDo's stored attachment metadata to the lean descriptors the prompt
@@ -101,16 +95,40 @@ func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []m
 	run.PromptHash = mercury.RunInputsHash(axs, laufregeln)
 }
 
-// runsList returns every run with a staleness flag, plus an id→title legend for the axioms in play.
+// upsertPlannedRun folds one planned auto run into out: if an auto run of the same name (case-insensitive)
+// already exists, its axioms are extended (deduped), its snapshot recomposed and its schedule re-armed;
+// otherwise np is appended as a new run. It returns the resulting list, a copy of the affected run (so the
+// caller can name it / link to it) and whether a new run was created. Only auto runs are matched — a ToDo
+// that happens to share a name is never turned into an axiom carrier. Shared by the interactive
+// fill-apply and the background auto-assigner so the merge semantics have a single definition.
+func upsertPlannedRun(out []runs.Run, np runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) ([]runs.Run, runs.Run, bool) {
+	for i := range out {
+		if out[i].IsTodo() || !strings.EqualFold(out[i].Name, np.Name) {
+			continue
+		}
+		out[i].AxiomIDs = dedupStrings(append(out[i].AxiomIDs, np.AxiomIDs...))
+		out[i].UpdatedAt = now
+		composeInto(&out[i], byID, laufregeln, now)
+		if out[i].Enabled {
+			if nf, e := out[i].Schedule.Next(now); e == nil {
+				out[i].NextFireAt = &nf
+			}
+		}
+		return out, out[i], false
+	}
+	return append(out, np), np, true
+}
+
+// runsList returns every run plus an id→title legend for the axioms in play. Snapshots are kept current
+// by every scheme write (reconcileAfterWrite), so there is no staleness flag to compute or surface.
 func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
 		return
 	}
-	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -118,12 +136,7 @@ func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
 		return
 	}
-	views := make([]runView, 0, len(all))
-	for _, run := range all {
-		cur := mercury.RunInputsHash(axiomsFor(run.AxiomIDs, byID), laufregeln)
-		views = append(views, runView{Run: run, Stale: run.PromptHash != "" && run.PromptHash != cur})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": views, "axioms": titleLegend(byID)})
+	writeJSON(w, http.StatusOK, map[string]any{"runs": orEmptyRuns(all), "axioms": titleLegend(byID)})
 }
 
 // runsCoverage reports which axioms are already backed by a run (badges in the picker) + the id→path
@@ -133,9 +146,9 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
 		return
 	}
-	byID, idPath, _, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, idPath, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -149,7 +162,12 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 			covered[id] = append(covered[id], run.ID)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"covered": covered, "index": idPath, "axioms": titleLegend(byID)})
+	// pending: an automatic assignment is scheduled or running, so a currently-uncovered axiom is only
+	// TEMPORARILY uncovered. Coverage stays honest (the axiom is reported uncovered until the assignment
+	// actually lands); pending merely lets the UI show the state as transient rather than permanent.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"covered": covered, "index": idPath, "axioms": titleLegend(byID), "pending": s.assignPending(),
+	})
 }
 
 func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
@@ -166,14 +184,13 @@ func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
-	cur := mercury.RunInputsHash(axiomsFor(run.AxiomIDs, byID), laufregeln)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":    runView{Run: run, Stale: run.PromptHash != "" && run.PromptHash != cur},
+		"run":    run,
 		"axioms": titleLegend(byID),
 	})
 }
@@ -190,9 +207,9 @@ func (s *Server) runPromptPreview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	axs := axiomsFor(run.AxiomIDs, byID)
@@ -203,6 +220,8 @@ type runBody struct {
 	Name     string        `json:"name"`
 	Type     runs.Type     `json:"type"` // "" = auto
 	Enabled  bool          `json:"enabled"`
+	Model    string        `json:"model"`  // Claude model id/alias; "" = runner default (opus)
+	Effort   string        `json:"effort"` // low|medium|high|xhigh|max|ultracode; "" = runner default (max)
 	Schedule runs.Schedule `json:"schedule"`
 	AxiomIDs []string      `json:"axiomIds"`
 	// todo only
@@ -217,6 +236,38 @@ type runBody struct {
 
 // repoNameRe bounds a new repo's name (it becomes a GitHub repo and a deploy-allowlist key).
 var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
+
+// runEffortAllowed is the effort ladder a run/todo may pick: the native claude CLI --effort levels
+// (effortAllowed — the very set the KI tab uses) PLUS "ultracode", Holistic's maximal tier, which the
+// executor translates to max effort plus multi-agent orchestration (see agentTuning.resolve). Derived
+// from the one native set so the two can never drift. Empty selects the runner default (max).
+var runEffortAllowed = func() map[string]bool {
+	m := map[string]bool{"ultracode": true}
+	for k := range effortAllowed {
+		m[k] = true
+	}
+	return m
+}()
+
+// runModelRe bounds a selected model to the shape a CLI model alias or id takes (opus, claude-opus-4-8,
+// claude-fable-5, …) so a stored value can never smuggle extra arguments into the executor's CLI call.
+// Empty selects the runner default (opus). The offerable set itself is the aigentic model catalog
+// (GET /api/assistant/models) — the single source the KI tab already reads — so this is only a guard.
+var runModelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// validateTuning trims and guards the model + effort a run/todo carries. Both are shared by auto and
+// todo and both are optional (empty = runner default), so it runs before the per-type branch.
+func validateTuning(b *runBody) (int, string) {
+	b.Model = strings.TrimSpace(b.Model)
+	if b.Model != "" && !runModelRe.MatchString(b.Model) {
+		return http.StatusBadRequest, "ungültiges Modell"
+	}
+	b.Effort = strings.TrimSpace(b.Effort)
+	if b.Effort != "" && !runEffortAllowed[b.Effort] {
+		return http.StatusBadRequest, "ungültiger Effort (erlaubt: low, medium, high, xhigh, max, ultracode)"
+	}
+	return 0, ""
+}
 
 // normalizeTargets validates and cleans a ToDo's target list: at least one target, each being exactly
 // one existing repo OR one new-repo name (bounded like a GitHub repo), with duplicates collapsed and
@@ -254,6 +305,9 @@ func validateRunBody(b *runBody, byID map[string]mercury.RunAxiom) (int, string)
 	b.Name = strings.TrimSpace(b.Name)
 	if b.Name == "" {
 		return http.StatusBadRequest, "name ist erforderlich"
+	}
+	if code, msg := validateTuning(b); code != 0 {
+		return code, msg
 	}
 	if b.Type == "" {
 		b.Type = runs.TypeAuto
@@ -305,9 +359,9 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -317,10 +371,15 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	run := runs.Run{
 		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
+		Model: body.Model, Effort: body.Effort,
 		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
 		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
 	composeInto(&run, byID, laufregeln, now.UTC())
+	// Optimise the branch description with AI only when the raw name is too thin to slugify; best-effort,
+	// so a miss just leaves the executor to slug the name itself. Done here (outside Mutate) so the store
+	// lock is never held across the aigentic round-trip.
+	run.BranchDesc = s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), run.Name, run.Task)
 	// Only a recurring auto run has a NextFireAt; a ToDo fires once at its optional DueAt (or manually).
 	if run.Enabled && !run.IsTodo() {
 		if nf, err := run.Schedule.Next(now); err == nil {
@@ -347,9 +406,9 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -357,6 +416,10 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	// Recompute the AI-optimized branch description for the edited name (outside Mutate so the store lock
+	// is never held across the aigentic round-trip). Recomputing on every edit keeps it consistent: a name
+	// that is now good enough clears it (""), a still-thin one refreshes it.
+	branchDesc := s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), body.Name, body.Task)
 	var updated runs.Run
 	if _, err := s.runs.Mutate("update", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
 		idx := indexOfRun(cur, id)
@@ -366,10 +429,13 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].Name = body.Name
 		cur[idx].Type = body.Type
 		cur[idx].Enabled = body.Enabled
+		cur[idx].Model = body.Model
+		cur[idx].Effort = body.Effort
 		cur[idx].Schedule = body.Schedule
 		cur[idx].AxiomIDs = body.AxiomIDs
 		cur[idx].Task = body.Task
 		cur[idx].Targets = body.Targets
+		cur[idx].BranchDesc = branchDesc
 		// Drop any legacy single-target fields so a record edited after the upgrade keeps Targets as its
 		// only source of truth (TodoTargets prefers Targets, but leaving stale fields is untidy).
 		cur[idx].Repo, cur[idx].NewRepo = "", ""
@@ -393,6 +459,8 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gespeichert werden")
 		return
 	}
+	// Editing a run may have removed axioms from it, leaving them uncovered; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -426,39 +494,8 @@ func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 	if s.attachments != nil {
 		_ = s.attachments.DeleteAll(id)
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) runRecompose(w http.ResponseWriter, r *http.Request) {
-	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
-		return
-	}
-	id := r.PathValue("id")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
-	if err != nil {
-		mercuryError(w, status, err)
-		return
-	}
-	now := time.Now().UTC()
-	// Patch, not Mutate: recomposing only refreshes the derived prompt snapshot from the current
-	// scheme — it is not a user config edit, so it must not flood the restore history.
-	if _, err := s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
-		idx := indexOfRun(cur, id)
-		if idx < 0 {
-			return nil, runs.ErrNotFound
-		}
-		composeInto(&cur[idx], byID, laufregeln, now)
-		cur[idx].UpdatedAt = now
-		return cur, nil
-	}); err != nil {
-		if errors.Is(err, runs.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht aktualisiert werden")
-		return
-	}
+	// Deleting a run may have orphaned its axioms; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -469,9 +506,9 @@ func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -502,7 +539,7 @@ func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 		return mercury.RunPlanFillPrompt(uncovered, names, correction)
 	})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
@@ -515,9 +552,9 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -536,7 +573,7 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 		return mercury.RunPlanFinetunePrompt(catalog, current, correction)
 	})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
@@ -563,6 +600,40 @@ func (s *Server) planRuns(ctx context.Context, cookie, csrf string, knownIDs []s
 	return mercury.RunPlan{}, lastErr
 }
 
+// aiBranchDesc supplies the "otherwise optimise with ai" half of the run-branch naming convention: when a
+// run's own name is too thin to slugify into a readable branch (see runs.BranchDescGoodEnough), it asks
+// aigentic for a concise English description instead. It is deliberately best-effort and non-blocking —
+// a short timeout and ANY error (aigentic down, missing right/key, junk output) yield "", so creating or
+// editing a run never hangs on or fails because of the AI service; the executor then slugifies the name
+// (or its "change" fallback) directly. It returns "" without spending a round-trip when the name is
+// already good enough, and only ever runs in a request handler, where the caller's cookie authorises the
+// aigentic proxy — the background executor has no session and so relies on the deterministic slug.
+func (s *Server) aiBranchDesc(ctx context.Context, cookie, csrf, name, task string) string {
+	if runs.BranchDescGoodEnough(name) {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	prompt := "Name a git branch for the following software task. Reply with ONLY a concise English " +
+		"description of 2 to 5 words, all lowercase, words separated by single spaces, no punctuation and " +
+		"no surrounding quotes.\n\nTask title: " + name + "\n"
+	if strings.TrimSpace(task) != "" {
+		prompt += "Task detail: " + task + "\n"
+	}
+	result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
+	if err != nil || result == nil {
+		return ""
+	}
+	desc := strings.TrimSpace(result.Output)
+	if i := strings.IndexByte(desc, '\n'); i >= 0 {
+		desc = strings.TrimSpace(desc[:i]) // keep only the first line if the model added prose
+	}
+	if !runs.BranchDescGoodEnough(desc) {
+		return "" // unusable answer — fall back to the deterministic name slug
+	}
+	return desc
+}
+
 // runsApplyProposal persists a (possibly user-edited) reviewed proposal. mode "fill" creates/extends
 // named runs; mode "replace" replaces the whole set (fine-tune).
 func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
@@ -582,9 +653,9 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, status, err := s.runCatalog(r.Context(), cookie)
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	// Re-validate the (possibly user-edited) plan against the current axiom set.
@@ -610,34 +681,18 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		if body.Mode == "replace" {
 			return planned, nil
 		}
-		// fill: extend a run of the same name (append axioms), else append the new run.
+		// fill: extend an auto run of the same name (append axioms), else append the new run.
 		out := append([]runs.Run(nil), cur...)
 		for _, np := range planned {
-			idx := -1
-			for i := range out {
-				if strings.EqualFold(out[i].Name, np.Name) {
-					idx = i
-					break
-				}
-			}
-			if idx < 0 {
-				out = append(out, np)
-				continue
-			}
-			out[idx].AxiomIDs = dedupStrings(append(out[idx].AxiomIDs, np.AxiomIDs...))
-			out[idx].UpdatedAt = now.UTC()
-			composeInto(&out[idx], byID, laufregeln, now.UTC())
-			if out[idx].Enabled {
-				if nf, e := out[idx].Schedule.Next(now); e == nil {
-					out[idx].NextFireAt = &nf
-				}
-			}
+			out, _, _ = upsertPlannedRun(out, np, byID, laufregeln, now.UTC())
 		}
 		return out, nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Vorschlag konnte nicht gespeichert werden")
 		return
 	}
+	// A replace can strip coverage from axioms the new set omits; cover them again in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -678,11 +733,20 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Snapshot mit diesem Zeitstempel")
 		return
 	}
+	// A snapshot carries each run's prompt as it was composed then; the axioms may have moved on since.
+	// Recompose from the CURRENT scheme so a restored config comes back correct, never stale (staleness
+	// is structurally unreachable — there is no longer a badge to surface it).
+	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	if err != nil {
+		mercuryError(w, err)
+		return
+	}
 	now := time.Now()
 	restored := make([]runs.Run, len(snap.Runs))
 	copy(restored, snap.Runs)
-	for i := range restored { // recompute NextFireAt forward so a restore doesn't fire the past immediately
-		if restored[i].Enabled {
+	for i := range restored {
+		composeInto(&restored[i], byID, laufregeln, now.UTC())
+		if restored[i].Enabled { // recompute NextFireAt forward so a restore doesn't fire the past immediately
 			if nf, e := restored[i].Schedule.Next(now); e == nil {
 				restored[i].NextFireAt = &nf
 			}
@@ -696,6 +760,8 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Wiederherstellung fehlgeschlagen")
 		return
 	}
+	// Restoring an older set can leave axioms added since then uncovered; re-cover them in the background.
+	s.kickAutoAssign(r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": len(restored)})
 }
 
@@ -740,8 +806,11 @@ func (s *Server) runResultGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// runsCalendar returns the upcoming run occurrences over a window (default 30 days) — the data for
-// the auto-updating Laufkalender, sorted chronologically.
+// runsCalendar returns the calendar for a window — the union of past executions and upcoming firings,
+// sorted chronologically. The upcoming side expands each enabled run's schedule up to `days` ahead
+// (default 30); the past side folds in every completed execution (all of history, so a run that fired
+// long ago stays reachable), each carrying its resultId and status so the calendar can show the outcome
+// and open the full report. This is the one calendar access point behind every Mercury calendar surface.
 func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
@@ -763,12 +832,17 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	want := strings.TrimSpace(r.URL.Query().Get("type"))
 	now := time.Now()
 	horizon := now.Add(time.Duration(days) * 24 * time.Hour)
+	// One dot on the calendar. A FUTURE firing carries its schedule; a PAST execution carries its
+	// resultId and status instead (schedule empty) — the presence of resultId tells the two apart.
 	type occ struct {
-		RunID    string    `json:"runId"`
-		RunName  string    `json:"runName"`
-		Type     runs.Type `json:"type"` // auto | todo — drives the colour separation
-		At       time.Time `json:"at"`
-		Schedule string    `json:"schedule"`
+		RunID     string    `json:"runId"`
+		RunName   string    `json:"runName"`
+		Type      runs.Type `json:"type"` // auto | todo — drives the colour separation
+		At        time.Time `json:"at"`
+		Schedule  string    `json:"schedule,omitempty"`  // future firing: how it recurs
+		ResultID  string    `json:"resultId,omitempty"`  // past execution: opens its full report
+		OK        bool      `json:"ok,omitempty"`        // past execution: outcome
+		Suspended bool      `json:"suspended,omitempty"` // past execution: paused on the usage limit
 	}
 	occs := []occ{} // never nil: a nil slice marshals to JSON null and hangs the UI
 	for _, run := range all {
@@ -781,7 +855,8 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 		}
 		if run.IsTodo() {
 			// A ToDo is a single point in time; an overdue-but-unfinished one still belongs on the
-			// calendar. Without a due date it only ever runs manually — nothing to show.
+			// calendar. Without a due date it only ever runs manually — nothing to show. A done ToDo's
+			// outcome returns below as its past execution instead.
 			if run.Done || run.DueAt == nil || run.DueAt.After(horizon) {
 				continue
 			}
@@ -798,25 +873,53 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 			t = next
 		}
 	}
-	sort.Slice(occs, func(i, j int) bool { return occs[i].At.Before(occs[j].At) })
-	writeJSON(w, http.StatusOK, map[string]any{"from": now, "to": horizon, "occurrences": occs})
-}
-
-// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
-// Includes executions of runs that were since deleted (persistent logs). ?type=auto|todo scopes it to
-// one surface (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the
-// global log. Each execution's kind is resolved from the stamp on the result, falling back to the live
-// run's kind for older (unstamped) results, and to auto for an orphan with neither (the "" == auto
-// convention). The resolved kind is returned so the caller sees a definite auto|todo.
-func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
-	if s.runResults == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"executions": []any{}})
-		return
-	}
-	execs, err := s.runResults.All()
+	// Past side: every completed execution, type-resolved exactly like the History (the shared source),
+	// so the calendar is the union of done and upcoming runs and each past run's status is reachable from
+	// it. All of history is included, so the window's start stretches back to the earliest execution.
+	execs, err := s.resolvedExecutions(want)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
 		return
+	}
+	from := now
+	for _, e := range execs {
+		occs = append(occs, occ{
+			RunID: e.RunID, RunName: e.RunName, Type: e.Type, At: e.At,
+			ResultID: e.ResultID, OK: e.OK, Suspended: e.Suspended,
+		})
+		if e.At.Before(from) {
+			from = e.At
+		}
+	}
+	sort.Slice(occs, func(i, j int) bool { return occs[i].At.Before(occs[j].At) })
+	writeJSON(w, http.StatusOK, map[string]any{"from": from, "to": horizon, "occurrences": occs})
+}
+
+// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
+// Includes executions of runs since deleted (persistent logs). ?type=auto|todo scopes it to one surface
+// (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the global log.
+// Kind resolution and type filtering live in the shared resolvedExecutions, which the calendar reuses.
+func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
+	out, err := s.resolvedExecutions(r.URL.Query().Get("type"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
+}
+
+// resolvedExecutions returns every stored execution (newest first) with its kind resolved — a stamped
+// result is trusted, an unstamped one falls back to its still-existing run's kind, an orphan with
+// neither reads as auto — filtered to `typeParam` (auto|todo, or ""/all for both). It is the single
+// source of past-execution truth shared by the execution History (runsExecutions) and the calendar's
+// past side (runsCalendar), so the two can never diverge. Empty (never nil) when no result store is wired.
+func (s *Server) resolvedExecutions(typeParam string) ([]runs.ExecutionSummary, error) {
+	if s.runResults == nil {
+		return []runs.ExecutionSummary{}, nil
+	}
+	execs, err := s.runResults.All()
+	if err != nil {
+		return nil, err
 	}
 	// runID → kind, so an unstamped result inherits the type of its still-existing run.
 	kindByRun := map[string]runs.Type{}
@@ -836,7 +939,7 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 		}
 		return runs.TypeAuto
 	}
-	want := strings.TrimSpace(r.URL.Query().Get("type"))
+	want := strings.TrimSpace(typeParam)
 	out := make([]runs.ExecutionSummary, 0, len(execs))
 	for _, e := range execs {
 		kind := resolve(e)
@@ -846,13 +949,13 @@ func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
 		e.Type = kind // hand back the resolved kind, never an empty one
 		out = append(out, e)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
+	return out, nil
 }
 
-// mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the
-// implementation rules, the Laufregeln, the runs and the ToDos, answers questions about any of them,
-// and — only when asked to create/change runs — embeds a run-plan the caller surfaces as a reviewable
-// proposal.
+// mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the implementation
+// rules, the Laufregeln, the meta-axioms, the runs and the ToDos, answers questions about any of them,
+// and — when asked to create/change something — embeds ONE action the caller surfaces as a reviewable
+// proposal (applied through the same access points the UI uses; see mercury/action.go).
 func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Messages []mercury.ChatMessage `json:"messages"`
@@ -865,67 +968,93 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	ctx, status, err := s.chatContext(r.Context(), cookie)
+	ctx, err := s.chatContext(r, cookie)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	prompt := mercury.MercuryChatPrompt(ctx, body.Messages)
 	result, _, err := aigentic.Run(r.Context(), cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
-	known := make([]string, 0, len(ctx.Axiome))
-	for _, a := range ctx.Axiome {
-		known = append(known, a.ID)
-	}
-	plan, cleaned, ok := mercury.ExtractRunPlan(result.Output, known)
+	action, cleaned, ok := mercury.ExtractChatAction(result.Output, ctx.ActionContext())
 	resp := map[string]any{"reply": cleaned}
 	if ok {
-		resp["proposal"] = plan
+		resp["action"] = action
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // chatContext gathers everything the Mercury-wide assistant knows: one scheme scan (axioms, rules,
-// Laufregeln) plus the runs and ToDos.
-func (s *Server) chatContext(ctx context.Context, cookie string) (mercury.ChatContext, int, error) {
-	paths, status, err := aigentic.GraveList(ctx, cookie, "")
+// Laufregeln, meta-axioms — each with its path and id), the runs and ToDos (each with its id), and the
+// existing repos (as possible ToDo targets). Every actionable entity carries the addressing an action
+// needs, so a proposed action can only reference things that exist.
+func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContext, error) {
+	ctx := r.Context()
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
-		return mercury.ChatContext{}, status, err
+		return mercury.ChatContext{}, err
 	}
 	var c mercury.ChatContext
 	for _, p := range paths {
 		if !strings.HasSuffix(p, ".md") {
 			continue
 		}
+		section := chatSection(p)
+		if section == "" {
+			continue
+		}
 		rec, ok := s.fetchRecord(ctx, cookie, p)
 		if !ok {
 			continue
 		}
-		a := mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}
-		switch {
-		case strings.HasPrefix(p, mercury.NsAxiome+"/"):
-			c.Axiome = append(c.Axiome, a)
-		case strings.HasPrefix(p, mercury.NsRegeln+"/"):
-			c.Regeln = append(c.Regeln, a)
-		case strings.HasPrefix(p, mercury.NsLaeufe+"/"):
-			c.Laufregeln = append(c.Laufregeln, a)
-		}
+		c.Records = append(c.Records, mercury.ChatRecord{
+			Section: section, Path: p, ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body,
+		})
 	}
 	if s.runs != nil {
 		if all, err := s.runs.List(); err == nil {
 			for _, run := range all {
+				cr := mercury.ChatRun{ID: run.ID, Name: run.Name, Todo: run.IsTodo()}
 				if run.IsTodo() {
-					c.Todos = append(c.Todos, run.Name+" — "+targetsLabel(run)+" — "+mercury.Snippet(run.Task, 120))
-					continue
+					cr.Task = run.Task
+					cr.Targets = chatTargets(run.TodoTargets())
+				} else {
+					cr.Schedule = fromSchedule(run.Schedule)
+					cr.AxiomIDs = run.AxiomIDs
 				}
-				c.Runs = append(c.Runs, mercury.PlannedRun{Name: run.Name, AxiomIDs: run.AxiomIDs, Schedule: fromSchedule(run.Schedule)})
+				c.Runs = append(c.Runs, cr)
 			}
 		}
 	}
-	return c, http.StatusOK, nil
+	// Existing repos as possible ToDo targets — best-effort: a GitHub hiccup must not break the chat.
+	if repos, ok := s.userRepos(r); ok {
+		for _, rp := range repos {
+			c.Repos = append(c.Repos, mercury.ChatRepo{ID: rp.ID, Name: rp.Name})
+		}
+	}
+	return c, nil
+}
+
+// chatSection maps a record path to its Mercury section, or "" if it is not under a known namespace.
+func chatSection(path string) string {
+	for _, ns := range []string{mercury.NsAxiome, mercury.NsRegeln, mercury.NsLaeufe, mercury.NsMeta} {
+		if strings.HasPrefix(path, ns+"/") {
+			return ns
+		}
+	}
+	return ""
+}
+
+// chatTargets converts a ToDo's stored targets to the chat action shape.
+func chatTargets(ts []runs.Target) []mercury.ActionTarget {
+	out := make([]mercury.ActionTarget, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, mercury.ActionTarget{Repo: t.Repo, NewRepo: t.NewRepo})
+	}
+	return out
 }
 
 // --- small helpers -----------------------------------------------------------
@@ -965,21 +1094,6 @@ func scheduleSummary(sc runs.Schedule) string {
 	}
 }
 
-// targetsLabel renders a ToDo's destinations for the Mercury-wide assistant context — each target as
-// its repo id, a to-be-created one prefixed "neu:", joined by commas.
-func targetsLabel(run runs.Run) string {
-	targets := run.TodoTargets()
-	parts := make([]string, 0, len(targets))
-	for _, t := range targets {
-		if t.NewRepo != "" {
-			parts = append(parts, "neu: "+t.NewRepo)
-			continue
-		}
-		parts = append(parts, t.Repo)
-	}
-	return strings.Join(parts, ", ")
-}
-
 func actor(r *http.Request) string {
 	if u := userFrom(r); u != nil {
 		return u.Username
@@ -994,6 +1108,15 @@ func indexOfRun(list []runs.Run, id string) int {
 		}
 	}
 	return -1
+}
+
+// orEmptyRuns guarantees a non-nil slice: a nil marshals to JSON null, and the client reads .length off
+// it and blanks the list. Every run list this API returns is a list.
+func orEmptyRuns(r []runs.Run) []runs.Run {
+	if r == nil {
+		return []runs.Run{}
+	}
+	return r
 }
 
 func dedupStrings(in []string) []string {

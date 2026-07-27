@@ -1,8 +1,11 @@
 package api
 
 import (
+	"errors"
+
 	"context"
 	"crypto/rand"
+	"devlab/backend/internal/axiomrepo"
 	"encoding/base32"
 	"net/http"
 	"strings"
@@ -18,7 +21,7 @@ const classifyAttempts = 3
 // proposes the category path within that namespace; the placement is validated and retried with a
 // correction on any contract violation; after three failures the record is parked under
 // <ns>/unsortiert/ rather than guessed — visible, never lost. A stable id is minted into the
-// front-matter (survives a later re-file), and the write refuses to clobber (409 → the slug is
+// front-matter (survives a later re-file), and the write refuses to clobber (ErrExists → the slug is
 // disambiguated and retried once).
 func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -48,9 +51,9 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	csrf := csrfFrom(r)
 
-	paths, status, err := aigentic.GraveList(r.Context(), cookie, "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	categories, members := s.classifyContext(r.Context(), cookie, ns, paths)
@@ -101,10 +104,18 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	ax := mercury.Axiom{ID: mintID(), Titel: titel, Body: body.Body}
 	content := mercury.Render(ax)
 
-	placed, err := s.putAxiom(r.Context(), cookie, csrf, path, desc, content)
+	placed, err := s.putAxiom(r.Context(), actor(r), path, desc, content)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
+	}
+	// Recompose the affected run snapshots and, for a CLAUDE.md-carried namespace, trigger the rollout.
+	s.reconcileAfterWrite(r.Context(), cookie, ns == mercury.NsAxiome || ns == mercury.NsRegeln)
+	// A brand-new axiom belongs to no run yet. Assign it to one automatically in the background (the
+	// write does not wait) so it is enforced without a manual step. Only axioms drive run coverage —
+	// a new Laufregel or meta-axiom leaves the covered set unchanged, so it need not kick.
+	if ns == mercury.NsAxiome {
+		s.kickAutoAssign(r)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
@@ -159,7 +170,7 @@ func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	// For an axiom, fold the meta-axioms into the polish so it comes out already conforming.
 	var metas []mercury.RunAxiom
 	if ns == mercury.NsAxiome {
-		if paths, _, err := aigentic.GraveList(r.Context(), cookie, ""); err == nil {
+		if paths, err := s.axioms.List(r.Context(), ""); err == nil {
 			metas = s.metaAxioms(r.Context(), cookie, paths)
 		}
 	}
@@ -167,8 +178,7 @@ func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 		result, _, err := aigentic.Run(r.Context(), cookie, csrf, "claude-cli",
 			aigentic.Request{Prompt: mercury.OptimizePrompt(body.Titel, body.Body, ns, metas), OutputFormat: "text"})
 		if err != nil {
-			mercuryError(w, http.StatusBadGateway, err)
-			return
+			break // model outage: stop retrying and return the input unchanged (never worse than the original)
 		}
 		if opt, perr := mercury.ParseOptimized(result.Output); perr == nil {
 			writeJSON(w, http.StatusOK, opt)
@@ -195,9 +205,9 @@ func (s *Server) conformRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	paths, status, err := aigentic.GraveList(r.Context(), cookie, "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	metas := s.metaAxioms(r.Context(), cookie, paths)
@@ -286,16 +296,16 @@ func (s *Server) classifyContext(ctx context.Context, cookie, ns string, paths [
 	return categories, members
 }
 
-// putAxiom writes the record, disambiguating a slug clash once (409 → append -2) so a new axiom can
-// never silently overwrite an existing one.
-func (s *Server) putAxiom(ctx context.Context, cookie, csrf, path, desc, content string) (string, error) {
-	_, status, err := aigentic.GravePut(ctx, cookie, csrf, path, desc, []byte(content), false)
+// putAxiom writes the record, disambiguating a slug clash once (ErrExists → append -2) so a new axiom
+// can never silently overwrite an existing one.
+func (s *Server) putAxiom(ctx context.Context, actorName, path, desc, content string) (string, error) {
+	err := s.axioms.Put(ctx, path, content, desc, actorName, false)
 	if err == nil {
 		return path, nil
 	}
-	if status == http.StatusConflict {
+	if errors.Is(err, axiomrepo.ErrExists) {
 		alt := strings.TrimSuffix(path, ".md") + "-2.md"
-		if _, _, err2 := aigentic.GravePut(ctx, cookie, csrf, alt, desc, []byte(content), false); err2 == nil {
+		if err2 := s.axioms.Put(ctx, alt, content, desc, actorName, false); err2 == nil {
 			return alt, nil
 		}
 	}
@@ -317,7 +327,7 @@ func firstNonEmpty(a, b string) string {
 }
 
 // mintID mints a stable, unguessable axiom id. It lives in the record's front-matter, not its path,
-// so it survives a re-file (scheme moves the content with the path).
+// so it survives a re-file (a move carries the content with the path).
 func mintID() string {
 	var b [10]byte
 	_, _ = rand.Read(b[:])

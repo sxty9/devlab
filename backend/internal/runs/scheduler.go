@@ -65,6 +65,9 @@ func NewScheduler(store *Store, exec Executor, tick time.Duration) *Scheduler {
 func (s *Scheduler) Run(ctx context.Context) {
 	t := time.NewTicker(s.tick)
 	defer t.Stop()
+	// A marker left behind by a killed predecessor would defer every deploy restart forever; at start-up
+	// no run can be in flight, so the slot is provably free.
+	clearBusy()
 	s.logf("devlabd: runs scheduler started (tick %s)", s.tick)
 	for {
 		select {
@@ -287,10 +290,12 @@ func (s *Scheduler) setCurrent(id string, cancel context.CancelCauseFunc) {
 	s.curID, s.curStop = id, cancel
 	s.curActivity = &Activity{RunID: id, StartedAt: time.Now().UTC()}
 	s.curMu.Unlock()
+	markBusy(id) // the deploy helper defers its restart while this marker stands
 }
 
 func (s *Scheduler) clearCurrent() {
 	s.curMu.Lock()
 	s.curID, s.curStop, s.curActivity = "", nil, nil
 	s.curMu.Unlock()
+	clearBusy()
 }

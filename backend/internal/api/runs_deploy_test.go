@@ -18,6 +18,73 @@ func tempPRStore(t *testing.T) *runs.PRStore {
 	return runs.NewPRStore()
 }
 
+// tempDeliveryStore builds a DeliveryStore backed by a throwaway file.
+func tempDeliveryStore(t *testing.T) *runs.DeliveryStore {
+	t.Helper()
+	t.Setenv("DEVLAB_MERCURY_RUNS_DELIVERIES", filepath.Join(t.TempDir(), "deliveries.json"))
+	return runs.NewDeliveryStore()
+}
+
+// TestMaintainMarksDeliveryMerged pins the ledger mirror: when Maintain sees a delivery's PR merged, it
+// flips the delivery to merged so LatestOpen (the stacked-PR base) stops pointing at it — the next
+// delivery then stacks on the newest STILL-open predecessor (or the default branch), never a merged one.
+func TestMaintainMarksDeliveryMerged(t *testing.T) {
+	now := time.Now()
+	prs := tempPRStore(t)
+	if err := prs.Add(runs.PendingPR{Repo: "o/x", Number: 7, MergeBy: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deliv := tempDeliveryStore(t)
+	if err := deliv.Add(runs.Delivery{ID: "d1", Repo: "o/x", Branch: "mercury-run/d1", PRNumber: 7, Status: runs.DeliveryOpen, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runPRs: prs, deliveries: deliv}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { return "ok", nil },
+		deployTargetFn: func(string) bool { return true },
+	}
+
+	x.Maintain(context.Background())
+
+	if d, _, _ := deliv.Get("d1"); d.Status != runs.DeliveryMerged {
+		t.Errorf("delivery status = %q, want merged after its PR merged", d.Status)
+	}
+	if _, ok, _ := deliv.LatestOpen("o/x"); ok {
+		t.Errorf("a merged delivery must not remain the stacked-PR base")
+	}
+}
+
+// TestMaintainMarksDeliveryClosed pins the withdrawn path: a PR closed WITHOUT merging closes its
+// delivery (it is no longer an eligible stacked base).
+func TestMaintainMarksDeliveryClosed(t *testing.T) {
+	now := time.Now()
+	prs := tempPRStore(t)
+	if err := prs.Add(runs.PendingPR{Repo: "o/x", Number: 8, MergeBy: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deliv := tempDeliveryStore(t)
+	if err := deliv.Add(runs.Delivery{ID: "d2", Repo: "o/x", Branch: "mercury-run/d2", PRNumber: 8, Status: runs.DeliveryOpen, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runPRs: prs, deliveries: deliv}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: false, State: "closed"}, nil // closed without merge
+		},
+	}
+
+	x.Maintain(context.Background())
+
+	if d, _, _ := deliv.Get("d2"); d.Status != runs.DeliveryClosed {
+		t.Errorf("delivery status = %q, want closed after its PR was closed unmerged", d.Status)
+	}
+}
+
 // ─── Pure decision helpers ─────────────────────────────────────────────────
 
 // TestShouldCheckPR pins Finding A's read-budget discipline: report/pr never touch an in-window PR
@@ -82,9 +149,10 @@ func TestDecidePR(t *testing.T) {
 	}
 }
 
-// TestShouldDevDeploy pins Findings B + C's gate: a dev-deploy runs ONLY in full mode, and NEVER for
-// the self repo (whose restart would kill the running sweep). Covers "dev-deploy only in full mode"
-// and "self repo dev-deploy skipped".
+// TestShouldDevDeploy pins the gate: a dev-deploy runs ONLY in full mode — for EVERY repo, the self
+// repo included. The old self-repo exclusion (a restart would kill the running sweep) is gone: the
+// install is harmless and the restart is deferred until the run slot frees (devlab-restart-idle), so
+// excluding the repo only meant DevLab never went live from its own runs.
 func TestShouldDevDeploy(t *testing.T) {
 	self := selfRepoID() // default "devlab"
 	cases := []struct {
@@ -95,7 +163,7 @@ func TestShouldDevDeploy(t *testing.T) {
 		{"report", "aigentic", false},
 		{"pr", "aigentic", false},
 		{"full", "aigentic", true},
-		{"full", self, false}, // self repo skipped even in full mode (Finding B)
+		{"full", self, true}, // the self repo deploys too — its restart is deferred, not skipped
 		{"report", self, false},
 		{"pr", self, false},
 	}
@@ -304,5 +372,63 @@ func TestMaintainFullModeThrottlesInWindowRecheck(t *testing.T) {
 	}
 	if r, _ := store.List(); len(r) != 1 {
 		t.Errorf("an in-window open PR must stay tracked, got %+v", r)
+	}
+}
+
+// TestMaintainMergesInCreationOrder pins the queue discipline: every run branches off the default
+// branch, so a younger PR that lands first turns the older one — touching the same files — into a
+// conflict that never resolves itself. Two overdue PRs of the SAME repo must therefore merge oldest
+// first, and a younger one must NOT overtake while the older is still open (here: its merge fails).
+// A PR of a DIFFERENT repo is unaffected — the queue is per repo, not global.
+func TestMaintainMergesInCreationOrder(t *testing.T) {
+	store := tempPRStore(t)
+	now := time.Now()
+	older := now.Add(-3 * time.Hour)
+	// Deliberately added youngest-first, so passing this test cannot rely on insertion order.
+	for _, p := range []runs.PendingPR{
+		{Repo: "o/app", Number: 2, CreatedAt: older.Add(time.Hour), MergeBy: now.Add(-time.Minute)},
+		{Repo: "o/app", Number: 1, CreatedAt: older, MergeBy: now.Add(-time.Minute)},
+		{Repo: "o/other", Number: 9, CreatedAt: older, MergeBy: now.Add(-time.Minute)},
+	} {
+		if err := store.Add(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var merged []int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(_ context.Context, _, _ string, _ int) (github.PullRequest, error) {
+			return github.PullRequest{State: "open"}, nil
+		},
+		mergePRFn: func(_ context.Context, _, repo string, n int) error {
+			merged = append(merged, n)
+			if repo == "o/app" && n == 1 {
+				return errors.New("merge conflict") // the oldest stays open → it blocks its repo's queue
+			}
+			return nil
+		},
+	}
+
+	x.Maintain(context.Background())
+
+	// The oldest of o/app was attempted; #2 must NOT have been merged behind its stuck predecessor.
+	for _, n := range merged {
+		if n == 2 {
+			t.Errorf("PR #2 overtook the still-open older PR #1 of the same repo — merge order broken (merged=%v)", merged)
+		}
+	}
+	if len(merged) == 0 || merged[0] != 1 {
+		t.Errorf("expected the OLDEST PR (#1) attempted first, got %v", merged)
+	}
+	var sawOther bool
+	for _, n := range merged {
+		if n == 9 {
+			sawOther = true
+		}
+	}
+	if !sawOther {
+		t.Errorf("a PR of a different repo must not be blocked by o/app's queue (merged=%v)", merged)
 	}
 }

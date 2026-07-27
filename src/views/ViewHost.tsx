@@ -3,6 +3,7 @@ import { IdeShell } from '@/shell/IdeShell';
 import { Dashboard } from '@/views/Dashboard';
 import { MercuryView } from '@/views/MercuryView';
 import { AtlasView } from '@/views/AtlasView';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 
 /** The single view gate: Dashboard · IDE · Mercury · Atlas.
  *
@@ -15,12 +16,20 @@ export function ViewHost() {
 
   return (
     <>
-      {view.kind === 'dashboard' && <Dashboard />}
-      {view.kind === 'mercury' && <MercuryView />}
-      {view.kind === 'atlas' && <AtlasView />}
+      {/* A render crash in a data-driven view must never blank the whole app — this contains it to the
+          content area (the top bar stays), and resetting on view.kind lets switching tabs recover. The
+          always-mounted IDE gets its OWN boundary so a crash on one side can't unmount the other (which
+          would drop the IDE's unsaved drafts, terminal socket and running agent, and vice-versa). */}
+      <ErrorBoundary resetKeys={[view.kind]}>
+        {view.kind === 'dashboard' && <Dashboard />}
+        {view.kind === 'mercury' && <MercuryView />}
+        {view.kind === 'atlas' && <AtlasView />}
+      </ErrorBoundary>
       {openedRepo && (
         <div className={view.kind === 'ide' ? 'contents' : 'hidden'}>
-          <IdeShell />
+          <ErrorBoundary>
+            <IdeShell />
+          </ErrorBoundary>
         </div>
       )}
     </>

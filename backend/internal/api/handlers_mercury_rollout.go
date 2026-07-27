@@ -3,13 +3,14 @@ package api
 import (
 	"context"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/mercury"
+	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
 
@@ -21,6 +22,7 @@ type rolloutRepo struct {
 	Branch  string `json:"branch,omitempty"`
 	Changed bool   `json:"changed"`
 	Commit  string `json:"commit,omitempty"`
+	PRUrl   string `json:"prUrl,omitempty"`   // the pull request carrying this repo's update
 	Skipped string `json:"skipped,omitempty"` // why this repo produced no change (error or "up-to-date")
 }
 
@@ -49,7 +51,7 @@ func (s *Server) mercuryRollout(w http.ResponseWriter, r *http.Request) {
 	// Build the generated block once from the live store.
 	block, err := s.buildRolloutBlock(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	splice := func(old string) string { return mercury.SpliceMarker(old, block) }
@@ -88,6 +90,17 @@ func (s *Server) mercuryRollout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// mercuryRolloutStatus reports the last automatic rollout — when it ran, which repos changed, how many
+// were already current, and which were skipped — portioned for the Mercury surface, not a raw log. It
+// returns null until the first background rollout completes. Read-only: the worker owns the writing.
+func (s *Server) mercuryRolloutStatus(w http.ResponseWriter, r *http.Request) {
+	var last *RolloutReport
+	if s.autoRollout != nil {
+		last = s.autoRollout.report()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"last": last})
+}
+
 // rolloutOne clones/updates a repo and syncs its CLAUDE.md. Never fatal: any failure becomes a
 // skipped entry so the rollout is per-repo independent.
 func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token string, splice func(string) string, apply bool) rolloutRepo {
@@ -113,7 +126,11 @@ func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token strin
 
 	wt, _ := s.workspaces.Path(user, id)
 	exec := workspace.Executor{User: user, PerUser: true}
-	out, err := exec.SyncFile(ctx, wt, token, branch, "CLAUDE.md", "CLAUDE.MD", splice, !apply)
+	// The constitution reaches a repo the SAME WAY every other change does: on a branch, through a pull
+	// request. Pushing straight onto the default branch was the one path that bypassed review entirely —
+	// and the one thing that made a protected default branch impossible.
+	prBranch := "mercury-axioms/" + rolloutStamp()
+	out, err := exec.SyncFile(ctx, wt, token, branch, "CLAUDE.md", "CLAUDE.MD", splice, !apply, prBranch)
 	if err != nil {
 		res.Skipped = err.Error()
 		return res
@@ -122,13 +139,53 @@ func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token strin
 	res.Commit = out.Commit
 	if !out.Changed {
 		res.Skipped = "up-to-date"
+		return res
+	}
+	if !apply {
+		return res // dry-run: nothing was pushed, so there is no PR to raise
+	}
+
+	pr, err := github.CreatePullRequest(ctx, token, fullName, prBranch, branch,
+		"Mercury: Axiome & Implementierungsregeln aktualisieren",
+		"Automatisch erzeugt vom Mercury-Rollout. Aktualisiert den generierten Abschnitt der CLAUDE.md; "+
+			"alles außerhalb der Marker bleibt unangetastet.\n\n🤖 Mercury")
+	if err != nil {
+		if found, ok := github.FindOpenPullRequest(ctx, token, fullName, prBranch); ok {
+			pr = found
+		} else {
+			res.Skipped = "PR: " + err.Error()
+			return res
+		}
+	}
+	res.PRUrl = pr.HTMLURL
+	// Tracked like a run PR, so the same ordered auto-merge carries it onto the default branch.
+	if s.runPRs != nil {
+		_ = s.runPRs.Add(runs.PendingPR{
+			Repo: fullName, Number: pr.Number, URL: pr.HTMLURL, RunID: "rollout",
+			CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(rolloutMergeAfter()).UTC(),
+		})
 	}
 	return res
 }
 
+// rolloutStamp is the per-rollout branch suffix: one branch per rollout, shared across repos, so a
+// repeated rollout of the same content reuses nothing stale.
+func rolloutStamp() string { return time.Now().UTC().Format("20060102-150405") }
+
+// rolloutMergeAfter mirrors the run PRs' auto-merge window (DEVLAB_RUNS_AUTOMERGE), so constitution
+// PRs and run PRs live under one rule rather than two.
+func rolloutMergeAfter() time.Duration {
+	if d := os.Getenv("DEVLAB_RUNS_AUTOMERGE"); d != "" {
+		if pd, err := time.ParseDuration(d); err == nil && pd > 0 {
+			return pd
+		}
+	}
+	return 30 * 24 * time.Hour
+}
+
 // buildRolloutBlock reads every axiom and rule from the store, parses each, and renders the block.
 func (s *Server) buildRolloutBlock(ctx context.Context, cookie string) (string, error) {
-	paths, _, err := aigentic.GraveList(ctx, cookie, "")
+	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
 		return "", err
 	}
@@ -149,7 +206,7 @@ func (s *Server) buildRolloutBlock(ctx context.Context, cookie string) (string, 
 }
 
 func (s *Server) fetchRecord(ctx context.Context, cookie, path string) (mercury.Record, bool) {
-	data, found, _, err := aigentic.GraveGet(ctx, cookie, path)
+	data, found, err := s.axioms.Get(ctx, path)
 	if err != nil || !found {
 		return mercury.Record{}, false
 	}

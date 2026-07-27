@@ -1,22 +1,23 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/mercury"
 )
 
-// Mercury is the axiom-management surface. It reads and writes the constitution through aigentic's
-// scheme-backed graveyard (owning no store of its own), forwarding the caller's session so aigentic
-// resolves the same identity and enforces its own rights.
+// Mercury is the axiom-management surface. It reads and writes the constitution through a single
+// access point — the axiomrepo store, a working copy of the dedicated constitution Git repository.
+// There is no second path to the same data.
 //
-// The one thing scheme cannot express is a manual sibling order (it sorts by name), so Mercury keeps
-// a small display-only order file beside it — a global preference, since the constitution is global.
-// orderMu guards its load-modify-save.
+// The one thing the record layout cannot express is a manual sibling order (paths sort by name), so
+// Mercury keeps a small display-only order file beside the clone — a global preference, since the
+// constitution is global. orderMu guards its load-modify-save.
 var orderMu sync.Mutex
 
 // mercuryOrderPath resolves the manual-order file, matching the other DevLab store conventions.
@@ -30,9 +31,9 @@ func mercuryOrderPath() string {
 // mercuryTree returns the whole axiom model — the three namespaces (axiome, regeln, laeufe) as
 // arbitrarily deep category trees, derived from the record paths and the user's manual sibling order.
 func (s *Server) mercuryTree(w http.ResponseWriter, r *http.Request) {
-	paths, status, err := aigentic.GraveList(r.Context(), r.Header.Get("Cookie"), "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, mercury.Build(paths, mercury.LoadOrder(mercuryOrderPath())))
@@ -72,9 +73,9 @@ func (s *Server) mercuryItem(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	data, found, status, err := aigentic.GraveGet(r.Context(), r.Header.Get("Cookie"), path)
+	data, found, err := s.axioms.Get(r.Context(), path)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, err)
 		return
 	}
 	if !found {
@@ -85,15 +86,22 @@ func (s *Server) mercuryItem(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"path": path, "axiom": ax})
 }
 
-// mercuryError maps aigentic's status onto DevLab's, translating the store's absence into an
-// actionable message rather than a bare 502.
-func mercuryError(w http.ResponseWriter, status int, err error) {
-	switch status {
-	case http.StatusServiceUnavailable:
-		writeErr(w, http.StatusServiceUnavailable, "Mercury's store is unavailable — aigentic must run with the scheme graveyard")
-	case http.StatusForbidden:
-		writeErr(w, http.StatusForbidden, "Mercury needs the aigentic 'run' right (hp_aigentic_run)")
+// mercuryError maps a Mercury backend failure onto an HTTP response that is honest about WHY it could
+// not be served. The two store-outage sentinels get distinct, actionable 503s — and, deliberately,
+// neither is ever an empty success: a constitution that cannot be reached must never read as "there
+// are no axioms". Anything else (a run-store slip, an unexpected git error) falls through to a plain
+// 502 carrying the underlying detail.
+func mercuryError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, axiomrepo.ErrNoToken):
+		writeErr(w, http.StatusServiceUnavailable,
+			"The constitution is unavailable: no GitHub account is linked to reach the axioms repository. "+
+				"Link the runner account, then retry — this is a connection problem, not an empty constitution.")
+	case errors.Is(err, axiomrepo.ErrUnavailable):
+		writeErr(w, http.StatusServiceUnavailable,
+			"The constitution is unavailable: the axioms repository could not be reached (no network, or the "+
+				"clone failed). This is a read error, not an empty constitution — no axioms have been lost.")
 	default:
-		writeErr(w, http.StatusBadGateway, "Mercury store error")
+		writeErr(w, http.StatusBadGateway, "Mercury backend error: "+err.Error())
 	}
 }

@@ -25,13 +25,32 @@ WEB="$ART/web"              # prebuilt Vite SPA (buildArtifact writes the SPA to
 
 case "$ENVN" in
   dev)
-    # Install the PREBUILT artifact into this box's local service paths and restart the local unit.
+    # Install the PREBUILT artifact into this box's local service paths, then restart the local unit.
     # (rsync --delete updates in place — the site is never emptied mid-copy — and prunes stale assets.)
-    echo "[deploy devlab] dev: install prebuilt binary + web, restart local devlabd"
+    #
+    # devlab is the ONE repo whose dev-deploy restarts the very process that drives Mercury runs. The
+    # install itself is harmless (a running process keeps its loaded image), so it happens now; only the
+    # RESTART is disruptive and is therefore handed to devlab-restart-idle, which waits for the run slot
+    # to free up. It runs as a TRANSIENT UNIT (systemd-run) so it lives outside devlabd's control group
+    # and survives the restart it performs — a plain background child would be killed with the unit.
+    echo "[deploy devlab] dev: install prebuilt binary + web"
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     mkdir -p /var/lib/devlab/www
     rsync -a --delete "$WEB"/ /var/lib/devlab/www/
-    systemctl restart devlabd
+    IDLE_HELPER=/usr/local/sbin/devlab-restart-idle
+    if [[ -x "$IDLE_HELPER" ]] && command -v systemd-run >/dev/null 2>&1; then
+      # A fixed unit name makes this idempotent: while one deferred restart is pending, further deploys
+      # simply ride along with it instead of queueing a restart each.
+      if systemd-run --collect --quiet --unit=devlabd-restart-idle "$IDLE_HELPER" 2>/dev/null; then
+        echo "[deploy devlab] dev: restart scheduled (fires as soon as no run is in flight)"
+      else
+        echo "[deploy devlab] dev: a deferred restart is already pending — installed bytes ride along"
+      fi
+    else
+      # No helper installed (older box): keep the historical behaviour rather than skipping the restart.
+      echo "[deploy devlab] dev: restart helper unavailable — restarting directly"
+      systemctl restart devlabd
+    fi
     echo "[deploy devlab] dev: done"
     ;;
 

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
@@ -36,8 +37,15 @@ type Server struct {
 	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
+	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
+	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
+	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
+	runExec     *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -65,7 +73,7 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: chat store disabled: %v", err)
 		chatStore = nil
 	}
-	return &Server{
+	s := &Server{
 		v:           v,
 		reposBase:   base,
 		links:       store,
@@ -75,9 +83,37 @@ func New(v *auth.Verifier) *Server {
 		runs:        runs.NewStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
+		runNotices:  runs.NewNoticeStore(),
+		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
+		axiomChecks: runs.NewAxiomChecks(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
+	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
+	// identity the autonomous pipeline commits with — so an edit works whether or not the person making
+	// it has linked GitHub themselves. With no link store (dev/preview, no encryption key) there is no
+	// token: report that cleanly so the store maps it to ErrNoToken rather than panicking on a nil store.
+	s.axioms = axiomrepo.New(axiomsDir(), axiomsRepo(), func() (string, error) {
+		if s.links == nil {
+			return "", errors.New("no GitHub link store configured")
+		}
+		return s.links.Token(axiomsTokenUser())
+	})
+	s.autoRollout = newAutoRollout(s)
+	// The auto-assigner runs on a caller's forwarded session (like the AI-fill button), so it needs no
+	// scheduler-style provisioning — arm it whenever the run store exists.
+	s.assigner = newAutoAssigner(s)
+	// The constitution repository documents itself. Seed its README on startup when an account is
+	// configured to push with — best-effort and create-only, so it never blocks and never fights a
+	// hand-edited README. Without a token user we skip it entirely (no background network I/O).
+	if axiomsTokenUser() != "" {
+		go func() {
+			if err := s.axioms.EnsureReadme(context.Background()); err != nil {
+				log.Printf("devlabd: axiom repository README seed skipped: %v", err)
+			}
+		}()
+	}
+	return s
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -169,12 +205,13 @@ func (s *Server) Handler() http.Handler {
 	// rights manifests + their Caddy routes). Read-only, host-scoped, no workspace access.
 	mux.HandleFunc("GET /api/atlas", s.guard(s.atlasGraph))
 
-	// Mercury — the axiom-management model over aigentic's scheme-backed graveyard. Read tier for
-	// now (the tree and a record); the caller's session is forwarded to aigentic.
+	// Mercury — the axiom-management model over the constitution's own Git repository (package
+	// axiomrepo). Read tier (the tree and a record); both are served from the local working copy.
 	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
 	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
-	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
-	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
+	// Add an axiom: aigentic classifies it into the tree, DevLab commits it to the constitution repo.
+	// CSRF-guarded; the push uses the runner's linked account (see New), so the caller needs no GitHub
+	// link of their own.
 	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
 	// Edit an axiom's text; move/rename it; delete it; rename a whole category. The user owns the
 	// tree by hand. All CSRF-guarded store writes; no GitHub involved.
@@ -193,10 +230,12 @@ func (s *Server) Handler() http.Handler {
 	// Mercury level (not inside a section), and may return a reviewable run-plan proposal.
 	mux.HandleFunc("POST /api/mercury/chat", s.guardCSRF(s.mercuryChat))
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
-	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
+	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account). The
+	// automatic rollout (on axiom/rule writes) runs in the background; GET reports its last result.
+	mux.HandleFunc("GET /api/mercury/rollout", s.guard(s.mercuryRolloutStatus))
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
-	// One-time constitution migration: decompose the original axiom document into atoms and file
-	// each via aigentic. Dry-run by default (?apply=true writes). Store authority, not GitHub.
+	// One-time constitution migration: decompose the original axiom document into atoms and commit
+	// each into the constitution repo. Dry-run by default (?apply=true writes).
 	mux.HandleFunc("POST /api/mercury/migrate", s.guardCSRF(s.mercuryMigrate))
 
 	// Automatische Läufe — run instances: scheduled autonomous runs over all holistic repos, whose
@@ -210,6 +249,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
 	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
+	// Automatic axiom→run assignment feed: the user is informed of every background assignment (and any
+	// failure) here, and can dismiss acknowledged entries. Reads under guard; dismiss/clear under CSRF.
+	mux.HandleFunc("GET /api/mercury/runs/notices", s.guard(s.runsNoticesList))
+	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
+	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
+	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -217,7 +262,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs", s.guardCSRF(s.runCreate))
 	mux.HandleFunc("PUT /api/mercury/runs/{id}", s.guardCSRF(s.runUpdate))
 	mux.HandleFunc("DELETE /api/mercury/runs/{id}", s.guardCSRF(s.runDelete))
-	mux.HandleFunc("POST /api/mercury/runs/{id}/recompose", s.guardCSRF(s.runRecompose))
 	mux.HandleFunc("POST /api/mercury/runs/ai-fill", s.guardCSRF(s.runsAiFill))
 	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))
@@ -225,6 +269,9 @@ func (s *Server) Handler() http.Handler {
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
 	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
+	// Deliveries: roll back a shipped delivery (counter-booking), or reset a repo's dev branch to default.
+	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))
+	mux.HandleFunc("POST /api/mercury/runs/reset", s.guardCSRF(s.runRepoReset))
 
 	// ToDo media — images/documents attached to a concrete ToDo, materialized into the agent's
 	// workspace at run time so the AI considers them. Upload/remove mutate (CSRF); raw serves bytes.
@@ -312,9 +359,10 @@ func (s *Server) guardWrite(h http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
-// guardCSRF gates a mutating request that does NOT touch a GitHub repo: a DevLab session (guard) +
-// CSRF, without the GitHub-link requirement. Used by Mercury's axiom writes, whose authority is
-// aigentic's hp_aigentic_run on the forwarded session, not GitHub.
+// guardCSRF gates a mutating request that does NOT require the CALLER to have linked GitHub: a DevLab
+// session (guard) + CSRF. Used by Mercury's axiom writes and run CRUD, whose authority is the DevLab
+// session; where such a write reaches GitHub (the constitution repo) it is pushed server-side with the
+// runner's own linked account (see New), never the caller's.
 func (s *Server) guardCSRF(h http.HandlerFunc) http.HandlerFunc {
 	return s.guard(func(w http.ResponseWriter, r *http.Request) {
 		if !s.v.CheckCSRF(r) {

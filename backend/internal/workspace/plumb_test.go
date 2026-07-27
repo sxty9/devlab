@@ -52,7 +52,7 @@ func TestSyncFilePlumbing(t *testing.T) {
 	}
 
 	// Dry-run: reports a change but pushes nothing.
-	dry, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, true)
+	dry, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, true, "")
 	if err != nil {
 		t.Fatalf("dry-run: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestSyncFilePlumbing(t *testing.T) {
 	}
 
 	// Apply.
-	res, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, false)
+	res, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, false, "")
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestSyncFilePlumbing(t *testing.T) {
 	}
 
 	// Idempotent: a second identical run changes nothing (same tree → no commit).
-	again, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, false)
+	again, err := e.SyncFile(ctx, wt, "", "main", "CLAUDE.md", "CLAUDE.MD", splice, false, "")
 	if err != nil {
 		t.Fatalf("second run: %v", err)
 	}

@@ -128,6 +128,24 @@ export interface AiMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: string;
+  /** A structured question the assistant posed (interactive turns); rendered as clickable options. */
+  ask?: AiAsk;
+}
+
+/** A structured multiple-choice question the AI posed, answerable by clicking options in the chat
+ * bubble (à la Claude Code). Mirrors aigentic's interactive protocol, surfaced verbatim. */
+export interface AiAskOption {
+  label: string;
+  description?: string;
+}
+export interface AiAskQuestion {
+  header?: string;
+  question: string;
+  options: AiAskOption[];
+  multiSelect?: boolean;
+}
+export interface AiAsk {
+  questions: AiAskQuestion[];
 }
 
 /** What the AI assistant returns after a run (proxied from aigentic). */
@@ -136,6 +154,8 @@ export interface AssistantReply {
   engine: string;
   model: string;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number; truncated: boolean };
+  /** Set when the model replied with a structured question instead of (or alongside) prose. */
+  ask?: AiAsk;
 }
 
 /** The payload for one AI turn. */
@@ -370,13 +390,15 @@ export interface RunAttachment {
 }
 
 /** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
- *  axioms + all Laufregeln (`stale` = that snapshot drifted from the store); a todo's prompt is just
- *  its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
+ *  axioms + all Laufregeln and kept current by every scheme write (so it never drifts); a todo's prompt
+ *  is just its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
 export interface Run {
   id: string;
   name: string;
   type?: RunType; // absent = auto (records predating ToDos)
   enabled: boolean;
+  model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
+  effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
   schedule: RunSchedule;
   axiomIds: string[];
   // todo only
@@ -395,7 +417,6 @@ export interface Run {
   nextFireAt?: string;
   lastFiredAt?: string;
   lastResult?: RunResultRef;
-  stale?: boolean;
   // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
   suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
 }
@@ -405,6 +426,8 @@ export interface RunInput {
   name: string;
   type?: RunType; // default 'auto'
   enabled: boolean;
+  model?: string; // Claude model id/alias; '' or absent = runner default (opus)
+  effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
@@ -417,11 +440,46 @@ export interface RunList {
   axioms: Record<string, string>; // axiom id → title, for display
 }
 
+/** One repo the last automatic rollout could not update, with a short reason (not a raw log). */
+export interface RolloutSkip {
+  repo: string;
+  reason: string;
+}
+
+/** The portioned outcome of the last automatic CLAUDE.md rollout: when it ran, which repos received a
+ *  new commit, how many were already current, and which were skipped. `error` is a whole-rollout
+ *  failure (e.g. no runner token). Absent (`last: null`) until the first rollout since startup. */
+export interface RolloutReport {
+  at: string;
+  repos: number;
+  changed: string[];
+  unchanged: number;
+  skipped?: RolloutSkip[];
+  error?: string;
+}
+
 /** Which axioms are already backed by a run (badges), plus id→path and id→title lookups. */
 export interface RunCoverage {
   covered: Record<string, string[]>; // axiom id → run ids
   index: Record<string, string>; // axiom id → scheme path
   axioms: Record<string, string>; // axiom id → title
+  // An automatic assignment is scheduled or running, so a currently-uncovered axiom is only TEMPORARILY
+  // uncovered. Coverage itself stays honest; this merely lets the UI show the state as transient.
+  pending?: boolean;
+}
+
+/** One entry in the automatic axiom→run assignment feed: either an assignment happened (`assigned`) or
+ *  it could not be carried out (`failed`). Portioned, and free of any raw log. */
+export interface RunNotice {
+  id: string;
+  at: string;
+  kind: 'assigned' | 'failed';
+  runId?: string; // assigned only — the run the axioms landed in (click-through to adjust it)
+  runName?: string; // assigned only
+  newRun?: boolean; // assigned only — a fresh run was created (vs. an existing one extended)
+  axiomIds: string[];
+  axioms: string[]; // title snapshot, so the feed reads without a live lookup
+  reason?: string; // failed only — a short human reason
 }
 
 /** One proposed run from an AI-planning button (reviewable before it is applied). */
@@ -457,7 +515,40 @@ export interface RunResultRef {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
+  /** How far delivery got. A finished execution is not "done" — it sits on a rung: implemented →
+   *  dev-deployed → PR offen → gemergt → prod-live. The server attests each rung (the executor the
+   *  first two, the PR maintenance the last two); `runStage` turns them into the label. */
+  deployed?: boolean;
+  prUrl?: string;
+  merged?: boolean;
+  prodDeployed?: boolean;
 }
+
+/** The delivery ladder, mirroring runs.Stage on the server: the furthest rung actually reached.
+ *  Deliberately NOT a green "Erledigt" — a run whose PR is still open has delivered nothing yet. */
+export type RunStage = 'failed' | 'suspended' | 'implemented' | 'dev-deployed' | 'pr-open' | 'merged' | 'prod-deployed';
+
+/** Derives the stage from a result reference (most-advanced rung first). */
+export function runStage(ref: RunResultRef | null | undefined): RunStage | null {
+  if (!ref) return null;
+  if (ref.prodDeployed) return 'prod-deployed';
+  if (ref.merged) return 'merged';
+  if (!ref.ok) return 'failed';
+  if (ref.prUrl) return 'pr-open';
+  if (ref.deployed) return 'dev-deployed';
+  return 'implemented';
+}
+
+/** The German label + tint for each rung, so every surface names a stage identically. */
+export const RUN_STAGE_LABEL: Record<RunStage, { label: string; tint: 'success' | 'accent' | 'warning' | 'danger' }> = {
+  'prod-deployed': { label: 'prod-live', tint: 'success' },
+  merged: { label: 'main-merged', tint: 'success' },
+  'pr-open': { label: 'PR offen', tint: 'accent' },
+  'dev-deployed': { label: 'dev-deployed', tint: 'accent' },
+  implemented: { label: 'implementiert', tint: 'warning' },
+  suspended: { label: 'pausiert', tint: 'warning' },
+  failed: { label: 'fehlgeschlagen', tint: 'danger' },
+};
 
 export interface RunStep {
   name: string; // analyze | implement | push | pr | deploy
@@ -473,12 +564,41 @@ export interface RepoResult {
   ok: boolean;
   deployed: boolean;
   prUrl?: string;
+  /** The delivered dev state: the persistent integration branch this run grew (mercury-dev) and the
+   *  exact commit dev serves. Always set once a run reaches the dev branch — even when it added nothing. */
+  devBranch?: string;
+  devCommit?: string;
+  /** This delivery's stacked-PR base: the previous still-open delivery's branch, else the default branch. */
+  prBase?: string;
+  /** The recorded delivery id (rollback target), when this run produced a delivery for the repo. */
+  deliveryId?: string;
   steps: RunStep[] | null; // null when the repo failed before any step ran (Go marshals the empty slice as null)
   error?: string;
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
   numTurns?: number;
+}
+
+/** One recorded delivery — a run's addressable unit of work at a repo (commit range + stacked PR). */
+export interface Delivery {
+  id: string;
+  runId: string;
+  resultId: string;
+  runName?: string;
+  repo: string;
+  branch: string;
+  devBranch: string;
+  baseBranch: string;
+  fromCommit: string;
+  toCommit: string;
+  prNumber?: number;
+  prUrl?: string;
+  createdAt: string;
+  status: 'open' | 'merged' | 'closed' | 'reverted';
+  revertedAt?: string;
+  revertedBy?: string;
+  revertOf?: string;
 }
 
 export interface RunResult {
@@ -491,8 +611,12 @@ export interface RunResult {
   /** The run's Promptstellung for THIS execution — the exact prompt the agent was driven by,
    *  snapshotted at run time. Absent on executions recorded before it was captured. */
   prompt?: string;
+  /** Which Claude engine drove THIS execution: the resolved model, and the selected effort tier
+   *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
+  model?: string;
+  effort?: string;
   ok: boolean;
-  repos: RepoResult[];
+  repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed
   // repos) so the live view can show it with its running steps and the agent's streaming output.
   live?: RepoResult;
@@ -511,13 +635,46 @@ export interface RunActive {
   startedAt: string;
 }
 
-/** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */
+/** One run the system is currently working, for the transparent "Aktive Läufe" overview: either
+ *  EXECUTING right now or SUSPENDED on the usage limit mid-execution (paused, waiting to resume). Enough
+ *  to render a list row — which run, on which repo/step, how far, how much spent — without a per-run
+ *  fetch. Server-assembled from the live Activity + the run's result document; purely observational. */
+export interface RunInFlight {
+  runId: string;
+  runName: string;
+  type: RunType; // auto | todo
+  state: 'executing' | 'suspended';
+  resultId?: string;
+  startedAt?: string; // execution start (executing)
+  resumeAt?: string; // when a suspended run resumes
+  attempts?: number; // suspended: resume attempts so far
+  currentRepo?: string; // the repo in flight (executing)
+  currentStep?: string; // the step running right now (executing)
+  reposDone: number; // repos already completed this execution
+  reposTotal?: number; // known only for ToDos (exact target count); omitted for automatic runs
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  numTurns: number;
+}
+
+/** One entry in the calendar — the union of past and upcoming runs. `type` separates automatic runs
+ *  from ToDos (colour). A FUTURE firing carries its `schedule`; a completed (PAST) execution carries
+ *  `resultId` and status (`ok`/`suspended`) instead. The presence of `resultId` marks an occurrence as
+ *  past — the calendar shows its outcome and opens the full report on click. */
 export interface RunOccurrence {
   runId: string;
   runName: string;
   type: RunType;
   at: string;
-  schedule: string;
+  /** Future firing: how the run recurs. Absent on a past execution. */
+  schedule?: string;
+  /** Past execution: its result id — opens the full status/report via mercuryRunResult. */
+  resultId?: string;
+  /** Past execution: pass/fail outcome. */
+  ok?: boolean;
+  /** Past execution: paused on the Claude usage limit. */
+  suspended?: boolean;
 }
 
 export interface RunCalendar {
@@ -548,10 +705,29 @@ export interface RunChatMessage {
   content: string;
 }
 
-/** A chat reply, optionally carrying a reviewable run-plan the model proposed. */
+/** One destination of a proposed ToDo action: exactly an existing repo id OR a new repo name. */
+export interface ActionTarget {
+  repo?: string;
+  newRepo?: string;
+}
+
+/** A single mutating operation the Mercury-wide assistant proposes for the user to review and apply.
+ *  Each kind mirrors one operation of the Mercury UI and is applied through the SAME data-source method
+ *  the UI uses — the chat opens no parallel path. Discriminated on `kind`. */
+export type MercuryAction =
+  | { kind: 'create_todo'; name: string; task: string; targets: ActionTarget[]; dueAt?: string }
+  | { kind: 'create_run'; name: string; axiomIds: string[]; schedule: RunSchedule }
+  | { kind: 'add_record'; section: 'axiome' | 'regeln' | 'laeufe' | 'meta'; titel: string; body: string }
+  | { kind: 'edit_record'; path: string; titel: string; body: string }
+  | { kind: 'delete_record'; path: string }
+  | { kind: 'delete_run'; runId: string }
+  | { kind: 'run_now'; runId: string }
+  | { kind: 'plan_runs'; mode: 'fill' | 'replace'; runs: PlannedRun[] };
+
+/** A chat reply, optionally carrying ONE reviewable action the model proposed. */
 export interface RunChatReply {
   reply: string;
-  proposal?: RunPlan;
+  action?: MercuryAction;
 }
 
 // ── Atlas — the deployed Holistic landscape ──────────────────────────────────

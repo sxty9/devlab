@@ -471,6 +471,210 @@ func (e Executor) ResetToRemote(ctx context.Context, wt, token, branch string) e
 	return nil
 }
 
+// ─── Growing dev integration branch (the autonomous runner) ─────────────────
+//
+// The runner no longer RECONSTRUCTS each run's state from "default branch + a hand-picked set of open
+// PRs" (which silently dropped finished work whenever the pick missed a PR). Instead a single
+// persistent dev branch per repo (mercury-dev) GROWS: every run sits on the accumulated state, folds
+// the default branch INTO it, and adds its work on top. The remote mercury-dev is the durable, nameable
+// record of exactly what dev serves. See EnsureDevBranch / FoldInBranch / CleanWorktree.
+
+// ErrMergeConflict is returned by FoldInBranch when folding the default branch conflicts with the
+// accumulated dev state. It is NON-fatal by design: the caller records a step and proceeds on the dev
+// branch as-is (the state simply lacks the very newest default until a run resolves it) — the run is
+// never sunk by it.
+var ErrMergeConflict = errors.New("merge conflict")
+
+// remoteRefExists reports whether origin/<branch> exists in the local remote-tracking refs. Call after
+// a Fetch so the answer reflects the real remote. A bad branch name is reported as "does not exist"
+// rather than reaching git.
+func (e Executor) remoteRefExists(ctx context.Context, wt, branch string) bool {
+	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
+		return false
+	}
+	_, err := runGit(e.gitIn(ctx, wt, "", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch))
+	return err == nil
+}
+
+// EnsureDevBranch puts the workspace on the persistent dev integration branch, so a run builds on the
+// ACCUMULATED work of previous runs instead of a fresh default-branch checkout. It fetches, then
+// force-checks-out devBranch at origin/devBranch when that already exists (the durable, pushed dev
+// state — "grows"), or at origin/defaultBranch the very FIRST time the branch is created. Reports
+// created=true only in that first-time case. The force checkout also drops an aborted run's uncommitted
+// edits to tracked files; CleanWorktree then removes untracked leftovers. It NEVER resets the branch to
+// the default branch once it exists — that is the whole point (contrast ResetDevToDefault, the explicit
+// way back).
+func (e Executor) EnsureDevBranch(ctx context.Context, wt, token, defaultBranch, devBranch string) (created bool, err error) {
+	for _, b := range []string{defaultBranch, devBranch} {
+		if !branchRe.MatchString(b) || strings.HasPrefix(b, "-") {
+			return false, fmt.Errorf("invalid branch name %q", b)
+		}
+	}
+	if err := e.Fetch(ctx, wt, token); err != nil {
+		return false, fmt.Errorf("fetch: %w", err)
+	}
+	start := "origin/" + devBranch
+	if !e.remoteRefExists(ctx, wt, devBranch) {
+		start, created = "origin/"+defaultBranch, true
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", "-B", devBranch, start)); err != nil {
+		return created, fmt.Errorf("checkout %s: %w", devBranch, err)
+	}
+	return created, nil
+}
+
+// CleanWorktree frees the working tree of unversioned remnants so an aborted run leaves no half-changes,
+// WITHOUT touching history: it hard-resets to HEAD (dropping uncommitted edits to tracked files) and
+// removes untracked and ignored files. The current branch pointer is untouched — this is hygiene, not a
+// reset of the accumulated state. Contrast ResetToRemote, which moves the branch onto a remote tip.
+func (e Executor) CleanWorktree(ctx context.Context, wt string) error {
+	if _, err := runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "HEAD")); err != nil {
+		return fmt.Errorf("reset: %w", err)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
+		return fmt.Errorf("clean: %w", err)
+	}
+	return nil
+}
+
+// FoldInBranch merges origin/<branch> (the default branch) INTO the current dev branch — the "fold the
+// default branch in, do not reset onto it" rule. "Already up to date" (the default branch is an
+// ancestor of the dev state — the common case) is a clean success with no new commit and no pollution
+// of any delivery diff. A CONFLICT aborts the merge, leaves the branch exactly as before, and returns
+// ErrMergeConflict (non-fatal — the caller notes it and proceeds). A merge that succeeds is authored as
+// the neutral mercury-run identity.
+func (e Executor) FoldInBranch(ctx context.Context, wt, branch string) error {
+	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "",
+		"-c", "user.name=mercury-run", "-c", "user.email=mercury-run@local",
+		"merge", "--no-edit", "origin/"+branch)); err != nil {
+		_, _ = runGit(e.gitIn(ctx, wt, "", "merge", "--abort"))
+		return ErrMergeConflict
+	}
+	return nil
+}
+
+// ResetDevToDefault is the EXPLICIT way back: it deliberately discards the accumulated dev state and
+// moves the dev branch back onto the default branch (fetch → force-checkout devBranch at
+// origin/defaultBranch → clean). Destructive by design and ONLY ever invoked on an explicit request,
+// never as a side effect of a run. The caller force-pushes devBranch afterwards to publish the reset.
+func (e Executor) ResetDevToDefault(ctx context.Context, wt, token, defaultBranch, devBranch string) error {
+	for _, b := range []string{defaultBranch, devBranch} {
+		if !branchRe.MatchString(b) || strings.HasPrefix(b, "-") {
+			return fmt.Errorf("invalid branch name %q", b)
+		}
+	}
+	if err := e.Fetch(ctx, wt, token); err != nil {
+		return fmt.Errorf("fetch: %w", err)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", "-B", devBranch, "origin/"+defaultBranch)); err != nil {
+		return fmt.Errorf("reset %s to %s: %w", devBranch, defaultBranch, err)
+	}
+	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
+		return fmt.Errorf("clean: %w", err)
+	}
+	return nil
+}
+
+// commitRe restricts revert/branch-point commits to a hex object id — the shape RevParse returns for a
+// stored delivery. A hostile value cannot reach git as an option or a ref expression.
+var commitRe = regexp.MustCompile(`^[0-9a-fA-F]{7,40}$`)
+
+// BranchAt creates (or force-moves) a local branch pointing at `at`, WITHOUT checking it out — used to
+// snapshot the dev tip as an immutable per-delivery branch for its stacked PR while the workspace stays
+// on the dev branch.
+func (e Executor) BranchAt(ctx context.Context, wt, name, at string) error {
+	if !branchRe.MatchString(name) || strings.Contains(name, "..") || strings.HasPrefix(name, "-") {
+		return fmt.Errorf("invalid branch name %q", name)
+	}
+	if at != "HEAD" && !commitRe.MatchString(at) {
+		return fmt.Errorf("invalid branch point %q", at)
+	}
+	_, err := runGit(e.gitIn(ctx, wt, "", "branch", "-f", name, at))
+	return err
+}
+
+// PushRefs pushes the named branches to origin in one invocation. --atomic makes a multi-ref push
+// all-or-nothing, so the dev branch never advances without its delivery snapshot branch (or vice versa).
+// force uses --force (for the explicit dev reset only); normal growth pushes fast-forward. The token
+// stays in ENV, never on argv.
+func (e Executor) PushRefs(ctx context.Context, wt, token string, force bool, branches ...string) (string, error) {
+	if len(branches) == 0 {
+		return "", errors.New("no branches to push")
+	}
+	args := []string{"push", "--atomic"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, "origin")
+	for _, b := range branches {
+		if !branchRe.MatchString(b) || strings.HasPrefix(b, "-") {
+			return "", fmt.Errorf("invalid branch name %q", b)
+		}
+		args = append(args, b)
+	}
+	out, err := runGit(e.gitIn(ctx, wt, token, args...))
+	if lerr := assertNoLeak(wt, token); lerr != nil {
+		return out, lerr
+	}
+	return out, err
+}
+
+// RevertRange counter-books a delivery: it applies the reverse of every commit in from..to as ONE new
+// reversing commit on the current branch (the "Gegenbuchung"). History is NEVER rewritten — the original
+// commits remain and the dev branch only grows (req 10). The range MUST be linear (the delivery range is
+// captured AFTER the default-branch fold, so it holds only the agent's own commits, no merges).
+//
+// It returns three outcomes so the caller reacts precisely:
+//   - conflicted=true: the reverse does not apply cleanly — later work built on this delivery and touched
+//     the same lines (or the range contains a merge). No guess is made (req 12): the branch is restored
+//     untouched and the caller raises a ToDo instead of committing a mangled revert.
+//   - changed=false (conflicted=false, err=nil): the reverse applied but produced NOTHING to book — the
+//     delivery's effect is already absent (already counter-booked, or a later change removed it). No
+//     commit is made; the caller treats it as an idempotent no-op rather than an error.
+//   - changed=true: a single counter-booking commit was made.
+func (e Executor) RevertRange(ctx context.Context, wt, from, to, ghLogin string, ghID int64, message string) (conflicted, changed bool, err error) {
+	if !commitRe.MatchString(from) || !commitRe.MatchString(to) {
+		return false, false, fmt.Errorf("invalid commit range %q..%q", from, to)
+	}
+	if from == to {
+		return false, false, errors.New("empty delivery range (from == to)")
+	}
+	if strings.TrimSpace(message) == "" {
+		return false, false, errors.New("empty counter-booking message")
+	}
+	restore := func() {
+		_, _ = runGit(e.gitIn(ctx, wt, "", "revert", "--abort")) // clears any sequencer state
+		_, _ = runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "HEAD"))
+		_, _ = runGit(e.gitIn(ctx, wt, "", "clean", "-fd"))
+	}
+	// --no-commit stages the reverse of the whole range so it lands as a single counter-booking commit.
+	if _, rerr := runGit(e.gitIn(ctx, wt, "", "revert", "--no-commit", from+".."+to)); rerr != nil {
+		restore() // conflict (or a merge in range) → make no guess, leave the branch untouched
+		return true, false, nil
+	}
+	// A revert that stages nothing means the effect is already gone (idempotent retry, or later work
+	// removed it) — NOT an error and NOT a commit. Clear the sequencer state and report "no change".
+	if _, diffErr := runGit(e.gitIn(ctx, wt, "", "diff", "--cached", "--quiet")); diffErr == nil {
+		restore()
+		return false, false, nil
+	}
+	name, email := ghLogin, ""
+	if name == "" {
+		name, email = "mercury-run", "mercury-run@local" // neutral fallback so the commit never fails on a missing identity
+	} else {
+		email = fmt.Sprintf("%d+%s@users.noreply.github.com", ghID, ghLogin)
+	}
+	pre := []string{"-c", "user.name=" + name, "-c", "user.email=" + email}
+	if _, cerr := runGit(e.gitIn(ctx, wt, "", append(pre, "commit", "-m", message)...)); cerr != nil {
+		restore()
+		return false, false, fmt.Errorf("counter-booking commit: %w", cerr)
+	}
+	return false, true, nil
+}
+
 // CommitsAhead counts commits on HEAD that base does not have — i.e. how much there is to push.
 // The autonomous runner needs this because an agent commits its own work: after such a run the
 // working tree is CLEAN, so a working-tree-only check concludes "nothing happened" and silently
@@ -549,15 +753,20 @@ func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) 
 	return strings.TrimSpace(s), err
 }
 
-// mergeRefRe restricts MergeRef to Mercury run branches on origin — the only refs the autonomous runner
-// ever folds into a run's base (the still-open pending PRs). A hostile branch name cannot reach git.
-var mergeRefRe = regexp.MustCompile(`^origin/mercury-run/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+// mergeRefRe restricts MergeRef to a well-formed origin/ branch ref — the shape the autonomous runner
+// folds into a run's base (the still-open pending Mercury PRs, whose heads now follow the human
+// <kind>/<description> convention rather than a fixed prefix). The caller has already vetted these as
+// Mercury's OWN PRs (hidden body marker); this regex is the structural safety net: it demands the origin/
+// prefix and an alphanumeric first segment character, so a hostile or malformed branch name cannot reach
+// git (path traversal is additionally blocked by the ".." check in MergeRef).
+var mergeRefRe = regexp.MustCompile(`^origin/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
 
 // MergeRef merges ref into the current branch (default merge; a merge commit is authored as the runner
 // identity when the histories diverge). On conflict it ABORTS the merge and returns an error, leaving the
 // branch exactly as before — the caller then proceeds without that pending PR in the base. Restricted to
-// origin/mercury-run/* refs. This is how the runner bases a run on "main + pending PRs" so it never redoes
-// not-yet-merged work while still implementing what a (possibly different-axiom) run still needs.
+// well-formed origin/* refs (see mergeRefRe). This is how the runner bases a run on "main + pending PRs"
+// so it never redoes not-yet-merged work while still implementing what a (possibly different-axiom) run
+// still needs.
 func (e Executor) MergeRef(ctx context.Context, wt, ref string) error {
 	if strings.Contains(ref, "..") || !mergeRefRe.MatchString(ref) {
 		return fmt.Errorf("invalid merge ref %q", ref)

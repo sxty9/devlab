@@ -105,6 +105,22 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
+| `DEVLAB_RUNS_DEV_BRANCH` | `mercury-dev` | Name des **persistenten dev-Integrationsbranches** je Repo, den der Runner wachsen lässt und den der dev-Deploy ausliefert. Nie der Standard-Branch (aus dem prod bei Merge beliefert wird). |
+
+### Wachsender dev-Stand statt Zusammensetzen
+
+Ein Lauf setzt nicht mehr hart auf den Standard-Branch zurück, sondern auf den persistenten `mercury-dev`
+je Repo — der **wächst**: der Standard-Branch wird eingefaltet (nicht der Stand auf ihn zurückgesetzt),
+und die Arbeit landet obendrauf. So ist die Vorarbeit früherer Läufe immer vorhanden, ohne dass jemand
+offene PRs einsammeln muss. Der **dev-Deploy liefert genau `mercury-dev`** aus (in der Ausführungsansicht
+als `mercury-dev@<sha>` benannt); **prod** wird weiterhin ausschließlich aus dem gemergten Standard-Branch
+beliefert. Jede Lieferung bekommt einen **gestapelten PR** (Basis = vorherige offene Lieferung, sonst
+Standard-Branch), zeigt also nur ihre eigenen Änderungen. Zwei bewusste Handlungen (nur `pr`/`full`):
+- `POST /api/mercury/runs/deliveries/{id}/rollback` — **Gegenbuchung** einer Lieferung (umkehrender
+  Commit, keine Historie umgeschrieben; offener PR wird geschlossen, gemergter bekommt einen umkehrenden
+  PR; baut spätere Arbeit darauf auf, wird automatisch ein ToDo erzeugt statt geraten).
+- `POST /api/mercury/runs/reset` `{"repo":"owner/name"}` — **ausdrückliches Zurücksetzen** von
+  `mercury-dev` auf den Standard-Branch (verwirft den akkumulierten dev-Stand, force-push).
 
 > **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
 > klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.

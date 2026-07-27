@@ -1,4 +1,4 @@
-import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -181,7 +181,9 @@ export const mockSource: DataSource = {
   async assistantModels() {
     return {
       claude: [
+        { id: 'claude-fable-5', label: 'Fable' },
         { id: 'claude-opus-4-8', label: 'Opus' },
+        { id: 'claude-fable-5', label: 'Fable' },
         { id: 'claude-sonnet-4-6', label: 'Sonnet' },
         { id: 'claude-haiku-4-5-20251001', label: 'Haiku' },
       ],
@@ -255,6 +257,9 @@ export const mockSource: DataSource = {
   async mercuryReorder(_category: string, _order: string[]) {
     /* mock: no-op */
   },
+  async mercuryRolloutStatus() {
+    return { last: null };
+  },
   async mercuryRuns() {
     // Fresh copies so setList always sees a new reference (and can't mutate the store by ref).
     return { runs: runStore.map((r) => ({ ...r })), axioms: {} };
@@ -278,7 +283,17 @@ export const mockSource: DataSource = {
     return { prompt: '# Mock-Prompt' };
   },
   async mercuryRunCoverage() {
-    return { covered: {}, index: {}, axioms: {} };
+    return { covered: {}, index: {}, axioms: {}, pending: false };
+  },
+  async mercuryRunNotices() {
+    return { notices: noticeStore.map((n) => ({ ...n })) };
+  },
+  async mercuryDismissRunNotice(id: string) {
+    const idx = noticeStore.findIndex((n) => n.id === id);
+    if (idx >= 0) noticeStore.splice(idx, 1);
+  },
+  async mercuryClearRunNotices() {
+    noticeStore.length = 0;
   },
   async mercuryCreateRun(body: RunInput) {
     const run: Run = { id: mockId('run'), ...mockRun(body) };
@@ -301,9 +316,6 @@ export const mockSource: DataSource = {
     const idx = runStore.findIndex((r) => r.id === id);
     if (idx >= 0) runStore.splice(idx, 1);
   },
-  async mercuryRecomposeRun(_id: string) {
-    /* mock: no-op */
-  },
   async mercuryRunAiFill() {
     return { proposal: { runs: [] }, axioms: {} };
   },
@@ -323,33 +335,83 @@ export const mockSource: DataSource = {
     return { results: [] };
   },
   async mercuryRunResult(id: string, resultId: string) {
+    const at = new Date().toISOString();
     return {
       runId: id,
       resultId,
       startedAt: new Date().toISOString(),
-      ok: true,
+      ok: !resultId.includes('fail'), // keep the preview coherent with the calendar's status pill
       prompt: '# Konkretes ToDo: Beispiel\n\n## Aufgabe\n\nBeispielhafte Promptstellung dieser Ausführung.',
-      repos: [],
+      // One repo showing the growing dev state: the delivered state is named (mercury-dev@<sha>) and the
+      // delivery's stacked PR sits on the previous open delivery's branch.
+      repos: [
+        {
+          repo: 'holistic/example',
+          ok: true,
+          deployed: true,
+          prUrl: 'https://example.invalid/pull/42',
+          devBranch: 'mercury-dev',
+          devCommit: '1a2b3c4d5e6f7a8b',
+          prBase: 'mercury-run/run_example/dlv_prev',
+          deliveryId: 'dlv_example',
+          steps: [
+            { name: 'fold', ok: true, log: 'Standard-Branch main eingefaltet', at },
+            { name: 'implement', ok: true, log: 'Feature umgesetzt und committet.', at },
+            { name: 'dev-deploy', ok: true, log: 'Ausgelieferter Stand: mercury-dev@1a2b3c4d', at },
+            { name: 'push', ok: true, log: 'mercury-dev, mercury-run/run_example/dlv_example', at },
+            { name: 'pr', ok: true, log: 'https://example.invalid/pull/42 (Basis: mercury-run/run_example/dlv_prev)', at },
+          ],
+          inputTokens: 0,
+          outputTokens: 0,
+          costUsd: 0,
+          numTurns: 0,
+        },
+      ],
       inputTokens: 0,
       outputTokens: 0,
       costUsd: 0,
       numTurns: 0,
     };
   },
-  async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {
-    return { from: new Date().toISOString(), to: new Date().toISOString(), occurrences: [] };
+  async mercuryRunCalendar(days?: number, type?: import('@/types').RunType) {
+    const dayMs = 86400000;
+    const iso = (offsetDays: number) => new Date(Date.now() + offsetDays * dayMs).toISOString();
+    // A representative union so the offline preview shows past executions (each with a status pill and
+    // openable via mercuryRunResult) beside upcoming firings. resultId present ⇒ past; absent ⇒ upcoming.
+    const all: import('@/types').RunOccurrence[] = [
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(-3), resultId: 'res_demo_1', ok: true },
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(-1), resultId: 'res_demo_fail', ok: false },
+      { runId: 'run_auto_demo', runName: 'Nightly Axiom-Rollout', type: 'auto', at: iso(1), schedule: 'täglich 03:00' },
+      { runId: 'run_todo_demo', runName: 'ToDo: Kalender-Union', type: 'todo', at: iso(-2), resultId: 'res_demo_3', ok: true },
+      { runId: 'run_todo_demo', runName: 'ToDo: Kalender-Union', type: 'todo', at: iso(2), schedule: 'einmalig' },
+    ];
+    const occurrences = type ? all.filter((o) => o.type === type) : all;
+    return { from: iso(-3), to: iso(days ?? 30), occurrences };
   },
   async mercuryRunExecutions(_type?: import('@/types').RunType) {
     return { executions: [] };
   },
-  async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
-    return { reply: 'Mock-Antwort' };
+  async mercuryChat(messages: import('@/types').RunChatMessage[]) {
+    // Offline stand-in: infer a plausible action from the last message so the review-and-apply flow is
+    // demonstrable without the backend. The real assistant derives the action from the model.
+    const last = messages[messages.length - 1]?.content.toLowerCase() ?? '';
+    let action: import('@/types').MercuryAction | undefined;
+    if (/todo|aufgabe|bug/.test(last)) {
+      action = { kind: 'create_todo', name: 'Neues ToDo', task: last.slice(0, 200) || 'Beschreibung', targets: [{ repo: DEFAULT_REPO_ID }] };
+    } else if (/axiom|regel/.test(last)) {
+      action = { kind: 'add_record', section: 'axiome', titel: 'Neues Axiom', body: last.slice(0, 200) || 'Ein Satz.' };
+    } else if (/lauf|läufe|plan/.test(last)) {
+      action = { kind: 'create_run', name: 'Neuer Lauf', axiomIds: ['ax_mock'], schedule: { kind: 'daily', timeOfDay: '03:00' } };
+    }
+    return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
   },
   async mercuryRunNow(_id: string) {
     return { started: true };
   },
   async mercuryRunActive() {
-    return { active: null };
+    // The mock has no executor, so nothing is ever genuinely in flight — an empty list is the honest
+    // answer (the "Aktive Läufe" overview simply stays quiet in offline/preview mode).
+    return { active: null, inflight: [] };
   },
   async mercuryCancelRun() {
     /* mock: no-op */
@@ -395,6 +457,21 @@ const mockId = (prefix: string) => `${prefix}_mock${(mockSeq += 1)}`;
 /** ToDos + Läufe, discriminated by `type` — the one store the backend keeps in runs.json. Starts empty,
  *  like a fresh instance; create/update/delete below keep it in sync so the list reflects every change. */
 const runStore: Run[] = [];
+
+/** The automatic axiom→run assignment feed — seeded with one believable entry so the panel is visible in
+ *  preview; dismiss/clear mutate it. The real feed is written by the backend's background assigner. */
+const noticeStore: RunNotice[] = [
+  {
+    id: 'ntc_mock1',
+    at: new Date(Date.now() - 90_000).toISOString(),
+    kind: 'assigned',
+    runId: 'run_mock_seed',
+    runName: 'Architektur & Minimalismus',
+    newRun: true,
+    axiomIds: ['ax_mock_seed'],
+    axioms: ['Portionierte Daten'],
+  },
+];
 
 /** The axiom / Implementierungsregeln / Läufe / Meta tree the sidebar renders — seeded with a believable
  *  sample, then mutated by add/delete so the sidebar reflects changes live. Mirrors the backend, which

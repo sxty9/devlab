@@ -38,7 +38,14 @@ type Result struct {
 	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
 	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
 	Mode string `json:"mode,omitempty"`
-	OK   bool   `json:"ok"`
+	// Model + Effort record which Claude engine drove THIS execution: the resolved model and the selected
+	// effort tier ("" = the runner default max, "ultracode" = the maximal tier). Stamped when the execution
+	// is minted and re-stamped on resume to track the run's current tuning, so the report can label the
+	// answer with its model — a Holistic requirement now that the model is chosen per run — and the History
+	// shows how each run was tuned. Empty on older results.
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	OK     bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
@@ -58,14 +65,46 @@ type Result struct {
 	NumTurns     int     `json:"numTurns"`
 }
 
+// Ref projects an execution to the lightweight reference stored on the run — including how far the
+// work got (dev-deploy, PR), so the surface can name the stage reached instead of a bare tick. One
+// definition for every return path of an execution; Maintain later adds the merge/prod rungs.
+func (r Result) Ref() ResultRef {
+	ref := ResultRef{
+		ResultID: r.ResultID, At: r.StartedAt, OK: r.OK, RepoCount: len(r.Repos),
+		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens, CostUSD: r.CostUSD,
+		Suspended: r.Suspended, ResumeAt: r.ResumeAt,
+	}
+	for _, rr := range r.Repos {
+		if rr.Deployed {
+			ref.Deployed = true
+		}
+		if ref.PRUrl == "" && rr.PRUrl != "" {
+			ref.PRUrl = rr.PRUrl
+		}
+	}
+	return ref
+}
+
 // RepoResult is the outcome of a run against one repository.
 type RepoResult struct {
 	Repo string `json:"repo"`
+	// Base is the commit this repo stood at when the agent examined it — the stand recorded per axiom so
+	// the NEXT run only has to look at what came after it.
+	Base string `json:"base,omitempty"`
 	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
-	Running      bool    `json:"running,omitempty"`
-	OK           bool    `json:"ok"`
-	Deployed     bool    `json:"deployed"`
-	PRUrl        string  `json:"prUrl,omitempty"`
+	Running  bool `json:"running,omitempty"`
+	OK       bool `json:"ok"`
+	Deployed bool `json:"deployed"`
+	PRUrl    string `json:"prUrl,omitempty"`
+	// DevBranch/DevCommit NAME the delivered dev state (req 2): the persistent integration branch the run
+	// grew (mercury-dev) and the exact commit dev serves. PRBase is this delivery's stacked PR base — the
+	// previous open delivery's branch, else the default branch (req 9). DeliveryID points at the recorded
+	// delivery. All empty when the run made no delivery for this repo (and DevBranch/DevCommit still name
+	// the unchanged state).
+	DevBranch    string  `json:"devBranch,omitempty"`
+	DevCommit    string  `json:"devCommit,omitempty"`
+	PRBase       string  `json:"prBase,omitempty"`
+	DeliveryID   string  `json:"deliveryId,omitempty"`
 	Steps        []Step  `json:"steps"`
 	Error        string  `json:"error,omitempty"`
 	InputTokens  int     `json:"inputTokens,omitempty"`
@@ -111,6 +150,12 @@ func NewResultID(t time.Time) string {
 // when the execution was last worked (used by FindStranded to bound resume by recency of activity).
 func (r *Results) Save(res Result) error {
 	res.UpdatedAt = time.Now().UTC()
+	// A nil slice marshals to JSON null, which the UI iterates directly and crashes on (a black screen on
+	// a failed/husk execution that completed no repo). Persist an empty slice instead — same guarantee the
+	// aggregate listings already make (see All/ListForRun).
+	if res.Repos == nil {
+		res.Repos = []RepoResult{}
+	}
 	dir := filepath.Join(r.dir, res.RunID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err

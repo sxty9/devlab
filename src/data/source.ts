@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -136,21 +136,28 @@ export interface DataSource {
   mercuryMoveCategory(from: string, to: string): Promise<{ moved: number }>;
   /** Set the manual order of a category's immediate children (full ordered child-name list). */
   mercuryReorder(category: string, order: string[]): Promise<void>;
+  /** The last automatic CLAUDE.md rollout (axiom/rule writes trigger it in the background). `last` is
+   *  null until the first rollout since startup. */
+  mercuryRolloutStatus(): Promise<{ last: RolloutReport | null }>;
 
   // ── Mercury — Automatische Läufe (run instances) ────────────────────────────
-  /** List all runs (each with a `stale` flag) plus an axiom id→title legend. */
+  /** List all runs plus an axiom id→title legend. Snapshots are kept current by every scheme write. */
   mercuryRuns(): Promise<RunList>;
   /** One run + the axiom id→title legend. */
   mercuryRun(id: string): Promise<{ run: Run; axioms: Record<string, string> }>;
   /** Live-compose a run's prompt from the current scheme (does not persist). */
   mercuryRunPrompt(id: string): Promise<{ prompt: string }>;
-  /** Which axioms are already covered by a run (+ id→path, id→title). */
+  /** Which axioms are already covered by a run (+ id→path, id→title, and whether an auto-assignment is pending). */
   mercuryRunCoverage(): Promise<RunCoverage>;
+  /** The automatic axiom→run assignment feed (newest first, portioned). */
+  mercuryRunNotices(): Promise<{ notices: RunNotice[] }>;
+  /** Dismiss one acknowledged assignment notice. */
+  mercuryDismissRunNotice(id: string): Promise<void>;
+  /** Clear the whole assignment feed. */
+  mercuryClearRunNotices(): Promise<void>;
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;
-  /** Refresh a run's prompt snapshot from the current scheme. */
-  mercuryRecomposeRun(id: string): Promise<void>;
   /** Ask AI to plan the not-yet-covered axioms into runs (reviewable; writes nothing). */
   mercuryRunAiFill(): Promise<RunProposal>;
   /** Ask AI to regroup the current runs (reviewable; writes nothing). */
@@ -177,8 +184,9 @@ export interface DataSource {
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. */
-  mercuryRunActive(): Promise<{ active: RunActive | null }>;
+   *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
+   *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
+  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
 

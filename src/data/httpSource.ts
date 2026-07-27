@@ -236,6 +236,9 @@ export const httpSource: DataSource = {
   async mercuryReorder(category, order) {
     await json<void>(await post('/api/mercury/reorder', { category, order }));
   },
+  async mercuryRolloutStatus() {
+    return json(await request('/api/mercury/rollout'));
+  },
 
   async mercuryRuns() {
     return json(await request('/api/mercury/runs'));
@@ -249,6 +252,15 @@ export const httpSource: DataSource = {
   async mercuryRunCoverage() {
     return json(await request('/api/mercury/runs/coverage'));
   },
+  async mercuryRunNotices() {
+    return json(await request('/api/mercury/runs/notices'));
+  },
+  async mercuryDismissRunNotice(id) {
+    await json<void>(await post('/api/mercury/runs/notices/dismiss', { id }));
+  },
+  async mercuryClearRunNotices() {
+    await json<void>(await post('/api/mercury/runs/notices/clear', {}));
+  },
   async mercuryCreateRun(body) {
     return json(await post('/api/mercury/runs', body));
   },
@@ -257,9 +269,6 @@ export const httpSource: DataSource = {
   },
   async mercuryDeleteRun(id) {
     await json<void>(await request(`/api/mercury/runs/${enc(id)}`, withCsrf({ method: 'DELETE' })));
-  },
-  async mercuryRecomposeRun(id) {
-    await json<void>(await post(`/api/mercury/runs/${enc(id)}/recompose`, {}));
   },
   async mercuryRunAiFill() {
     return json(await post('/api/mercury/runs/ai-fill', {}));
