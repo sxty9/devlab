@@ -271,7 +271,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))
 	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
-	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
+	// Cancel targets a SPECIFIC run by id — several run concurrently.
+	mux.HandleFunc("POST /api/mercury/runs/{id}/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
 	// Deliveries: roll back a shipped delivery (counter-booking), or reset a repo's dev branch to default.
 	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))

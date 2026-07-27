@@ -108,6 +108,19 @@ func resumeEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_LIMIT_RESUME")), "off")
 }
 
+// maxConcurrentRuns is the seed for the concurrency cap (how many runs execute at once). DEVLAB_RUNS_MAX_
+// CONCURRENT overrides; a non-positive/absent value leaves the scheduler's conservative default. This is
+// only the STARTING value — the cap is configurable live at runtime (see the settings store), env just
+// seeds it.
+func maxConcurrentRuns() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_CONCURRENT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return n
+		}
+	}
+	return 0 // 0 → NewScheduler applies its default
+}
+
 // StartScheduler arms the run scheduler iff configured. Absent config → it logs and stays dormant
 // (the management layer keeps working). Wired from main() with a cancelable context.
 func (s *Server) StartScheduler(ctx context.Context) {
@@ -152,9 +165,10 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
-	s.scheduler = runs.NewScheduler(s.runs, x, tick)
-	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
-		mode, user, tokenUser, autoMerge, tick)
+	maxConc := maxConcurrentRuns()
+	s.scheduler = runs.NewScheduler(s.runs, x, tick, maxConc)
+	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s maxConcurrent=%d",
+		mode, user, tokenUser, autoMerge, tick, maxConc)
 	go s.scheduler.Run(ctx)
 }
 
@@ -2165,7 +2179,7 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
 // parallel data path.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
+	active := []runs.Activity{}
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
@@ -2199,11 +2213,11 @@ type inFlightRun struct {
 	NumTurns     int     `json:"numTurns"`
 }
 
-// assembleInFlight builds the transparent list of runs the system is currently working: the one
-// EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
-// limit). Each entry is enriched from its live result document so the overview shows the current
-// repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
-func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+// assembleInFlight builds the transparent list of runs the system is currently working: EVERY run
+// EXECUTING right now (from the live Activities — several may run concurrently) followed by every
+// SUSPENDED run (paused on the usage limit or deferred). Each entry is enriched from its live result
+// document so the overview shows the current repo/step, progress and spend at a glance. Read-only.
+func (s *Server) assembleInFlight(active []runs.Activity) []inFlightRun {
 	out := []inFlightRun{}
 	if s.runs == nil {
 		return out
@@ -2216,25 +2230,27 @@ func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
 	for _, r := range all {
 		byID[r.ID] = r
 	}
+	executing := make(map[string]bool, len(active))
 
-	// 1) The run executing right now (at most one — the scheduler runs runs serially).
-	if active != nil {
-		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
-		st := active.StartedAt
+	// 1) Every run executing right now (concurrent).
+	for _, a := range active {
+		executing[a.RunID] = true
+		e := inFlightRun{RunID: a.RunID, State: "executing", ResultID: a.ResultID}
+		st := a.StartedAt
 		e.StartedAt = &st
-		if run, ok := byID[active.RunID]; ok {
+		if run, ok := byID[a.RunID]; ok {
 			e.RunName = run.Name
 			e.Type = string(runs.NormalizeType(run.Type))
 			e.ReposTotal = todoRepoTotal(run)
 		}
-		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		s.enrichInFlight(&e, a.RunID, a.ResultID)
 		out = append(out, e)
 	}
 
-	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
-	//    double-count the executing one (a run cannot be both).
+	// 2) Every run suspended mid-execution (usage limit or deferred) — genuinely in flight, just paused.
+	//    Never double-count one that is executing right now (a run cannot be both).
 	for _, run := range all {
-		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+		if run.Suspended == nil || executing[run.ID] {
 			continue
 		}
 		e := inFlightRun{
@@ -2288,14 +2304,15 @@ func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
 	}
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts a SPECIFIC run in progress (kill-switch). With concurrent runs the target is named by
+// {id} — other live runs keep going.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

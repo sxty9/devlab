@@ -90,7 +90,8 @@ export default function RunsView() {
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
   const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
   // also pulls the auto-assignment feed, so a background assignment surfaces on the next refresh.
@@ -106,11 +107,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When ANY run finishes (an id leaves the active set), refresh the list so lastResult/next-fire/
+  // ToDo-done update. Set-diff, not a single id — several runs execute concurrently now.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -143,19 +145,19 @@ export default function RunsView() {
     return () => window.clearTimeout(t);
   }, [coverage?.pending, dataVersion, reload]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
+  const cancelRun = useCallback(async (id: string) => {
+    if (cancellingId) return;
+    setCancellingId(id);
     try {
-      await source.mercuryCancelRun();
+      await source.mercuryCancelRun(id);
       toast({ title: 'Lauf abgebrochen', variant: 'default' });
       refetchActive();
     } catch (e) {
       toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
-      setCancelling(false);
+      setCancellingId(null);
     }
-  }, [cancelling, source, toast, refetchActive]);
+  }, [cancellingId, source, toast, refetchActive]);
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -272,7 +274,7 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={activeFor(selectedRun.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -302,7 +304,7 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
+        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} className="ml-auto max-w-xs" />
       </header>
 
       <BlockedDeploysPanel />

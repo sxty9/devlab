@@ -803,9 +803,9 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
+  const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
   const [bump, setBump] = useState(0);
 
@@ -816,7 +816,7 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
       try {
         const r = await source.mercuryRunActive();
         if (!cancelled) {
-          setActive(r.active);
+          setActive(r.active ?? []);
           setInflight(r.inflight ?? []);
         }
       } catch {
@@ -1094,7 +1094,7 @@ function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: 
 
 /** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
  *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
-function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+function RunSession({ row, onCancel, cancellingId }: { row: RunInFlight; onCancel: (id: string) => void; cancellingId: string | null }) {
   const executing = row.state === 'executing';
   return (
     <div className="flex min-h-0 flex-col gap-3">
@@ -1102,8 +1102,8 @@ function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel:
         <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
         <TypeChip type={row.type} />
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+          <Button variant="danger" size="sm" disabled={cancellingId === row.runId} onClick={() => onCancel(row.runId)}>
+            {cancellingId === row.runId ? 'Bricht ab…' : 'Abbrechen'}
           </Button>
         )}
       </div>
@@ -1145,12 +1145,12 @@ function writeWatch(v: { open: boolean; runId: string | null }) {
 export function ActiveRunsOverview({
   inflight,
   onCancel,
-  cancelling,
+  cancellingId,
   className,
 }: {
   inflight: RunInFlight[];
-  onCancel: () => void;
-  cancelling: boolean;
+  onCancel: (id: string) => void;
+  cancellingId: string | null;
   className?: string;
 }) {
   const [restored] = useState(readWatch); // lazy: read session storage once, on mount
@@ -1176,7 +1176,6 @@ export function ActiveRunsOverview({
 
   if (inflight.length === 0) return null;
 
-  const executing = inflight.some((r) => r.state === 'executing');
   const only = inflight.length === 1 ? inflight[0] : null;
   const summary = only ? `${only.state === 'executing' ? 'Läuft' : 'Pausiert'}: ${only.runName || 'Lauf'}` : `${inflight.length} Läufe aktiv`;
   const nExec = inflight.filter((r) => r.state === 'executing').length;
@@ -1194,11 +1193,6 @@ export function ActiveRunsOverview({
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" />
           <span className="truncate">{summary}</span>
         </button>
-        {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-          </Button>
-        )}
       </div>
 
       <Modal open={open} onClose={() => setOpen(false)} title="Aktive Läufe" description={description} size="xl">
@@ -1210,7 +1204,7 @@ export function ActiveRunsOverview({
           </div>
           <div className="min-w-0 flex-1 border-t border-separator pt-4 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
             {selected ? (
-              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancelling={cancelling} />
+              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancellingId={cancellingId} />
             ) : (
               <EmptyPlaceholder text="Wähle links einen Lauf, um ihn live zu verfolgen." />
             )}

@@ -186,12 +186,12 @@ export interface DataSource {
    *  which happened and why, so the trigger can show "fortgesetzt" vs "neu begonnen". 503 if the executor
    *  is unconfigured, 409 if one is running. */
   mercuryRunNow(id: string, opts?: { fresh?: boolean }): Promise<{ started: boolean; plan?: RunResumePlan }>;
-  /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
-   *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
-  /** Abort the run currently in progress (kill-switch). */
-  mercuryCancelRun(): Promise<void>;
+  /** Every run executing right now (server truth) — several run concurrently. Read on mount so live runs
+   *  survive a page reload, and polled to follow them. `inflight` is the transparent list of every run
+   *  currently being worked (executing + suspended) for the "Aktive Läufe" overview. */
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[] }>;
+  /** Abort a SPECIFIC run in progress by id (kill-switch) — other concurrent runs keep going. */
+  mercuryCancelRun(id: string): Promise<void>;
   /** The deliveries blocked on a permanent prod-deploy failure — waiting for an explicit resume. */
   mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;
   /** Clear the block on one delivery so its prod-deploy is retried (full attempt budget again). */

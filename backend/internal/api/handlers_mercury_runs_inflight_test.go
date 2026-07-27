@@ -55,7 +55,7 @@ func TestAssembleInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	list := s.assembleInFlight(&runs.Activity{RunID: "run_exec", ResultID: "rid_exec", StartedAt: now})
+	list := s.assembleInFlight([]runs.Activity{{RunID: "run_exec", ResultID: "rid_exec", StartedAt: now}})
 	if len(list) != 2 {
 		t.Fatalf("want 2 in-flight, got %d: %+v", len(list), list)
 	}
@@ -107,7 +107,7 @@ func TestAssembleInFlightNoDoubleCount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	list := s.assembleInFlight(&runs.Activity{RunID: "run_x", ResultID: "rid", StartedAt: time.Now().UTC()})
+	list := s.assembleInFlight([]runs.Activity{{RunID: "run_x", ResultID: "rid", StartedAt: time.Now().UTC()}})
 	if len(list) != 1 || list[0].State != "executing" {
 		t.Fatalf("want a single executing entry, got %+v", list)
 	}
