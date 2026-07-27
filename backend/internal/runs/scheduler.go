@@ -6,6 +6,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // ErrRunAborted is the cancellation cause the kill-switch (Cancel) attaches to a run's context. It lets
@@ -51,7 +53,15 @@ type Scheduler struct {
 	curID       string
 	curStop     context.CancelCauseFunc
 	curActivity *Activity
+
+	// pub broadcasts a "live-run pointer changed" signal on start / result-id known / end, so open UIs
+	// track the running run without a resting poll. Optional (nil = no-op). Set by SetPublisher.
+	pub *live.Broker
 }
+
+// SetPublisher wires the live-change broker so the scheduler notifies open UIs when the running run
+// starts, gets its result id, or ends. Nil is allowed (publishing off).
+func (s *Scheduler) SetPublisher(b *live.Broker) { s.pub = b }
 
 // NewScheduler builds a scheduler. tick defaults to 30s.
 func NewScheduler(store *Store, exec Executor, tick time.Duration) *Scheduler {
@@ -205,6 +215,7 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 			s.curActivity.ResultID = resultID
 		}
 		s.curMu.Unlock()
+		s.pub.Publish(live.TopicActive) // the live result id is now known — point the UI at it
 	}
 	ref, err := s.exec.Execute(ctx, run, report)
 	if err != nil {
@@ -287,10 +298,12 @@ func (s *Scheduler) setCurrent(id string, cancel context.CancelCauseFunc) {
 	s.curID, s.curStop = id, cancel
 	s.curActivity = &Activity{RunID: id, StartedAt: time.Now().UTC()}
 	s.curMu.Unlock()
+	s.pub.Publish(live.TopicActive) // a run just went live
 }
 
 func (s *Scheduler) clearCurrent() {
 	s.curMu.Lock()
 	s.curID, s.curStop, s.curActivity = "", nil, nil
 	s.curMu.Unlock()
+	s.pub.Publish(live.TopicActive) // the run ended
 }

@@ -16,6 +16,7 @@ import (
 
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/github"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
@@ -151,6 +152,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	}
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
+	s.scheduler.SetPublisher(s.live) // live-run start/result-id/end notify open UIs
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
 		mode, user, tokenUser, autoMerge, tick)
 	go s.scheduler.Run(ctx)
@@ -234,7 +236,10 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	res, resuming := x.resumeOrNew(run)
 	res.Suspended, res.ResumeAt = false, nil // recomputed below if we hit the limit again
 	res.Live = nil                           // drop any stale in-flight repo left by a crashed prior attempt
-	saver := &liveSaver{do: func() { _ = x.s.runResults.Save(res) }}
+	saver := &liveSaver{do: func() {
+		_ = x.s.runResults.Save(res)
+		x.s.publish(live.TopicProgress) // the in-flight execution advanced → live-follow refetches
+	}}
 	save := saver.force
 	// Publish the live result id (so /active can point the UI at this execution) and materialize the
 	// result file up front — so a run is followable, and survives a page reload, from its first moment.

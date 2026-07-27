@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -48,6 +49,9 @@ func (s *Server) mercuryMigrate(w http.ResponseWriter, r *http.Request) {
 		results = append(results, mr)
 	}
 
+	if apply {
+		s.publish(live.TopicAxioms)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"applied": apply,
 		"atoms":   len(atoms),

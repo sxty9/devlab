@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -106,6 +107,7 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
 		"id":         ax.ID,

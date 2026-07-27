@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -73,6 +74,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, status, err)
 		return
 	}
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]any{"path": newPath, "axiom": ax})
 }
 
@@ -104,6 +106,7 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, status, err)
 		return
 	}
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
@@ -118,6 +121,7 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, status, err)
 		return
 	}
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -163,6 +167,9 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		moved++
+	}
+	if moved > 0 {
+		s.publish(live.TopicAxioms)
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

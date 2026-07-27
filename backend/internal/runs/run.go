@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // ErrNotFound is returned by a Mutate closure that matched no run, so Mutate aborts before writing —
@@ -160,6 +162,9 @@ type Store struct {
 	path string
 	hist *History
 	mu   sync.Mutex
+	// pub broadcasts a "runs changed" signal after every successful mutation, so open UIs refetch
+	// without polling. Optional (nil = no-op via live.Broker's nil handling) — set by SetPublisher.
+	pub *live.Broker
 }
 
 // NewStore builds the store (and its history) from the environment. It never errors — a missing file
@@ -167,6 +172,10 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{path: runsPath(), hist: NewHistory()}
 }
+
+// SetPublisher wires the live-change broker so mutations notify open UIs. Idempotent; nil is allowed
+// (leaves publishing off, e.g. in tests that don't care about notifications).
+func (s *Store) SetPublisher(b *live.Broker) { s.pub = b }
 
 func runsPath() string {
 	if p := os.Getenv("DEVLAB_MERCURY_RUNS"); p != "" {
@@ -236,6 +245,7 @@ func (s *Store) Mutate(action, actor string, fn func([]Run) ([]Run, error)) ([]R
 		return nil, err
 	}
 	s.hist.snapshot(action, actor, next) // best-effort: a history write must never lose the mutation
+	s.pub.Publish(live.TopicRuns)        // tell open UIs to refetch the run/ToDo lists
 	return next, nil
 }
 
@@ -244,7 +254,12 @@ func (s *Store) Mutate(action, actor string, fn func([]Run) ([]Run, error)) ([]R
 func (s *Store) Patch(fn func([]Run) ([]Run, error)) ([]Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.apply(fn)
+	next, err := s.apply(fn)
+	if err != nil {
+		return nil, err
+	}
+	s.pub.Publish(live.TopicRuns) // runtime state (schedule advanced, result attached, …) is UI truth too
+	return next, nil
 }
 
 // apply loads, applies fn, and atomically saves. The caller holds s.mu.

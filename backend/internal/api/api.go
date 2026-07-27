@@ -18,6 +18,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
@@ -38,6 +39,7 @@ type Server struct {
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	live        *live.Broker          // Mercury's single change-notification bus (SSE fan-out); never nil
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -65,6 +67,9 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: chat store disabled: %v", err)
 		chatStore = nil
 	}
+	broker := live.NewBroker()
+	runStore := runs.NewStore()
+	runStore.SetPublisher(broker) // every run/ToDo mutation now notifies open UIs
 	return &Server{
 		v:           v,
 		reposBase:   base,
@@ -72,13 +77,18 @@ func New(v *auth.Verifier) *Server {
 		workspaces:  workspace.NewManager(),
 		comments:    cstore,
 		chats:       chatStore,
-		runs:        runs.NewStore(),
+		runs:        runStore,
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
 		attachments: runs.NewAttachmentStore(),
+		live:        broker,
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
+
+// publish emits a Mercury change-topic to every open UI stream. Nil-safe on the broker, so it is
+// always callable. Kept as a one-liner so mutation handlers can announce a change in a single line.
+func (s *Server) publish(topic string) { s.live.Publish(topic) }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
 type ctxKey int
@@ -173,6 +183,10 @@ func (s *Server) Handler() http.Handler {
 	// now (the tree and a record); the caller's session is forwarded to aigentic.
 	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
 	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+	// The single live-update stream (Server-Sent Events): one long-lived connection per open Mercury
+	// surface over which the server pushes coarse "topic X changed" notifications. Read-tier (a GET,
+	// no CSRF); the client refetches through the normal read endpoints on each notification.
+	mux.HandleFunc("GET /api/mercury/events", s.guard(s.mercuryEvents))
 	// Add an axiom: aigentic classifies it into the tree, DevLab writes it. CSRF-guarded, but no
 	// GitHub link needed — the store authority is aigentic's hp_aigentic_run, not GitHub.
 	mux.HandleFunc("POST /api/mercury/axiom", s.guardCSRF(s.addAxiom))
