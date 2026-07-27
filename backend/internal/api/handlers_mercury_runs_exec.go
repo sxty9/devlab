@@ -388,6 +388,13 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			break
 		}
 		if ctx.Err() != nil {
+			// A deliberate DEFER (Defer attaches ErrRunDeferred) stands the run down to free its slot: keep
+			// every completed repo and re-arm as an immediately-due deferred suspension so the SAME
+			// execution resumes at the next free slot — never a finalise (abort) and never a plain
+			// carry-over (which would park it until the next scheduled fire).
+			if errors.Is(context.Cause(ctx), runs.ErrRunDeferred) {
+				return x.suspendDeferred(run, &res, save)
+			}
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
 			// ErrRunAborted as the cause) finalises the run — "abort" means stop, not resume. Our own
 			// sweep-duration cap (DeadlineExceeded) and a process shutdown (a plain cancel with no abort
@@ -418,6 +425,17 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 				run.ID, repo.ID, lim.infraErr)
 			carriedOver = true
 			break
+		}
+		// A defer landed WHILE this repo ran: record a durable mid-repo result (a success or one that
+		// already opened a PR — dropping it would redo work or duplicate a PR), drop a non-durable one (it
+		// retries on resume), then re-arm as an immediately-due deferred suspension. Handled before the
+		// generic carry-over so the run becomes due at once (not parked until its next scheduled fire).
+		if errors.Is(context.Cause(ctx), runs.ErrRunDeferred) {
+			if rr.OK || rr.PRUrl != "" {
+				rr.Running = false
+				res.Repos = append(res.Repos, rr)
+			}
+			return x.suspendDeferred(run, &res, save)
 		}
 		// If the context ended DURING this repo (duration cap or shutdown, not a deliberate abort) before
 		// it produced any durable result, do NOT record the half-done repo — carry over so it retries
@@ -608,6 +626,24 @@ func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, sa
 	log.Printf("devlabd: run %s suspended on usage limit — resuming at %s (attempt %d)", run.ID, resumeAt.Format(time.RFC3339), attempts+1)
 	ref := res.Ref()
 	ref.OK = false
+	ref.Reason = runs.ReasonUsageLimit
+	return ref, nil
+}
+
+// suspendDeferred persists the partial execution as a DEFERRED suspension and returns a suspended ref
+// marked so — the run gave up its slot on an explicit stand-down (ErrRunDeferred), keeps every completed
+// repo, and resumes the SAME execution at the next free slot (ResumeAt = now → immediately due). Unlike a
+// usage-limit suspension it does NOT count toward the resume budget: a defer is a deliberate user action,
+// never a failed retry, so repeatedly deferring an urgent run must never make it give up.
+func (x *runExecutor) suspendDeferred(run runs.Run, res *runs.Result, save func()) (runs.ResultRef, error) {
+	now := time.Now()
+	res.Suspended = true
+	res.ResumeAt = &now
+	save()
+	log.Printf("devlabd: run %s deferred — freed its slot, resuming the same execution at the next free slot", run.ID)
+	ref := res.Ref()
+	ref.OK = false
+	ref.Reason = runs.ReasonDeferred
 	return ref, nil
 }
 
@@ -2120,48 +2156,6 @@ func clip(s string) string {
 
 // runNow triggers a run immediately, detached from this request (it can take a long time). Returns at
 // once; the UI polls the run's results. 503 when unconfigured, 409 when a run is already in progress.
-func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
-	if s.scheduler == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert (DEVLAB_RUNS_MODE/DEVLAB_RUNS_USER)")
-		return
-	}
-	id := r.PathValue("id")
-	if _, ok, err := s.runs.Get(id); err != nil || !ok {
-		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
-		return
-	}
-	// ?fresh=1 explicitly discards any interrupted execution and starts over (req 4); the default (no flag)
-	// continues an interrupted execution if one exists (req 1). Either way the returned plan says which
-	// happened and why, so the difference is visible to whoever triggered the run (req 2).
-	q := r.URL.Query().Get("fresh")
-	fresh := q == "1" || strings.EqualFold(q, "true")
-	plan, started := s.scheduler.FireNow(id, actor(r), fresh)
-	if !started {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
-}
-
-// runActive reports the run executing in THIS process right now — its id, the live result id (once the
-// executor mints it), and when it started — or null when nothing runs. It is the single source of truth
-// the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
-// mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
-// scheme scan), so it is safe to poll frequently.
-//
-// Alongside it the endpoint returns `inflight`: the transparent list of every run the system is currently
-// working — the executing one PLUS every run SUSPENDED mid-execution on the usage limit (waiting to
-// resume). `active` stays the minimal projection existing consumers depend on; `inflight` is the enriched
-// list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
-// parallel data path.
-func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
-	if s.scheduler != nil {
-		active = s.scheduler.Active()
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
-}
-
 // inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,
 // state "executing") or SUSPENDED on the usage limit mid-execution (state "suspended", waiting for its
 // window to reset). A portioned, read-only projection assembled for the "Aktive Läufe" overview so the UI
@@ -2171,11 +2165,16 @@ type inFlightRun struct {
 	RunID   string `json:"runId"`
 	RunName string `json:"runName"`
 	Type    string `json:"type"`  // auto|todo
-	State   string `json:"state"` // executing|suspended
+	State   string `json:"state"` // executing|suspended|deferred
+
+	// Exclusive/Overload flag an EXECUTING run: it holds the whole floor (an auto sweep) or it took a
+	// temporary extra slot beyond the cap. Both surface so the overview can portion belegt/frei/Überladung.
+	Exclusive bool `json:"exclusive,omitempty"`
+	Overload  bool `json:"overload,omitempty"`
 
 	ResultID  string     `json:"resultId,omitempty"`
 	StartedAt *time.Time `json:"startedAt,omitempty"` // execution start (executing)
-	ResumeAt  *time.Time `json:"resumeAt,omitempty"`  // when a suspended run resumes
+	ResumeAt  *time.Time `json:"resumeAt,omitempty"`  // when a suspended/deferred run resumes
 	Attempts  int        `json:"attempts,omitempty"`  // suspended: resume attempts so far
 
 	CurrentRepo string `json:"currentRepo,omitempty"` // the repo in flight (executing)
@@ -2189,11 +2188,12 @@ type inFlightRun struct {
 	NumTurns     int     `json:"numTurns"`
 }
 
-// assembleInFlight builds the transparent list of runs the system is currently working: the one
-// EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
-// limit). Each entry is enriched from its live result document so the overview shows the current
+// assembleInFlight builds the transparent list of runs the system is currently working: every run
+// EXECUTING right now (one per live slot, including overloads) followed by every SUSPENDED run — paused
+// on the usage limit (state "suspended") or stood down to free a slot (state "deferred", waiting for the
+// next free one). Each entry is enriched from its live result document so the overview shows the current
 // repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
-func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+func (s *Server) assembleInFlight(active []runs.Activity) []inFlightRun {
 	out := []inFlightRun{}
 	if s.runs == nil {
 		return out
@@ -2206,29 +2206,42 @@ func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
 	for _, r := range all {
 		byID[r.ID] = r
 	}
+	live := make(map[string]bool, len(active))
 
-	// 1) The run executing right now (at most one — the scheduler runs runs serially).
-	if active != nil {
-		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
-		st := active.StartedAt
+	// 1) Every run executing right now — one per occupied slot (concurrent), each with its exclusive/
+	//    overload flags so the overview can portion belegt/frei/Überladung.
+	for _, a := range active {
+		live[a.RunID] = true
+		e := inFlightRun{
+			RunID: a.RunID, RunName: a.RunName, State: "executing", ResultID: a.ResultID,
+			Exclusive: a.Exclusive, Overload: a.Overload,
+		}
+		st := a.StartedAt
 		e.StartedAt = &st
-		if run, ok := byID[active.RunID]; ok {
-			e.RunName = run.Name
+		if run, ok := byID[a.RunID]; ok {
+			if e.RunName == "" {
+				e.RunName = run.Name
+			}
 			e.Type = string(runs.NormalizeType(run.Type))
 			e.ReposTotal = todoRepoTotal(run)
 		}
-		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		s.enrichInFlight(&e, a.RunID, a.ResultID)
 		out = append(out, e)
 	}
 
-	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
-	//    double-count the executing one (a run cannot be both).
+	// 2) Every run suspended mid-execution — genuinely in flight, just paused. A defer that is CURRENTLY
+	//    resuming still carries its Suspended pointer until it finishes but already shows in (1); skip it
+	//    here so it is not listed twice. Never double-count an executing run (a run cannot be both).
 	for _, run := range all {
-		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+		if run.Suspended == nil || live[run.ID] {
 			continue
 		}
+		state := "suspended"
+		if run.Suspended.IsDeferred() {
+			state = "deferred"
+		}
 		e := inFlightRun{
-			RunID: run.ID, RunName: run.Name, State: "suspended",
+			RunID: run.ID, RunName: run.Name, State: state,
 			Type:       string(runs.NormalizeType(run.Type)),
 			ResultID:   run.Suspended.ResultID,
 			Attempts:   run.Suspended.Attempts,
@@ -2278,14 +2291,15 @@ func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
 	}
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts ONE specific in-flight run (kill-switch), named by path id — with several runs
+// concurrent, cancelling is per-run, not a single global stop. 409 when that run is not currently live.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
