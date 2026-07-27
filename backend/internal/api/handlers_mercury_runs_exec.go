@@ -817,6 +817,61 @@ func noDeployTargetReason(repoName string) string {
 		filepath.Join(deployScriptDir, repoName) + "); das Repo installiert keinen Dienst, es gibt nichts zu deployen"
 }
 
+// noDeployRepos is the set of repos an operator has marked NOT-TO-BE-DELIVERED to prod
+// (DEVLAB_RUNS_NO_DEPLOY — comma/space/newline/semicolon separated bare repo names, case-insensitive).
+// A merged PR for such a repo triggers NO prod-deploy attempt at all, so a service deliberately not run
+// in prod never produces a failed attempt. This is RUNTIME config (an operator's decision), never a
+// repo-committed instance specific — keeping the repos instance-neutral.
+func noDeployRepos() map[string]bool {
+	out := map[string]bool{}
+	fields := strings.FieldsFunc(os.Getenv("DEVLAB_RUNS_NO_DEPLOY"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == ';'
+	})
+	for _, f := range fields {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" {
+			out[f] = true
+		}
+	}
+	return out
+}
+
+func isNoDeployRepo(name string) bool {
+	return noDeployRepos()[strings.ToLower(strings.TrimSpace(name))]
+}
+
+// shipToProd is the SINGLE gate deciding whether a merged PR's repo should be prod-deployed at all. Two
+// deliberate no-ship cases return ship=false with a human reason and are untracked WITHOUT an attempt,
+// so neither can produce a failed attempt:
+//   - the repo is explicitly not-to-be-delivered (DEVLAB_RUNS_NO_DEPLOY) — an operator's decision; or
+//   - the repo has no vetted deploy script (a library/template/data repo — nothing to ship).
+//
+// Otherwise ship=true and Maintain runs the deploy. Unifying both "don't ship" reasons behind one call
+// keeps a single access point for "is this repo prod-deployable" rather than two parallel checks.
+func (x *runExecutor) shipToProd(name string) (bool, string) {
+	if isNoDeployRepo(name) {
+		return false, "als nicht auszuliefern geführt (DEVLAB_RUNS_NO_DEPLOY) — " + name +
+			" wird bewusst nicht nach prod ausgeliefert"
+	}
+	if !x.deployable(name) {
+		return false, noDeployTargetReason(name)
+	}
+	return true, ""
+}
+
+const defaultMaxDeployAttempts = 3
+
+// maxDeployAttempts is how many consecutive PERMANENT prod-deploy failures a merged PR gets before it is
+// blocked — a small safety margin against a misclassified transient failure. Transient failures never
+// count toward it. DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS overrides; a non-positive value keeps the default.
+func maxDeployAttempts() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxDeployAttempts
+}
+
 // repoNameOf reduces an owner/repo full name to the bare repo name the deploy allowlist is keyed by.
 func repoNameOf(fullName string) string {
 	if i := strings.LastIndex(fullName, "/"); i >= 0 {
@@ -886,16 +941,111 @@ var infraErrorMarkers = []string{
 // geklont werden kann" step: the runner distinguishes "the network is down" from "this repo is broken"
 // and reacts differently — the former is transient and retried, the latter is a real per-repo failure.
 func isInfraError(err error) bool {
-	if err == nil {
-		return false
-	}
-	m := strings.ToLower(err.Error())
-	for _, s := range infraErrorMarkers {
-		if strings.Contains(m, s) {
+	return err != nil && hasInfraMarker(err.Error())
+}
+
+// hasInfraMarker reports whether a message carries a connectivity-failure signature. Split out of
+// isInfraError so a deploy failure can be classified on the wrapper's combined OUTPUT (where the real
+// ssh/rsync cause lives) as well as on the Go error. Matched case-insensitively.
+func hasInfraMarker(s string) bool {
+	m := strings.ToLower(s)
+	for _, marker := range infraErrorMarkers {
+		if strings.Contains(m, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// ─── prod-deploy failure classification ─────────────────────────────────────
+//
+// A merged PR's prod-deploy can fail two very different ways, and Maintain must tell them apart: a
+// TRANSIENT connectivity failure (the VPS is briefly unreachable) will succeed on a later tick and is
+// retried; a PERMANENT failure (the service is not set up on the target, a missing unit, a bad config)
+// will fail identically forever and, after a few attempts, blocks. The real cause lives in the deploy
+// wrapper's combined OUTPUT, not in the Go exit-status error — so classification reads the output first.
+
+// deployTransient reports whether a failed prod-deploy is a transient connectivity failure (retry)
+// rather than a permanent one (eventually block). Reuses the sweep's infra-marker set against the
+// wrapper output and the Go error, so an ssh/rsync "connection refused" / "timed out" / "no route to
+// host" is retried while a missing-unit or bad-config failure is not.
+func deployTransient(out string, err error) bool {
+	return hasInfraMarker(out) || isInfraError(err)
+}
+
+// deploySetupMissingMarkers are substrings of a deploy's combined OUTPUT that mean the service is NOT
+// SET UP ON THE TARGET — no unit to (re)start, no vetted per-repo deploy script, missing prod config, or
+// an unknown repo on the receiver — as distinct from a generic build/argument failure. Matched
+// case-insensitively; used only to phrase the block reason, never to decide transient-vs-permanent.
+var deploySetupMissingMarkers = []string{
+	".service not found", // systemctl: the prod unit is not installed on the target
+	"unit not found",
+	"no such unit",
+	"no deploy script",  // wrapper exit 3: no vetted per-repo script on the runner host
+	"prod: missing",     // per-repo script exit 11: missing prod-target / deploy key config
+	"prod: empty target",
+	"no staged artifact", // receiver exit 3: nothing staged / no mapping for this repo on the target
+	"no mapping",
+	"unknown env",
+}
+
+// deploySetupMissing reports whether a permanent deploy failure specifically means "the service is not
+// set up on the target", so the block reason can NAME that cause rather than leave a bare exit code.
+func deploySetupMissing(out string) bool {
+	m := strings.ToLower(out)
+	for _, marker := range deploySetupMissingMarkers {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// deployBlockReason renders a human, service-and-target-naming reason for a blocked prod-deploy — never
+// a bare technical return value (requirement 1). When the output matches a "not set up on the target"
+// signature it says exactly that; otherwise it reports a durable delivery failure with the output tail.
+func deployBlockReason(service, out string, err error) string {
+	target := prodTargetName()
+	detail := lastMeaningfulLine(out, err)
+	if deploySetupMissing(out) {
+		return fmt.Sprintf("Dienst »%s« ist im Ziel »%s« nicht eingerichtet: %s", service, target, detail)
+	}
+	return fmt.Sprintf("Auslieferung von »%s« nach »%s« dauerhaft fehlgeschlagen: %s", service, target, detail)
+}
+
+// prodTargetName is the human name of the delivery target a block reason cites. The concrete host lives
+// server-side (/etc/devlab/prod-target) and is deliberately never exposed to the runner, so the target
+// is named by its ENVIRONMENT ("prod"); DEVLAB_RUNS_PROD_TARGET_NAME overrides for a friendlier label.
+func prodTargetName() string {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_TARGET_NAME")); v != "" {
+		return v
+	}
+	return "prod"
+}
+
+// lastMeaningfulLine pulls the most informative line out of a deploy's combined output for a block
+// reason — the last non-empty line (usually the concrete error), falling back to the Go error — clipped
+// so the reason stays one readable sentence rather than a wall of log.
+func lastMeaningfulLine(out string, err error) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			return clipLine(s)
+		}
+	}
+	if err != nil {
+		return clipLine(err.Error())
+	}
+	return "unbekannter Fehler"
+}
+
+func clipLine(s string) string {
+	const max = 240
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
 }
 
 // githubReachable probes GitHub's API (a cheap, unauthenticated-safe rate-limit GET) to decide whether

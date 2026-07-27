@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,6 +121,96 @@ func TestShouldDevDeploy(t *testing.T) {
 		if !x.shouldDevDeploy("aigentic") {
 			t.Errorf("DEVLAB_RUNS_DEV_DEPLOY=%q: dev-deploy must be ON in full mode", v)
 		}
+	}
+}
+
+// TestDeployTransientVsPermanent pins the transient/permanent split that decides retry-forever vs
+// eventually-block. Connectivity failures (in the wrapper OUTPUT or the Go error) are transient; a
+// missing unit, missing config, bad argument or unknown env is permanent.
+func TestDeployTransientVsPermanent(t *testing.T) {
+	cases := []struct {
+		name          string
+		out           string
+		err           error
+		wantTransient bool
+	}{
+		{"ssh connection refused (output)", "ssh: connect to host 10.0.0.1 port 22: Connection refused", errors.New("exit status 255"), true},
+		{"no route to host (output)", "ssh: connect to host vps port 22: No route to host", errors.New("exit status 255"), true},
+		{"rsync timed out (output)", "rsync error: timeout in data send/receive (code 30)", errors.New("exit status 30"), true},
+		{"could not resolve host (output)", "ssh: Could not resolve hostname vps: Name or service not known", errors.New("exit status 255"), true},
+		{"infra error (go error only)", "", errors.New("dial tcp: i/o timeout"), true},
+		{"missing unit on target", "Failed to restart devlab.service: Unit devlab.service not found.", errors.New("exit status 1"), false},
+		{"missing prod config", "[deploy devlab] prod: missing /etc/devlab/prod-target", errors.New("exit status 11"), false},
+		{"no deploy script (wrapper exit 3)", "devlab-deploy: no deploy script for 'prizm' (/etc/devlab/deploy.d/prizm) — skipped", errors.New("exit status 3"), false},
+		{"bare exit status, no clue", "", errors.New("exit status 1"), false},
+	}
+	for _, c := range cases {
+		if got := deployTransient(c.out, c.err); got != c.wantTransient {
+			t.Errorf("%s: deployTransient=%v, want %v", c.name, got, c.wantTransient)
+		}
+	}
+}
+
+// TestDeployBlockReason pins requirement 1: a block reason NAMES the service and the target and, for a
+// "not set up on the target" failure, says exactly that — never leaving a bare exit code.
+func TestDeployBlockReason(t *testing.T) {
+	unit := deployBlockReason("aigentic", "Failed to restart aigentic.service: Unit aigentic.service not found.", errors.New("exit status 1"))
+	if !strings.Contains(unit, "aigentic") || !strings.Contains(unit, "prod") || !strings.Contains(unit, "nicht eingerichtet") {
+		t.Errorf("setup-missing reason must name service+target and say 'nicht eingerichtet': %q", unit)
+	}
+	if strings.TrimSpace(unit) == "exit status 1" {
+		t.Errorf("reason must not be a bare exit code: %q", unit)
+	}
+
+	generic := deployBlockReason("studiq", "[deploy studiq] copy failed: disk full", errors.New("exit status 1"))
+	if !strings.Contains(generic, "studiq") || !strings.Contains(generic, "prod") {
+		t.Errorf("generic reason must still name service+target: %q", generic)
+	}
+	if strings.Contains(generic, "nicht eingerichtet") {
+		t.Errorf("a non-setup failure must NOT claim 'nicht eingerichtet': %q", generic)
+	}
+	if !strings.Contains(generic, "disk full") {
+		t.Errorf("generic reason should carry the output tail as detail: %q", generic)
+	}
+}
+
+// TestShipToProd pins the single no-ship gate: an explicitly not-to-be-delivered repo and a repo with
+// no deploy script both return ship=false with a reason (no attempt); a deployable, non-excluded repo
+// ships. The concrete case — a service marked not-to-be-delivered — never reaches a deploy.
+func TestShipToProd(t *testing.T) {
+	x := &runExecutor{deployTargetFn: func(name string) bool { return name != "nodeploytarget" }}
+
+	if ship, _ := x.shipToProd("aigentic"); !ship {
+		t.Errorf("a deployable, non-excluded repo must ship")
+	}
+	if ship, why := x.shipToProd("nodeploytarget"); ship || why == "" {
+		t.Errorf("a repo with no deploy script must not ship, with a reason (got ship=%v why=%q)", ship, why)
+	}
+
+	t.Setenv("DEVLAB_RUNS_NO_DEPLOY", "phantom, aigentic ;other")
+	if ship, why := x.shipToProd("aigentic"); ship || !strings.Contains(why, "nicht auszuliefern") {
+		t.Errorf("an excluded repo must not ship, citing the exclusion (got ship=%v why=%q)", ship, why)
+	}
+	if ship, why := x.shipToProd("AIGENTIC"); ship { // case-insensitive
+		t.Errorf("exclusion must be case-insensitive, but %q shipped (why=%q)", "AIGENTIC", why)
+	}
+	if ship, _ := x.shipToProd("studiq"); !ship {
+		t.Errorf("a repo NOT on the exclusion list must still ship")
+	}
+}
+
+// TestMaxDeployAttempts pins the threshold knob: default 3, overridable, non-positive ignored.
+func TestMaxDeployAttempts(t *testing.T) {
+	if got := maxDeployAttempts(); got != defaultMaxDeployAttempts {
+		t.Errorf("default maxDeployAttempts=%d, want %d", got, defaultMaxDeployAttempts)
+	}
+	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "5")
+	if got := maxDeployAttempts(); got != 5 {
+		t.Errorf("override maxDeployAttempts=%d, want 5", got)
+	}
+	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "0")
+	if got := maxDeployAttempts(); got != defaultMaxDeployAttempts {
+		t.Errorf("non-positive override ignored: got %d, want %d", got, defaultMaxDeployAttempts)
 	}
 }
 
