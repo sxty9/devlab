@@ -4,32 +4,18 @@ import { useToast } from '@/ui/Toast';
 import { Modal } from '@/ui/Modal';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
+import { badgeTone } from '@/ui/tint';
 import { GitBranchIcon, GitCommitIcon, RefreshIcon } from '@/ui/icons';
 import { fmtDateTime, EmptyPlaceholder } from './MercuryExecutions';
-import {
-  groupDeliveriesByRepo,
-  canRollback,
-  summarizeRollbackOutcome,
-  DELIVERY_STATUS,
-  shortSha,
-  type DeliveryTint,
-} from './mercuryDeliveries';
+import { groupDeliveriesByRepo, canRollback, summarizeRollbackOutcome, DELIVERY_STATUS, shortSha } from './mercuryDeliveries';
 import type { Delivery } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
 
-const TONE: Record<DeliveryTint, string> = {
-  success: 'bg-success/15 text-success',
-  accent: 'bg-accent/15 text-accent',
-  warning: 'bg-warning/15 text-warning',
-  danger: 'bg-danger/15 text-danger',
-  neutral: 'bg-fill/15 text-text-tertiary',
-};
-
 function StatusBadge({ status }: { status: Delivery['status'] }) {
   const { label, tint } = DELIVERY_STATUS[status];
-  return <span className={cn('shrink-0 rounded px-1.5 py-0.5 text-caption font-medium', TONE[tint])}>{label}</span>;
+  return <span className={cn('shrink-0 rounded px-1.5 py-0.5 text-caption font-medium', badgeTone[tint])}>{label}</span>;
 }
 
 /** MercuryDeliveries — the "Lieferungen" surface: the addressable record of what every run shipped, per

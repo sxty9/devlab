@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
+import { badgeTone } from '@/ui/tint';
 import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
@@ -95,14 +96,8 @@ function StageBadge({ todo, className }: { todo: Run; className?: string }) {
   const stage = runStage(todo.lastResult);
   if (!stage) return null;
   const { label, tint } = RUN_STAGE_LABEL[stage];
-  const tone = {
-    success: 'bg-success/15 text-success',
-    accent: 'bg-accent/15 text-accent',
-    warning: 'bg-warning/15 text-warning',
-    danger: 'bg-danger/15 text-danger',
-  }[tint];
   return (
-    <span className={cn('flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium', tone, className)}>
+    <span className={cn('flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium', badgeTone[tint], className)}>
       {stage === 'prod-deployed' && <CheckIcon className="h-3 w-3" />}
       {label}
     </span>

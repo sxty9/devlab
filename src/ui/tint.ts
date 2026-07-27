@@ -31,3 +31,15 @@ export const tintSoftBg: Record<Repo['tint'], string> = {
   ssd: 'bg-ssd/15',
   ram: 'bg-ram/15',
 };
+
+/** Semantic status tone → soft tinted background + matching text, for the status/stage pills across the
+ *  app (a run's stage, a delivery's lifecycle, an ok/fail marker). Distinct from the Repo channel tints
+ *  above, which cover the hardware-style palette. One map so every pill is tinted identically. */
+export type BadgeTone = 'success' | 'accent' | 'warning' | 'danger' | 'neutral';
+export const badgeTone: Record<BadgeTone, string> = {
+  success: 'bg-success/15 text-success',
+  accent: 'bg-accent/15 text-accent',
+  warning: 'bg-warning/15 text-warning',
+  danger: 'bg-danger/15 text-danger',
+  neutral: 'bg-fill/15 text-text-tertiary',
+};
