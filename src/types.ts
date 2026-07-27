@@ -399,6 +399,7 @@ export interface Run {
   enabled: boolean;
   model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
+  timeBudget?: string; // per-repo cap: absent = service default (3h), a duration ('2h'), or 'off' = no cap
   schedule: RunSchedule;
   axiomIds: string[];
   // todo only
@@ -428,6 +429,7 @@ export interface RunInput {
   enabled: boolean;
   model?: string; // Claude model id/alias; '' or absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
+  timeBudget?: string; // per-repo cap: '' or absent = service default, a duration ('2h'), or 'off' = no cap
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
@@ -620,10 +622,12 @@ export interface RunResult {
   /** The run's Promptstellung for THIS execution — the exact prompt the agent was driven by,
    *  snapshotted at run time. Absent on executions recorded before it was captured. */
   prompt?: string;
-  /** Which Claude engine drove THIS execution: the resolved model, and the selected effort tier
-   *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
+  /** Which Claude engine drove THIS execution: the resolved model, the selected effort tier (absent =
+   *  the runner default max, 'ultracode' = the maximal tier), and the per-repo time budget that applied
+   *  ('3h', '90m', or 'off' for no cap). Absent on older executions. */
   model?: string;
   effort?: string;
+  timeBudget?: string;
   ok: boolean;
   repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed

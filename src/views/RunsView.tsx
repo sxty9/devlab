@@ -8,7 +8,7 @@ import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
-import { RunTuningFields } from './RunTuning';
+import { RunTuningFields, budgetLabel } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
   Run,
@@ -549,9 +549,9 @@ function RunDetail({
         {run.suspended && (
           <span className="rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent">pausiert · Abo-Limit</span>
         )}
-        {(run.model || run.effort) && (
+        {(run.model || run.effort || run.timeBudget) && (
           <span className="rounded bg-fill/10 px-1.5 py-0.5 font-medium text-text-secondary">
-            {[run.model, run.effort].filter(Boolean).join(' · ')}
+            {[run.model, run.effort, budgetLabel(run.timeBudget)].filter(Boolean).join(' · ')}
           </span>
         )}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
@@ -644,6 +644,7 @@ function RunEditor({
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
   const [model, setModel] = useState(base?.model ?? '');
   const [effort, setEffort] = useState(base?.effort ?? '');
+  const [timeBudget, setTimeBudget] = useState(base?.timeBudget ?? '');
   const [schedule, setSchedule] = useState<RunSchedule>(base?.schedule ?? { kind: 'daily', timeOfDay: '03:00' });
   const [axiomIds, setAxiomIds] = useState<string[]>(base?.axiomIds ?? []);
   const [busy, setBusy] = useState(false);
@@ -661,7 +662,7 @@ function RunEditor({
       schedule.kind === 'weekly'
         ? { kind: 'weekly', timeOfDay: schedule.timeOfDay, weekdays: [...(schedule.weekdays ?? [])].sort((a, b) => a - b) }
         : { kind: 'daily', timeOfDay: schedule.timeOfDay };
-    const body: RunInput = { name: name.trim(), enabled, model, effort, schedule: cleanSchedule, axiomIds };
+    const body: RunInput = { name: name.trim(), enabled, model, effort, timeBudget, schedule: cleanSchedule, axiomIds };
     try {
       const run = base ? await source.mercuryUpdateRun(base.id, body) : await source.mercuryCreateRun(body);
       toast({ title: base ? 'Lauf gespeichert' : 'Lauf angelegt', variant: 'success' });
@@ -704,7 +705,14 @@ function RunEditor({
         {axiomIds.length === 0 && <p className="mt-1.5 text-caption text-danger">Mindestens ein Axiom wählen.</p>}
       </div>
 
-      <RunTuningFields model={model} effort={effort} onModelChange={setModel} onEffortChange={setEffort} />
+      <RunTuningFields
+        model={model}
+        effort={effort}
+        timeBudget={timeBudget}
+        onModelChange={setModel}
+        onEffortChange={setEffort}
+        onTimeBudgetChange={setTimeBudget}
+      />
 
       <div className="flex items-center gap-2">
         <Button variant="primary" size="sm" disabled={!valid || busy} onClick={save}>

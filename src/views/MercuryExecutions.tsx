@@ -18,6 +18,7 @@ import {
   type Job,
   type JobStatus,
 } from './mercuryPipeline';
+import { budgetLabel } from './RunTuning';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -103,12 +104,16 @@ export function TokenStat({ input, output, cost }: { input?: number; output?: nu
 }
 
 /** The Claude engine that drove an execution — the model (a Holistic requirement: every AI answer is
- *  labelled with its model) and, when it differs from the default, the effort tier. */
-export function ModelStat({ model, effort }: { model: string; effort?: string }) {
+ *  labelled with its model), the effort tier when it differs from the default, and the per-repo time
+ *  budget that applied ("3h", or "no limit" for an explicit no-cap) so a run names honestly what bounded
+ *  it. The budget is the resolved value stamped at run time, present on every execution the runner minted. */
+export function ModelStat({ model, effort, timeBudget }: { model: string; effort?: string; timeBudget?: string }) {
+  const budget = budgetLabel(timeBudget);
   return (
-    <span className="flex items-center gap-1.5 text-caption text-text-tertiary" title="Model · Effort">
+    <span className="flex items-center gap-1.5 text-caption text-text-tertiary" title="Model · Effort · Zeitbudget">
       <span className="font-medium text-text-secondary">{model}</span>
       {effort && <span>· {effort}</span>}
+      {budget && <span>· {budget}</span>}
     </span>
   );
 }
@@ -562,7 +567,7 @@ function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?:
 
       <div className={cn('flex flex-wrap items-center justify-between gap-3', !hideHeader && 'mt-4')}>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
-          {res.model && <ModelStat model={res.model} effort={res.effort} />}
+          {res.model && <ModelStat model={res.model} effort={res.effort} timeBudget={res.timeBudget} />}
           <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
           <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
         </div>
@@ -748,7 +753,7 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
           {fmtDateTime(res.startedAt)}
           {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
         </span>
-        {res.model && <ModelStat model={res.model} effort={res.effort} />}
+        {res.model && <ModelStat model={res.model} effort={res.effort} timeBudget={res.timeBudget} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
@@ -906,7 +911,7 @@ export function LiveExecution({
           <span className={cn('h-2 w-2 rounded-full', dotLive ? 'animate-pulse bg-warning' : 'bg-text-tertiary')} /> {label}
         </span>
         <span className="text-caption text-text-tertiary">seit {fmtDateTime(res.startedAt)}</span>
-        {res.model && <ModelStat model={res.model} effort={res.effort} />}
+        {res.model && <ModelStat model={res.model} effort={res.effort} timeBudget={res.timeBudget} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
