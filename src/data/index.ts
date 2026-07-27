@@ -88,6 +88,7 @@ export const dataSource: DataSource = {
   mercuryRunResult: (id, resultId) => impl.mercuryRunResult(id, resultId),
   mercuryRunCalendar: (days, type) => impl.mercuryRunCalendar(days, type),
   mercuryRunExecutions: (type) => impl.mercuryRunExecutions(type),
+  mercuryReportStatus: () => impl.mercuryReportStatus(),
   mercuryChat: (messages) => impl.mercuryChat(messages),
   mercuryRunNow: (id) => impl.mercuryRunNow(id),
   mercuryRunActive: () => impl.mercuryRunActive(),

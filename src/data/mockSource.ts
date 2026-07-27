@@ -418,6 +418,11 @@ export const mockSource: DataSource = {
       action = { kind: 'create_run', name: 'Neuer Lauf', axiomIds: ['ax_mock'], schedule: { kind: 'daily', timeOfDay: '03:00' } };
     }
     return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
+  async mercuryReportStatus() {
+    return { records: [] as import('@/types').ReportDelivery[] };
+  },
+  async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
+    return { reply: 'Mock-Antwort' };
   },
   async mercuryRunNow(_id: string) {
     return { started: true };

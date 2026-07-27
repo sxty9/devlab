@@ -736,6 +736,20 @@ export interface RunExecution {
   requestedBy?: string;
 }
 
+/** Delivery record of one day's run-report email to the owner. `status` is 'sent' once the mail
+ *  service accepted it, or 'failed' while a send has errored — surfaced so a failed send is visible,
+ *  not silent, and understood to be retried automatically. */
+export interface ReportDelivery {
+  recipient: string;
+  day: string; // YYYY-MM-DD
+  status: 'sent' | 'failed';
+  executions: number;
+  attempts: number;
+  sentAt?: string;
+  lastAttempt?: string;
+  lastError?: string;
+}
+
 /** One turn of the free-form run-planning chat. */
 export interface RunChatMessage {
   role: 'user' | 'assistant';

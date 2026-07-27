@@ -20,6 +20,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/report"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
@@ -48,6 +49,7 @@ type Server struct {
 	axioms       *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
 	assigner     *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
 	runExec      *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
+	reportLedger *report.Ledger        // passive record of delivered/failed daily run reports (StartReporter drives sending)
 	staticDir    string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -90,6 +92,7 @@ func New(v *auth.Verifier) *Server {
 		attachments:  runs.NewAttachmentStore(),
 		axiomChecks:  runs.NewAxiomChecks(),
 		axiomAuthors: axiomauthors.NewStore(),
+		reportLedger: report.NewLedger(),
 		staticDir:    os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
@@ -258,6 +261,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
+	// Delivery status of the daily run-report email (so a failed send is visible, not silent).
+	mux.HandleFunc("GET /api/mercury/runs/report-status", s.guard(s.runsReportStatus))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))

@@ -303,6 +303,9 @@ export const httpSource: DataSource = {
   async mercuryRunExecutions(type) {
     return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
   },
+  async mercuryReportStatus() {
+    return json(await request('/api/mercury/runs/report-status'));
+  },
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
