@@ -31,6 +31,10 @@ case "$ENVN" in
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     mkdir -p /var/lib/devlab/www
     rsync -a --delete "$WEB"/ /var/lib/devlab/www/
+    # SIGTERM is the restart signal: devlabd gates new Mercury runs and drains the in-flight one before
+    # exiting (bounded by DEVLAB_RUNS_DRAIN_GRACE, within TimeoutStopSec), so this restart never kills a
+    # run mid-flight and no run can start once the restart is imminent. An interrupted run self-heals on
+    # boot. No wait/marker needed here — the mutual exclusion lives in devlabd, not this script.
     systemctl restart devlabd
     echo "[deploy devlab] dev: done"
     ;;
