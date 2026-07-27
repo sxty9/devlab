@@ -326,12 +326,23 @@ export interface Conformance {
   unavailable?: boolean; // the checker (aigentic) was unreachable — treated as conforming
 }
 
+/** Who created and last changed an axiom — from DevLab's local authorship pool, never the shared,
+ *  instance-neutral axioms repo. Absent fields ⇒ unknown (an axiom predating authorship tracking). */
+export interface AxiomAuthor {
+  createdBy?: string;
+  createdAt?: string;
+  updatedBy?: string;
+  updatedAt?: string;
+}
+
 /** A parsed axiom record: front-matter fields + the body markdown. */
 export interface Axiom {
   id: string;
   titel: string;
   quelle?: string;
   body: string;
+  /** Authorship joined from the local pool by the stable id (absent ⇒ unknown). */
+  author?: AxiomAuthor;
 }
 
 // ── Mercury — Automatische Läufe (scheduled autonomous run instances) ─────────

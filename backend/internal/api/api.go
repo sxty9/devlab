@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/axiomauthors"
 	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
@@ -27,18 +28,19 @@ const version = "0.1.0"
 // Server wires the verifier + repo base + per-user GitHub link store + workspace manager into
 // HTTP handlers.
 type Server struct {
-	v           *auth.Verifier
-	reposBase   string
-	links       *links.Store // nil when no encryption key is configured (dev/preview sandbox)
-	workspaces  *workspace.Manager
-	comments    *comments.Store       // nil if the comments dir can't be created
-	chats       *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
-	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
-	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
-	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
-	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
-	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
-	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
+	v            *auth.Verifier
+	reposBase    string
+	links        *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	workspaces   *workspace.Manager
+	comments     *comments.Store       // nil if the comments dir can't be created
+	chats        *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
+	runs         *runs.Store           // Mercury's Automatische Läufe — run instances + config history
+	axiomAuthors *axiomauthors.Store   // passive, DevLab-local pool: who created/last-changed each axiom
+	runResults   *runs.Results         // per-execution results/logs (written by the executor, read here)
+	runPRs       *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	attachments  *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	scheduler    *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	staticDir    string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
@@ -66,17 +68,18 @@ func New(v *auth.Verifier) *Server {
 		chatStore = nil
 	}
 	return &Server{
-		v:           v,
-		reposBase:   base,
-		links:       store,
-		workspaces:  workspace.NewManager(),
-		comments:    cstore,
-		chats:       chatStore,
-		runs:        runs.NewStore(),
-		runResults:  runs.NewResults(),
-		runPRs:      runs.NewPRStore(),
-		attachments: runs.NewAttachmentStore(),
-		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
+		v:            v,
+		reposBase:    base,
+		links:        store,
+		workspaces:   workspace.NewManager(),
+		comments:     cstore,
+		chats:        chatStore,
+		runs:         runs.NewStore(),
+		axiomAuthors: axiomauthors.NewStore(),
+		runResults:   runs.NewResults(),
+		runPRs:       runs.NewPRStore(),
+		attachments:  runs.NewAttachmentStore(),
+		staticDir:    os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
 

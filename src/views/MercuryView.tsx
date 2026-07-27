@@ -3,6 +3,7 @@ import { getDataSource } from '@/data';
 import { renderMarkdown } from '@/lib/markdown';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Authorship } from '@/ui/Authorship';
 import { Splash } from '@/shell/Splash';
 import RunsView from './RunsView';
 import TodosView from './TodosView';
@@ -918,9 +919,9 @@ function AxiomPane({
             onChanged(res.path);
             return;
           }
-          // Same path: this pane won't remount and its item fetch won't re-run, so update local
-          // state from the server's response — the reading view reflects the edit without a reload.
-          setAxiom(res.axiom);
+          // Same path: this pane won't remount and its item fetch won't re-run, so refresh from the
+          // server — the reading view reflects the edit (and its refreshed authorship) without a reload.
+          setAxiom(await source.mercuryItem(path).catch(() => res.axiom));
           setMode('view');
         }}
       />
@@ -968,6 +969,7 @@ function AxiomPane({
         </div>
       </div>
       <p className="mt-1 font-mono text-caption text-text-tertiary">{path}</p>
+      <Authorship className="mt-2" createdBy={axiom.author?.createdBy} updatedBy={axiom.author?.updatedBy} />
       <div className="dl-markdown mt-5" dangerouslySetInnerHTML={{ __html: renderMarkdown(axiom.body) }} />
       {conf && (
         <ConformancePanel

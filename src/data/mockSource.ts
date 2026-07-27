@@ -226,6 +226,7 @@ export const mockSource: DataSource = {
       titel: path.split('/').pop()?.replace('.md', '') ?? 'Axiom',
       quelle: 'axioms/CLAUDE.MD.md#holistic_architecture_maxims/Single Source of Truth',
       body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
+      author: { createdBy: MOCK_ACTOR, createdAt: new Date().toISOString(), updatedBy: MOCK_ACTOR, updatedAt: new Date().toISOString() },
     };
   },
   async mercuryAddAxiom(titel: string, _body: string, section?: string, _force?: boolean) {

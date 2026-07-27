@@ -68,13 +68,13 @@ type Run struct {
 
 	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
 	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
-	Repo        string     `json:"repo,omitempty"`
-	NewRepo     string     `json:"newRepo,omitempty"`
-	Prompt      string     `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
-	PromptAt    time.Time  `json:"promptAt,omitempty"`   // when the snapshot was composed
-	PromptHash  string     `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
+	Repo       string    `json:"repo,omitempty"`
+	NewRepo    string    `json:"newRepo,omitempty"`
+	Prompt     string    `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
+	PromptAt   time.Time `json:"promptAt,omitempty"`   // when the snapshot was composed
+	PromptHash string    `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 	// CreatedBy and UpdatedBy are the Holistic usernames of who first created this run/ToDo and who last
 	// changed it — kept SEPARATE so the creator stays visible even after someone else edits it. They are
 	// stamped from the same actor already flowing into Store.Mutate, so no second author signal is
