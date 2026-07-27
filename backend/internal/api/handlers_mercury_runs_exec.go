@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,9 +40,9 @@ const (
 	deployWrapper = "/usr/local/sbin/devlab-deploy"
 	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
 	// no deploy target at all — see hasDeployTarget.
-	deployScriptDir = "/etc/devlab/deploy.d"
-	runAgentTimeout = 60 * time.Minute // a full implement pass can be long
-	runnerPreamble  = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
+	deployScriptDir     = "/etc/devlab/deploy.d"
+	defaultAgentTimeout = 60 * time.Minute // a full implement pass can be long
+	runnerPreamble      = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
 		"unresolved operational gaps follow the Laufregeln (log a non-blocking skip, do not stop). Make " +
 		"focused, correct, well-tested changes and summarise precisely what you did."
@@ -59,6 +60,19 @@ const (
 	// runAgentTimeout: even 19 repos each just under 60m would otherwise run ~19h. 0 via env = off.
 	defaultMaxRunDuration = 4 * time.Hour
 )
+
+// agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
+// service from nothing — that hit the ceiling and was killed mid-implement, leaving an empty repo, no
+// PR and no usable output. So the cap is configurable (DEVLAB_RUNS_AGENT_TIMEOUT); an explicit "0"
+// removes it entirely, leaving the whole-sweep duration cap as the only bound.
+func runAgentTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return defaultAgentTimeout
+}
 
 // maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
 // (remaining repos are left for the next scheduled run). 0 (the default) = no ceiling.
@@ -144,11 +158,9 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	}
 	// The OS identity that executes and the GitHub identity that pushes are separate concerns: the
 	// runner should be a powerless Linux account while the token belongs to a real linked account.
-	// Defaults to user so an existing single-account setup keeps working untouched.
-	tokenUser := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_TOKEN_USER"))
-	if tokenUser == "" {
-		tokenUser = user
-	}
+	// runnerTokenUser resolves DEVLAB_RUNS_TOKEN_USER, falling back to DEVLAB_RUNS_USER — shared with
+	// the background rollout so both agree on which account pushes.
+	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
@@ -245,7 +257,9 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.FinishedAt = time.Now().UTC()
 		res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false, Error: msg})
 		save()
-		return runs.ResultRef{ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos)}, fmt.Errorf("%s", msg)
+		ref := res.Ref()
+		ref.OK = false
+		return ref, fmt.Errorf("%s", msg)
 	}
 	// carryOver stops WITHOUT finalising (FinishedAt stays zero) so the next fire resumes this same
 	// result and skips the done repos — for transient infrastructure failures (no network) that must not
@@ -254,10 +268,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		res.OK = false
 		save()
 		log.Printf("devlabd: run %s carried over before completing (%s) — next fire resumes it", run.ID, reason)
-		return runs.ResultRef{
-			ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
-			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
-		}, nil
+		return res.Ref(), nil
 	}
 
 	token, err := x.s.links.Token(x.tokenUser)
@@ -371,7 +382,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			carriedOver = true
 			break
 		}
-		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
+		rr, lim := x.executeRepo(ctx, run, repo, newRepoName[repo.ID] != "", x.promptFor(run, repo.ID, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
@@ -403,6 +414,11 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			break
 		}
 		rr.Running = false // a recorded repo is complete, never in-flight
+		// Note the stand this repo was examined against, per axiom of the run — the next run then only
+		// has to look at the commits after it (never examined ⇒ full repository).
+		if rr.OK && !run.IsTodo() && rr.Base != "" {
+			x.s.axiomChecks.Record(repo.ID, run.AxiomIDs, rr.Base, time.Now())
+		}
 		res.Repos = append(res.Repos, rr)
 		res.InputTokens += rr.InputTokens
 		res.OutputTokens += rr.OutputTokens
@@ -424,19 +440,13 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	if carriedOver {
 		res.OK = overallOK
 		save()
-		return runs.ResultRef{
-			ResultID: res.ResultID, At: res.StartedAt, OK: overallOK, RepoCount: len(res.Repos),
-			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
-		}, nil
+		return res.Ref(), nil
 	}
 
 	res.FinishedAt = time.Now().UTC()
 	res.OK = overallOK
 	save()
-	return runs.ResultRef{
-		ResultID: res.ResultID, At: res.StartedAt, OK: overallOK, RepoCount: len(res.Repos),
-		InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
-	}, nil
+	return res.Ref(), nil
 }
 
 // resumeOrNew continues an interrupted execution, or mints a fresh one. Three interruption kinds resume
@@ -454,8 +464,9 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 	fresh := func() runs.Result {
 		start := time.Now()
+		model, _, _ := tuningFor(run).resolve() // the engine this execution is minted with (re-stamped on resume, see consider)
 		return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
-			Type: runs.NormalizeType(run.Type), Mode: x.mode, StartedAt: start.UTC(),
+			Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
 			PromptHash: run.PromptHash, Prompt: run.Prompt}
 	}
 	consider := func(existing runs.Result) (runs.Result, bool, bool) {
@@ -463,6 +474,11 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 			x.reap(existing, fmt.Sprintf("Modus gewechselt (%s → %s) — Husk nicht fortgesetzt", existing.Mode, x.mode))
 			return runs.Result{}, false, true // reaped: don't resume, fall through to fresh
 		}
+		// A resumed attempt is driven by the run's CURRENT tuning (executeRepo reads tuningFor(run) each
+		// fire), so re-stamp the engine label to match — else a legacy husk shows no model, and one whose
+		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
+		m, _, _ := tuningFor(run).resolve()
+		existing.Model, existing.Effort = m, run.Effort
 		return existing, true, false
 	}
 	if run.Suspended != nil && run.Suspended.ResultID != "" {
@@ -514,16 +530,17 @@ func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, sa
 		res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false,
 			Error: fmt.Sprintf("Abo-Limit: nach %d automatischen Fortsetzungen aufgegeben", attempts)})
 		save()
-		return runs.ResultRef{ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
-			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD}, nil
+		ref := res.Ref()
+		ref.OK = false
+		return ref, nil
 	}
 	res.Suspended = true
 	res.ResumeAt = &resumeAt
 	save()
 	log.Printf("devlabd: run %s suspended on usage limit — resuming at %s (attempt %d)", run.ID, resumeAt.Format(time.RFC3339), attempts+1)
-	return runs.ResultRef{ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
-		InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
-		Suspended: true, ResumeAt: &resumeAt}, nil
+	ref := res.Ref()
+	ref.OK = false
+	return ref, nil
 }
 
 // repoSignal reports why a repo step stopped in a way that must NOT be recorded as a terminal repo
@@ -542,7 +559,7 @@ type repoSignal struct {
 	infraErr string
 }
 
-func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
+func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, isNewRepo bool, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
 	rr := runs.RepoResult{Repo: repo.ID, Running: true}
 	res.Live = &rr // publish this repo as the in-flight one; the caller clears Live once it settles
 	saver.force()
@@ -611,12 +628,22 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	actx, cancel := context.WithTimeout(ctx, runAgentTimeout)
+	// The stand the agent actually examines: the refreshed remote tip. Recorded per axiom once this repo
+	// succeeds, so the next run can scope itself to the commits after it.
+	if head, herr := ex.RevParse(ctx, wt, "origin/"+branch); herr == nil {
+		rr.Base = head
+	}
+
+	actx, cancel := context.WithCancel(ctx)
+	if d := runAgentTimeout(); d > 0 {
+		cancel()
+		actx, cancel = context.WithTimeout(ctx, d)
+	}
 	defer cancel()
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", atts, &rr, saver)
+		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
 		if lim.limited {
 			return rr, lim
 		}
@@ -629,8 +656,16 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	// PR / FULL: implement on a fresh run branch.
-	runBranch := "mercury-run/" + run.ID + "/" + runs.NewResultID(time.Now())
+	// PR / FULL: implement on a fresh run branch. The name follows Mercury's uniform convention
+	// <kind>/<description> (e.g. feature/dark_mode-k3f9a2): kind is fix, or feature for a newly planned
+	// service; description is the run's own name (its AI-optimized form when the raw name was too thin),
+	// slugified. A short token keeps each firing's branch unique — the workspace is reused and the push is
+	// non-forced, so a stable name would collide on switch -c and on a non-fast-forward push.
+	branchDesc := run.Name
+	if run.BranchDesc != "" {
+		branchDesc = run.BranchDesc
+	}
+	runBranch := runs.BranchName(runs.BranchKindFor(isNewRepo), branchDesc, runs.NewBranchToken())
 	if err := ex.CreateBranch(ctx, wt, runBranch, "origin/"+branch); err != nil {
 		rr.Error = "branch: " + err.Error()
 		return rr, repoSignal{}
@@ -674,7 +709,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", atts, &rr, saver)
+	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
 	}
@@ -739,6 +774,12 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	case !x.deployable(repo.Name):
 		step("dev-deploy", noDeployTargetReason(repo.Name), true)
 	default:
+		// What goes live on dev is the SUM of the pending work, not this run alone: build from a
+		// throwaway branch that folds in the other open Mercury PRs. Without it each dev-deploy would
+		// install "main + just my ToDo" and silently undo every earlier ToDo that is still waiting for
+		// its auto-merge — dev would flip between features instead of accumulating them. The run branch
+		// itself stays untouched, so the PR keeps carrying only this run's work.
+		restore := x.foldPendingForDeploy(ctx, ex, wt, token, repo, run, runBranch, step)
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
 			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
 		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
@@ -747,6 +788,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			step("dev-deploy", depLog, true)
 			rr.Deployed = true
 		}
+		restore()
 	}
 
 	// Push + PR. The remote branch and PR are the durable record of what was built — established before
@@ -783,20 +825,68 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	return rr, repoSignal{}
 }
 
-// shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
-// full mode, only while dev-deploy is enabled, and NEVER for the self repo (Finding B — dev-deploying
-// devlab restarts THIS devlabd, killing the running sweep). report/pr never dev-deploy at all.
-func (x *runExecutor) shouldDevDeploy(repoID string) bool {
-	return x.mode == "full" && devDeployEnabled() && !isSelfRepo(repoID)
+// foldPendingForDeploy prepares the tree the dev-deploy BUILDS from: this run's branch plus every other
+// open Mercury PR on the repo, merged into a throwaway local branch. It returns a restore func that
+// switches back to the run branch, so push and PR still carry this run's work alone.
+//
+// An automatic run already bases on main + pending PRs, so there is nothing to fold; a ToDo bases on
+// plain main, which is exactly the case that used to make dev regress. A branch that does not merge
+// cleanly is skipped with a logged note — a deploy is worth doing even if one pending PR conflicts.
+func (x *runExecutor) foldPendingForDeploy(ctx context.Context, ex workspace.Executor, wt, token string,
+	repo model.Repo, run runs.Run, runBranch string, step func(name, logtxt string, ok bool)) func() {
+	noop := func() {}
+	if !run.IsTodo() {
+		return noop
+	}
+	heads := x.openPRHeads(ctx, token, repo.FullName)
+	var others []string
+	for _, h := range heads {
+		if h != runBranch {
+			others = append(others, h)
+		}
+	}
+	if len(others) == 0 {
+		return noop
+	}
+	deployBranch := "mercury-dev/" + strings.TrimPrefix(runBranch, "mercury-run/")
+	if err := ex.CreateBranch(ctx, wt, deployBranch, runBranch); err != nil {
+		step("dev-deploy", "Sammel-Branch nicht anlegbar — es wird nur die Arbeit dieses Laufs deployt: "+err.Error(), false)
+		return noop
+	}
+	_ = ex.Fetch(ctx, wt, token)
+	merged := 0
+	for _, h := range others {
+		if err := ex.MergeRef(ctx, wt, "origin/"+h); err != nil {
+			step("dev-deploy", "offener PR-Branch "+h+" nicht konfliktfrei mergebar — ohne ihn deployt: "+err.Error(), false)
+			continue
+		}
+		merged++
+	}
+	step("dev-deploy", fmt.Sprintf("dev-Stand = diese Arbeit + %d offene(r) PR(s)", merged), true)
+	return func() {
+		if err := ex.Checkout(ctx, wt, runBranch); err != nil {
+			log.Printf("devlabd: run %s could not return to %s after the deploy build: %v", run.ID, runBranch, err)
+		}
+	}
 }
 
-// devDeploySkipReason explains, for the recorded step, why shouldDevDeploy said no in full mode — the
-// self-repo guard (Finding B) or the kill switch. It never invents a third reason: any other "no" comes
-// from the deploy target, which hasDeployTarget/noDeployTargetReason report.
+// shouldDevDeploy reports whether executeRepo performs an in-process dev-deploy for repoID: only in
+// full mode and only while dev-deploy is enabled. report/pr never dev-deploy at all.
+//
+// The self repo is NO LONGER excluded. It used to be (dev-deploying devlab restarts THIS devlabd and
+// would kill the running sweep), but the exclusion had no counterpart: the one service the owner
+// watches never updated from its own runs, so every ToDo against it landed as an unmerged PR and
+// nothing was ever live. The disruptive half is only the RESTART, not the install — so the per-repo
+// deploy script installs immediately and defers the restart until the run slot is free (see
+// deploy/devlab-restart-idle and the busy marker in the runs package).
+func (x *runExecutor) shouldDevDeploy(repoID string) bool {
+	return x.mode == "full" && devDeployEnabled()
+}
+
+// devDeploySkipReason explains, for the recorded step, why shouldDevDeploy said no in full mode: the
+// kill switch is now the only reason. Any other "no" comes from the deploy target, which
+// hasDeployTarget/noDeployTargetReason report.
 func devDeploySkipReason(repoID string) string {
-	if isSelfRepo(repoID) {
-		return "Selbst-Deploy übersprungen — " + repoID + " wird nicht aus seinem eigenen Lauf heraus neugestartet (PR steht, Deploy out-of-band)"
-	}
 	return "dev-deploy abgeschaltet (DEVLAB_RUNS_DEV_DEPLOY) — nur der prod-Deploy bei Merge ist scharf"
 }
 
@@ -962,10 +1052,13 @@ func retryInfra(ctx context.Context, attempts int, backoff time.Duration, op fun
 	return err
 }
 
-// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName (prefix
-// "mercury-run/") — the still-pending, not-yet-merged work the run must BASE ON (main + pending), so it
-// neither redoes it nor skips the repo. A lookup error yields no heads (the run then bases on plain main;
-// a genuine outage is caught as an infra carry-over at the clone step).
+// openMercuryPRHeads returns the head branch names of every OPEN Mercury PR on fullName — the still-
+// pending, not-yet-merged work the run must BASE ON (main + pending), so it neither redoes it nor skips
+// the repo. A Mercury PR is recognised by its hidden body marker (mercuryPRMarker), which is stable and
+// language-independent now that the branch itself follows the human <kind>/<description> convention; the
+// legacy "mercury-run/" branch prefix is still matched so a PR opened before the rename folds in too. A
+// lookup error yields no heads (the run then bases on plain main; a genuine outage is caught as an infra
+// carry-over at the clone step).
 func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName string) []string {
 	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
 	if err != nil {
@@ -973,9 +1066,33 @@ func (x *runExecutor) openMercuryPRHeads(ctx context.Context, token, fullName st
 	}
 	var heads []string
 	for _, pr := range prs {
-		if strings.HasPrefix(pr.Head.Ref, "mercury-run/") {
+		if isMercuryPR(pr) {
 			heads = append(heads, pr.Head.Ref)
 		}
+	}
+	return heads
+}
+
+// isMercuryPR reports whether pr was opened by a Mercury run: primarily by the hidden body marker, with a
+// fallback to the legacy branch prefix for PRs created before branches moved to <kind>/<description>.
+func isMercuryPR(pr github.PullRequest) bool {
+	return strings.Contains(pr.Body, mercuryPRMarker) || strings.HasPrefix(pr.Head.Ref, "mercury-run/")
+}
+
+// openPRHeads returns the head branch of EVERY open pull request on fullName — Mercury's own and the
+// ones a human raised alike. The dev box should show the sum of what is pending, whoever wrote it: a
+// deploy that folds in only Mercury's branches silently reinstalls over a person's un-merged work, which
+// is exactly how a hand-built change vanished from dev minutes after it was deployed. The base of a RUN
+// stays Mercury-only (openMercuryPRHeads) — that is about not redoing the agent's own work — while the
+// DEPLOY, which decides what is live, takes everything.
+func (x *runExecutor) openPRHeads(ctx context.Context, token, fullName string) []string {
+	prs, err := github.ListOpenPullRequests(ctx, token, fullName)
+	if err != nil {
+		return nil
+	}
+	heads := make([]string, 0, len(prs))
+	for _, pr := range prs {
+		heads = append(heads, pr.Head.Ref)
 	}
 	return heads
 }
@@ -1041,11 +1158,37 @@ func findRepo(repos []model.Repo, idOrName string) (model.Repo, bool) {
 // repo; a ToDo composes its prompt per target so that ONLY a freshly-created repo (newRepo non-empty)
 // is told to scaffold from scratch, while an existing target is worked as-is. A ToDo's attachments are
 // the same across targets and are announced in every target's prompt (they are materialized per repo).
-func (x *runExecutor) promptFor(run runs.Run, newRepo string, atts []loadedAttachment) string {
+func (x *runExecutor) promptFor(run runs.Run, repoID, newRepo string, atts []loadedAttachment) string {
 	if run.IsTodo() {
 		return mercury.ComposeTodoPrompt(run.Name, run.Task, newRepo, attachmentDescriptors(atts))
 	}
-	return run.Prompt
+	// The stored snapshot is shared by every repo of the sweep; WHICH commit each repo was last examined
+	// against is per repo, so it is appended here rather than baked into the snapshot.
+	return run.Prompt + x.repoScope(run, repoID)
+}
+
+// repoScope renders the "last examined stand" addendum for one repo of an automatic run: per axiom the
+// commit it was checked against, so the agent looks only at what came after it. Empty when nothing is
+// recorded yet AND the run has no axioms; otherwise it explicitly names the never-examined axioms as
+// full-repository work, which is what makes the incremental instruction actionable instead of a wish.
+func (x *runExecutor) repoScope(run runs.Run, repoID string) string {
+	if len(run.AxiomIDs) == 0 {
+		return ""
+	}
+	recorded := x.s.axiomChecks.ForRepo(repoID)
+	checked := make(map[string]mercury.LastCheck, len(recorded))
+	for id, c := range recorded {
+		at := ""
+		if !c.At.IsZero() {
+			at = c.At.Format("2006-01-02")
+		}
+		checked[id] = mercury.LastCheck{Commit: c.Commit, At: at}
+	}
+	axioms := make([]mercury.RunAxiom, 0, len(run.AxiomIDs))
+	for _, id := range run.AxiomIDs {
+		axioms = append(axioms, mercury.RunAxiom{ID: id})
+	}
+	return mercury.RepoScopeSection(axioms, checked)
 }
 
 // loadedAttachment is one of a ToDo's media, read from the passive pool and ready to drop into a
@@ -1109,7 +1252,7 @@ func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAt
 // attachments again as it returns (the deferred cleanup runs the instant the agent finishes, BEFORE
 // executeRepo commits) — so the media reaches the agent yet never leaks into the PR. For an auto run
 // (no attachments) it is exactly the plain agent call.
-func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, atts []loadedAttachment, onLine func([]byte)) ([]byte, error) {
+func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, prompt, permMode string, t agentTuning, atts []loadedAttachment, onLine func([]byte)) ([]byte, error) {
 	cleanup, err := writeWorkspaceAttachments(ex, wt, atts)
 	if err != nil {
 		return nil, fmt.Errorf("Medien bereitstellen: %w", err)
@@ -1118,9 +1261,9 @@ func (x *runExecutor) runAgent(actx context.Context, ex workspace.Executor, wt, 
 	// Stream when a live sink is present (a real run) and streaming is enabled — so the agent can be
 	// followed as it works. Otherwise the plain buffered call. resultEvent() reconciles both wire formats.
 	if onLine != nil && streamEnabled() {
-		return ex.AgentStream(actx, wt, onLine, streamAgentArgs(prompt, permMode)...)
+		return ex.AgentStream(actx, wt, onLine, streamAgentArgs(prompt, permMode, t)...)
 	}
-	return ex.Agent(actx, wt, agentArgs(prompt, permMode)...)
+	return ex.Agent(actx, wt, agentArgs(prompt, permMode, t)...)
 }
 
 // liveSaver persists the in-progress result. Boundary events (a step starting/ending, a repo starting)
@@ -1183,9 +1326,9 @@ func (a *agentStep) fail(logtxt string) {
 // runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
 // (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
 // (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
-	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, atts, ag.onProgress)
+	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
 	final = resultEvent(out)
 	if l := detectLimit(final, aerr); l.limited {
 		return final, l, aerr // leave the step running; the repo is not recorded
@@ -1297,26 +1440,56 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 	}
 	now := time.Now()
 	recheck := prRecheck()
+
+	// Auto-merge STRICTLY in creation order, per repo. Every run branches off the default branch, so a
+	// younger PR that lands first turns the older one — written against the same files — into a conflict
+	// that then never merges on its own. Sorting alone is not enough: the older PR must also BLOCK the
+	// younger one while it is still open, so a stuck PR halts its repo's queue instead of letting the
+	// rest overtake it. Merging is the only gated action; observing a merge someone else performed (and
+	// the prod-deploy that follows) stays free, so a manually merged younger PR still ships.
+	sort.SliceStable(prs, func(i, j int) bool { return prs[i].CreatedAt.Before(prs[j].CreatedAt) })
+	blocked := map[string]bool{} // repo → an older PR is still open, so no younger one may auto-merge
+
 	for _, p := range prs {
 		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
-			continue // report/pr: within window → not touched. full: throttled between rechecks.
+			blocked[p.Repo] = true // still open and unexamined → the queue behind it waits
+			continue               // report/pr: within window → not touched. full: throttled between rechecks.
 		}
 		if x.mode == "full" {
 			_ = x.s.runPRs.Touch(p.Repo, p.Number, now) // stamp the recheck up front (throttle even on error)
 		}
 		cur, err := x.fetchPR(ctx, token, p.Repo, p.Number)
 		if err != nil {
-			continue // transient; retry next eligible tick
+			blocked[p.Repo] = true // unknown state → do not let a younger PR of this repo overtake it
+			continue               // transient; retry next eligible tick
 		}
-		switch decidePR(x.mode, cur, !now.Before(p.MergeBy)) {
+		action := decidePR(x.mode, cur, !now.Before(p.MergeBy))
+		if action == prMerge && blocked[p.Repo] {
+			log.Printf("devlabd: %s#%d is due but an older Mercury PR of %s is still open — merging in creation order",
+				p.Repo, p.Number, p.Repo)
+			blocked[p.Repo] = true
+			continue
+		}
+		if cur.State == "open" && action != prMerge {
+			blocked[p.Repo] = true // still open (in-window) → younger PRs of this repo keep waiting
+		}
+		switch action {
 		case prUntrack:
+			if cur.Merged {
+				x.markDelivered(p, true, false) // report/pr: the ladder ends at "merged"
+			}
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
 		case prMerge:
+			// One merge per repo per tick, whatever the outcome: a failed merge leaves the older PR open
+			// (its queue must wait), and a successful one has just moved the default branch — GitHub needs
+			// a moment to recompute mergeability for the rest, so they go on the next tick.
+			blocked[p.Repo] = true
 			if err := x.mergePR(ctx, token, p.Repo, p.Number); err != nil {
 				log.Printf("devlabd: auto-merge %s#%d failed (will retry): %v", p.Repo, p.Number, err)
 				continue
 			}
 			log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			x.markDelivered(p, true, false)
 			if x.mode != "full" {
 				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
 			}
@@ -1325,6 +1498,7 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
 			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
 			if name := repoNameOf(p.Repo); !x.deployable(name) {
+				x.markDelivered(p, true, false) // merged; there is simply nothing to ship
 				_ = x.s.runPRs.Remove(p.Repo, p.Number)
 				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
 				continue
@@ -1334,12 +1508,37 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
 				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
 			}
+			x.markDelivered(p, true, true)
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
 			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
 		}
 	}
+}
+
+// markDelivered records on the run that its PR reached the next rung of the delivery ladder, so the
+// surface can say "merged" / "prod-live" instead of stopping at "PR offen". Patch, not Mutate: this is
+// observed delivery state, not a config edit. It only touches a LastResult that still points at THIS
+// PR — a newer execution has its own ladder and must not inherit an older PR's merge.
+func (x *runExecutor) markDelivered(p runs.PendingPR, merged, prod bool) {
+	if x.s.runs == nil {
+		return
+	}
+	_, _ = x.s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
+		for i := range cur {
+			if cur[i].ID != p.RunID || cur[i].LastResult == nil || cur[i].LastResult.PRUrl != p.URL {
+				continue
+			}
+			if merged {
+				cur[i].LastResult.Merged = true
+			}
+			if prod {
+				cur[i].LastResult.ProdDeployed = true
+			}
+		}
+		return cur, nil
+	})
 }
 
 // prAction is Maintain's decision for one tracked PR after it has been fetched.
@@ -1446,22 +1645,73 @@ func parseClaudeUsage(out []byte) usage {
 	}
 }
 
-func agentArgs(prompt, mode string) []string {
+// agentTuning selects the model + effort tier for one agent invocation, taken from the run/todo. Empty
+// fields fall back to the runner defaults (opus / max), so a record written before these fields existed
+// behaves exactly as before.
+type agentTuning struct {
+	model  string
+	effort string
+}
+
+func tuningFor(run runs.Run) agentTuning { return agentTuning{model: run.Model, effort: run.Effort} }
+
+// ultracodeDirective is folded into the runner's system prompt when a run picks the "ultracode" effort:
+// the maximal tier runs at max reasoning AND asks the agent to decompose and verify via multi-agent
+// orchestration, trading token economy for thoroughness. It is opt-in per run — the default never sets it.
+const ultracodeDirective = "Operate in ultracode mode: decompose the task and use multi-agent workflow " +
+	"orchestration, adversarially verifying your work before committing. Favour correctness and " +
+	"completeness over token economy."
+
+// resolve turns the (possibly empty) tuning into the concrete claude CLI model + effort and the system
+// preamble. "ultracode" is not a native --effort level, so it maps to max plus the ultracode directive;
+// every other empty case falls back to the historical opus / max the runner has always used.
+func (t agentTuning) resolve() (model, effort, preamble string) {
+	// Re-guard at the argv boundary: this feeds a bypassPermissions CLI, so a model/effort that somehow
+	// reached the store unvalidated (a hand-edited runs.json, a future writer that skips validateTuning)
+	// still cannot put an arbitrary token onto the command line — a non-conforming value falls back to the
+	// safe default rather than being forwarded verbatim.
+	model = t.model
+	if model == "" || !runModelRe.MatchString(model) {
+		model = "opus"
+	}
+	effort = t.effort
+	if effort != "" && !runEffortAllowed[effort] {
+		effort = ""
+	}
+	preamble = runnerPreamble
+	switch effort {
+	case "ultracode":
+		effort = "max"
+		preamble = runnerPreamble + "\n\n" + ultracodeDirective
+	case "":
+		effort = "max"
+	}
+	return model, effort, preamble
+}
+
+func agentArgs(prompt, mode string, t agentTuning) []string {
+	model, effort, preamble := t.resolve()
 	return []string{
 		"-p", prompt,
 		"--output-format", "json",
 		"--permission-mode", mode,
-		"--model", "opus",
-		"--effort", "max",
-		"--append-system-prompt", runnerPreamble,
+		"--model", model,
+		"--effort", effort,
+		"--append-system-prompt", preamble,
 	}
 }
 
 func runPRBody(run runs.Run) string {
 	return "Automatisch erzeugt vom Mercury-Lauf **" + run.Name + "**. Dieser PR bündelt die vom autonomen " +
 		"Runner implementierten Änderungen gegen die Axiome dieses Laufs. Merge jederzeit möglich; ohne Merge " +
-		"innerhalb der Frist wird automatisch gemergt.\n\n🤖 Mercury"
+		"innerhalb der Frist wird automatisch gemergt.\n\n🤖 Mercury\n" + mercuryPRMarker
 }
+
+// mercuryPRMarker is the stable, language-independent fingerprint of a Mercury-created PR. It sits in the
+// PR body as an HTML comment (invisible when rendered, untouched by the nightly translation pass), so a
+// run can recognise its own still-open PRs WITHOUT relying on the branch name — the branch now follows the
+// human <kind>/<description> convention and no longer carries a distinguishing prefix.
+const mercuryPRMarker = "<!-- holistic-mercury-run -->"
 
 func clip(s string) string {
 	const max = 20000
@@ -1496,12 +1746,134 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // the UI reads on mount (so a running run survives a page reload) and polls to follow a live run: it
 // mirrors an actually-alive goroutine, hence correct across reloads and empty after a restart. Cheap (no
 // scheme scan), so it is safe to poll frequently.
+//
+// Alongside it the endpoint returns `inflight`: the transparent list of every run the system is currently
+// working — the executing one PLUS every run SUSPENDED mid-execution on the usage limit (waiting to
+// resume). `active` stays the minimal projection existing consumers depend on; `inflight` is the enriched
+// list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
+// parallel data path.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
 	var active *runs.Activity
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active})
+	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+}
+
+// inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,
+// state "executing") or SUSPENDED on the usage limit mid-execution (state "suspended", waiting for its
+// window to reset). A portioned, read-only projection assembled for the "Aktive Läufe" overview so the UI
+// can render a transparent list — which run, on which repo/step, how far, how much spent — without a
+// follow-up fetch per run. Purely observational: nothing here drives scheduling or resume.
+type inFlightRun struct {
+	RunID   string `json:"runId"`
+	RunName string `json:"runName"`
+	Type    string `json:"type"`  // auto|todo
+	State   string `json:"state"` // executing|suspended
+
+	ResultID  string     `json:"resultId,omitempty"`
+	StartedAt *time.Time `json:"startedAt,omitempty"` // execution start (executing)
+	ResumeAt  *time.Time `json:"resumeAt,omitempty"`  // when a suspended run resumes
+	Attempts  int        `json:"attempts,omitempty"`  // suspended: resume attempts so far
+
+	CurrentRepo string `json:"currentRepo,omitempty"` // the repo in flight (executing)
+	CurrentStep string `json:"currentStep,omitempty"` // the step running right now (executing)
+	ReposDone   int    `json:"reposDone"`             // repos already completed this execution
+	ReposTotal  int    `json:"reposTotal,omitempty"`  // known only for ToDos (exact target count)
+
+	InputTokens  int     `json:"inputTokens"`
+	OutputTokens int     `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
+	NumTurns     int     `json:"numTurns"`
+}
+
+// assembleInFlight builds the transparent list of runs the system is currently working: the one
+// EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
+// limit). Each entry is enriched from its live result document so the overview shows the current
+// repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
+func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+	out := []inFlightRun{}
+	if s.runs == nil {
+		return out
+	}
+	all, err := s.runs.List()
+	if err != nil {
+		all = nil
+	}
+	byID := make(map[string]runs.Run, len(all))
+	for _, r := range all {
+		byID[r.ID] = r
+	}
+
+	// 1) The run executing right now (at most one — the scheduler runs runs serially).
+	if active != nil {
+		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
+		st := active.StartedAt
+		e.StartedAt = &st
+		if run, ok := byID[active.RunID]; ok {
+			e.RunName = run.Name
+			e.Type = string(runs.NormalizeType(run.Type))
+			e.ReposTotal = todoRepoTotal(run)
+		}
+		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		out = append(out, e)
+	}
+
+	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
+	//    double-count the executing one (a run cannot be both).
+	for _, run := range all {
+		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+			continue
+		}
+		e := inFlightRun{
+			RunID: run.ID, RunName: run.Name, State: "suspended",
+			Type:       string(runs.NormalizeType(run.Type)),
+			ResultID:   run.Suspended.ResultID,
+			Attempts:   run.Suspended.Attempts,
+			ReposTotal: todoRepoTotal(run),
+		}
+		resume := run.Suspended.ResumeAt
+		e.ResumeAt = &resume
+		s.enrichInFlight(&e, run.ID, run.Suspended.ResultID)
+		out = append(out, e)
+	}
+	return out
+}
+
+// todoRepoTotal is the exact destination-repo count for a ToDo (its Targets). An automatic run's repo set
+// is derived at execution time and not cheaply known here, so it returns 0 (unknown) and the UI shows
+// only the completed count rather than a fabricated denominator.
+func todoRepoTotal(run runs.Run) int {
+	if run.IsTodo() {
+		return len(run.TodoTargets())
+	}
+	return 0
+}
+
+// enrichInFlight fills an entry from its live result document: the repo currently in flight and its
+// running step, how many repos are already done, and the running token/cost totals. A missing or
+// unreadable result is non-fatal — the entry keeps its base fields so the overview still lists the run.
+func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
+	if s.runResults == nil || resultID == "" {
+		return
+	}
+	res, ok, err := s.runResults.Get(runID, resultID)
+	if err != nil || !ok {
+		return
+	}
+	e.ReposDone = len(res.Repos)
+	e.InputTokens, e.OutputTokens = res.InputTokens, res.OutputTokens
+	e.CostUSD, e.NumTurns = res.CostUSD, res.NumTurns
+	if res.Live != nil {
+		e.CurrentRepo = res.Live.Repo
+		// The step running right now is the last one still marked Running.
+		for i := len(res.Live.Steps) - 1; i >= 0; i-- {
+			if res.Live.Steps[i].Running {
+				e.CurrentStep = res.Live.Steps[i].Name
+				break
+			}
+		}
+	}
 }
 
 // runCancel aborts the run in progress (kill-switch).

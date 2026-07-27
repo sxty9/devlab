@@ -15,6 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"devlab/backend/internal/model"
 )
 
 var httpClient = &http.Client{Timeout: 120 * time.Second}
@@ -47,6 +49,9 @@ type Request struct {
 	OutputFormat string       `json:"outputFormat,omitempty"`
 	Model        string       `json:"model,omitempty"`
 	Claude       *ClaudeOpts  `json:"claude,omitempty"`
+	// Interactive lets the model reply with a structured multiple-choice question (à la Claude Code),
+	// surfaced on Result.Ask and rendered as clickable options in the chat bubble.
+	Interactive bool `json:"interactive,omitempty"`
 }
 
 // Get proxies an authenticated GET to an aigentic sub-path (e.g. "models") forwarding the caller's
@@ -80,13 +85,16 @@ type Usage struct {
 	Truncated    bool `json:"truncated"`
 }
 
-// Result is aigentic's answer (the fields DevLab surfaces).
+// Result is aigentic's answer (the fields DevLab surfaces). Ask is aigentic's structured-question
+// shape; DevLab owns that DTO in the model package (surfaced verbatim to the SPA), so the client
+// decodes straight into it — one definition, no local mirror to keep in sync.
 type Result struct {
-	Output string `json:"output"`
-	Engine string `json:"engine"`
-	Model  string `json:"model"`
-	Effort string `json:"effort,omitempty"`
-	Usage  Usage  `json:"usage"`
+	Output string       `json:"output"`
+	Engine string       `json:"engine"`
+	Model  string       `json:"model"`
+	Effort string       `json:"effort,omitempty"`
+	Usage  Usage        `json:"usage"`
+	Ask    *model.AiAsk `json:"ask,omitempty"`
 }
 
 type envelope struct {

@@ -55,6 +55,14 @@ type Run struct {
 	Type    Type   `json:"type"` // "" is read as auto (records predating ToDos)
 	Enabled bool   `json:"enabled"`
 
+	// Model + Effort tune the Claude engine the executor drives for THIS run/todo. Both are shared by
+	// auto and todo. Empty selects the runner default (opus / max), so records predating this field keep
+	// behaving exactly as before. Model is a CLI model id or alias (e.g. "opus", "claude-opus-4-8"); Effort
+	// is one of low|medium|high|xhigh|max|ultracode — "ultracode" being the maximal tier the executor maps
+	// to max reasoning plus multi-agent orchestration.
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+
 	// auto only
 	Schedule Schedule `json:"schedule"`
 	AxiomIDs []string `json:"axiomIds"`
@@ -65,6 +73,13 @@ type Run struct {
 	Attachments []Attachment `json:"attachments,omitempty"` // media (images, documents) the agent must take into account
 	DueAt       *time.Time   `json:"dueAt,omitempty"`       // optional one-time due date; nil = run it manually
 	Done        bool         `json:"done,omitempty"`        // set after a successful execution — a ToDo fires once
+
+	// BranchDesc is an optional, AI-optimized description for this run's git branch (both run types push
+	// branches). It is set at create/update time ONLY when Name does not slugify into something usable on
+	// its own (see BranchDescGoodEnough); the executor prefers it over Name when naming the run branch, and
+	// empty means "the name was good enough, slug that". Display metadata, never a path segment as stored —
+	// the executor slugifies it.
+	BranchDesc string `json:"branchDesc,omitempty"`
 
 	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
 	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
@@ -137,6 +152,12 @@ type Attachment struct {
 
 // ResultRef is a lightweight pointer to a stored execution result (with its token/cost totals so the
 // history list can show consumption without loading the full result).
+//
+// It also carries HOW FAR the work got — implemented, dev-deployed, PR open, merged, prod-live. A run
+// that merely produced an unmerged PR is not "done" in any sense the owner cares about, so the surface
+// shows the furthest stage actually reached instead of a single green tick. Delivery is a ladder, and
+// these are the rungs the system can attest to: the executor fills Deployed/PRUrl, Maintain fills
+// Merged/ProdDeployed when it observes the merge and ships prod.
 type ResultRef struct {
 	ResultID     string     `json:"resultId"`
 	At           time.Time  `json:"at"`
@@ -147,6 +168,45 @@ type ResultRef struct {
 	CostUSD      float64    `json:"costUsd,omitempty"`
 	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
+
+	Deployed     bool   `json:"deployed,omitempty"`     // at least one repo went live on dev
+	PRUrl        string `json:"prUrl,omitempty"`        // the PR this execution opened (first, if several)
+	Merged       bool   `json:"merged,omitempty"`       // that PR reached the default branch
+	ProdDeployed bool   `json:"prodDeployed,omitempty"` // and prod was shipped from the merge
+}
+
+// Stage is the furthest rung of the delivery ladder an execution reached. It is derived, never stored:
+// one definition, used by the API and mirrored by the UI label.
+type Stage string
+
+const (
+	StageFailed    Stage = "failed"        // the execution did not succeed
+	StageSuspended Stage = "suspended"     // paused on the usage limit, waiting to resume
+	StageImplement Stage = "implemented"   // work done, nothing shipped or pushed (yet)
+	StageDevLive   Stage = "dev-deployed"  // live on the dev box
+	StagePROpen    Stage = "pr-open"       // pushed and a PR is waiting for its merge
+	StageMerged    Stage = "merged"        // merged into the default branch
+	StageProdLive  Stage = "prod-deployed" // shipped to prod
+)
+
+// Stage reports the furthest stage this reference attests to, most-advanced first.
+func (r ResultRef) Stage() Stage {
+	switch {
+	case r.Suspended:
+		return StageSuspended
+	case r.ProdDeployed:
+		return StageProdLive
+	case r.Merged:
+		return StageMerged
+	case !r.OK:
+		return StageFailed
+	case r.PRUrl != "":
+		return StagePROpen
+	case r.Deployed:
+		return StageDevLive
+	default:
+		return StageImplement
+	}
 }
 
 type file struct {

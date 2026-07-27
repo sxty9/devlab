@@ -82,9 +82,10 @@ func TestDecidePR(t *testing.T) {
 	}
 }
 
-// TestShouldDevDeploy pins Findings B + C's gate: a dev-deploy runs ONLY in full mode, and NEVER for
-// the self repo (whose restart would kill the running sweep). Covers "dev-deploy only in full mode"
-// and "self repo dev-deploy skipped".
+// TestShouldDevDeploy pins the gate: a dev-deploy runs ONLY in full mode — for EVERY repo, the self
+// repo included. The old self-repo exclusion (a restart would kill the running sweep) is gone: the
+// install is harmless and the restart is deferred until the run slot frees (devlab-restart-idle), so
+// excluding the repo only meant DevLab never went live from its own runs.
 func TestShouldDevDeploy(t *testing.T) {
 	self := selfRepoID() // default "devlab"
 	cases := []struct {
@@ -95,7 +96,7 @@ func TestShouldDevDeploy(t *testing.T) {
 		{"report", "aigentic", false},
 		{"pr", "aigentic", false},
 		{"full", "aigentic", true},
-		{"full", self, false}, // self repo skipped even in full mode (Finding B)
+		{"full", self, true}, // the self repo deploys too — its restart is deferred, not skipped
 		{"report", self, false},
 		{"pr", self, false},
 	}
@@ -304,5 +305,63 @@ func TestMaintainFullModeThrottlesInWindowRecheck(t *testing.T) {
 	}
 	if r, _ := store.List(); len(r) != 1 {
 		t.Errorf("an in-window open PR must stay tracked, got %+v", r)
+	}
+}
+
+// TestMaintainMergesInCreationOrder pins the queue discipline: every run branches off the default
+// branch, so a younger PR that lands first turns the older one — touching the same files — into a
+// conflict that never resolves itself. Two overdue PRs of the SAME repo must therefore merge oldest
+// first, and a younger one must NOT overtake while the older is still open (here: its merge fails).
+// A PR of a DIFFERENT repo is unaffected — the queue is per repo, not global.
+func TestMaintainMergesInCreationOrder(t *testing.T) {
+	store := tempPRStore(t)
+	now := time.Now()
+	older := now.Add(-3 * time.Hour)
+	// Deliberately added youngest-first, so passing this test cannot rely on insertion order.
+	for _, p := range []runs.PendingPR{
+		{Repo: "o/app", Number: 2, CreatedAt: older.Add(time.Hour), MergeBy: now.Add(-time.Minute)},
+		{Repo: "o/app", Number: 1, CreatedAt: older, MergeBy: now.Add(-time.Minute)},
+		{Repo: "o/other", Number: 9, CreatedAt: older, MergeBy: now.Add(-time.Minute)},
+	} {
+		if err := store.Add(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var merged []int
+	x := &runExecutor{
+		s: &Server{runPRs: store}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(_ context.Context, _, _ string, _ int) (github.PullRequest, error) {
+			return github.PullRequest{State: "open"}, nil
+		},
+		mergePRFn: func(_ context.Context, _, repo string, n int) error {
+			merged = append(merged, n)
+			if repo == "o/app" && n == 1 {
+				return errors.New("merge conflict") // the oldest stays open → it blocks its repo's queue
+			}
+			return nil
+		},
+	}
+
+	x.Maintain(context.Background())
+
+	// The oldest of o/app was attempted; #2 must NOT have been merged behind its stuck predecessor.
+	for _, n := range merged {
+		if n == 2 {
+			t.Errorf("PR #2 overtook the still-open older PR #1 of the same repo — merge order broken (merged=%v)", merged)
+		}
+	}
+	if len(merged) == 0 || merged[0] != 1 {
+		t.Errorf("expected the OLDEST PR (#1) attempted first, got %v", merged)
+	}
+	var sawOther bool
+	for _, n := range merged {
+		if n == 9 {
+			sawOther = true
+		}
+	}
+	if !sawOther {
+		t.Errorf("a PR of a different repo must not be blocked by o/app's queue (merged=%v)", merged)
 	}
 }

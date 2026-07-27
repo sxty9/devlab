@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/mercury"
 )
 
@@ -30,9 +29,9 @@ func mercuryOrderPath() string {
 // mercuryTree returns the whole axiom model — the three namespaces (axiome, regeln, laeufe) as
 // arbitrarily deep category trees, derived from the record paths and the user's manual sibling order.
 func (s *Server) mercuryTree(w http.ResponseWriter, r *http.Request) {
-	paths, status, err := aigentic.GraveList(r.Context(), r.Header.Get("Cookie"), "")
+	paths, err := s.axioms.List(r.Context(), "")
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, mercury.Build(paths, mercury.LoadOrder(mercuryOrderPath())))
@@ -72,9 +71,9 @@ func (s *Server) mercuryItem(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	data, found, status, err := aigentic.GraveGet(r.Context(), r.Header.Get("Cookie"), path)
+	data, found, err := s.axioms.Get(r.Context(), path)
 	if err != nil {
-		mercuryError(w, status, err)
+		mercuryError(w, http.StatusBadGateway, err)
 		return
 	}
 	if !found {

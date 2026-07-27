@@ -8,9 +8,10 @@ import RunsView from './RunsView';
 import TodosView from './TodosView';
 import GlobalCalendarView from './GlobalCalendarView';
 import MercuryChat from './MercuryChat';
+import { fmtDateTime } from './MercuryExecutions';
 import { cn } from '@/lib/cn';
-import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon, LightbulbIcon } from '@/ui/icons';
-import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation } from '@/types';
+import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon } from '@/ui/icons';
+import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation, RolloutReport } from '@/types';
 
 type SectionId = 'axiome' | 'regeln' | 'laeufe' | 'todos' | 'kalender';
 
@@ -120,8 +121,9 @@ export function MercuryView() {
   // The "Axiome" section holds two things: the axioms themselves and the Meta-Axiome that bindingly
   // govern how an axiom must be formulated. A sub-tab switches the tree's namespace between them.
   const [axiomeTab, setAxiomeTab] = useState<'axiome' | 'meta'>('axiome');
-  // The KI-Chat acts for ALL of Mercury, so it lives here rather than inside a section. Kept mounted
-  // so the conversation survives closing.
+  // The KI-Chat acts for ALL of Mercury, so it lives here rather than inside a section. Its toggle and
+  // its panel share the right edge (MercuryChat renders a collapsed tab when closed); kept mounted so
+  // the conversation survives closing.
   const [chatOpen, setChatOpen] = useState(false);
   // A record + text handed to the detail pane so it opens in edit pre-filled — used when the user
   // resolves a duplicate by extending or adjusting the existing record.
@@ -256,20 +258,6 @@ export function MercuryView() {
           })}
         </nav>
 
-        <div className="border-b border-separator px-2 py-1.5">
-          <button
-            type="button"
-            onClick={() => setChatOpen((o) => !o)}
-            className={cn(
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-footnote transition duration-fast hover:bg-fill/10 hover:text-text-primary',
-              chatOpen ? 'bg-fill/[0.07] text-text-primary' : 'text-text-secondary',
-            )}
-          >
-            <LightbulbIcon className="h-4 w-4 text-accent" />
-            KI-Chat
-          </button>
-        </div>
-
         {section === 'laeufe' && (
           <div className="flex gap-1 border-b border-separator p-2">
             {(['laufregeln', 'laeufe'] as const).map((t) => (
@@ -369,6 +357,7 @@ export function MercuryView() {
                 ))
               )}
             </NamespaceDropZone>
+            {(activeNs === 'axiome' || activeNs === 'regeln') && <RolloutStatus refresh={tree} />}
           </>
         )}
       </aside>
@@ -398,9 +387,66 @@ export function MercuryView() {
         )}
       </main>
 
-      <MercuryChat open={chatOpen} onClose={() => setChatOpen(false)} onApplied={() => void reload()} />
+      <MercuryChat open={chatOpen} onOpenChange={setChatOpen} onApplied={() => void reload()} />
     </div>
     </MercuryDnD.Provider>
+  );
+}
+
+/** capNames renders a repo-id list portioned: up to `n` names, then a "+K weitere" tail — a digestible
+ *  summary, never a raw dump. */
+function capNames(names: string[], n: number): string {
+  if (names.length <= n) return names.join(', ');
+  return names.slice(0, n).join(', ') + ` +${names.length - n} weitere`;
+}
+
+/** The last automatic CLAUDE.md rollout, shown under the Axiome/Implementierungsregeln tree (the two
+ *  namespaces the rollout carries). A write to either triggers a debounced background rollout; this is
+ *  its portioned outcome — when it ran, what changed, what was skipped — not a raw log. `refresh` re-reads
+ *  it whenever the tree reloads after an edit. */
+function RolloutStatus({ refresh }: { refresh: unknown }) {
+  const source = useMemo(() => getDataSource(), []);
+  const [last, setLast] = useState<RolloutReport | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    source
+      .mercuryRolloutStatus()
+      .then((r) => {
+        if (cancelled) return;
+        setLast(r.last);
+        setLoaded(true);
+      })
+      .catch(() => !cancelled && setLoaded(true));
+    return () => {
+      cancelled = true;
+    };
+  }, [source, refresh]);
+
+  if (!loaded) return null;
+
+  return (
+    <div className="border-t border-separator px-2.5 py-2 text-caption text-text-tertiary">
+      <div className="mb-1 flex items-center gap-1.5 font-medium uppercase tracking-wide">
+        <RocketIcon className="h-3.5 w-3.5" /> CLAUDE.md-Rollout
+      </div>
+      {!last ? (
+        <p>Noch nicht ausgerollt.</p>
+      ) : last.error ? (
+        <p className="text-warning">Fehlgeschlagen: {last.error}</p>
+      ) : (
+        <>
+          <p>
+            {fmtDateTime(last.at)} · {last.changed.length} geändert
+            {last.unchanged > 0 ? ` · ${last.unchanged} unverändert` : ''}
+          </p>
+          {last.changed.length > 0 && <p className="text-text-secondary">{capNames(last.changed, 6)}</p>}
+          {last.skipped && last.skipped.length > 0 && (
+            <p className="text-warning">übersprungen: {last.skipped.map((s) => `${s.repo} (${s.reason})`).join('; ')}</p>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

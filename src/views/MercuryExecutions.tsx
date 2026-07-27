@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Modal } from '@/ui/Modal';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -34,6 +36,17 @@ export function TokenStat({ input, output, cost }: { input?: number; output?: nu
       {input != null && <span title="Eingabe-Tokens">↓ {fmtNum(input)}</span>}
       {output != null && <span title="Ausgabe-Tokens">↑ {fmtNum(output)}</span>}
       {cost != null && <span className="font-medium text-text-secondary">{fmtCost(cost)}</span>}
+    </span>
+  );
+}
+
+/** The Claude engine that drove an execution — the model (a Holistic requirement: every AI answer is
+ *  labelled with its model) and, when it differs from the default, the effort tier. */
+export function ModelStat({ model, effort }: { model: string; effort?: string }) {
+  return (
+    <span className="flex items-center gap-1.5 text-caption text-text-tertiary" title="Model · Effort">
+      <span className="font-medium text-text-secondary">{model}</span>
+      {effort && <span>· {effort}</span>}
     </span>
   );
 }
@@ -195,8 +208,13 @@ export function PromptDisclosure({ prompt }: { prompt?: string }) {
 // One run execution = a pipeline. Stages run left→right; each repo is a job flowing through them, shown
 // as a status pill sitting on the pipeline line (GitLab's stages→jobs graph). The Merge stage is a manual
 // gate (a human/auto-merge outside the run); Prod-Deploy is downstream (green once the repo is deployed).
+//
+// The SAME pipeline renders a LIVE run: the repo in flight (RunResult.live) is appended as a row, its
+// running stage pulses (`running`), and clicking it drops into the agent's live transcript — so watching
+// a run is not a separate view but the pipeline itself, moving. Stages the running repo has not reached
+// yet read as `pending`, not `skipped`.
 
-type JobStatus = 'success' | 'failed' | 'skipped' | 'manual' | 'pending';
+type JobStatus = 'success' | 'failed' | 'skipped' | 'manual' | 'pending' | 'running';
 
 interface PipelineStage {
   key: string;
@@ -223,36 +241,48 @@ interface Job {
 }
 
 // deriveJobs maps one repo's recorded steps onto the canonical stage chain, GitLab-style: a recorded step
-// is success/failed by its ok flag; once something fails the later run stages are skipped; a run stage
-// with no step is either a bypass (no changes → no push/PR) or, when the repo errored before any step ran
-// (e.g. a clone failure leaves no steps), the failure point. Merge is a manual gate while a PR is open;
-// Prod-Deploy is pending until the PR merges and the repo reports deployed.
+// is success/failed by its ok flag (or `running` while in flight); once something fails the later run
+// stages are skipped; a run stage with no step is either a bypass (no changes → no push/PR) or, when the
+// repo errored before any step ran (e.g. a clone failure leaves no steps), the failure point. Merge is a
+// manual gate while a PR is open; Prod-Deploy is pending until the PR merges and the repo reports
+// deployed. For a repo still RUNNING, stages it has not reached yet are `pending`, not `skipped`.
 function deriveJobs(repo: RepoResult, stages: PipelineStage[]): Job[] {
   const byName = new Map((repo.steps ?? []).map((s) => [s.name, s]));
   const anyRunStep = RUN_STEP_KEYS.some((k) => byName.has(k));
+  const live = !!repo.running;
+  // For a still-running repo, a stage with no recorded step has not happened YET, so it is pending — the
+  // agent will get to it — rather than a deliberately skipped bypass.
+  const unreached: JobStatus = live ? 'pending' : 'skipped';
   let terminal = false;
   return stages.map((stage) => {
     const step = byName.get(stage.key);
     if (step) {
+      if (step.running) return { status: 'running', log: step.log || undefined };
       if (!step.ok) terminal = true;
       return { status: step.ok ? 'success' : 'failed', log: step.log || undefined };
     }
-    if (stage.key === 'merge') return { status: repo.prUrl ? 'manual' : 'skipped', href: repo.prUrl };
-    if (stage.key === 'prod-deploy') {
-      return { status: repo.deployed ? 'success' : repo.prUrl ? 'pending' : 'skipped' };
+    if (stage.key === 'merge') {
+      if (repo.prUrl) return { status: 'manual', href: repo.prUrl };
+      return { status: terminal ? 'skipped' : unreached };
     }
-    if (!RUN_STEP_KEYS.includes(stage.key) || terminal) return { status: 'skipped' };
+    if (stage.key === 'prod-deploy') {
+      if (repo.deployed) return { status: 'success' };
+      if (repo.prUrl) return { status: 'pending' };
+      return { status: terminal ? 'skipped' : unreached };
+    }
+    if (!RUN_STEP_KEYS.includes(stage.key) || terminal) return { status: terminal ? 'skipped' : unreached };
     // No recorded step for this run stage and nothing has failed yet: the failure point when the repo
-    // errored before recording any step (clone/setup), otherwise a bypassed stage.
+    // errored before recording any step (clone/setup), otherwise a bypassed (or not-yet-reached) stage.
     if (repo.error && !anyRunStep) {
       terminal = true;
       return { status: 'failed', log: repo.error };
     }
-    return { status: 'skipped' };
+    return { status: unreached };
   });
 }
 
 const JOB_STYLES: Record<JobStatus, { dot: string; pill: string; label: string }> = {
+  running: { dot: 'bg-warning', pill: 'border-warning/40 bg-warning/10 text-warning', label: 'läuft' },
   success: { dot: 'bg-success', pill: 'border-success/30 bg-success/10 text-success', label: 'OK' },
   failed: { dot: 'bg-danger', pill: 'border-danger/30 bg-danger/10 text-danger', label: 'Fehler' },
   manual: { dot: 'bg-accent', pill: 'border-accent/40 bg-accent/10 text-accent', label: 'manuell' },
@@ -271,6 +301,7 @@ function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onS
       className={cn(
         'relative z-10 flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-caption font-medium transition',
         st.pill,
+        job.status === 'running' && 'ring-1 ring-warning/40',
         selected && 'ring-2 ring-accent/40',
         clickable ? 'cursor-pointer hover:brightness-110' : 'cursor-default',
       )}
@@ -278,38 +309,67 @@ function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onS
       {job.status === 'manual' ? (
         <PlayIcon className="h-3 w-3 shrink-0" />
       ) : (
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', st.dot)} />
+        <span className={cn('h-2 w-2 shrink-0 rounded-full', st.dot, job.status === 'running' && 'animate-pulse')} />
       )}
       <span className="truncate">{st.label}</span>
     </button>
   );
 }
 
-/** The whole execution rendered as a GitLab-style pipeline: repos (rows) × stages (columns). */
+/** The whole execution rendered as a GitLab-style pipeline: repos (rows) × stages (columns). Works for a
+ *  finished run and a LIVE one alike — the in-flight repo (result.live) is appended as a pulsing row, and
+ *  the detail pane follows the job the agent is working right now (its live transcript) until the viewer
+ *  picks a job themselves. */
 export function ExecutionPipeline({ result }: { result: RunResult }) {
-  const [sel, setSel] = useState<{ repo: number; stage: number } | null>(null);
-  // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This
-  // must NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps)
-  // as "report" — that would collapse to a single Analyze stage and hide the failures. Such a run has no
+  // Finished repos, then the one in flight (if any) as the trailing, live row.
+  const rows = useMemo(() => [...(result.repos ?? []), ...(result.live ? [result.live] : [])], [result.repos, result.live]);
+
+  // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This must
+  // NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps) as
+  // "report" — that would collapse to a single Analyze stage and hide the failures. Such a run has no
   // analyze step anywhere, so it correctly falls through to the pipeline, where the failure shows as
-  // implement=failed.
-  const hasAnalyze = result.repos.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
-  const hasRunStep = result.repos.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
+  // implement=failed. The live row counts too, so a live report run reads as report from its first step.
+  const hasAnalyze = rows.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
+  const hasRunStep = rows.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
   const isReport = hasAnalyze && !hasRunStep;
   const stages = isReport ? REPORT_STAGES : PIPELINE_STAGES;
 
-  if (result.repos.length === 0) {
+  // Derive every row's jobs once, then locate the job in flight (first running one) to follow live.
+  const grid = useMemo(() => rows.map((repo) => deriveJobs(repo, stages)), [rows, stages]);
+  const runningAt = useMemo(() => {
+    for (let ri = 0; ri < grid.length; ri++) {
+      const si = grid[ri].findIndex((j) => j.status === 'running');
+      if (si >= 0) return { repo: ri, stage: si };
+    }
+    return null;
+  }, [grid]);
+
+  const [sel, setSel] = useState<{ repo: number; stage: number } | null>(null);
+  const pickedRef = useRef(false); // once the viewer clicks a job, stop auto-following the live one
+
+  // Default the detail pane to the job in flight and keep following it as the agent advances — until the
+  // viewer selects a job themselves, after which their choice stands.
+  useEffect(() => {
+    if (!pickedRef.current && runningAt) setSel(runningAt);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runningAt?.repo, runningAt?.stage]);
+
+  if (rows.length === 0) {
     return <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>;
   }
 
-  const selJob = sel ? deriveJobs(result.repos[sel.repo], stages)[sel.stage] : null;
+  const selRepo = sel && rows[sel.repo] ? rows[sel.repo] : null;
+  const selJob = sel && grid[sel.repo] ? grid[sel.repo][sel.stage] : null;
+  const legend: JobStatus[] = runningAt
+    ? ['running', 'success', 'failed', 'manual', 'pending', 'skipped']
+    : ['success', 'failed', 'manual', 'pending', 'skipped'];
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-caption text-text-tertiary">
-        {(['success', 'failed', 'manual', 'pending', 'skipped'] as JobStatus[]).map((s) => (
+        {legend.map((s) => (
           <span key={s} className="inline-flex items-center gap-1.5">
-            <span className={cn('h-2 w-2 rounded-full', JOB_STYLES[s].dot)} />
+            <span className={cn('h-2 w-2 rounded-full', JOB_STYLES[s].dot, s === 'running' && 'animate-pulse')} />
             {JOB_STYLES[s].label}
           </span>
         ))}
@@ -326,12 +386,23 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
             ))}
           </div>
 
-          {result.repos.map((repo, ri) => {
-            const jobs = deriveJobs(repo, stages);
+          {rows.map((repo, ri) => {
+            const jobs = grid[ri];
             return (
-              <div key={`${repo.repo}:${ri}`} className="flex items-center border-b border-separator px-3 py-2.5 last:border-0">
+              <div
+                key={`${repo.repo}:${ri}`}
+                className={cn(
+                  'flex items-center border-b border-separator px-3 py-2.5 last:border-0',
+                  repo.running && 'bg-warning/5',
+                )}
+              >
                 <div className="flex w-44 shrink-0 items-center gap-2 pr-2">
-                  <span className={cn('h-2 w-2 shrink-0 rounded-full', repo.ok ? 'bg-success' : 'bg-danger')} />
+                  <span
+                    className={cn(
+                      'h-2 w-2 shrink-0 rounded-full',
+                      repo.running ? 'animate-pulse bg-warning' : repo.ok ? 'bg-success' : 'bg-danger',
+                    )}
+                  />
                   <span className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{repo.repo}</span>
                 </div>
                 <div className="relative flex items-center">
@@ -341,7 +412,10 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
                       <JobPill
                         job={job}
                         selected={sel?.repo === ri && sel?.stage === si}
-                        onSelect={() => setSel(sel?.repo === ri && sel?.stage === si ? null : { repo: ri, stage: si })}
+                        onSelect={() => {
+                          pickedRef.current = true;
+                          setSel(sel?.repo === ri && sel?.stage === si ? null : { repo: ri, stage: si });
+                        }}
                       />
                     </div>
                   ))}
@@ -352,22 +426,41 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
         </div>
       </div>
 
-      {selJob && (selJob.log || selJob.href) && (
-        <div className="rounded-card border border-separator bg-bg-base p-3">
-          <div className="mb-1.5 flex items-center justify-between gap-2">
-            <span className="text-caption font-semibold uppercase tracking-wide text-text-tertiary">
-              {result.repos[sel!.repo].repo} · {stages[sel!.stage].label}
-            </span>
-            {selJob.href && (
-              <a href={selJob.href} target="_blank" rel="noreferrer" className="shrink-0 text-caption font-medium text-accent hover:underline">
-                PR öffnen ↗
-              </a>
-            )}
-          </div>
-          {selJob.log && (
-            <pre className="dl-scroll max-h-80 overflow-auto whitespace-pre-wrap font-mono text-caption text-text-secondary">{selJob.log}</pre>
-          )}
-        </div>
+      {selRepo && selJob && (selJob.log || selJob.href) && (
+        <PipelineJobDetail repo={selRepo.repo} stageLabel={stages[sel!.stage].label} job={selJob} />
+      )}
+    </div>
+  );
+}
+
+/** The detail pane under the pipeline for one selected job: its report (or, for the job in flight, the
+ *  agent's LIVE transcript — auto-scrolled to the newest line as it streams). */
+function PipelineJobDetail({ repo, stageLabel, job }: { repo: string; stageLabel: string; job: Job }) {
+  const running = job.status === 'running';
+  const logRef = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [running, job.log]);
+  return (
+    <div className={cn('rounded-card border bg-bg-base p-3', running ? 'border-warning/40' : 'border-separator')}>
+      <div className="mb-1.5 flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
+          {running && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-warning" />}
+          {repo} · {stageLabel}
+        </span>
+        {job.href && (
+          <a href={job.href} target="_blank" rel="noreferrer" className="shrink-0 text-caption font-medium text-accent hover:underline">
+            PR öffnen ↗
+          </a>
+        )}
+      </div>
+      {job.log && (
+        <pre
+          ref={logRef}
+          className="dl-scroll max-h-80 overflow-auto whitespace-pre-wrap font-mono text-caption text-text-secondary"
+        >
+          {job.log}
+        </pre>
       )}
     </div>
   );
@@ -375,7 +468,7 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
 
 /** The full execution document as a page: title, totals, then the repos as a GitLab-style pipeline or a
  *  detailed list (toggle). The right pane of an aggregate ExecutionHistory. */
-export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: string }) {
+export function ExecutionDetail({ runId, resultId, hideHeader }: { runId: string; resultId: string; hideHeader?: boolean }) {
   const source = useMemo(() => getDataSource(), []);
   const [res, setRes] = useState<RunResult | null>(null);
   const [err, setErr] = useState(false);
@@ -396,28 +489,33 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
   if (err) return <p className="px-8 py-7 text-footnote text-text-secondary">Diese Ausführung konnte nicht geladen werden.</p>;
   if (!res) return <p className="px-8 py-7 text-footnote text-text-tertiary">Lädt…</p>;
 
-  return <ExecutionDetailBody res={res} />;
+  return <ExecutionDetailBody res={res} hideHeader={hideHeader} />;
 }
 
 /** The execution body: title, totals, prompt, then the repos as a GitLab-style pipeline (default) or a
- *  detailed per-repo list, toggled by the viewer. Both read the same recorded steps. */
-function ExecutionDetailBody({ res }: { res: RunResult }) {
+ *  detailed per-repo list, toggled by the viewer. Both read the same recorded steps. `hideHeader` drops
+ *  the title/date/status block and the outer padding for embedding under chrome that already carries
+ *  them (the calendar's detail modal), leaving the totals, prompt and pipeline. */
+function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?: boolean }) {
   const [view, setView] = useState<'pipeline' | 'list'>('pipeline');
   return (
-    <article className="mx-auto max-w-5xl px-8 py-7">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
-          <p className="mt-1 text-footnote text-text-secondary">
-            {fmtDateTime(res.startedAt)}
-            {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
-          </p>
+    <article className={cn('mx-auto max-w-5xl', hideHeader ? '' : 'px-8 py-7')}>
+      {!hideHeader && (
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
+            <p className="mt-1 text-footnote text-text-secondary">
+              {fmtDateTime(res.startedAt)}
+              {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
+            </p>
+          </div>
+          <OkPill ok={res.ok} />
         </div>
-        <OkPill ok={res.ok} />
-      </div>
+      )}
 
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+      <div className={cn('flex flex-wrap items-center justify-between gap-3', !hideHeader && 'mt-4')}>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
+          {res.model && <ModelStat model={res.model} effort={res.effort} />}
           <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
           <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
         </div>
@@ -449,10 +547,10 @@ function ExecutionDetailBody({ res }: { res: RunResult }) {
           <ExecutionPipeline result={res} />
         ) : (
           <div className="flex flex-col gap-4">
-            {res.repos.length === 0 ? (
+            {(res.repos ?? []).length === 0 ? (
               <p className="text-footnote text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
             ) : (
-              res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+              (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
             )}
           </div>
         )}
@@ -559,11 +657,15 @@ export function ExecutionHistory({ type }: { type: RunType }) {
       </div>
 
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
-        {sel ? (
-          <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
-        ) : (
-          <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
-        )}
+        {/* A single unreadable/partial execution must not blank the surface — contain it to this pane and
+            let picking another (healthy) execution recover via resetKeys. */}
+        <ErrorBoundary resetKeys={[sel?.runId, sel?.resultId]}>
+          {sel ? (
+            <ExecutionDetail key={`${sel.runId}:${sel.resultId}`} runId={sel.runId} resultId={sel.resultId} />
+          ) : (
+            <EmptyPlaceholder text="Wähle links eine Ausführung, um Bericht, Schritte und Token-Verbrauch zu sehen." />
+          )}
+        </ErrorBoundary>
       </div>
     </>
   );
@@ -599,14 +701,15 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
           {fmtDateTime(res.startedAt)}
           {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
         </span>
+        {res.model && <ModelStat model={res.model} effort={res.effort} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
       <PromptDisclosure prompt={res.prompt} />
-      {res.repos.length === 0 ? (
+      {(res.repos ?? []).length === 0 ? (
         <p className="text-caption text-text-tertiary">Keine Repositories in dieser Ausführung.</p>
       ) : (
-        res.repos.map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
+        (res.repos ?? []).map((repo, i) => <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />)
       )}
     </div>
   );
@@ -653,9 +756,10 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; refetch: () => void } {
+export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
   const [active, setActive] = useState<RunActive | null>(null);
+  const [inflight, setInflight] = useState<RunInFlight[]>([]);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -664,7 +768,10 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
     const poll = async () => {
       try {
         const r = await source.mercuryRunActive();
-        if (!cancelled) setActive(r.active);
+        if (!cancelled) {
+          setActive(r.active);
+          setInflight(r.inflight ?? []);
+        }
       } catch {
         /* transient — keep the last known state */
       }
@@ -680,14 +787,12 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
     };
   }, [source, bump]);
 
-  return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, inflight, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
 
-/** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already
- *  finished, and the one in flight (its running steps and the agent's streaming output). Polls only
- *  while `live`; once the run settles it fetches the final state once and stops, so the finished result
- *  stays on screen. Reuses RepoBlock/StepRow, so a live run and a past one look the same — just moving. */
-export function LiveExecution({ runId, resultId, live }: { runId: string; resultId: string; live: boolean }) {
+/** Poll a run's result document, following it live while `live` (every 2s); once it settles it fetches
+ *  the final state once and stops. The single source of the live result for every follower. */
+function useLiveResult(runId: string, resultId: string, live: boolean): { res: RunResult | null; err: boolean } {
   const source = useMemo(() => getDataSource(), []);
   const [res, setRes] = useState<RunResult | null>(null);
   const [err, setErr] = useState(false);
@@ -696,6 +801,9 @@ export function LiveExecution({ runId, resultId, live }: { runId: string; result
   useEffect(() => {
     let cancelled = false;
     let timer: number | undefined;
+    resRef.current = null;
+    setRes(null);
+    setErr(false);
     const poll = async () => {
       try {
         const r = await source.mercuryRunResult(runId, resultId);
@@ -716,27 +824,258 @@ export function LiveExecution({ runId, resultId, live }: { runId: string; result
     };
   }, [source, runId, resultId, live]);
 
+  return { res, err };
+}
+
+/** Follow a run LIVE: poll its in-flight result document and render it as the moving pipeline — repos
+ *  already finished, the one in flight (its running stage and the agent's streaming transcript), and the
+ *  totals. Watching a run IS the pipeline here: the running stage pulses and its live transcript opens in
+ *  the detail pane. `state` labels a paused (usage-limit) run; otherwise the label follows `live`. */
+export function LiveExecution({
+  runId,
+  resultId,
+  live,
+  state,
+}: {
+  runId: string;
+  resultId: string;
+  live: boolean;
+  state?: 'executing' | 'suspended';
+}) {
+  const { res, err } = useLiveResult(runId, resultId, live);
+  const suspended = state === 'suspended';
+
   if (!res) {
     return <p className="text-footnote text-text-tertiary">{err ? 'Live-Ausführung wird vorbereitet…' : 'Lädt…'}</p>;
   }
 
-  const repos = res.repos ?? [];
+  const label = suspended ? 'Pausiert' : live ? 'Läuft gerade' : 'Gerade beendet';
+  const dotLive = suspended || live;
+  const hasRows = (res.repos?.length ?? 0) > 0 || !!res.live;
   return (
-    <div className="flex flex-col gap-3 rounded-card border border-warning/30 bg-warning/5 p-3">
+    <div className={cn('flex flex-col gap-3 rounded-card border p-3', dotLive ? 'border-warning/30 bg-warning/5' : 'border-separator')}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="flex items-center gap-1.5 text-footnote font-medium text-text-primary">
-          <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> {live ? 'Läuft gerade' : 'Gerade beendet'}
+          <span className={cn('h-2 w-2 rounded-full', dotLive ? 'animate-pulse bg-warning' : 'bg-text-tertiary')} /> {label}
         </span>
         <span className="text-caption text-text-tertiary">seit {fmtDateTime(res.startedAt)}</span>
+        {res.model && <ModelStat model={res.model} effort={res.effort} />}
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
       </div>
       <PromptDisclosure prompt={res.prompt} />
-      {repos.map((repo, i) => (
-        <RepoBlock key={`${repo.repo}:${i}`} repo={repo} />
-      ))}
-      {res.live && <RepoBlock key="live" repo={res.live} />}
-      {repos.length === 0 && !res.live && <p className="text-caption text-text-tertiary">Der Lauf startet…</p>}
+      {hasRows ? <ExecutionPipeline result={res} /> : <p className="text-caption text-text-tertiary">Der Lauf startet…</p>}
     </div>
+  );
+}
+
+// ── Aktive Läufe — the transparent live overview ──────────────────────────────
+// Replaces the thin "Lauf aktiv" badge with a list of everything the system is working right now
+// (executing + suspended-on-limit), each openable into a live session — the moving pipeline with the
+// agent's streaming transcript. Shared verbatim by both Mercury surfaces (Läufe and ToDos), since a run
+// of either kind can be the one in flight.
+
+/** A coarse human duration ("3 min", "1 h 12 min", "8 s"). */
+function fmtDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h} h ${m} min`;
+  if (m > 0) return `${m} min`;
+  return `${s} s`;
+}
+const fmtSince = (iso?: string) => {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  return Number.isNaN(t) ? '—' : fmtDuration(Date.now() - t);
+};
+const fmtUntil = (iso?: string) => {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return '—';
+  const d = t - Date.now();
+  return d <= 0 ? 'jetzt' : `in ${fmtDuration(d)}`;
+};
+
+/** Completed vs total repos this execution — an exact denominator only when known (ToDos). */
+const progressText = (r: RunInFlight) => (r.reposTotal ? `${r.reposDone}/${r.reposTotal} Repos` : `${r.reposDone} Repos`);
+
+function TypeChip({ type }: { type: RunType }) {
+  return (
+    <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">
+      {type === 'todo' ? 'ToDo' : 'Auto'}
+    </span>
+  );
+}
+
+function StatePill({ state }: { state: RunInFlight['state'] }) {
+  if (state === 'executing') {
+    return (
+      <span className="flex shrink-0 items-center gap-1 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-warning" /> läuft
+      </span>
+    );
+  }
+  return (
+    <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-caption font-medium text-accent">pausiert</span>
+  );
+}
+
+/** One row in the overview list: state, name, kind, and a portioned line of live detail (repo/step for a
+ *  running run; resume time for a paused one) plus its running spend. */
+function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: boolean; onSelect: () => void }) {
+  const executing = row.state === 'executing';
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={cn(
+        'flex w-full flex-col gap-1 rounded-md px-2.5 py-2 text-left transition duration-fast',
+        selected ? 'bg-accent/15' : 'hover:bg-fill/10',
+      )}
+    >
+      <div className="flex items-center gap-1.5">
+        <StatePill state={row.state} />
+        <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
+          {row.runName || 'Lauf'}
+        </span>
+        <TypeChip type={row.type} />
+      </div>
+      <span className="truncate text-caption text-text-tertiary">
+        {executing
+          ? `seit ${fmtSince(row.startedAt)} · ${progressText(row)}${row.currentStep ? ` · ${row.currentStep}` : ''}`
+          : `Fortsetzung ${fmtUntil(row.resumeAt)}${row.attempts ? ` · Versuch ${row.attempts}` : ''}`}
+      </span>
+      <TokenStat input={row.inputTokens} output={row.outputTokens} cost={row.costUsd} />
+    </button>
+  );
+}
+
+/** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
+ *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
+function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+  const executing = row.state === 'executing';
+  return (
+    <div className="flex min-h-0 flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
+        <TypeChip type={row.type} />
+        {executing && (
+          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+          </Button>
+        )}
+      </div>
+      {row.resultId ? (
+        <LiveExecution runId={row.runId} resultId={row.resultId} live={executing} state={row.state} />
+      ) : (
+        <p className="rounded-card border border-separator bg-surface px-3 py-6 text-center text-footnote text-text-tertiary">
+          Der Lauf wird vorbereitet…
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Persist the open overview + watched run so a browser reload drops the viewer back into the same live
+// session (Zustandserhalt beim Reload). Session-scoped and best-effort — a blocked storage is non-fatal.
+const WATCH_KEY = 'dl.mercury.watch';
+function readWatch(): { open: boolean; runId: string | null } {
+  try {
+    const raw = sessionStorage.getItem(WATCH_KEY);
+    if (raw) return JSON.parse(raw) as { open: boolean; runId: string | null };
+  } catch {
+    /* ignore */
+  }
+  return { open: false, runId: null };
+}
+function writeWatch(v: { open: boolean; runId: string | null }) {
+  try {
+    sessionStorage.setItem(WATCH_KEY, JSON.stringify(v));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** The live "Aktive Läufe" overview: a compact bar (what is running, with a kill-switch) that opens a
+ *  list of every in-flight run, each inspectable as a live Claude-Code-style session. `inflight` is server
+ *  truth from useActiveRun; `onCancel` aborts the executing run. Renders nothing when nothing is in
+ *  flight. Reused identically by the Läufe and ToDos surfaces. */
+export function ActiveRunsOverview({
+  inflight,
+  onCancel,
+  cancelling,
+  className,
+}: {
+  inflight: RunInFlight[];
+  onCancel: () => void;
+  cancelling: boolean;
+  className?: string;
+}) {
+  const [restored] = useState(readWatch); // lazy: read session storage once, on mount
+  const [open, setOpen] = useState(restored.open);
+  const [selId, setSelId] = useState<string | null>(restored.runId);
+
+  const selected = inflight.find((r) => r.runId === selId) ?? null;
+
+  // When the overview is open with no valid selection, focus the first in-flight run.
+  useEffect(() => {
+    if (open && !selected && inflight.length > 0) setSelId(inflight[0].runId);
+  }, [open, selected, inflight]);
+
+  // Nothing left in flight → close (and the bar unmounts below).
+  useEffect(() => {
+    if (inflight.length === 0 && open) setOpen(false);
+  }, [inflight.length, open]);
+
+  // Persist for reload restore.
+  useEffect(() => {
+    writeWatch({ open, runId: selId });
+  }, [open, selId]);
+
+  if (inflight.length === 0) return null;
+
+  const executing = inflight.some((r) => r.state === 'executing');
+  const only = inflight.length === 1 ? inflight[0] : null;
+  const summary = only ? `${only.state === 'executing' ? 'Läuft' : 'Pausiert'}: ${only.runName || 'Lauf'}` : `${inflight.length} Läufe aktiv`;
+  const nExec = inflight.filter((r) => r.state === 'executing').length;
+  const nSusp = inflight.length - nExec;
+  const description = [nExec ? `${nExec} läuft` : '', nSusp ? `${nSusp} pausiert` : ''].filter(Boolean).join(' · ');
+
+  return (
+    <>
+      <div className={cn('flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5', className)}>
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="flex min-w-0 items-center gap-1.5 text-caption font-medium text-text-secondary transition hover:text-text-primary"
+        >
+          <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" />
+          <span className="truncate">{summary}</span>
+        </button>
+        {executing && (
+          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+          </Button>
+        )}
+      </div>
+
+      <Modal open={open} onClose={() => setOpen(false)} title="Aktive Läufe" description={description} size="xl">
+        <div className="flex min-h-[55vh] flex-col gap-4 sm:flex-row">
+          <div className="dl-scroll flex shrink-0 flex-col gap-0.5 overflow-y-auto sm:w-64 sm:max-h-[60vh]">
+            {inflight.map((row) => (
+              <OverviewRow key={row.runId} row={row} selected={row.runId === selId} onSelect={() => setSelId(row.runId)} />
+            ))}
+          </div>
+          <div className="min-w-0 flex-1 border-t border-separator pt-4 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
+            {selected ? (
+              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancelling={cancelling} />
+            ) : (
+              <EmptyPlaceholder text="Wähle links einen Lauf, um ihn live zu verfolgen." />
+            )}
+          </div>
+        </div>
+      </Modal>
+    </>
   );
 }

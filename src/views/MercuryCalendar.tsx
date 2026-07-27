@@ -2,6 +2,8 @@ import { useMemo, useState } from 'react';
 import { cn } from '@/lib/cn';
 import { Button, IconButton } from '@/ui/Button';
 import { ChevronRightIcon } from '@/ui/icons';
+import { Modal } from '@/ui/Modal';
+import { ExecutionDetail, OkPill, fmtDateTime } from './MercuryExecutions';
 import type { RunOccurrence, RunType } from '@/types';
 
 /** The two kinds an occurrence can carry, spelled out so Tailwind sees whole class names. `auto`
@@ -49,10 +51,12 @@ const dayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 const fmtTime = (iso: string) => new Date(iso).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
 
 /** MercuryCalendar — the one shared calendar behind every Mercury surface (Laufkalender, ToDo-Kalender
- *  and „Kalender — alles"). Pure presentation: the parent fetches the occurrences (and auto-refreshes),
- *  this renders them. Modelled on a real calendar app: a month mini-grid with clickable days beside a
- *  Tag / Woche / Agenda view, navigable by day or week. `showTypes` colour-separates automatic runs
- *  from ToDos (accent vs warning) and shows a legend; without it a single accent style is used. */
+ *  and „Kalender — alles"). It renders the union the parent fetches: past executions AND upcoming
+ *  firings. A past occurrence (it carries a resultId) shows its outcome and opens the full report on
+ *  click; a future firing shows its schedule. Modelled on a real calendar app: a month mini-grid with
+ *  clickable days beside a Tag / Woche / Agenda view, navigable by day or week. `showTypes` colour-
+ *  separates automatic runs from ToDos (accent vs warning) and shows a legend; without it a single
+ *  accent style is used. */
 export function MercuryCalendar({
   occurrences,
   showTypes = false,
@@ -65,6 +69,14 @@ export function MercuryCalendar({
   const [view, setView] = useState<CalView>('agenda');
   const [focusDate, setFocusDate] = useState<Date>(() => startOfDay(new Date()));
   const today = useMemo(() => startOfDay(new Date()), []);
+
+  // A completed (past) occurrence carries a resultId; clicking it opens the full execution report in a
+  // modal, so every past run's status is reachable straight from the calendar. A future firing has no
+  // result yet and is not clickable.
+  const [selected, setSelected] = useState<RunOccurrence | null>(null);
+  const openOcc = (o: RunOccurrence) => {
+    if (o.resultId) setSelected(o);
+  };
 
   const styleOf = (o: RunOccurrence): TypeStyle => (showTypes ? TYPE_STYLE[o.type ?? 'auto'] : NEUTRAL_STYLE);
 
@@ -157,14 +169,28 @@ export function MercuryCalendar({
               )}
             </div>
 
-            {view === 'tag' && <TagView occ={byDay.get(dayKey(focusDate)) ?? []} styleOf={styleOf} showTypes={showTypes} />}
-            {view === 'woche' && (
-              <WocheView days={weekDays} today={today} byDay={byDay} styleOf={styleOf} onPickDay={pickDay} />
+            {view === 'tag' && (
+              <TagView occ={byDay.get(dayKey(focusDate)) ?? []} styleOf={styleOf} showTypes={showTypes} onOpen={openOcc} />
             )}
-            {view === 'agenda' && <AgendaView groups={agendaGroups} styleOf={styleOf} showTypes={showTypes} />}
+            {view === 'woche' && (
+              <WocheView days={weekDays} today={today} byDay={byDay} styleOf={styleOf} onPickDay={pickDay} onOpen={openOcc} />
+            )}
+            {view === 'agenda' && <AgendaView groups={agendaGroups} styleOf={styleOf} showTypes={showTypes} onOpen={openOcc} today={today} />}
           </div>
         </div>
       </div>
+
+      {selected?.resultId && (
+        <Modal
+          open
+          onClose={() => setSelected(null)}
+          title={selected.runName || 'Ausführung'}
+          description={`${fmtDateTime(selected.at)} · ${selected.suspended ? 'Pausiert' : selected.ok ? 'Erfolgreich' : 'Fehlgeschlagen'}`}
+          size="lg"
+        >
+          <ExecutionDetail runId={selected.runId} resultId={selected.resultId} hideHeader />
+        </Modal>
+      )}
     </div>
   );
 }
@@ -183,18 +209,46 @@ function Legend() {
   );
 }
 
-/** One agenda/day row: the time in its type's colour, a matching left border, the run name and a
- *  sub-line (the type spelled out, when separated, plus the schedule). */
-function OccurrenceRow({ occ, style, showType }: { occ: RunOccurrence; style: TypeStyle; showType: boolean }) {
-  return (
-    <div className={cn('flex items-center gap-3 rounded-md border border-separator border-l-2 bg-surface px-3 py-2', style.borderLeft)}>
+/** The inline status of a past execution: paused on the usage limit, else the pass/fail pill. */
+function OccStatus({ occ }: { occ: RunOccurrence }) {
+  if (occ.suspended) {
+    return <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">Pausiert</span>;
+  }
+  return <OkPill ok={occ.ok ?? false} />;
+}
+
+/** One agenda/day row: the time in its type's colour and a matching left border, the run name and a
+ *  sub-line. A PAST execution (it carries a resultId) shows its outcome and is a button that opens the
+ *  full report; a FUTURE firing shows its schedule and is inert. */
+function OccurrenceRow({
+  occ,
+  style,
+  showType,
+  onOpen,
+}: {
+  occ: RunOccurrence;
+  style: TypeStyle;
+  showType: boolean;
+  onOpen: (o: RunOccurrence) => void;
+}) {
+  const past = !!occ.resultId;
+  const subLine = past ? (showType ? style.label : 'Ausführung') : showType ? `${style.label} · ${occ.schedule ?? ''}` : (occ.schedule ?? '');
+  const body = (
+    <>
       <span className={cn('w-14 shrink-0 font-mono text-footnote tabular-nums', style.text)}>{fmtTime(occ.at)}</span>
       <div className="min-w-0 flex-1">
         <p className="truncate text-footnote text-text-primary">{occ.runName}</p>
-        <p className="truncate text-caption text-text-tertiary">{showType ? `${style.label} · ${occ.schedule}` : occ.schedule}</p>
+        <p className="truncate text-caption text-text-tertiary">{subLine}</p>
       </div>
-      {showType && <span className={cn('h-2 w-2 shrink-0 rounded-full', style.dot)} />}
-    </div>
+      {past ? <OccStatus occ={occ} /> : showType ? <span className={cn('h-2 w-2 shrink-0 rounded-full', style.dot)} /> : null}
+    </>
+  );
+  const base = cn('flex items-center gap-3 rounded-md border border-separator border-l-2 bg-surface px-3 py-2', style.borderLeft);
+  if (!past) return <div className={base}>{body}</div>;
+  return (
+    <button type="button" onClick={() => onOpen(occ)} className={cn(base, 'w-full text-left transition duration-fast hover:bg-fill/10')}>
+      {body}
+    </button>
   );
 }
 
@@ -203,22 +257,24 @@ function TagView({
   occ,
   styleOf,
   showTypes,
+  onOpen,
 }: {
   occ: RunOccurrence[];
   styleOf: (o: RunOccurrence) => TypeStyle;
   showTypes: boolean;
+  onOpen: (o: RunOccurrence) => void;
 }) {
   if (occ.length === 0) {
     return (
       <div className="rounded-card border border-separator bg-surface px-4 py-8 text-center">
-        <p className="text-footnote text-text-tertiary">Für diesen Tag sind keine Läufe geplant.</p>
+        <p className="text-footnote text-text-tertiary">An diesem Tag sind keine Läufe.</p>
       </div>
     );
   }
   return (
     <div className="flex flex-col gap-1.5">
       {occ.map((o, i) => (
-        <OccurrenceRow key={`${o.runId}:${o.at}:${i}`} occ={o} style={styleOf(o)} showType={showTypes} />
+        <OccurrenceRow key={`${o.runId}:${o.at}:${i}`} occ={o} style={styleOf(o)} showType={showTypes} onOpen={onOpen} />
       ))}
     </div>
   );
@@ -232,12 +288,14 @@ function WocheView({
   byDay,
   styleOf,
   onPickDay,
+  onOpen,
 }: {
   days: Date[];
   today: Date;
   byDay: Map<string, RunOccurrence[]>;
   styleOf: (o: RunOccurrence) => TypeStyle;
   onPickDay: (d: Date) => void;
+  onOpen: (o: RunOccurrence) => void;
 }) {
   return (
     <div className="grid grid-cols-1 gap-2 sm:grid-cols-7">
@@ -263,13 +321,31 @@ function WocheView({
               ) : (
                 occ.map((o, i) => {
                   const s = styleOf(o);
-                  return (
-                    <div
-                      key={`${o.runId}:${o.at}:${i}`}
-                      className={cn('flex flex-col gap-0.5 rounded border border-l-2 border-separator bg-bg-base px-1.5 py-1', s.borderLeft)}
-                    >
-                      <span className={cn('font-mono text-caption tabular-nums', s.text)}>{fmtTime(o.at)}</span>
+                  const past = !!o.resultId;
+                  const chipBody = (
+                    <>
+                      <span className="flex items-center gap-1">
+                        <span className={cn('font-mono text-caption tabular-nums', s.text)}>{fmtTime(o.at)}</span>
+                        {past && (
+                          <span className={cn('ml-auto h-1.5 w-1.5 shrink-0 rounded-full', o.suspended ? 'bg-warning' : o.ok ? 'bg-success' : 'bg-danger')} />
+                        )}
+                      </span>
                       <span className="truncate text-caption text-text-primary">{o.runName}</span>
+                    </>
+                  );
+                  const chip = cn('flex flex-col gap-0.5 rounded border border-l-2 border-separator bg-bg-base px-1.5 py-1', s.borderLeft);
+                  return past ? (
+                    <button
+                      key={`${o.runId}:${o.at}:${i}`}
+                      type="button"
+                      onClick={() => onOpen(o)}
+                      className={cn(chip, 'text-left transition duration-fast hover:bg-fill/10')}
+                    >
+                      {chipBody}
+                    </button>
+                  ) : (
+                    <div key={`${o.runId}:${o.at}:${i}`} className={chip}>
+                      {chipBody}
                     </div>
                   );
                 })
@@ -282,29 +358,49 @@ function WocheView({
   );
 }
 
-/** Agenda — the whole window grouped by day, flowing into as many columns as the pane affords. */
+/** Agenda — the union grouped by day, split into what is still to come (Anstehend, soonest first) and
+ *  what already ran (Verlauf, most recent first), so both halves of the calendar are legible however
+ *  much history has piled up. Each half flows into as many columns as the pane affords. */
 function AgendaView({
   groups,
   styleOf,
   showTypes,
+  onOpen,
+  today,
 }: {
   groups: { key: string; date: Date; occ: RunOccurrence[] }[];
   styleOf: (o: RunOccurrence) => TypeStyle;
   showTypes: boolean;
+  onOpen: (o: RunOccurrence) => void;
+  today: Date;
 }) {
   if (groups.length === 0) {
-    return <p className="text-footnote text-text-tertiary">Keine anstehenden Einträge im Zeitraum.</p>;
+    return <p className="text-footnote text-text-tertiary">Keine Läufe im Zeitraum.</p>;
   }
+  // groups arrive oldest-first: upcoming (today onward) keeps that order; the past reads newest-first.
+  const upcoming = groups.filter((g) => g.date.getTime() >= today.getTime());
+  const past = groups.filter((g) => g.date.getTime() < today.getTime()).reverse();
+  const sections = [
+    { title: 'Anstehend', items: upcoming },
+    { title: 'Verlauf', items: past },
+  ].filter((s) => s.items.length > 0);
   return (
-    <div className="grid gap-5 sm:grid-cols-2 2xl:grid-cols-3">
-      {groups.map((g) => (
-        <div key={g.key}>
-          <p className="mb-2 text-footnote font-semibold text-text-primary">
-            {g.date.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' })}
-          </p>
-          <div className="flex flex-col gap-1.5">
-            {g.occ.map((o, i) => (
-              <OccurrenceRow key={`${o.runId}:${o.at}:${i}`} occ={o} style={styleOf(o)} showType={showTypes} />
+    <div className="flex flex-col gap-6">
+      {sections.map((s) => (
+        <div key={s.title}>
+          <p className="mb-3 text-caption font-semibold uppercase tracking-wide text-text-tertiary">{s.title}</p>
+          <div className="grid gap-5 sm:grid-cols-2 2xl:grid-cols-3">
+            {s.items.map((g) => (
+              <div key={g.key}>
+                <p className="mb-2 text-footnote font-semibold text-text-primary">
+                  {g.date.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' })}
+                </p>
+                <div className="flex flex-col gap-1.5">
+                  {g.occ.map((o, i) => (
+                    <OccurrenceRow key={`${o.runId}:${o.at}:${i}`} occ={o} style={styleOf(o)} showType={showTypes} onOpen={onOpen} />
+                  ))}
+                </div>
+              </div>
             ))}
           </div>
         </div>

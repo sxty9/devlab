@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
@@ -36,8 +37,13 @@ type Server struct {
 	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
+	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
+	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -65,7 +71,7 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: chat store disabled: %v", err)
 		chatStore = nil
 	}
-	return &Server{
+	s := &Server{
 		v:           v,
 		reposBase:   base,
 		links:       store,
@@ -75,9 +81,20 @@ func New(v *auth.Verifier) *Server {
 		runs:        runs.NewStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
+		runNotices:  runs.NewNoticeStore(),
 		attachments: runs.NewAttachmentStore(),
+		axiomChecks: runs.NewAxiomChecks(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
+	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
+	// identity the autonomous pipeline commits with — so an edit works whether or not the person making
+	// it has linked GitHub themselves.
+	s.axioms = axiomrepo.New(axiomsDir(), axiomsRepo(), func() (string, error) { return s.links.Token(axiomsTokenUser()) })
+	s.autoRollout = newAutoRollout(s)
+	// The auto-assigner runs on a caller's forwarded session (like the AI-fill button), so it needs no
+	// scheduler-style provisioning — arm it whenever the run store exists.
+	s.assigner = newAutoAssigner(s)
+	return s
 }
 
 // ctxKey namespaces the resolved user stashed in the request context by the guards.
@@ -193,7 +210,9 @@ func (s *Server) Handler() http.Handler {
 	// Mercury level (not inside a section), and may return a reviewable run-plan proposal.
 	mux.HandleFunc("POST /api/mercury/chat", s.guardCSRF(s.mercuryChat))
 	// Roll the axioms + rules into every holistic repo's CLAUDE.md. Dry-run by default (?apply=true
-	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account).
+	// pushes). This DOES touch GitHub repos, so it needs the full write guard (a linked account). The
+	// automatic rollout (on axiom/rule writes) runs in the background; GET reports its last result.
+	mux.HandleFunc("GET /api/mercury/rollout", s.guard(s.mercuryRolloutStatus))
 	mux.HandleFunc("POST /api/mercury/rollout", s.guardWrite(s.mercuryRollout))
 	// One-time constitution migration: decompose the original axiom document into atoms and file
 	// each via aigentic. Dry-run by default (?apply=true writes). Store authority, not GitHub.
@@ -210,6 +229,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
 	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
+	// Automatic axiom→run assignment feed: the user is informed of every background assignment (and any
+	// failure) here, and can dismiss acknowledged entries. Reads under guard; dismiss/clear under CSRF.
+	mux.HandleFunc("GET /api/mercury/runs/notices", s.guard(s.runsNoticesList))
+	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
+	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -217,7 +241,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs", s.guardCSRF(s.runCreate))
 	mux.HandleFunc("PUT /api/mercury/runs/{id}", s.guardCSRF(s.runUpdate))
 	mux.HandleFunc("DELETE /api/mercury/runs/{id}", s.guardCSRF(s.runDelete))
-	mux.HandleFunc("POST /api/mercury/runs/{id}/recompose", s.guardCSRF(s.runRecompose))
 	mux.HandleFunc("POST /api/mercury/runs/ai-fill", s.guardCSRF(s.runsAiFill))
 	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))

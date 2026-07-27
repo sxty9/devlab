@@ -3,10 +3,13 @@ import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
-import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
+import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { RunTuningFields } from './RunTuning';
+import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
   Run,
   RunActive,
@@ -14,6 +17,7 @@ import type {
   RunSchedule,
   RunList,
   RunCoverage,
+  RunNotice,
   PlannedRun,
   RunProposal,
   RunSnapshotMeta,
@@ -36,7 +40,8 @@ const WEEKDAYS: { num: number; label: string }[] = [
 ];
 
 /** A human schedule line: `täglich 03:00` or `wöchentlich Mo, Do · 03:00`. */
-function scheduleSummary(s: RunSchedule): string {
+function scheduleSummary(s: RunSchedule | undefined | null): string {
+  if (!s) return '—';
   if (s.kind === 'daily') return `täglich ${s.timeOfDay}`;
   const days = WEEKDAYS.filter((w) => s.weekdays?.includes(w.num)).map((w) => w.label);
   if (days.length === 0) return `wöchentlich · ${s.timeOfDay}`;
@@ -68,6 +73,7 @@ export default function RunsView() {
 
   const [list, setList] = useState<RunList | null>(null);
   const [coverage, setCoverage] = useState<RunCoverage | null>(null);
+  const [notices, setNotices] = useState<RunNotice[]>([]);
   const [failed, setFailed] = useState<string | null>(null);
   // Bumped on every run-config mutation; the calendar depends on it to refetch.
   const [dataVersion, setDataVersion] = useState(0);
@@ -78,20 +84,22 @@ export default function RunsView() {
   const [aiBusy, setAiBusy] = useState<'fill' | 'finetune' | null>(null);
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
-  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
-  // live-follow view — survive a page reload instead of living only in this component. The global cancel
-  // shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
+  // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
+  // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
+  // cancel lives in that overview.
+  const { active, inflight, refetch: refetchActive } = useActiveRun();
   const [cancelling, setCancelling] = useState(false);
 
-  // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success.
+  // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
+  // also pulls the auto-assignment feed, so a background assignment surfaces on the next refresh.
   const reload = useCallback(async () => {
     try {
-      const [l, c] = await Promise.all([source.mercuryRuns(), source.mercuryRunCoverage()]);
+      const [l, c, n] = await Promise.all([source.mercuryRuns(), source.mercuryRunCoverage(), source.mercuryRunNotices()]);
       setList(l);
       setCoverage(c);
+      setNotices(n.notices ?? []);
       setDataVersion((v) => v + 1);
     } catch (e) {
       toast({ title: 'Läufe konnten nicht geladen werden', description: msg(e), variant: 'danger' });
@@ -111,10 +119,11 @@ export default function RunsView() {
     let cancelled = false;
     void (async () => {
       try {
-        const [l, c] = await Promise.all([source.mercuryRuns(), source.mercuryRunCoverage()]);
+        const [l, c, n] = await Promise.all([source.mercuryRuns(), source.mercuryRunCoverage(), source.mercuryRunNotices()]);
         if (!cancelled) {
           setList(l);
           setCoverage(c);
+          setNotices(n.notices ?? []);
         }
       } catch (e) {
         if (!cancelled) setFailed(msg(e));
@@ -124,6 +133,15 @@ export default function RunsView() {
       cancelled = true;
     };
   }, [source]);
+
+  // While a background assignment is in flight (coverage.pending), poll so the new run, the cleared
+  // coverage and the fresh notice appear on their own. `dataVersion` (bumped by every reload) is a
+  // changing dep so the loop reschedules while pending stays true, and stops the moment it clears.
+  useEffect(() => {
+    if (!coverage?.pending) return;
+    const t = window.setTimeout(() => void reload(), 1500);
+    return () => window.clearTimeout(t);
+  }, [coverage?.pending, dataVersion, reload]);
 
   const cancelRun = useCallback(async () => {
     if (cancelling) return;
@@ -180,6 +198,36 @@ export default function RunsView() {
     await reload();
   }, [reload]);
 
+  // Acknowledge one assignment notice (optimistic — the feed is a passive pool, a failed dismiss just
+  // reappears on the next reload).
+  const dismissNotice = useCallback(
+    async (id: string) => {
+      setNotices((prev) => prev.filter((n) => n.id !== id));
+      try {
+        await source.mercuryDismissRunNotice(id);
+      } catch (e) {
+        toast({ title: 'Hinweis konnte nicht entfernt werden', description: msg(e), variant: 'danger' });
+      }
+    },
+    [source, toast],
+  );
+
+  const clearNotices = useCallback(async () => {
+    setNotices([]);
+    try {
+      await source.mercuryClearRunNotices();
+    } catch (e) {
+      toast({ title: 'Hinweise konnten nicht entfernt werden', description: msg(e), variant: 'danger' });
+    }
+  }, [source, toast]);
+
+  // Jump to the run an assignment landed in, so the user can adjust it.
+  const openRun = useCallback((runId: string) => {
+    setTab('laeufe');
+    setSelectedId(runId);
+    setMode('view');
+  }, []);
+
   if (failed) {
     return (
       <div className="flex h-full min-h-0 items-center justify-center bg-bg-base px-6">
@@ -195,14 +243,28 @@ export default function RunsView() {
     );
   }
 
-  const selectedRun = selectedId ? list.runs.find((r) => r.id === selectedId) ?? null : null;
+  // Konkrete ToDos share the run store but belong to the ToDos-Ansicht, not here. The Automatischen
+  // Läufe list shows ONLY auto runs (type absent = auto, mirroring TodosView's `type === 'todo'`).
+  // Without this filter a ToDo appears here and selecting it renders the auto-run detail against
+  // todo-shaped data — a blank screen.
+  const autoRuns = list.runs.filter((r) => r.type !== 'todo');
+  const shownRuns = applyRunFilter(autoRuns, filter);
+
+  const selectedRun = selectedId ? autoRuns.find((r) => r.id === selectedId) ?? null : null;
 
   let rightPane: ReactNode;
   if (mode === 'create') {
-    rightPane = <RunEditor base={null} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} />;
+    rightPane = <RunEditor base={null} coverage={coverage} notices={notices} onCancel={() => setMode('view')} onSaved={handleSaved} />;
   } else if (mode === 'edit' && selectedRun) {
     rightPane = (
-      <RunEditor key={selectedRun.id} base={selectedRun} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} />
+      <RunEditor
+        key={selectedRun.id}
+        base={selectedRun}
+        coverage={coverage}
+        notices={notices}
+        onCancel={() => setMode('view')}
+        onSaved={handleSaved}
+      />
     );
   } else if (selectedRun) {
     rightPane = (
@@ -213,7 +275,6 @@ export default function RunsView() {
         active={active && active.runId === selectedRun.id ? active : null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
-        onRecomposed={reload}
         onRunStarted={refetchActive}
       />
     );
@@ -241,16 +302,7 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        {running && (
-          <div className="ml-auto flex items-center gap-2">
-            <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-            </span>
-            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
-          </div>
-        )}
+        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
       </header>
 
       <div className="flex min-h-0 flex-1">
@@ -280,16 +332,21 @@ export default function RunsView() {
                     Verlauf
                   </Button>
                 </div>
+                {autoRuns.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} />}
               </div>
 
+              <NoticesPanel notices={notices} onOpenRun={openRun} onDismiss={dismissNotice} onClear={clearNotices} />
+
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
-                {list.runs.length === 0 ? (
+                {autoRuns.length === 0 ? (
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine Läufe. Lege einen an oder nutze „Mit KI auffüllen“.
                   </p>
+                ) : shownRuns.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">No runs match the current filter.</p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {list.runs.map((run) => (
+                    {shownRuns.map((run) => (
                       <RunRow
                         key={run.id}
                         run={run}
@@ -305,8 +362,11 @@ export default function RunsView() {
               </div>
             </div>
 
-            {/* RIGHT — detail, editor, or placeholder */}
-            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">{rightPane}</div>
+            {/* RIGHT — detail, editor, or placeholder. Boundary-wrapped so a single dead/partial run only
+                fails its own pane (recovering when another is picked, via resetKeys) while the list stays live. */}
+            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
+              <ErrorBoundary resetKeys={[selectedId, mode]}>{rightPane}</ErrorBoundary>
+            </div>
           </>
         )}
 
@@ -362,7 +422,6 @@ function RunRow({ run, selected, onSelect }: { run: Run; selected: boolean; onSe
         {run.suspended && (
           <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-caption font-medium text-accent">pausiert</span>
         )}
-        {run.stale && <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">veraltet</span>}
       </div>
       <span className="text-caption text-text-tertiary">{scheduleSummary(run.schedule)}</span>
       <span className="text-caption text-text-tertiary">
@@ -380,7 +439,6 @@ function RunDetail({
   active,
   onEdit,
   onDeleted,
-  onRecomposed,
   onRunStarted,
 }: {
   run: Run;
@@ -388,7 +446,6 @@ function RunDetail({
   active: RunActive | null;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
-  onRecomposed: () => void | Promise<void>;
   onRunStarted: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
@@ -458,19 +515,6 @@ function RunDetail({
     }
   };
 
-  const recompose = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await source.mercuryRecomposeRun(run.id);
-      toast({ title: 'Prompt neu komponiert', variant: 'success' });
-      await onRecomposed();
-    } catch (e) {
-      toast({ title: 'Neu komponieren fehlgeschlagen', description: msg(e), variant: 'danger' });
-      setBusy(false);
-    }
-  };
-
   const runNow = async () => {
     if (runningNow) return;
     setRunningNow(true);
@@ -487,6 +531,9 @@ function RunDetail({
   };
 
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
+  // A legacy/damaged run can carry no axioms at all (Go marshals the empty slice as null); guard so the
+  // detail pane counts and lists them safely instead of throwing on null.
+  const axiomIds = run.axiomIds ?? [];
 
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
@@ -499,11 +546,6 @@ function RunDetail({
           <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
             <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
           </Button>
-          {run.stale && (
-            <Button variant="secondary" size="sm" disabled={busy} onClick={recompose}>
-              <RefreshIcon className="h-4 w-4" /> Neu komponieren
-            </Button>
-          )}
           <Button variant="secondary" size="sm" onClick={onEdit}>
             Bearbeiten
           </Button>
@@ -525,17 +567,21 @@ function RunDetail({
         {run.suspended && (
           <span className="rounded bg-accent/15 px-1.5 py-0.5 font-medium text-accent">pausiert · Abo-Limit</span>
         )}
-        {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
+        {(run.model || run.effort) && (
+          <span className="rounded bg-fill/10 px-1.5 py-0.5 font-medium text-text-secondary">
+            {[run.model, run.effort].filter(Boolean).join(' · ')}
+          </span>
+        )}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
 
       <section className="mt-6">
-        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({run.axiomIds.length})</p>
-        {run.axiomIds.length === 0 ? (
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({axiomIds.length})</p>
+        {axiomIds.length === 0 ? (
           <p className="text-footnote text-text-tertiary">Keine Axiome zugeordnet.</p>
         ) : (
           <div className="flex flex-wrap gap-1.5">
-            {run.axiomIds.map((id) => (
+            {axiomIds.map((id) => (
               <span key={id} className="rounded-md bg-fill/10 px-2 py-0.5 text-caption text-text-secondary">
                 {axioms[id] ?? id}
               </span>
@@ -600,11 +646,13 @@ function RunDetail({
 function RunEditor({
   base,
   coverage,
+  notices,
   onCancel,
   onSaved,
 }: {
   base: Run | null;
   coverage: RunCoverage;
+  notices: RunNotice[];
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
 }) {
@@ -612,6 +660,8 @@ function RunEditor({
   const { toast } = useToast();
   const [name, setName] = useState(base?.name ?? '');
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
+  const [model, setModel] = useState(base?.model ?? '');
+  const [effort, setEffort] = useState(base?.effort ?? '');
   const [schedule, setSchedule] = useState<RunSchedule>(base?.schedule ?? { kind: 'daily', timeOfDay: '03:00' });
   const [axiomIds, setAxiomIds] = useState<string[]>(base?.axiomIds ?? []);
   const [busy, setBusy] = useState(false);
@@ -629,7 +679,7 @@ function RunEditor({
       schedule.kind === 'weekly'
         ? { kind: 'weekly', timeOfDay: schedule.timeOfDay, weekdays: [...(schedule.weekdays ?? [])].sort((a, b) => a - b) }
         : { kind: 'daily', timeOfDay: schedule.timeOfDay };
-    const body: RunInput = { name: name.trim(), enabled, schedule: cleanSchedule, axiomIds };
+    const body: RunInput = { name: name.trim(), enabled, model, effort, schedule: cleanSchedule, axiomIds };
     try {
       const run = base ? await source.mercuryUpdateRun(base.id, body) : await source.mercuryCreateRun(body);
       toast({ title: base ? 'Lauf gespeichert' : 'Lauf angelegt', variant: 'success' });
@@ -668,9 +718,11 @@ function RunEditor({
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({axiomIds.length})</p>
-        <AxiomPicker coverage={coverage} editingId={base?.id} selectedIds={axiomIds} onToggle={toggleAxiom} />
+        <AxiomPicker coverage={coverage} notices={notices} editingId={base?.id} selectedIds={axiomIds} onToggle={toggleAxiom} />
         {axiomIds.length === 0 && <p className="mt-1.5 text-caption text-danger">Mindestens ein Axiom wählen.</p>}
       </div>
+
+      <RunTuningFields model={model} effort={effort} onModelChange={setModel} onEffortChange={setEffort} />
 
       <div className="flex items-center gap-2">
         <Button variant="primary" size="sm" disabled={!valid || busy} onClick={save}>
@@ -744,19 +796,29 @@ function ScheduleFields({ schedule, onChange }: { schedule: RunSchedule; onChang
 }
 
 /** Axiom picker: every axiom (title + category), a text filter, and a coverage badge showing how
- *  many OTHER runs already back each axiom. */
+ *  many OTHER runs already back each axiom. A not-yet-covered axiom is shown honestly as uncovered; while
+ *  a background assignment is pending it reads as transient ("Zuordnung läuft…") rather than permanent,
+ *  and a failed auto-assignment is flagged so the state stays visible. */
 function AxiomPicker({
   coverage,
+  notices,
   editingId,
   selectedIds,
   onToggle,
 }: {
   coverage: RunCoverage;
+  notices: RunNotice[];
   editingId?: string;
   selectedIds: string[];
   onToggle: (id: string) => void;
 }) {
   const [filter, setFilter] = useState('');
+
+  // Axioms whose most recent auto-assignment failed — so an uncovered axiom shows WHY it is still uncovered.
+  const failedIds = useMemo(
+    () => new Set(notices.filter((n) => n.kind === 'failed').flatMap((n) => n.axiomIds ?? [])),
+    [notices],
+  );
 
   const items = useMemo(
     () =>
@@ -766,6 +828,8 @@ function AxiomPicker({
           title: coverage.axioms[id] ?? id,
           category: categoryLabel(coverage.index[id] ?? ''),
           others: (coverage.covered[id] ?? []).filter((r) => r !== editingId),
+          // Uncovered = backed by NO run at all (an axiom held only by the run being edited is covered).
+          uncovered: (coverage.covered[id] ?? []).length === 0,
         }))
         .sort((a, b) => a.title.localeCompare(b.title, 'de')),
     [coverage, editingId],
@@ -801,6 +865,15 @@ function AxiomPicker({
                         in {it.others.length} {it.others.length === 1 ? 'Lauf' : 'Läufen'}
                       </span>
                     )}
+                    {it.uncovered && failedIds.has(it.id) ? (
+                      <span className="shrink-0 rounded bg-danger/15 px-1.5 py-0.5 text-caption font-medium text-danger">
+                        Zuordnung fehlgeschlagen
+                      </span>
+                    ) : it.uncovered && coverage.pending ? (
+                      <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">
+                        Zuordnung läuft…
+                      </span>
+                    ) : null}
                   </span>
                   {it.category && <span className="truncate text-caption text-text-tertiary">{it.category}</span>}
                 </span>
@@ -809,6 +882,95 @@ function AxiomPicker({
           })
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Automatische Zuordnungen (assignment feed) ─────────────────────────────────
+
+/** The automatic axiom→run assignment feed: a portioned, dismissable notice list. A success links to the
+ *  run its axioms landed in (so the user can adjust it); a failure names its reason. Hidden when empty. */
+function NoticesPanel({
+  notices,
+  onOpenRun,
+  onDismiss,
+  onClear,
+}: {
+  notices: RunNotice[];
+  onOpenRun: (runId: string) => void;
+  onDismiss: (id: string) => void;
+  onClear: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  if (notices.length === 0) return null;
+  const shown = expanded ? notices : notices.slice(0, 3);
+  const hidden = notices.length - shown.length;
+  return (
+    <div className="border-b border-separator bg-surface px-2 py-2">
+      <div className="flex items-center justify-between px-1 pb-1.5">
+        <span className="text-caption font-semibold uppercase tracking-wide text-text-tertiary">Automatische Zuordnungen</span>
+        <button type="button" onClick={onClear} className="text-caption text-text-tertiary transition hover:text-text-primary">
+          Alle verwerfen
+        </button>
+      </div>
+      <div className="flex flex-col gap-1">
+        {shown.map((n) => (
+          <NoticeRow key={n.id} notice={n} onOpen={onOpenRun} onDismiss={() => onDismiss(n.id)} />
+        ))}
+      </div>
+      {hidden > 0 && (
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          className="mt-1 px-1 text-caption text-text-tertiary transition hover:text-text-primary"
+        >
+          +{hidden} weitere anzeigen
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** One assignment notice: a success (axioms → run, clickable) or a failure (axioms + reason). */
+function NoticeRow({ notice, onOpen, onDismiss }: { notice: RunNotice; onOpen: (runId: string) => void; onDismiss: () => void }) {
+  const titles = notice.axioms ?? [];
+  const count = titles.length || notice.axiomIds.length;
+  const axiomLabel = titles.length === 0 ? `${count} Axiome` : titles.length === 1 ? titles[0] : `${titles[0]} +${titles.length - 1}`;
+  const failed = notice.kind === 'failed';
+  const clickable = !failed && !!notice.runId;
+  return (
+    <div className={cn('group flex items-start gap-2 rounded-md px-2 py-1.5', failed ? 'bg-danger/5' : 'bg-fill/5')}>
+      <span className={cn('mt-1 h-1.5 w-1.5 shrink-0 rounded-full', failed ? 'bg-danger' : 'bg-success')} />
+      <button
+        type="button"
+        disabled={!clickable}
+        onClick={() => clickable && notice.runId && onOpen(notice.runId)}
+        className={cn('flex min-w-0 flex-1 flex-col gap-0.5 text-left', clickable && 'cursor-pointer')}
+      >
+        <span className="truncate text-caption text-text-primary">
+          {failed ? (
+            <>
+              <span className="font-medium">{axiomLabel}</span> nicht zugeordnet
+            </>
+          ) : (
+            <>
+              <span className="font-medium">{axiomLabel}</span> → {notice.newRun ? 'neuer Lauf ' : ''}
+              <span className="font-medium">{notice.runName}</span>
+            </>
+          )}
+        </span>
+        <span className="truncate text-caption text-text-tertiary">
+          {failed ? notice.reason ?? 'Zuordnung fehlgeschlagen' : fmtDateTime(notice.at)}
+        </span>
+      </button>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Hinweis verwerfen"
+        className="shrink-0 rounded p-0.5 text-text-tertiary opacity-0 transition hover:text-text-primary group-hover:opacity-100"
+      >
+        <XIcon className="h-3.5 w-3.5" />
+      </button>
     </div>
   );
 }
@@ -827,7 +989,9 @@ function CalendarView({ dataVersion }: { dataVersion: number }) {
     let cancelled = false;
     const load = async () => {
       try {
-        const c = await source.mercuryRunCalendar(30);
+        // Auto runs only — this is the Automatische-Läufe calendar; ToDos have their own (the global
+        // calendar unites both). Mirrors the History tab's type="auto".
+        const c = await source.mercuryRunCalendar(30, 'auto');
         if (!cancelled) {
           setCal(c);
           gotDataRef.current = true;

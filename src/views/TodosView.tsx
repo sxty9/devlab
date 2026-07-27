@@ -2,11 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
-import { humanSize, toBase64 } from '@/lib/file';
+import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { RunTuningFields } from './RunTuning';
+import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
+import { runStage, RUN_STAGE_LABEL } from '@/types';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -84,6 +88,27 @@ function defaultDueLocalInput(): string {
   return isoToLocalInput(d.toISOString());
 }
 
+/** The delivery badge: the furthest rung this ToDo actually reached — implementiert → dev-deployed →
+ *  PR offen → main-merged → prod-live. A plain green "Erledigt" was actively misleading: a ToDo whose
+ *  PR is still waiting for its auto-merge has shipped nothing, yet read as finished. */
+function StageBadge({ todo, className }: { todo: Run; className?: string }) {
+  const stage = runStage(todo.lastResult);
+  if (!stage) return null;
+  const { label, tint } = RUN_STAGE_LABEL[stage];
+  const tone = {
+    success: 'bg-success/15 text-success',
+    accent: 'bg-accent/15 text-accent',
+    warning: 'bg-warning/15 text-warning',
+    danger: 'bg-danger/15 text-danger',
+  }[tint];
+  return (
+    <span className={cn('flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium', tone, className)}>
+      {stage === 'prod-deployed' && <CheckIcon className="h-3 w-3" />}
+      {label}
+    </span>
+  );
+}
+
 /** One attachment tile: an image thumbnail or a file glyph, with the name and size. `href` (when set)
  *  opens the raw bytes in a new tab; `preview` is a data/URL for the image thumbnail; `onRemove` adds a
  *  remove affordance. Shared by the editor (add/remove) and the detail pane (read-only). */
@@ -153,7 +178,7 @@ function MediaField({
   existing: RunAttachment[];
   pending: PendingAttachment[];
   rawUrl: (attachmentId: string) => string | undefined;
-  onPick: (files: FileList) => void;
+  onPick: (files: File[]) => void;
   onRemoveExisting: (id: string) => void;
   onRemovePending: (index: number) => void;
 }) {
@@ -191,7 +216,7 @@ function MediaField({
           accept="image/*,application/pdf,text/*,.md,.csv,.json,.doc,.docx,.xls,.xlsx,.ppt,.pptx"
           className="hidden"
           onChange={(e) => {
-            if (e.target.files?.length) onPick(e.target.files);
+            if (e.target.files?.length) onPick(Array.from(e.target.files));
             e.target.value = ''; // allow re-picking the same file
           }}
         />
@@ -251,11 +276,12 @@ export default function TodosView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
   const [refreshing, setRefreshing] = useState(false);
+  const [filter, setFilter] = useState<RunFilter>(NO_RUN_FILTER);
 
-  // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
-  // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
-  const running = active != null;
+  // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
+  // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
+  // affordance lives in that overview.
+  const { active, inflight, refetch: refetchActive } = useActiveRun();
   const [cancelling, setCancelling] = useState(false);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
@@ -352,14 +378,28 @@ export default function TodosView() {
     );
   }
 
+  // The list carries only NEVER-executed ToDos; once a ToDo has fired (lastFiredAt set) its record lives
+  // in the History tab instead, so list ∩ history = ∅. selectedTodo still resolves against the full set,
+  // so a ToDo you just ran keeps showing its result in the detail pane before it drops out of the list.
+  const openTodos = todos.filter((t) => !t.lastFiredAt);
+  const shownTodos = applyRunFilter(openTodos, filter);
   const selectedTodo = selectedId ? todos.find((t) => t.id === selectedId) ?? null : null;
 
   let rightPane: ReactNode;
   if (mode === 'create') {
-    rightPane = <TodoEditor base={null} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />;
+    rightPane = (
+      <TodoEditor base={null} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} onRunStarted={refetchActive} />
+    );
   } else if (mode === 'edit' && selectedTodo) {
     rightPane = (
-      <TodoEditor key={selectedTodo.id} base={selectedTodo} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />
+      <TodoEditor
+        key={selectedTodo.id}
+        base={selectedTodo}
+        repos={repos}
+        onCancel={() => setMode('view')}
+        onSaved={handleSaved}
+        onRunStarted={refetchActive}
+      />
     );
   } else if (selectedTodo) {
     rightPane = (
@@ -420,16 +460,8 @@ export default function TodosView() {
                     <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
                   </Button>
                 </div>
-                {running && (
-                  <div className="flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5">
-                    <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-                    </span>
-                    <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-                      {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-                    </Button>
-                  </div>
-                )}
+                {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
+                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} />
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
@@ -437,9 +469,13 @@ export default function TodosView() {
                   <p className="px-2.5 py-3 text-caption text-text-tertiary">
                     Noch keine ToDos. Lege eins an für einen Ad-hoc-Fix oder einen neuen Service.
                   </p>
+                ) : openTodos.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">All ToDos have run — see the History tab.</p>
+                ) : shownTodos.length === 0 ? (
+                  <p className="px-2.5 py-3 text-caption text-text-tertiary">No ToDos match the current filter.</p>
                 ) : (
                   <div className="flex flex-col gap-0.5">
-                    {todos.map((todo) => (
+                    {shownTodos.map((todo) => (
                       <TodoRow
                         key={todo.id}
                         todo={todo}
@@ -456,8 +492,11 @@ export default function TodosView() {
               </div>
             </div>
 
-            {/* RIGHT — detail, editor, or placeholder */}
-            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">{rightPane}</div>
+            {/* RIGHT — detail, editor, or placeholder. Boundary-wrapped so a single dead/partial ToDo only
+                fails its own pane (recovering when another is picked, via resetKeys) while the list stays live. */}
+            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
+              <ErrorBoundary resetKeys={[selectedId, mode]}>{rightPane}</ErrorBoundary>
+            </div>
           </>
         )}
         {tab === 'kalender' && <TodoCalendar dataVersion={dataVersion} />}
@@ -467,7 +506,8 @@ export default function TodosView() {
   );
 }
 
-/** One row in the left list: name, target, due date, plus done/disabled pills. */
+/** One row in the left list: name, target, due date, plus a disabled pill. The list holds only
+ *  never-run ToDos, so no "done" state appears here — executed ToDos live in the History tab. */
 function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; onSelect: () => void }) {
   return (
     <button
@@ -482,11 +522,7 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
         <span className={cn('min-w-0 flex-1 truncate text-footnote font-medium', selected ? 'text-text-primary' : 'text-text-secondary')}>
           {todo.name}
         </span>
-        {todo.done && (
-          <span className="flex shrink-0 items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 text-caption font-medium text-success">
-            <CheckIcon className="h-3 w-3" /> Erledigt
-          </span>
-        )}
+        <StageBadge todo={todo} />
         {!todo.enabled && (
           <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">deaktiviert</span>
         )}
@@ -621,9 +657,10 @@ function TodoDetail({
         <span className={cn('rounded px-1.5 py-0.5 font-medium', todo.enabled ? 'bg-success/15 text-success' : 'bg-fill/15 text-text-tertiary')}>
           {todo.enabled ? 'Aktiv' : 'Deaktiviert'}
         </span>
-        {todo.done && (
-          <span className="flex items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 font-medium text-success">
-            <CheckIcon className="h-3 w-3" /> Erledigt
+        <StageBadge todo={todo} />
+        {(todo.model || todo.effort) && (
+          <span className="rounded bg-fill/10 px-1.5 py-0.5 font-medium text-text-secondary">
+            {[todo.model, todo.effort].filter(Boolean).join(' · ')}
           </span>
         )}
         <span>Termin: {dueLabel(todo)}</span>
@@ -684,27 +721,44 @@ function initialTargetRows(base: Run | null): TargetRow[] {
 
 const rowValid = (r: TargetRow) => (r.kind === 'existing' ? r.repo.trim().length > 0 : NEW_REPO_RE.test(r.newRepo.trim()));
 
+/** How a ToDo runs. "now" executes it the instant it is saved, "scheduled" fires it once at a chosen
+ *  moment, "ondemand" only ever runs via "Jetzt ausführen". A fresh ToDo defaults to "now". */
+type RunMode = 'now' | 'scheduled' | 'ondemand';
+const RUN_MODES: { id: RunMode; label: string }[] = [
+  { id: 'now', label: 'Now' },
+  { id: 'scheduled', label: 'Scheduled' },
+  { id: 'ondemand', label: 'On demand' },
+];
+
 /** Create/update form for a ToDo: name, the free-text task, one or more targets (each an existing repo
- *  or a new one to create), the optional one-time due date, and the active flag. */
+ *  or a new one to create), how it runs (now / scheduled / on demand), and the active flag. */
 function TodoEditor({
   base,
   repos,
   onCancel,
   onSaved,
+  onRunStarted,
 }: {
   base: Run | null;
   repos: Repo[];
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
+  onRunStarted?: () => void;
 }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [name, setName] = useState(base?.name ?? '');
   const [task, setTask] = useState(base?.task ?? '');
+  const [model, setModel] = useState(base?.model ?? '');
+  const [effort, setEffort] = useState(base?.effort ?? '');
   const [rows, setRows] = useState<TargetRow[]>(() => initialTargetRows(base));
-  // New ToDos get a sensible default Termin (next full hour); editing preserves the stored one
-  // exactly — including "no Termin" (manual), which must never silently gain a schedule.
-  const [due, setDue] = useState(() => (base ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
+  // How the ToDo runs. A fresh ToDo defaults to "now" (create → execute at once); editing reflects the
+  // stored plan — a due date is "scheduled", none is "ondemand". "now" is a save-time action, not a
+  // stored state, so re-editing a ToDo that was run once shows it as "ondemand".
+  const [mode, setMode] = useState<RunMode>(() => (base ? (base.dueAt ? 'scheduled' : 'ondemand') : 'now'));
+  // The scheduled moment. Kept populated with a sensible default (next full hour) even outside
+  // "scheduled" mode, so switching to it is never an empty field; an edited scheduled ToDo shows its own.
+  const [due, setDue] = useState(() => (base?.dueAt ? isoToLocalInput(base.dueAt) : defaultDueLocalInput()));
   const [enabled, setEnabled] = useState(base?.enabled ?? true);
   const [busy, setBusy] = useState(false);
 
@@ -717,11 +771,11 @@ function TodoEditor({
   const visibleAtts = useMemo(() => existingAtts.filter((a) => !removedIds.has(a.id)), [existingAtts, removedIds]);
 
   const pickFiles = useCallback(
-    async (files: FileList) => {
+    async (files: File[]) => {
       const taken = new Set([...visibleAtts.map((a) => a.filename.toLowerCase()), ...pending.map((p) => p.name.toLowerCase())]);
       let count = visibleAtts.length + pending.length;
       const added: PendingAttachment[] = [];
-      for (const file of Array.from(files)) {
+      for (const file of files) {
         if (count >= MAX_ATTACHMENTS) {
           toast({ title: 'Zu viele Anhänge', description: `Höchstens ${MAX_ATTACHMENTS} Dateien je ToDo.`, variant: 'danger' });
           break;
@@ -756,18 +810,20 @@ function TodoEditor({
   const setRow = (i: number, patch: Partial<TargetRow>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const addRow = () => setRows((rs) => [...rs, { kind: 'existing', repo: '', newRepo: '' }]);
   const removeRow = (i: number) => setRows((rs) => rs.filter((_, j) => j !== i));
-  // A Termin in the past would never fire (a ToDo runs once, at its due moment). Both strings are
-  // zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is a chronological one.
+  // Only "scheduled" needs a valid moment: a missing or past one would never fire (a ToDo runs once,
+  // at its due moment). Both strings are zero-padded YYYY-MM-DDTHH:mm, so a lexicographic compare is
+  // a chronological one.
   const dueInPast = due !== '' && due < minDue;
-  const valid = name.trim().length > 0 && task.trim().length > 0 && targetsOk && !dueInPast;
+  const scheduleBad = mode === 'scheduled' && (due === '' || dueInPast);
+  const valid = name.trim().length > 0 && task.trim().length > 0 && targetsOk && !scheduleBad;
 
   const save = async () => {
     if (!valid || busy) return;
-    // Re-check against a fresh clock: a form left open across the minute boundary must not slip a
-    // past Termin through the mount-pinned floor above.
-    const dueIso = localInputToIso(due);
-    if (dueIso && dueIso < new Date().toISOString()) {
-      toast({ title: 'Der Termin darf nicht in der Vergangenheit liegen.', variant: 'danger' });
+    // "scheduled" only: re-check against a fresh clock so a form left open across the minute boundary
+    // can't slip a past moment through the mount-pinned floor above. "now"/"ondemand" carry no date.
+    const dueIso = mode === 'scheduled' ? localInputToIso(due) : null;
+    if (mode === 'scheduled' && (!dueIso || dueIso < new Date().toISOString())) {
+      toast({ title: "The time can't be in the past.", variant: 'danger' });
       return;
     }
     setBusy(true);
@@ -778,6 +834,8 @@ function TodoEditor({
       name: name.trim(),
       type: 'todo',
       enabled,
+      model,
+      effort,
       task: task.trim(),
       dueAt: dueIso,
       targets,
@@ -800,7 +858,20 @@ function TodoEditor({
           toast({ title: `Anhang „${p.name}“ fehlgeschlagen`, description: msg(e), variant: 'danger' });
         }
       }
-      toast({ title: base ? 'ToDo gespeichert' : 'ToDo angelegt', variant: 'success' });
+      // "now": create/save, then execute at once — reusing the very same run-now access point as the
+      // detail view (single source of truth). The ToDo is already saved, so a busy executor (409) or an
+      // unconfigured one (503) is a non-fatal warning, not a lost ToDo.
+      if (mode === 'now') {
+        try {
+          await source.mercuryRunNow(saved.id);
+          toast({ title: 'ToDo gestartet', variant: 'success' });
+          onRunStarted?.();
+        } catch (e) {
+          toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
+        }
+      } else {
+        toast({ title: base ? 'ToDo gespeichert' : 'ToDo angelegt', variant: 'success' });
+      }
       await onSaved(saved.id);
     } catch (e) {
       toast({ title: 'Speichern fehlgeschlagen', description: msg(e), variant: 'danger' });
@@ -809,7 +880,18 @@ function TodoEditor({
   };
 
   return (
-    <div className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7">
+    // A paste anywhere in the editor attaches its clipboard files — the same pipeline as the dialog,
+    // so the clipboard is an equal upload path. Text pastes carry no files and fall through to the
+    // focused field untouched.
+    <div
+      className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7"
+      onPaste={(e) => {
+        const files = filesFromClipboard(e);
+        if (files.length === 0) return;
+        e.preventDefault();
+        void pickFiles(files);
+      }}
+    >
       <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{base ? 'ToDo bearbeiten' : 'Neues ToDo'}</h1>
 
       <div>
@@ -927,30 +1009,38 @@ function TodoEditor({
       </div>
 
       <div>
-        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Termin</p>
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="datetime-local"
-            value={due}
-            min={minDue}
-            onChange={(e) => setDue(e.target.value)}
-            className={cn(
-              'rounded-md border bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50',
-              dueInPast ? 'border-danger' : 'border-separator',
-            )}
-          />
-          {due && (
-            <Button variant="ghost" size="sm" onClick={() => setDue('')}>
-              Termin entfernen
-            </Button>
-          )}
+        <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Execution</p>
+        <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
+          {RUN_MODES.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => setMode(m.id)}
+              className={cn(
+                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
+                mode === m.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
+              )}
+            >
+              {m.label}
+            </button>
+          ))}
         </div>
-        {dueInPast ? (
-          <p className="mt-1.5 text-caption text-danger">Der Termin darf nicht in der Vergangenheit liegen.</p>
-        ) : (
-          <p className="mt-1.5 text-caption text-text-tertiary">
-            {due ? 'Das ToDo läuft einmalig zu diesem Zeitpunkt.' : 'Ohne Termin läuft das ToDo nur über „Jetzt ausführen“.'}
-          </p>
+        {mode === 'scheduled' && (
+          <div className="mt-2">
+            <input
+              type="datetime-local"
+              value={due}
+              min={minDue}
+              onChange={(e) => setDue(e.target.value)}
+              className={cn(
+                'rounded-md border bg-surface px-2.5 py-1.5 text-footnote text-text-primary outline-none focus:border-accent/50',
+                scheduleBad ? 'border-danger' : 'border-separator',
+              )}
+            />
+            {scheduleBad && (
+              <p className="mt-1.5 text-caption text-danger">{due === '' ? 'Pick a date and time.' : "The time can't be in the past."}</p>
+            )}
+          </div>
         )}
       </div>
 
@@ -958,6 +1048,8 @@ function TodoEditor({
         <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4 accent-accent" />
         <span className="text-footnote text-text-primary">Aktiv</span>
       </label>
+
+      <RunTuningFields model={model} effort={effort} onModelChange={setModel} onEffortChange={setEffort} />
 
       <div className="flex items-center gap-2">
         <Button variant="primary" size="sm" disabled={!valid || busy} onClick={save}>
