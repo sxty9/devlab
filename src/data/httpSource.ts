@@ -320,6 +320,12 @@ export const httpSource: DataSource = {
   async mercuryDeferRun(id: string) {
     await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
   },
+  async mercuryRunConfig() {
+    return json(await request('/api/mercury/runs/config'));
+  },
+  async mercurySetRunConfig(maxConcurrent: number) {
+    return json(await post('/api/mercury/runs/config', { maxConcurrent }, 'PUT'));
+  },
   async mercuryBlockedDeploys() {
     return json(await request('/api/mercury/runs/deploys'));
   },

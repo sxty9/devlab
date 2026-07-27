@@ -165,7 +165,14 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
+	// Seed the concurrency cap: a configured setting wins (req 13 — set in the UI, survives a restart);
+	// otherwise the env value seeds it; otherwise the scheduler's conservative default.
 	maxConc := maxConcurrentRuns()
+	if s.runSettings != nil {
+		if rs, err := s.runSettings.Get(); err == nil && rs.MaxConcurrent > 0 {
+			maxConc = rs.MaxConcurrent
+		}
+	}
 	s.scheduler = runs.NewScheduler(s.runs, x, tick, maxConc)
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s maxConcurrent=%d",
 		mode, user, tokenUser, autoMerge, tick, maxConc)
@@ -378,10 +385,23 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
+	// Per-repo coordination (req 14): an auto run occupies ONE slot and claims each repo through the
+	// scheduler just before working it, releasing it after — so a repo momentarily busy (held by another
+	// run) is put to the BACK of the worklist and retried, not skipped, and ToDos in other repos run
+	// alongside. A ToDo already holds its target claims (reserved at admission), so it does not re-claim.
+	perRepoClaim := !run.IsTodo() && x.s != nil && x.s.scheduler != nil
+	worklist := make([]model.Repo, 0, len(repos))
 	for _, repo := range repos {
-		if done[repo.ID] {
-			continue // completed in an earlier attempt of this same execution
+		if !done[repo.ID] { // skip repos completed in an earlier attempt of this same execution
+			worklist = append(worklist, repo)
 		}
+	}
+	busyStreak := 0 // consecutive repos found busy this cycle → all remaining busy ⇒ wait, don't spin
+
+	for len(worklist) > 0 {
+		repo := worklist[0]
+		worklist = worklist[1:]
+
 		if ctx.Err() != nil {
 			// A DEFER (freeing a slot) re-arms the run as an immediately-due deferred suspension — it keeps
 			// its progress and resumes at the next free slot. Checked first: it is a stand-down, not a stop.
@@ -402,7 +422,32 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			carriedOver = true
 			break
 		}
+
+		var releaseRepo func()
+		if perRepoClaim {
+			key := runs.RepoClaimKey(repo.ID)
+			if !x.s.scheduler.TryClaimRepo(run.ID, key) {
+				worklist = append(worklist, repo) // busy — put it at the back and come back (req 14)
+				busyStreak++
+				if busyStreak >= len(worklist) {
+					// A whole cycle found every remaining repo busy — wait briefly (bounded by the sweep
+					// duration cap via ctx) rather than spinning, then retry.
+					busyStreak = 0
+					select {
+					case <-ctx.Done():
+					case <-time.After(2 * time.Second):
+					}
+				}
+				continue
+			}
+			busyStreak = 0
+			releaseRepo = func() { x.s.scheduler.ReleaseRepo(run.ID, key) }
+		}
+
 		rr, lim := x.executeRepo(ctx, run, repo, newRepoName[repo.ID] != "", x.promptFor(run, repo.ID, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
+		if releaseRepo != nil {
+			releaseRepo() // free the repo the instant this one settles, so another run can take it
+		}
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and

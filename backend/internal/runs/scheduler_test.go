@@ -160,41 +160,44 @@ func TestSchedulerSerializesSameRepo(t *testing.T) {
 	settle(t, s)
 }
 
-// TestSchedulerAutoRunExclusive: an auto run (all repos) runs strictly alone, in BOTH orderings.
-func TestSchedulerAutoRunExclusive(t *testing.T) {
+// TestSchedulerAutoRunSharesFloor (Part D, overrides Part B point 7): an auto run over all repos is NOT
+// exclusive — it occupies one slot, so a ToDo in another repo runs alongside it. Two runs in the SAME repo
+// still never run at once. This is req 15's second test.
+func TestSchedulerAutoRunSharesFloor(t *testing.T) {
 	past := time.Now().Add(-time.Minute)
-	t.Run("auto first blocks a ToDo", func(t *testing.T) {
+
+	t.Run("an auto run and a ToDo in another repo run concurrently", func(t *testing.T) {
 		store := seedStore(t, []Run{autoRun("auto", past), todoRun("todo", "repoX", past)})
 		ge := newGateExec()
 		s := quiet(NewScheduler(store, ge, time.Second, 4))
 		s.fireDue(context.Background())
-		if s.ActiveCount() != 1 {
-			t.Fatalf("an auto run must hold the floor alone, ActiveCount=%d", s.ActiveCount())
+		if s.ActiveCount() != 2 {
+			t.Fatalf("an auto run must NOT hold the whole floor — it and a ToDo in another repo run together, ActiveCount=%d", s.ActiveCount())
 		}
-		waitFor(t, "auto started", func() bool { return len(ge.startedIDs()) == 1 })
-		if got := ge.startedIDs(); got[0] != "auto" {
-			t.Fatalf("the auto run should be the one holding the floor, started=%v", got)
-		}
+		waitFor(t, "both live", func() bool { return len(ge.startedIDs()) == 2 })
 		ge.release("auto")
-		waitFor(t, "auto done", func() bool { return s.ActiveCount() == 0 })
-		s.fireDue(context.Background())
-		waitFor(t, "todo runs after", func() bool { return s.ActiveCount() == 1 })
 		ge.release("todo")
 		settle(t, s)
 	})
-	t.Run("a ToDo blocks the auto run", func(t *testing.T) {
-		store := seedStore(t, []Run{todoRun("todo", "repoX", past), autoRun("auto", past)})
+
+	t.Run("two runs in the same repo still never run at once", func(t *testing.T) {
+		store := seedStore(t, []Run{todoRun("a", "same", past), todoRun("b", "same", past)})
 		ge := newGateExec()
 		s := quiet(NewScheduler(store, ge, time.Second, 4))
 		s.fireDue(context.Background())
 		if s.ActiveCount() != 1 {
-			t.Fatalf("an auto run must wait for an empty floor, ActiveCount=%d", s.ActiveCount())
+			t.Fatalf("two runs in the same repo must serialize, ActiveCount=%d", s.ActiveCount())
 		}
-		ge.release("todo")
-		waitFor(t, "todo done", func() bool { return s.ActiveCount() == 0 })
+		time.Sleep(30 * time.Millisecond)
+		if s.ActiveCount() != 1 {
+			t.Fatalf("the same-repo sibling must stay deferred, ActiveCount=%d", s.ActiveCount())
+		}
+		ge.release(ge.startedIDs()[0])
+		waitFor(t, "first done", func() bool { return s.ActiveCount() == 0 })
 		s.fireDue(context.Background())
-		waitFor(t, "auto runs after", func() bool { return s.ActiveCount() == 1 })
-		ge.release("auto")
+		waitFor(t, "sibling runs after", func() bool { return s.ActiveCount() == 1 })
+		ge.release("a")
+		ge.release("b")
 		settle(t, s)
 	})
 }
@@ -546,6 +549,88 @@ func TestDeferReArmsRunAsResumable(t *testing.T) {
 // FireNowStart is a tiny test convenience: start a run, ignoring the resume plan.
 func (s *Scheduler) FireNowStart(id string) bool { _, ok := s.FireNow(id, "t", false); return ok }
 
+// TestSchedulerTenConcurrent (req 15 test 1): with ten slots, ten different-repo ToDos all run at once.
+func TestSchedulerTenConcurrent(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	in := make([]Run, 0, 10)
+	for i := 0; i < 10; i++ {
+		in = append(in, todoRun("t"+string(rune('0'+i)), "repo"+string(rune('0'+i)), past))
+	}
+	store := seedStore(t, in)
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 10))
+
+	s.fireDue(context.Background())
+	if s.ActiveCount() != 10 {
+		t.Fatalf("ten slots must run ten concurrent ToDos, ActiveCount=%d", s.ActiveCount())
+	}
+	waitFor(t, "all ten executing", func() bool { return len(ge.startedIDs()) == 10 })
+	for _, r := range in {
+		ge.release(r.ID)
+	}
+	settle(t, s)
+}
+
+// TestSetCapacityTakesEffectLive (req 13): raising the cap admits a waiting run at once (no restart);
+// lowering it stops new admissions and lets the floor drain naturally (never killing a live run).
+func TestSetCapacityTakesEffectLive(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{todoRun("a", "r1", past), todoRun("b", "r2", past), todoRun("c", "r3", past)})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 1))
+	go s.Run(t.Context()) // the poke path needs the Run loop
+
+	waitFor(t, "one admitted at cap 1", func() bool { return s.ActiveCount() == 1 })
+	time.Sleep(30 * time.Millisecond)
+	if s.ActiveCount() != 1 {
+		t.Fatalf("cap 1 must hold at one, ActiveCount=%d", s.ActiveCount())
+	}
+
+	s.SetCapacity(3) // raise → the poke admits the waiting runs immediately
+	waitFor(t, "raise admits waiting runs", func() bool { return s.ActiveCount() == 3 })
+
+	// Lower to 1: a live run is never killed — the count only falls by natural completion.
+	s.SetCapacity(1)
+	if s.ActiveCount() != 3 {
+		t.Fatalf("lowering the cap must not kill live runs, ActiveCount=%d", s.ActiveCount())
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		ge.release(id)
+	}
+	settle(t, s)
+}
+
+// TestPerRepoClaimCoordination (req 14): the per-repo claim an auto run takes during execution blocks a
+// ToDo targeting that repo (repo-busy) and frees it on release — the mechanism behind "put a busy repo at
+// the back and come back", shared with the ToDo admission claim.
+func TestPerRepoClaimCoordination(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{autoRun("auto", past), todoRun("todo", "shared", past)})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 4))
+
+	s.FireNowStart("auto")
+	waitFor(t, "auto live", func() bool { return s.ActiveCount() == 1 })
+
+	key := RepoClaimKey("shared")
+	if !s.TryClaimRepo("auto", key) {
+		t.Fatal("the auto run should be able to claim a free repo")
+	}
+	if s.TryClaimRepo("auto", key) {
+		t.Error("a repo already claimed must not be claimable again")
+	}
+	todo, _, _ := store.Get("todo")
+	if blk := s.Admissibility(todo); blk.Reason != AdmitRepoBusy {
+		t.Errorf("a ToDo on the repo the auto run holds must be repo-busy, got %+v", blk)
+	}
+	s.ReleaseRepo("auto", key)
+	if blk := s.Admissibility(todo); blk.Reason != AdmitOK {
+		t.Errorf("releasing the repo must let the ToDo in, got %+v", blk)
+	}
+	ge.release("auto")
+	settle(t, s)
+}
+
 // TestOverloadAdmitsPastCapAndSelfHeals: an overload runs past the cap in an extra slot that vanishes on
 // release — repeated overloads never raise the standing ceiling.
 func TestOverloadAdmitsPastCapAndSelfHeals(t *testing.T) {
@@ -598,18 +683,6 @@ func TestOverloadRespectsHardLimits(t *testing.T) {
 		ge.release("c")
 		settle(t, s)
 	})
-	t.Run("refused under an exclusive auto run", func(t *testing.T) {
-		store := seedStore(t, []Run{autoRun("auto", past), todoRun("t", "r1", past)})
-		ge := newGateExec()
-		s := quiet(NewScheduler(store, ge, time.Second, 4))
-		s.FireNowStart("auto")
-		waitFor(t, "auto holds the floor", func() bool { return s.ActiveCount() == 1 })
-		if _, ok := s.StartOverload("t", "t", false); ok {
-			t.Error("overload must be refused while an exclusive auto run holds the floor")
-		}
-		ge.release("auto")
-		settle(t, s)
-	})
 }
 
 // TestAdmissibilityClassifiesBlocks: the classifier names the block and the conflicting run-ids.
@@ -637,9 +710,10 @@ func TestAdmissibilityClassifiesBlocks(t *testing.T) {
 	if blk := s.Admissibility(bRun); blk.Reason != AdmitRepoBusy || len(blk.Conflicts) != 1 || blk.Conflicts[0] != "a" {
 		t.Errorf("a same-repo ToDo must be repo-busy conflicting with a, got %+v", blk)
 	}
+	// An auto run declares no repos up front, so it is admissible while a ToDo runs (they share the floor).
 	autoR, _, _ := store.Get("auto")
-	if blk := s.Admissibility(autoR); blk.Reason != AdmitExclusive || len(blk.Conflicts) == 0 {
-		t.Errorf("a fresh auto run needs an empty floor → exclusive, got %+v", blk)
+	if blk := s.Admissibility(autoR); blk.Reason != AdmitOK {
+		t.Errorf("an auto run should be admissible alongside a running ToDo (no exclusivity), got %+v", blk)
 	}
 	ge.release("a")
 	settle(t, s)

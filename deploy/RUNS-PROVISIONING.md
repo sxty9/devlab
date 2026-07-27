@@ -101,6 +101,7 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | Env | Default | Bedeutung |
 |---|---|---|
 | `DEVLAB_RUNS_MAX_DURATION` | `4h` | Obergrenze Wall-Clock **pro Lauf-Versuch**. Reststrecke wird auf den nächsten Termin übertragen (nicht neu begonnen). **`0` = AUS (unbegrenzt)** — nicht „keine Läufe"; Läufe stoppt man mit `MODE=off`. |
+| `DEVLAB_RUNS_MAX_CONCURRENT` | `2` | **Startwert** für die Zahl gleichzeitiger Ausführungsplätze. Nur ein Seed: die Zahl wird in der Oberfläche eingestellt (wirkt sofort ohne Neustart) und überlebt dort einen Neustart; der Env-Wert gilt nur, solange nichts eingestellt wurde. Nie zwei Vorgänge im selben Repository — unabhängig von der Zahl. |
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |

@@ -55,22 +55,15 @@ func (s *Server) slotOverview(active []runs.Activity) SlotOverview {
 	if s.scheduler != nil {
 		ov.Capacity = s.scheduler.Capacity()
 	}
-	exclusive := false
 	for _, a := range active {
 		if a.Overload {
 			ov.Overload++
-		}
-		if a.Exclusive {
-			exclusive = true
 		}
 	}
 	ov.Used = len(active) - ov.Overload
 	ov.Free = ov.Capacity - ov.Used
 	if ov.Free < 0 {
 		ov.Free = 0
-	}
-	if exclusive {
-		ov.Free = 0 // a whole-floor exclusive run leaves no slot truly free, however few are nominally used
 	}
 	ov.Deferred = s.deferredRuns(active)
 	return ov
@@ -184,14 +177,11 @@ func (s *Server) suggestDefer(block runs.AdmitBlock) *DeferSuggestion {
 }
 
 // deferScore ranks a candidate for deferral — LOWER is a better target. A run between repos loses nothing
-// (0); a run mid-repo would discard that repo's in-flight work (1000, always worse). A conflicting
-// exclusive/repo-busy run carries its own justification.
+// (0); a run mid-repo would discard that repo's in-flight work (1000, always worse). A run holding a repo
+// this ToDo needs carries its own justification.
 func (s *Server) deferScore(a runs.Activity, block runs.AdmitBlock) (int, string) {
 	done, liveRepo, _ := s.runProgress(a.RunID, a.ResultID)
-	switch block.Reason {
-	case runs.AdmitExclusive:
-		return 0, "Belegt als Rundumlauf alle Plätze — nur sein Zurückstellen gibt einen Platz frei."
-	case runs.AdmitRepoBusy:
+	if block.Reason == runs.AdmitRepoBusy {
 		return 0, "Belegt ein Repository, das dieses ToDo braucht — Zurückstellen macht es frei."
 	}
 	if liveRepo != "" {
@@ -225,6 +215,78 @@ func (s *Server) markRunDueNow(id string) {
 		}
 		return cur, nil
 	})
+}
+
+// runConfig reports the runs subsystem's live configuration: the number of execution slots in effect and
+// the env/default seed (so the UI can show what a reset would fall back to). This is the service's config
+// interface (req 13) — the setting belongs to the central configuration, not the env of the host.
+func (s *Server) runConfig(w http.ResponseWriter, r *http.Request) {
+	effective := 0
+	if s.scheduler != nil {
+		effective = s.scheduler.Capacity()
+	}
+	configured := 0
+	if s.runSettings != nil {
+		if rs, err := s.runSettings.Get(); err == nil {
+			configured = rs.MaxConcurrent
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"maxConcurrent":     effective,          // slots currently in effect
+		"maxConcurrentSeed": maxConcurrentSeed(), // the env/default fallback when nothing is configured
+		"configured":        configured != 0,     // whether a UI value is set (vs. running on the seed)
+	})
+}
+
+// runSetConfig sets the number of execution slots from the UI (req 13). It persists the value AND applies
+// it to the running scheduler at once — a raise starts waiting runs immediately, a lower drains naturally
+// — without a restart. maxConcurrent<=0 clears the setting, reverting to the env/default seed.
+func (s *Server) runSetConfig(w http.ResponseWriter, r *http.Request) {
+	if s.runSettings == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Einstellungen sind nicht verfügbar")
+		return
+	}
+	var body struct {
+		MaxConcurrent int `json:"maxConcurrent"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if body.MaxConcurrent > runMaxSlots {
+		writeErr(w, http.StatusBadRequest, "die Zahl der Plätze ist zu hoch")
+		return
+	}
+	if _, err := s.runSettings.Set(func(rs *runs.RunSettings) {
+		if body.MaxConcurrent < 1 {
+			rs.MaxConcurrent = 0 // clear → fall back to the env/default seed
+		} else {
+			rs.MaxConcurrent = body.MaxConcurrent
+		}
+	}); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Einstellung konnte nicht gespeichert werden")
+		return
+	}
+	// Apply live. A cleared value reverts to the seed.
+	effective := body.MaxConcurrent
+	if effective < 1 {
+		effective = maxConcurrentSeed()
+	}
+	if s.scheduler != nil {
+		s.scheduler.SetCapacity(effective)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"maxConcurrent": effective})
+}
+
+// runMaxSlots is a sanity ceiling on the configured slot count — high enough to never bind in practice,
+// low enough to reject a fat-fingered value that would spawn thousands of runs.
+const runMaxSlots = 64
+
+// maxConcurrentSeed is the env/default fallback for the slot count when nothing is configured in the UI.
+func maxConcurrentSeed() int {
+	if n := maxConcurrentRuns(); n > 0 {
+		return n
+	}
+	return runs.DefaultMaxConcurrent
 }
 
 // runDefer stands a specific run down to free its slot (first-class, independent of starting anything).

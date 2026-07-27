@@ -165,6 +165,48 @@ func TestRunDeferEndpoint(t *testing.T) {
 	}
 }
 
+// TestRunConfigSetGetLive: setting the slot count persists it AND applies it to the running scheduler at
+// once (no restart); clearing it reverts to the env/default seed.
+func TestRunConfigSetGetLive(t *testing.T) {
+	t.Setenv("DEVLAB_MERCURY_RUNS_SETTINGS", filepath.Join(t.TempDir(), "settings.json"))
+	store := seedRunsStore(t, nil)
+	sched := runs.NewScheduler(store, &slotGate{release: make(chan struct{})}, time.Second, 2)
+	s := &Server{runs: store, runSettings: runs.NewSettingsStore(), scheduler: sched}
+
+	put := func(body string) int {
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPut, "/api/mercury/runs/config", strings.NewReader(body))
+		s.runSetConfig(rec, r)
+		return rec.Code
+	}
+	if code := put(`{"maxConcurrent":5}`); code != http.StatusOK {
+		t.Fatalf("set config = %d, want 200", code)
+	}
+	if sched.Capacity() != 5 {
+		t.Errorf("the cap must be applied live, Capacity=%d", sched.Capacity())
+	}
+	if rs, _ := s.runSettings.Get(); rs.MaxConcurrent != 5 {
+		t.Errorf("the setting must persist, got %d", rs.MaxConcurrent)
+	}
+
+	rec := httptest.NewRecorder()
+	s.runConfig(rec, httptest.NewRequest(http.MethodGet, "/api/mercury/runs/config", nil))
+	if !strings.Contains(rec.Body.String(), "\"maxConcurrent\":5") || !strings.Contains(rec.Body.String(), "\"configured\":true") {
+		t.Errorf("GET config should reflect 5 + configured, got %s", rec.Body.String())
+	}
+
+	// Clearing reverts to the env/default seed (env unset here → default 2).
+	if code := put(`{"maxConcurrent":0}`); code != http.StatusOK {
+		t.Fatalf("clear config = %d, want 200", code)
+	}
+	if sched.Capacity() != runs.DefaultMaxConcurrent {
+		t.Errorf("clearing must revert to the seed (%d), got %d", runs.DefaultMaxConcurrent, sched.Capacity())
+	}
+	if code := put(`{"maxConcurrent":9999}`); code != http.StatusBadRequest {
+		t.Errorf("an absurd slot count must be rejected, got %d", code)
+	}
+}
+
 func contains(xs []string, v string) bool {
 	for _, x := range xs {
 		if x == v {

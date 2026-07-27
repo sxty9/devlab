@@ -890,6 +890,85 @@ export function SlotsOverview({ slots, className }: { slots: SlotOverview | null
   );
 }
 
+/** The execution-slot count as an editable setting (req 13): shown in the UI, applied immediately (no
+ *  restart — a raise starts waiting runs at once, a lower drains). Self-hides when the scheduler is not
+ *  armed. This is the service's slot configuration; the backend exposes the full config interface. */
+export function SlotCapacityConfig({ onChanged }: { onChanged?: () => void }) {
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [cfg, setCfg] = useState<{ maxConcurrent: number } | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setCfg(await source.mercuryRunConfig());
+    } catch {
+      setCfg(null); // scheduler not armed / offline → nothing to configure here
+    }
+  }, [source]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (!cfg) return null;
+
+  const save = async () => {
+    const n = Number.parseInt(value, 10);
+    if (Number.isNaN(n) || n < 1) {
+      toast({ title: 'Bitte eine Zahl ≥ 1', variant: 'danger' });
+      return;
+    }
+    setSaving(true);
+    try {
+      await source.mercurySetRunConfig(n);
+      toast({ title: `Ausführungsplätze: ${n}`, description: 'Wirkt sofort — wartende Vorgänge laufen an.', variant: 'success' });
+      setEditing(false);
+      await load();
+      onChanged?.();
+    } catch (e) {
+      toast({ title: 'Konnte die Plätze nicht setzen', description: msg(e), variant: 'danger' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1.5 text-caption text-text-tertiary">
+      <span>Ausführungsplätze</span>
+      {editing ? (
+        <>
+          <input
+            type="number"
+            min={1}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            className="w-14 rounded border border-separator bg-surface px-1.5 py-0.5 text-text-primary outline-none focus:border-accent/50"
+          />
+          <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
+            Speichern
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+            Abbrechen
+          </Button>
+        </>
+      ) : (
+        <button
+          type="button"
+          className="rounded px-1 font-medium text-text-secondary transition hover:text-text-primary"
+          onClick={() => {
+            setValue(String(cfg.maxConcurrent));
+            setEditing(true);
+          }}
+        >
+          {cfg.maxConcurrent} ✎
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Shown when a start is blocked because every slot is busy (req 5/6): the current floor, the system's
  *  reasoned defer suggestion (which the user may accept), and the ways forward — einreihen, or überladen
  *  (only when the block is the cap; a busy repo or an exclusive floor cannot be crossed). A targeted,

@@ -646,6 +646,14 @@ export interface RunActive {
   overload?: boolean; // admitted past the cap in a temporary slot
 }
 
+/** The runs subsystem's live configuration — currently the number of execution slots. `configured` is
+ *  false while it runs on the env/default seed (no UI value set yet). */
+export interface RunConfig {
+  maxConcurrent: number;
+  maxConcurrentSeed: number;
+  configured: boolean;
+}
+
 /** How a start proceeds when all slots are busy. */
 export type StartStrategy = 'queue' | 'defer' | 'overload';
 

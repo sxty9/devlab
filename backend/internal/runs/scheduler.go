@@ -16,11 +16,11 @@ import (
 // rather than redoing every repo into duplicate PRs.
 var ErrRunAborted = errors.New("run aborted by kill-switch")
 
-// defaultMaxConcurrent caps how many runs execute at once when the cap is not configured. Conservative:
+// DefaultMaxConcurrent caps how many runs execute at once when the cap is not configured. Conservative:
 // each run drives a Claude session across repos, so the ceiling protects the subscription quota, CPU and
 // memory from a burst of ToDos firing together. Repos are still mutually exclusive on top of this, so two
 // runs never touch the same workspace.
-const defaultMaxConcurrent = 2
+const DefaultMaxConcurrent = 2
 
 // Executor runs a run end-to-end (across all target repos) and performs periodic maintenance
 // (auto-merging overdue PRs). It is injected by the api layer so the runs package never imports it —
@@ -59,41 +59,42 @@ type Activity struct {
 // vanishes on release), and its kill-switch. The map of these IS the concurrency state — its size is the
 // active-run count, its keys the busy runs.
 type activeRun struct {
-	activity  Activity
-	claims    []string // repo-keys this run reserved (a ToDo/per-repo run)
-	exclusive bool     // an auto run holding the whole floor
-	overload  bool     // admitted past the cap for this one execution
-	stop      context.CancelCauseFunc
+	activity Activity
+	claims   []string // repo-keys this run currently holds (a ToDo's targets, or an auto run's current repo)
+	overload bool     // admitted past the cap for this one execution
+	stop     context.CancelCauseFunc
 }
 
-// Scheduler fires due runs on a ticker and runs several at once — bounded by the concurrency cap, never
-// two on the same repo, and (until Part D relaxes it) an auto run strictly alone. It also drives run-now
-// and per-run cancel.
+// Scheduler fires due runs on a ticker and runs several at once — bounded by the (live-adjustable)
+// concurrency cap and never two runs on the same repo. An auto run over all repos is NOT exclusive
+// (Part D overrides Part B point 7): it occupies ONE slot and coordinates the repos it touches one at a
+// time (per-repo claims), so ToDos in other repos run alongside it. It also drives run-now and per-run
+// cancel/defer.
 type Scheduler struct {
 	store *Store
 	exec  Executor
 	tick  time.Duration
 	logf  func(string, ...any)
 
-	maxConc int // concurrency cap (0 → default)
+	mu           sync.Mutex
+	maxConc      int                   // concurrency cap — live-adjustable via SetCapacity
+	active       map[string]*activeRun // runID → its live state; len is the active-run marker
+	claimedRepos map[string]bool       // repo-key → a live run is working it (ToDo target OR auto's current repo)
 
-	mu            sync.Mutex
-	active        map[string]*activeRun // runID → its live state; len is the active-run marker
-	claimedRepos  map[string]bool       // repo-key → a live run is working it
-	exclusiveHeld bool                  // an auto run holds the whole floor
+	poke chan struct{} // nudged by SetCapacity so a raised cap admits waiting runs at once, not next tick
 }
 
-// NewScheduler builds a scheduler. tick defaults to 30s; maxConcurrent to defaultMaxConcurrent.
+// NewScheduler builds a scheduler. tick defaults to 30s; maxConcurrent to DefaultMaxConcurrent.
 func NewScheduler(store *Store, exec Executor, tick time.Duration, maxConcurrent int) *Scheduler {
 	if tick <= 0 {
 		tick = 30 * time.Second
 	}
 	if maxConcurrent <= 0 {
-		maxConcurrent = defaultMaxConcurrent
+		maxConcurrent = DefaultMaxConcurrent
 	}
 	return &Scheduler{
 		store: store, exec: exec, tick: tick, logf: log.Printf, maxConc: maxConcurrent,
-		active: map[string]*activeRun{}, claimedRepos: map[string]bool{},
+		active: map[string]*activeRun{}, claimedRepos: map[string]bool{}, poke: make(chan struct{}, 1),
 	}
 }
 
@@ -110,6 +111,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 		case <-ctx.Done():
 			s.logf("devlabd: runs scheduler stopped")
 			return
+		case <-s.poke:
+			s.fireDue(ctx) // a cap was just raised → admit waiting runs immediately, no restart
 		case <-t.C:
 			s.maintain(ctx)
 			s.fireDue(ctx)
@@ -191,11 +194,9 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) 
 	if _, dup := s.active[r.ID]; dup {
 		return false // already executing — never double-start
 	}
-	if s.exclusiveHeld {
-		return false // an auto run holds the whole floor — nothing else admits, not even an overload
-	}
 	ar := &activeRun{stop: cancel, overload: overload}
 	if r.IsTodo() {
+		// A ToDo declares its target repos, so it claims them all up front (held for its whole execution).
 		keys := claimKeys(r)
 		for _, k := range keys {
 			if s.claimedRepos[k] {
@@ -210,18 +211,68 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) 
 		}
 		ar.claims = keys
 	} else {
-		// An auto run sweeps every repo, so it runs alone: it needs an empty floor and blocks everything
-		// while live. There is no "extra exclusive slot", so overload never applies to it.
-		if overload || len(s.active) > 0 {
+		// An auto run occupies ONE slot and claims each repo it touches during execution (per-repo), so it
+		// no longer reserves the whole floor (Part D overrides Part B point 7) — only the cap bounds it.
+		if !overload && len(s.active) >= s.maxConc {
 			return false
 		}
-		s.exclusiveHeld = true
-		ar.exclusive = true
 	}
-	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC(), Exclusive: ar.exclusive, Overload: ar.overload}
+	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC(), Overload: ar.overload}
 	s.active[r.ID] = ar
 	markActive(len(s.active))
 	return true
+}
+
+// TryClaimRepo reserves one repo for a live run WITHOUT blocking: it returns false if another run already
+// holds that repo, so an auto run can put a busy repo to the back of its worklist and come back to it
+// (req 14) rather than block. The claim rides on the run's active record, so a crash/cancel frees it too.
+func (s *Scheduler) TryClaimRepo(runID, key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ar := s.active[runID]
+	if ar == nil {
+		return false // the run is not live (defensive) — never claim a repo for a dead run
+	}
+	if s.claimedRepos[key] {
+		return false // busy
+	}
+	s.claimedRepos[key] = true
+	ar.claims = append(ar.claims, key)
+	return true
+}
+
+// ReleaseRepo frees a per-repo claim an auto run took, once it finishes that repo.
+func (s *Scheduler) ReleaseRepo(runID, key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.claimedRepos, key)
+	if ar := s.active[runID]; ar != nil {
+		for i, k := range ar.claims {
+			if k == key {
+				ar.claims = append(ar.claims[:i], ar.claims[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+// SetCapacity changes the concurrency cap at runtime (req 13). It takes effect at once, without a restart:
+// a RAISE nudges an immediate admission pass so waiting runs start now; a LOWER simply stops admitting past
+// the new cap and lets the floor drain by natural completion (never killing a live run).
+func (s *Scheduler) SetCapacity(n int) {
+	if n < 1 {
+		return
+	}
+	s.mu.Lock()
+	raised := n > s.maxConc
+	s.maxConc = n
+	s.mu.Unlock()
+	if raised {
+		select {
+		case s.poke <- struct{}{}:
+		default: // a nudge is already pending — one admission pass covers it
+		}
+	}
 }
 
 // release frees a run's slot (its repo claims / the exclusive floor) and updates the active-run marker.
@@ -231,9 +282,6 @@ func (s *Scheduler) release(id string) {
 		for _, k := range ar.claims {
 			delete(s.claimedRepos, k)
 		}
-		if ar.exclusive {
-			s.exclusiveHeld = false
-		}
 	}
 	delete(s.active, id)
 	n := len(s.active)
@@ -241,15 +289,22 @@ func (s *Scheduler) release(id string) {
 	markActive(n)
 }
 
+// RepoClaimKey normalises a repo identifier into the scheduler's per-repo claim key, so a ToDo's target
+// claim (taken at admission) and an auto run's per-repo claim (taken during execution) collide iff they
+// name the same repo. The per-repo workspace.Lock is the ultimate hard backstop; this key is a fast
+// heuristic on top of it.
+func RepoClaimKey(idOrName string) string {
+	return "repo:" + strings.ToLower(strings.TrimSpace(idOrName))
+}
+
 // claimKeys is the set of repo-keys a ToDo reserves: one per target (an existing repo, or a to-be-created
-// one). Keying on the normalised target string matches how the executor resolves targets; the per-repo
-// workspace.Lock is the ultimate backstop, so this claim is a fast heuristic, not the sole guarantee.
+// one).
 func claimKeys(r Run) []string {
 	var keys []string
 	for _, t := range r.TodoTargets() {
 		switch {
 		case t.Repo != "":
-			keys = append(keys, "repo:"+strings.ToLower(strings.TrimSpace(t.Repo)))
+			keys = append(keys, RepoClaimKey(t.Repo))
 		case t.NewRepo != "":
 			keys = append(keys, "new:"+strings.ToLower(strings.TrimSpace(t.NewRepo)))
 		}
@@ -445,31 +500,26 @@ type AdmitBlock struct {
 
 // Admission-block reasons.
 const (
-	AdmitOK        = ""          // admissible right now
-	AdmitRunning   = "running"   // this run is already executing
-	AdmitExclusive = "exclusive" // an exclusive auto run holds the floor, or a fresh auto needs an empty one
-	AdmitRepoBusy  = "repo-busy" // a target repo is claimed by a live run
-	AdmitCap       = "cap"       // the concurrency ceiling is reached (the only block an overload can cross)
+	AdmitOK       = ""          // admissible right now
+	AdmitRunning  = "running"   // this run is already executing
+	AdmitRepoBusy = "repo-busy" // a target repo is claimed by a live run (a ToDo)
+	AdmitCap      = "cap"       // the concurrency ceiling is reached (the only block an overload can cross)
 )
 
-// Admissibility reports why run r cannot start now (or AdmitOK). Priority mirrors admit: an uncrossable
-// block (running / exclusive / repo-busy) is reported ABOVE the cap, because only the cap can be
-// overloaded past — the UI must not offer "overload" when a repo is genuinely busy.
+// Admissibility reports why run r cannot start now (or AdmitOK). A busy target repo (uncrossable) is
+// reported ABOVE the cap, because only the cap can be overloaded past — the UI must not offer "overload"
+// when a repo is genuinely busy. An auto run declares no repos up front (it claims them during execution),
+// so it is only ever blocked by the cap.
 func (s *Scheduler) Admissibility(r Run) AdmitBlock {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.active[r.ID]; ok {
 		return AdmitBlock{Reason: AdmitRunning}
 	}
-	if s.exclusiveHeld {
-		return AdmitBlock{Reason: AdmitExclusive, Conflicts: s.exclusiveHolderLocked()}
-	}
 	if r.IsTodo() {
 		if busy := s.repoConflictsLocked(claimKeys(r)); len(busy) > 0 {
 			return AdmitBlock{Reason: AdmitRepoBusy, Conflicts: busy}
 		}
-	} else if len(s.active) > 0 {
-		return AdmitBlock{Reason: AdmitExclusive, Conflicts: s.activeIDsLocked()} // a fresh auto needs an empty floor
 	}
 	if len(s.active) >= s.maxConc {
 		return AdmitBlock{Reason: AdmitCap}
@@ -477,19 +527,7 @@ func (s *Scheduler) Admissibility(r Run) AdmitBlock {
 	return AdmitBlock{Reason: AdmitOK}
 }
 
-// exclusiveHolderLocked / repoConflictsLocked / activeIDsLocked name conflicting live run-ids. Callers
-// hold s.mu.
-func (s *Scheduler) exclusiveHolderLocked() []string {
-	var out []string
-	for id, ar := range s.active {
-		if ar.exclusive {
-			out = append(out, id)
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
+// repoConflictsLocked names the live run-ids whose repo claims intersect keys. Caller holds s.mu.
 func (s *Scheduler) repoConflictsLocked(keys []string) []string {
 	want := make(map[string]bool, len(keys))
 	for _, k := range keys {
@@ -503,15 +541,6 @@ func (s *Scheduler) repoConflictsLocked(keys []string) []string {
 				break
 			}
 		}
-	}
-	sort.Strings(out)
-	return out
-}
-
-func (s *Scheduler) activeIDsLocked() []string {
-	out := make([]string, 0, len(s.active))
-	for id := range s.active {
-		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out

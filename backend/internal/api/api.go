@@ -39,6 +39,7 @@ type Server struct {
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
 	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
+	runSettings *runs.SettingsStore   // live, UI-adjustable runs settings (currently: the number of execution slots)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
@@ -83,6 +84,7 @@ func New(v *auth.Verifier) *Server {
 		runs:        runs.NewStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
+		runSettings: runs.NewSettingsStore(),
 		runNotices:  runs.NewNoticeStore(),
 		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
@@ -255,6 +257,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
+	// Execution-slot configuration (req 13): the service's config interface for the number of slots. The
+	// literal `config` segment is registered before the {id} route so it is never captured as a run id.
+	mux.HandleFunc("GET /api/mercury/runs/config", s.guard(s.runConfig))
+	mux.HandleFunc("PUT /api/mercury/runs/config", s.guardCSRF(s.runSetConfig))
 	// Blocked prod-deploys: the deliveries that failed permanently and wait for an explicit resume. The
 	// literal `deploys` segment is registered before the {id} route so it is never captured as a run id.
 	mux.HandleFunc("GET /api/mercury/runs/deploys", s.guard(s.runDeploysBlocked))

@@ -23,6 +23,9 @@ const MOCK_BLOCKED_DEPLOYS = [
 ];
 const mockResumedDeploys = new Set<string>();
 
+/** Mock execution-slot count so the config control is exercisable offline (default mirrors the backend). */
+let mockRunSlots = 2;
+
 /** Fabricate a believable "before" for a modified file with no explicit diff content. */
 function synthBefore(after: string): string {
   const lines = after.split('\n');
@@ -484,6 +487,13 @@ export const mockSource: DataSource = {
   },
   async mercuryDeferRun(_id: string) {
     /* mock: no-op */
+  },
+  async mercuryRunConfig() {
+    return { maxConcurrent: mockRunSlots, maxConcurrentSeed: 2, configured: mockRunSlots !== 2 };
+  },
+  async mercurySetRunConfig(maxConcurrent: number) {
+    mockRunSlots = maxConcurrent < 1 ? 2 : maxConcurrent;
+    return { maxConcurrent: mockRunSlots };
   },
   async mercuryBlockedDeploys() {
     const blocked = MOCK_BLOCKED_DEPLOYS.filter((d) => !mockResumedDeploys.has(`${d.repo}#${d.number}`));

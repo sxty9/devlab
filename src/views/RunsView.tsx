@@ -7,7 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -319,7 +319,10 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} className="ml-auto max-w-xs" />
+        <div className="ml-auto flex items-center gap-3">
+          <SlotCapacityConfig onChanged={refetchActive} />
+          <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} className="max-w-xs" />
+        </div>
       </header>
 
       <BlockedDeploysPanel />
