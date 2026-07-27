@@ -118,7 +118,7 @@ func isNoBudget(v string) bool {
 
 // humanizeDuration renders a resolved budget for display and for the honest overrun message: a positive
 // duration compactly ("3h", "1h30m", "45m") and the explicit no-cap as "off". It is the single formatter
-// behind Result.TimeBudget and budgetOverrun, so the stamped label and the overrun text never diverge.
+// behind Result.TimeBudget and budgetAwareError, so the stamped label and the overrun text never diverge.
 func humanizeDuration(d time.Duration) string {
 	if d <= 0 {
 		return "off"
