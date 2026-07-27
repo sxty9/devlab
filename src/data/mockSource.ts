@@ -336,37 +336,86 @@ export const mockSource: DataSource = {
   },
   async mercuryRunResult(id: string, resultId: string) {
     const at = new Date().toISOString();
+    const failing = resultId.includes('fail');
+    // A representative union so the offline preview shows all four honest step states. The ok result: a
+    // clean chain (holistic/example, everything executed) plus a library whose dev-deploy DOES NOT APPLY
+    // (holistic/sdk — no deploy target — so the chain continues to push+PR). The fail result adds a repo
+    // whose dev-deploy FAILED and halted the chain (holistic/broken — push and PR are not-executed).
+    const repos: import('@/types').RepoResult[] = [
+      {
+        repo: 'holistic/example',
+        ok: true,
+        deployed: true,
+        prUrl: 'https://example.invalid/pull/42',
+        devBranch: 'mercury-dev',
+        devCommit: '1a2b3c4d5e6f7a8b',
+        prBase: 'mercury-run/run_example/dlv_prev',
+        deliveryId: 'dlv_example',
+        steps: [
+          { name: 'implement', status: 'ok', log: 'Feature umgesetzt und committet.', at },
+          { name: 'dev-deploy', status: 'ok', log: 'Ausgelieferter Stand: mercury-dev@1a2b3c4d', at },
+          { name: 'push', status: 'ok', log: 'mercury-dev, mercury-run/run_example/dlv_example', at },
+          { name: 'pr', status: 'ok', log: 'https://example.invalid/pull/42 (Basis: mercury-run/run_example/dlv_prev)', at },
+        ],
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        numTurns: 0,
+      },
+      {
+        repo: 'holistic/sdk',
+        ok: true,
+        deployed: false,
+        prUrl: 'https://example.invalid/pull/43',
+        devBranch: 'mercury-dev',
+        devCommit: 'abcdef0123456789',
+        prBase: 'main',
+        deliveryId: 'dlv_sdk',
+        steps: [
+          { name: 'implement', status: 'ok', log: 'Gemeinsame SDK-Komponente erweitert und committet.', at },
+          {
+            name: 'dev-deploy',
+            status: 'not-applicable',
+            log: 'kein Deploy-Ziel — für sdk ist kein geprüftes Deploy-Skript hinterlegt; das Repo installiert keinen Dienst, es gibt nichts zu deployen',
+            at,
+          },
+          { name: 'push', status: 'ok', log: 'mercury-dev, mercury-run/run_example/dlv_sdk', at },
+          { name: 'pr', status: 'ok', log: 'https://example.invalid/pull/43 (Basis: main)', at },
+        ],
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        numTurns: 0,
+      },
+      ...(failing
+        ? [
+            {
+              repo: 'holistic/broken',
+              ok: false,
+              deployed: false,
+              devBranch: 'mercury-dev',
+              devCommit: '9f8e7d6c5b4a3210',
+              steps: [
+                { name: 'implement', status: 'ok', log: 'Änderung umgesetzt und committet.', at },
+                { name: 'dev-deploy', status: 'failed', log: 'devlab-deploy broken (dev): wrapper exit 3\nInstallation fehlgeschlagen', at },
+                { name: 'push', status: 'not-executed', log: 'nicht ausgeführt — vorheriger Schritt fehlgeschlagen (dev-deploy); die Kette wurde angehalten', at },
+                { name: 'pr', status: 'not-executed', log: 'nicht ausgeführt — vorheriger Schritt fehlgeschlagen (dev-deploy); die Kette wurde angehalten', at },
+              ],
+              inputTokens: 0,
+              outputTokens: 0,
+              costUsd: 0,
+              numTurns: 0,
+            } satisfies import('@/types').RepoResult,
+          ]
+        : []),
+    ];
     return {
       runId: id,
       resultId,
       startedAt: new Date().toISOString(),
-      ok: !resultId.includes('fail'), // keep the preview coherent with the calendar's status pill
+      ok: repos.every((r) => r.ok), // the execution follows the chain: a failed repo sinks the whole result
       prompt: '# Konkretes ToDo: Beispiel\n\n## Aufgabe\n\nBeispielhafte Promptstellung dieser Ausführung.',
-      // One repo showing the growing dev state: the delivered state is named (mercury-dev@<sha>) and the
-      // delivery's stacked PR sits on the previous open delivery's branch.
-      repos: [
-        {
-          repo: 'holistic/example',
-          ok: true,
-          deployed: true,
-          prUrl: 'https://example.invalid/pull/42',
-          devBranch: 'mercury-dev',
-          devCommit: '1a2b3c4d5e6f7a8b',
-          prBase: 'mercury-run/run_example/dlv_prev',
-          deliveryId: 'dlv_example',
-          steps: [
-            { name: 'fold', ok: true, log: 'Standard-Branch main eingefaltet', at },
-            { name: 'implement', ok: true, log: 'Feature umgesetzt und committet.', at },
-            { name: 'dev-deploy', ok: true, log: 'Ausgelieferter Stand: mercury-dev@1a2b3c4d', at },
-            { name: 'push', ok: true, log: 'mercury-dev, mercury-run/run_example/dlv_example', at },
-            { name: 'pr', ok: true, log: 'https://example.invalid/pull/42 (Basis: mercury-run/run_example/dlv_prev)', at },
-          ],
-          inputTokens: 0,
-          outputTokens: 0,
-          costUsd: 0,
-          numTurns: 0,
-        },
-      ],
+      repos,
       inputTokens: 0,
       outputTokens: 0,
       costUsd: 0,

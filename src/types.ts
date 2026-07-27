@@ -550,11 +550,20 @@ export const RUN_STAGE_LABEL: Record<RunStage, { label: string; tint: 'success' 
   failed: { label: 'fehlgeschlagen', tint: 'danger' },
 };
 
+/** A pipeline step's honest outcome: executed and succeeded (ok), executed and failed, structurally
+ *  not-applicable to this repo, or never executed because an earlier step failed. Only `ok` is a success
+ *  — a not-applicable step is never rendered green, and a not-executed one marks where the chain stopped. */
+export type RunStepStatus = 'ok' | 'failed' | 'not-applicable' | 'not-executed';
+
 export interface RunStep {
-  name: string; // analyze | implement | push | pr | deploy
+  name: string; // analyze | implement | dev-deploy | push | pr
   running?: boolean; // in flight — while true, `log` carries the agent's streaming transcript
-  ok: boolean;
-  log?: string; // for analyze/implement this is the agent's full report (what was done / blocked)
+  status: RunStepStatus;
+  /** Legacy pre-status flag; the server now always sends `status`, but a mock/older cache may carry ok. */
+  ok?: boolean;
+  // for analyze/implement `log` is the agent's full report (what was done / blocked); for a
+  // not-applicable or not-executed step it is a short reason in the user's language (what was not done, why)
+  log?: string;
   at: string;
 }
 
