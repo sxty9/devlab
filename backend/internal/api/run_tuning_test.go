@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"devlab/backend/internal/runs"
 )
@@ -107,6 +110,138 @@ func TestAgentArgsCarryTuning(t *testing.T) {
 		args := agentArgs("do it", "plan", tuningFor(runs.Run{}))
 		assertFlag(t, args, "--model", "opus")
 		assertFlag(t, args, "--effort", "max")
+	})
+}
+
+// The time budget is the third tunable: an optional per-repo cap that is trimmed and canonicalized like
+// its siblings. Empty is the service default, a Go duration caps the pass, every no-cap spelling folds to
+// the canonical "off", and an unparseable or non-positive value is rejected (never silently defaulted).
+func TestValidateTimeBudget(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         string
+		wantOK     bool
+		wantBudget string // canonical value after a successful validate
+	}{
+		{name: "empty is the default", in: "", wantOK: true, wantBudget: ""},
+		{name: "duration in hours", in: "2h", wantOK: true, wantBudget: "2h"},
+		{name: "duration in minutes", in: "90m", wantOK: true, wantBudget: "90m"},
+		{name: "compound duration", in: "1h30m", wantOK: true, wantBudget: "1h30m"},
+		{name: "trims surrounding space", in: "  3h  ", wantOK: true, wantBudget: "3h"},
+		{name: "off is no-cap", in: "off", wantOK: true, wantBudget: "off"},
+		{name: "none folds to off", in: "none", wantOK: true, wantBudget: "off"},
+		{name: "zero folds to off", in: "0", wantOK: true, wantBudget: "off"},
+		{name: "zero seconds folds to off", in: "0s", wantOK: true, wantBudget: "off"},
+		{name: "off is case-insensitive", in: "OFF", wantOK: true, wantBudget: "off"},
+		{name: "negative rejected", in: "-2h", wantOK: false},
+		{name: "unparseable rejected", in: "soon", wantOK: false},
+		{name: "smuggled flag rejected", in: "2h --dangerously", wantOK: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			b := &runBody{TimeBudget: c.in}
+			code, _ := validateTuning(b)
+			if (code == 0) != c.wantOK {
+				t.Fatalf("validateTuning(timeBudget=%q) code=%d, wantOK=%v", c.in, code, c.wantOK)
+			}
+			if c.wantOK && b.TimeBudget != c.wantBudget {
+				t.Fatalf("after validate: timeBudget=%q, want %q", b.TimeBudget, c.wantBudget)
+			}
+		})
+	}
+}
+
+// budgetFor resolves a run's (possibly empty) TimeBudget into the concrete per-repo cap: an explicit
+// duration passes through, every no-cap spelling resolves to 0 (no cap), and anything unparseable falls
+// back to the service default rather than running unbounded.
+func TestBudgetFor(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "3h") // pin the service default for the fallback cases
+	cases := []struct {
+		name   string
+		budget string
+		want   time.Duration
+	}{
+		{name: "explicit hours", budget: "2h", want: 2 * time.Hour},
+		{name: "explicit minutes", budget: "90m", want: 90 * time.Minute},
+		{name: "off is no cap", budget: "off", want: 0},
+		{name: "none is no cap", budget: "none", want: 0},
+		{name: "0 is no cap", budget: "0", want: 0},
+		{name: "0s is no cap", budget: "0s", want: 0},
+		{name: "garbage falls back to the default", budget: "soon", want: 3 * time.Hour},
+		{name: "empty follows the default", budget: "", want: 3 * time.Hour},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := budgetFor(runs.Run{TimeBudget: c.budget}); got != c.want {
+				t.Fatalf("budgetFor(%q) = %v, want %v", c.budget, got, c.want)
+			}
+		})
+	}
+}
+
+// referenced-not-copied: an empty budget tracks the service default at RUN TIME (so moving the default
+// moves every un-chosen run at once), while an explicit choice is pinned and survives a default change.
+func TestBudgetForReferencedNotCopied(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "2h")
+	if got := budgetFor(runs.Run{}); got != 2*time.Hour {
+		t.Fatalf("un-chosen budget = %v, want to follow the 2h default", got)
+	}
+	if got := budgetFor(runs.Run{TimeBudget: "5h"}); got != 5*time.Hour {
+		t.Fatalf("explicit 5h = %v, want pinned 5h", got)
+	}
+	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "4h") // the default moves…
+	if got := budgetFor(runs.Run{}); got != 4*time.Hour {
+		t.Fatalf("un-chosen budget after default change = %v, want to follow the new 4h default", got)
+	}
+	if got := budgetFor(runs.Run{TimeBudget: "5h"}); got != 5*time.Hour {
+		t.Fatalf("explicit 5h after default change = %v, want still-pinned 5h", got)
+	}
+}
+
+// humanizeDuration is the single formatter behind the stamped Result.TimeBudget and the honest overrun
+// message, so a compact duration and the no-cap "off" render identically wherever the budget is shown.
+func TestHumanizeDuration(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{3 * time.Hour, "3h"},
+		{2 * time.Hour, "2h"},
+		{90 * time.Minute, "1h30m"},
+		{45 * time.Minute, "45m"},
+		{0, "off"},
+		{-time.Hour, "off"},
+	}
+	for _, c := range cases {
+		if got := humanizeDuration(c.d); got != c.want {
+			t.Errorf("humanizeDuration(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+// A budget overrun is reported honestly — named as the spent budget with the value that applied — while a
+// deliberate abort or any other cancel keeps the underlying error, so the two are never conflated.
+func TestBudgetAwareError(t *testing.T) {
+	base := errors.New("signal: killed")
+	t.Run("budget overrun is named with its value", func(t *testing.T) {
+		actx, cancel := context.WithTimeoutCause(context.Background(), -time.Second, errBudgetExceeded)
+		defer cancel()
+		<-actx.Done()
+		if got := budgetAwareError(actx, 3*time.Hour, base); got != "Zeitbudget überschritten (3h)" {
+			t.Fatalf("overrun = %q, want the honest Zeitbudget message", got)
+		}
+	})
+	t.Run("a deliberate abort keeps the raw error", func(t *testing.T) {
+		actx, cancel := context.WithCancelCause(context.Background())
+		cancel(runs.ErrRunAborted)
+		if got := budgetAwareError(actx, 3*time.Hour, base); got != base.Error() {
+			t.Fatalf("abort = %q, want the raw error %q", got, base.Error())
+		}
+	})
+	t.Run("a plain (non-context) error passes through", func(t *testing.T) {
+		if got := budgetAwareError(context.Background(), 3*time.Hour, base); got != base.Error() {
+			t.Fatalf("plain error = %q, want %q", got, base.Error())
+		}
 	})
 }
 

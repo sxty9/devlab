@@ -55,13 +55,21 @@ type Run struct {
 	Type    Type   `json:"type"` // "" is read as auto (records predating ToDos)
 	Enabled bool   `json:"enabled"`
 
-	// Model + Effort tune the Claude engine the executor drives for THIS run/todo. Both are shared by
-	// auto and todo. Empty selects the runner default (opus / max), so records predating this field keep
+	// Model + Effort + TimeBudget tune the Claude engine the executor drives for THIS run/todo. All three
+	// are shared by auto and todo. Empty selects the runner default, so records predating these fields keep
 	// behaving exactly as before. Model is a CLI model id or alias (e.g. "opus", "claude-opus-4-8"); Effort
 	// is one of low|medium|high|xhigh|max|ultracode — "ultracode" being the maximal tier the executor maps
 	// to max reasoning plus multi-agent orchestration.
-	Model  string `json:"model,omitempty"`
-	Effort string `json:"effort,omitempty"`
+	//
+	// TimeBudget caps ONE repository's agent pass. It is a three-state field, the sibling of the two above:
+	// empty FOLLOWS the service default (DEVLAB_RUNS_AGENT_TIMEOUT, 3h) — resolved at run time and never
+	// copied in, so changing the default moves every un-chosen run at once; a Go duration ("2h", "90m") caps
+	// at that value; and the explicit no-cap "off" removes the cap entirely, leaving only the whole-sweep
+	// duration as the bound. An empty budget is NOT the same as an explicit choice equal to the default —
+	// the latter is a stored deviation that survives a default change (see budgetFor).
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	TimeBudget string `json:"timeBudget,omitempty"`
 
 	// auto only
 	Schedule Schedule `json:"schedule"`

@@ -217,13 +217,14 @@ func (s *Server) runPromptPreview(w http.ResponseWriter, r *http.Request) {
 }
 
 type runBody struct {
-	Name     string        `json:"name"`
-	Type     runs.Type     `json:"type"` // "" = auto
-	Enabled  bool          `json:"enabled"`
-	Model    string        `json:"model"`  // Claude model id/alias; "" = runner default (opus)
-	Effort   string        `json:"effort"` // low|medium|high|xhigh|max|ultracode; "" = runner default (max)
-	Schedule runs.Schedule `json:"schedule"`
-	AxiomIDs []string      `json:"axiomIds"`
+	Name       string        `json:"name"`
+	Type       runs.Type     `json:"type"` // "" = auto
+	Enabled    bool          `json:"enabled"`
+	Model      string        `json:"model"`      // Claude model id/alias; "" = runner default (opus)
+	Effort     string        `json:"effort"`     // low|medium|high|xhigh|max|ultracode; "" = runner default (max)
+	TimeBudget string        `json:"timeBudget"` // per-repo cap: "" = service default, a duration ("2h"), or "off" = no cap
+	Schedule   runs.Schedule `json:"schedule"`
+	AxiomIDs   []string      `json:"axiomIds"`
 	// todo only
 	Task    string        `json:"task"`
 	Targets []runs.Target `json:"targets"`
@@ -255,8 +256,10 @@ var runEffortAllowed = func() map[string]bool {
 // (GET /api/assistant/models) — the single source the KI tab already reads — so this is only a guard.
 var runModelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-// validateTuning trims and guards the model + effort a run/todo carries. Both are shared by auto and
-// todo and both are optional (empty = runner default), so it runs before the per-type branch.
+// validateTuning trims and guards the model + effort + time budget a run/todo carries. All three are
+// shared by auto and todo and all optional (empty = the service default), so it runs before the per-type
+// branch. The time budget is canonicalized to "off" for any no-cap spelling so the stored value is always
+// one the editor round-trips; an unparseable non-"off" value is rejected rather than silently defaulted.
 func validateTuning(b *runBody) (int, string) {
 	b.Model = strings.TrimSpace(b.Model)
 	if b.Model != "" && !runModelRe.MatchString(b.Model) {
@@ -265,6 +268,14 @@ func validateTuning(b *runBody) (int, string) {
 	b.Effort = strings.TrimSpace(b.Effort)
 	if b.Effort != "" && !runEffortAllowed[b.Effort] {
 		return http.StatusBadRequest, "ungültiger Effort (erlaubt: low, medium, high, xhigh, max, ultracode)"
+	}
+	b.TimeBudget = strings.TrimSpace(b.TimeBudget)
+	if b.TimeBudget != "" {
+		if isNoBudget(b.TimeBudget) {
+			b.TimeBudget = "off" // canonical no-cap
+		} else if d, err := time.ParseDuration(b.TimeBudget); err != nil || d <= 0 {
+			return http.StatusBadRequest, "ungültiges Zeitbudget (z. B. 2h, 90m — oder „off“ für kein Limit)"
+		}
 	}
 	return 0, ""
 }
@@ -371,7 +382,7 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	run := runs.Run{
 		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
-		Model: body.Model, Effort: body.Effort,
+		Model: body.Model, Effort: body.Effort, TimeBudget: body.TimeBudget,
 		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
 		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
@@ -431,6 +442,7 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].Enabled = body.Enabled
 		cur[idx].Model = body.Model
 		cur[idx].Effort = body.Effort
+		cur[idx].TimeBudget = body.TimeBudget
 		cur[idx].Schedule = body.Schedule
 		cur[idx].AxiomIDs = body.AxiomIDs
 		cur[idx].Task = body.Task

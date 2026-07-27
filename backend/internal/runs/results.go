@@ -38,14 +38,18 @@ type Result struct {
 	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
 	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
 	Mode string `json:"mode,omitempty"`
-	// Model + Effort record which Claude engine drove THIS execution: the resolved model and the selected
-	// effort tier ("" = the runner default max, "ultracode" = the maximal tier). Stamped when the execution
-	// is minted and re-stamped on resume to track the run's current tuning, so the report can label the
-	// answer with its model — a Holistic requirement now that the model is chosen per run — and the History
-	// shows how each run was tuned. Empty on older results.
-	Model  string `json:"model,omitempty"`
-	Effort string `json:"effort,omitempty"`
-	OK     bool   `json:"ok"`
+	// Model + Effort + TimeBudget record which Claude engine drove THIS execution: the resolved model, the
+	// selected effort tier ("" = the runner default max, "ultracode" = the maximal tier), and the per-repo
+	// time budget that actually applied. Stamped when the execution is minted and re-stamped on resume to
+	// track the run's current tuning, so the report can label the answer with its model — a Holistic
+	// requirement now that the model is chosen per run — and the History shows how each run was tuned.
+	// TimeBudget holds the RESOLVED budget ("3h", "90m", or "off" for no cap) — what bounded THIS run, not
+	// the raw choice — so the execution view names the budget that was in force honestly. Empty on older
+	// results (the executor never stamped it) — read as "the default of the day".
+	Model      string `json:"model,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	TimeBudget string `json:"timeBudget,omitempty"`
+	OK         bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
@@ -92,9 +96,9 @@ type RepoResult struct {
 	// the NEXT run only has to look at what came after it.
 	Base string `json:"base,omitempty"`
 	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
-	Running  bool `json:"running,omitempty"`
-	OK       bool `json:"ok"`
-	Deployed bool `json:"deployed"`
+	Running  bool   `json:"running,omitempty"`
+	OK       bool   `json:"ok"`
+	Deployed bool   `json:"deployed"`
 	PRUrl    string `json:"prUrl,omitempty"`
 	// DevBranch/DevCommit NAME the delivered dev state (req 2): the persistent integration branch the run
 	// grew (mercury-dev) and the exact commit dev serves. PRBase is this delivery's stacked PR base — the
