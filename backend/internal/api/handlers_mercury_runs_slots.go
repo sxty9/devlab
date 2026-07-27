@@ -70,14 +70,23 @@ func (s *Server) slotOverview() SlotOverview {
 	ov.Active = active
 	ov.Capacity = s.scheduler.Capacity()
 	live := map[string]bool{}
+	exclusive := false
 	for _, a := range active {
 		live[a.RunID] = true
 		if a.Overload {
 			ov.Overload++
 		}
+		if a.Exclusive {
+			exclusive = true
+		}
 	}
 	ov.Used = len(active) - ov.Overload
 	if ov.Free = ov.Capacity - ov.Used; ov.Free < 0 {
+		ov.Free = 0
+	}
+	// A Rundumlauf holds the WHOLE floor — no other run can start beside it, so no slot is truly free
+	// however few are nominally occupied. Report it honestly rather than dangling an unusable "frei".
+	if exclusive {
 		ov.Free = 0
 	}
 

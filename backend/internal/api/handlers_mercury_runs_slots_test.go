@@ -243,6 +243,29 @@ func TestSlotOverviewCountsUsedFreeOverloadAndDeferred(t *testing.T) {
 	exec.release("c")
 }
 
+func TestSlotOverviewExclusiveRunShowsNoFreeSlot(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	s, exec := newSlotServer(t, "2", []runs.Run{
+		{ID: "auto", Enabled: true, Schedule: runs.Schedule{Kind: runs.Daily, TimeOfDay: "03:00"}, NextFireAt: &past, AxiomIDs: []string{"x"}},
+	})
+	startAndWait(t, s, exec, "auto")
+
+	rec := httptest.NewRecorder()
+	s.runActive(rec, httptest.NewRequest(http.MethodGet, "/api/mercury/runs/active", nil))
+	var ov SlotOverview
+	if err := json.Unmarshal(rec.Body.Bytes(), &ov); err != nil {
+		t.Fatal(err)
+	}
+	// A Rundumlauf holds the whole floor: 1 of 2 nominally used, but 0 truly free.
+	if ov.Used != 1 || ov.Free != 0 {
+		t.Fatalf("an exclusive run must leave no free slot: %+v", ov)
+	}
+	if len(ov.Active) != 1 || !ov.Active[0].Exclusive {
+		t.Fatalf("the active run must be flagged exclusive: %+v", ov.Active)
+	}
+	exec.release("auto")
+}
+
 func TestRunNowBlockedByCapReturnsDecisionWithOverloadAndSuggestion(t *testing.T) {
 	s, exec := newSlotServer(t, "1", []runs.Run{slotTodo("a", "repo-a"), slotTodo("b", "repo-b")})
 	exec.plan["a"] = slotPlan{done: []string{"r1"}} // a is cleanly between repos → the ideal defer target
