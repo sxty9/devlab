@@ -184,14 +184,15 @@ export interface DataSource {
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
-  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
+  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if it cannot start
+   *  right now (concurrency cap reached, an exclusive auto run holds the floor, or a target repo busy). */
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
    *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
    *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
-  /** Abort the run currently in progress (kill-switch). */
-  mercuryCancelRun(): Promise<void>;
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[] }>;
+  /** Abort ONE specific run in progress by id (kill-switch); the others keep running. */
+  mercuryCancelRun(runId: string): Promise<void>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */

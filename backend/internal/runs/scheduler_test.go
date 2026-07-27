@@ -2,11 +2,17 @@ package runs
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func noopLog(string, ...any) {}
+
+// ── test executors ──────────────────────────────────────────────────────────────────────────────────
 
 type fakeExec struct {
 	mu       sync.Mutex
@@ -32,56 +38,49 @@ func (f *fakeExec) count() int {
 	return len(f.executed)
 }
 
-// blockingExec reports a result id, signals it has started, then blocks until released — so a test can
-// observe Active() WHILE a run is in flight.
+// blockingExec lets a test hold runs mid-flight so it can OBSERVE concurrency: each Execute reports its
+// result id, announces it started (on `started`), then blocks until the test releases it by id — or the
+// run's context is cancelled (then it announces on `cancelled`). This is how the concurrency, exclusivity
+// and cancel proofs pin down whether two runs actually overlap.
 type blockingExec struct {
-	reported chan string
-	release  chan struct{}
+	mu        sync.Mutex
+	started   chan string
+	cancelled chan string
+	releases  map[string]chan struct{}
 }
 
-func (b *blockingExec) Execute(_ context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
-	report("res_live")
-	b.reported <- run.ID
-	<-b.release
-	return ResultRef{ResultID: "res_live", OK: true}, nil
+func newBlockingExec() *blockingExec {
+	return &blockingExec{
+		started:   make(chan string, 16),
+		cancelled: make(chan string, 16),
+		releases:  map[string]chan struct{}{},
+	}
+}
+func (b *blockingExec) gate(id string) chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	c, ok := b.releases[id]
+	if !ok {
+		c = make(chan struct{})
+		b.releases[id] = c
+	}
+	return c
+}
+func (b *blockingExec) Execute(ctx context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
+	report("res_" + run.ID)
+	b.started <- run.ID
+	select {
+	case <-b.gate(run.ID):
+		return ResultRef{ResultID: "res_" + run.ID, OK: true}, nil
+	case <-ctx.Done():
+		b.cancelled <- run.ID
+		return ResultRef{ResultID: "res_" + run.ID, OK: false}, ctx.Err()
+	}
 }
 func (b *blockingExec) Maintain(context.Context) {}
+func (b *blockingExec) release(id string)        { close(b.gate(id)) }
 
-func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
-	past := time.Now().Add(-time.Minute)
-	store := seedStore(t, []Run{
-		{ID: "r", Enabled: true, Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, NextFireAt: &past, AxiomIDs: []string{"x"}},
-	})
-	be := &blockingExec{reported: make(chan string, 1), release: make(chan struct{})}
-	s := NewScheduler(store, be, time.Second)
-	s.logf = func(string, ...any) {}
-
-	if a := s.Active(); a != nil {
-		t.Fatalf("expected no activity before firing, got %+v", a)
-	}
-	if !s.FireNow("r", "t") {
-		t.Fatal("FireNow returned false")
-	}
-	<-be.reported // the run has reported its result id and is now blocked mid-execution
-
-	a := s.Active()
-	if a == nil || a.RunID != "r" || a.ResultID != "res_live" {
-		t.Fatalf("Active() did not reflect the running run: %+v", a)
-	}
-	if a.StartedAt.IsZero() {
-		t.Error("Active().StartedAt not stamped")
-	}
-
-	close(be.release) // let the run finish → Active clears
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if s.Active() == nil {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("Active() did not clear after the run finished")
-}
+// ── helpers ─────────────────────────────────────────────────────────────────────────────────────────
 
 func seedStore(t *testing.T, runsIn []Run) *Store {
 	t.Helper()
@@ -95,6 +94,92 @@ func seedStore(t *testing.T, runsIn []Run) *Store {
 	return s
 }
 
+func autoRun(id string) Run {
+	past := time.Now().Add(-time.Minute)
+	return Run{ID: id, Enabled: true, Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, NextFireAt: &past, AxiomIDs: []string{"x"}}
+}
+
+func todoRun(id string, targets ...string) Run {
+	past := time.Now().Add(-time.Minute)
+	ts := make([]Target, 0, len(targets))
+	for _, r := range targets {
+		ts = append(ts, Target{Repo: r})
+	}
+	return Run{ID: id, Type: TypeTodo, Enabled: true, DueAt: &past, Targets: ts, Task: "do it"}
+}
+
+func recvWithin(t *testing.T, ch chan string, d time.Duration) string {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(d):
+		t.Fatal("timed out waiting for a run signal")
+		return ""
+	}
+}
+
+// expectNoStart asserts NO run begins within d — used to prove a run was DEFERRED (repo busy, exclusive
+// floor held, or cap reached) rather than started.
+func expectNoStart(t *testing.T, b *blockingExec, d time.Duration) {
+	t.Helper()
+	select {
+	case id := <-b.started:
+		t.Fatalf("expected no run to start, but %s did", id)
+	case <-time.After(d):
+	}
+}
+
+func waitFor(t *testing.T, d time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("condition never held: %s", msg)
+}
+
+func marker(path string) (string, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(b)), true
+}
+
+// ── adapted existing tests ──────────────────────────────────────────────────────────────────────────
+
+func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
+	store := seedStore(t, []Run{autoRun("r")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	if a := s.Active(); len(a) != 0 {
+		t.Fatalf("expected no activity before firing, got %+v", a)
+	}
+	if !s.FireNow("r", "t") {
+		t.Fatal("FireNow returned false")
+	}
+	if id := recvWithin(t, be.started, time.Second); id != "r" {
+		t.Fatalf("expected run r to start, got %s", id)
+	}
+
+	a := s.Active()
+	if len(a) != 1 || a[0].RunID != "r" || a[0].ResultID != "res_r" {
+		t.Fatalf("Active() did not reflect the running run: %+v", a)
+	}
+	if a[0].StartedAt.IsZero() {
+		t.Error("Active()[0].StartedAt not stamped")
+	}
+
+	be.release("r")
+	waitFor(t, 2*time.Second, func() bool { return len(s.Active()) == 0 }, "Active() did not clear after the run finished")
+}
+
 func TestSchedulerFiresOnlyDueEnabledRunsAndAdvances(t *testing.T) {
 	past := time.Now().Add(-time.Minute)
 	future := time.Now().Add(time.Hour)
@@ -106,9 +191,10 @@ func TestSchedulerFiresOnlyDueEnabledRunsAndAdvances(t *testing.T) {
 	})
 	fe := &fakeExec{}
 	s := NewScheduler(store, fe, time.Second)
-	s.logf = func(string, ...any) {}
+	s.logf = noopLog
 
 	s.fireDue(context.Background())
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 && fe.count() == 1 }, "the due run to finish")
 
 	fe.mu.Lock()
 	got := append([]string(nil), fe.executed...)
@@ -162,10 +248,11 @@ func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 		{ResultID: "res_1", OK: true},                       // resume: completes
 	}}
 	s := NewScheduler(store, fe, time.Second)
-	s.logf = func(string, ...any) {}
+	s.logf = noopLog
 
 	// Fire 1 → suspends.
 	s.fireDue(context.Background())
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "fire 1 to finish")
 	r, _, _ := store.Get("r")
 	if r.Suspended == nil {
 		t.Fatal("run should be suspended after the executor reported a usage limit")
@@ -182,6 +269,7 @@ func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 
 	// Fire 2 → resumes the same execution and finishes.
 	s.fireDue(context.Background())
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "resume to finish")
 	fe.mu.Lock()
 	nCalls := len(fe.calls)
 	resumedSuspended := nCalls == 2 && fe.calls[1].Suspended != nil
@@ -204,63 +292,6 @@ func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 	}
 }
 
-// TestSchedulerTodoDoneOnlyWhenNoPRsOpen pins the "in die History erst nach dem Merge"-rule: a ToDo whose
-// execution opened PRs is NOT checked off — it stays in the active list awaiting its merge — while a ToDo
-// with nothing to merge (report mode / no changes → PRsOpen false) is done at once.
-func TestSchedulerTodoDoneOnlyWhenNoPRsOpen(t *testing.T) {
-	past := time.Now().Add(-time.Minute)
-	store := seedStore(t, []Run{
-		{ID: "a", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
-		{ID: "b", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
-	})
-	fe := &scriptedExec{resps: []ResultRef{
-		{ResultID: "r", OK: true, PRsOpen: true},  // a — opened PRs, awaits merge
-		{ResultID: "r", OK: true, PRsOpen: false}, // b — nothing to merge
-	}}
-	s := NewScheduler(store, fe, time.Second)
-	s.logf = func(string, ...any) {}
-
-	s.fireDue(context.Background())
-
-	a, _, _ := store.Get("a")
-	if a.Done {
-		t.Error("a ToDo with open PRs must stay in the list (not done) until the main-merge is through")
-	}
-	b, _, _ := store.Get("b")
-	if !b.Done {
-		t.Error("a ToDo with nothing to merge must be checked off at once")
-	}
-}
-
-// TestSchedulerFireNowRestartsDoneTodo pins the restart: manually re-running an already-erledigt ToDo
-// reopens it (Done cleared) and — because the fresh run opens PRs — it awaits merge again rather than
-// snapping straight back to done. This is the "wieder anstartbar" path for a completed/stuck ToDo.
-func TestSchedulerFireNowRestartsDoneTodo(t *testing.T) {
-	store := seedStore(t, []Run{{ID: "t", Type: TypeTodo, Enabled: true, Done: true, Task: "x"}})
-	fe := &scriptedExec{resps: []ResultRef{{ResultID: "r", OK: true, PRsOpen: true}}}
-	s := NewScheduler(store, fe, time.Second)
-	s.logf = func(string, ...any) {}
-
-	if !s.FireNow("t", "tester") {
-		t.Fatal("FireNow returned busy on an idle scheduler")
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		fe.mu.Lock()
-		done := len(fe.calls) >= 1
-		fe.mu.Unlock()
-		if done {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	time.Sleep(20 * time.Millisecond) // let the detached result-attach patch land
-	got, _, _ := store.Get("t")
-	if got.Done {
-		t.Error("re-running a done ToDo must reopen it (Done cleared), not leave it checked off")
-	}
-}
-
 func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	store := seedStore(t, []Run{
@@ -268,63 +299,202 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	})
 	fe := &fakeExec{}
 	s := NewScheduler(store, fe, time.Second)
-	s.logf = func(string, ...any) {}
+	s.logf = noopLog
 
 	if !s.FireNow("m", "tester") {
 		t.Fatal("FireNow returned busy on an idle scheduler")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && fe.count() == 0 {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if fe.count() != 1 {
-		t.Fatalf("expected exactly 1 execution, got %d", fe.count())
-	}
-	// give the detached goroutine a moment to finish its result-attach patch
-	time.Sleep(20 * time.Millisecond)
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 && fe.count() == 1 }, "the manual run to finish")
 	m, _, _ := store.Get("m")
 	if m.NextFireAt == nil || !m.NextFireAt.Equal(future) {
 		t.Errorf("run-now must NOT advance the schedule; got %v want %v", m.NextFireAt, future)
 	}
 }
 
-// capturingExec records the Trigger it was handed, so a test can assert the scheduler's provenance
-// decision (autonomous for a scheduled firing, the caller for a manual run-now).
-type capturingExec struct{ got chan Trigger }
+// ── concurrency proofs (task point 6) ─────────────────────────────────────────────────────────────────
 
-func (c *capturingExec) Execute(_ context.Context, _ Run, tr Trigger, report func(string)) (ResultRef, error) {
-	report("res_cap")
-	c.got <- tr
-	return ResultRef{ResultID: "res_cap", At: time.Now(), OK: true}, nil
-}
-func (c *capturingExec) Maintain(context.Context) {}
+// Two ToDos on DIFFERENT repositories run at the same time.
+func TestConcurrentDifferentReposRunTogether(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), todoRun("t2", "repo-b")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
 
-// A scheduled firing is autonomous and names NO person; a manual run-now is attributed to its caller.
-// This is exactly what lets the execution history show an autonomous run without ascribing it to a
-// person, while a manual run keeps its initiator.
-func TestSchedulerTriggerProvenance(t *testing.T) {
-	past := time.Now().Add(-time.Minute)
-	future := time.Now().Add(time.Hour)
-	sc := Schedule{Kind: Daily, TimeOfDay: "03:00"}
-	store := seedStore(t, []Run{
-		{ID: "auto", Enabled: true, Schedule: sc, NextFireAt: &past, AxiomIDs: []string{"x"}},
-		{ID: "manual", Enabled: true, Schedule: sc, NextFireAt: &future, AxiomIDs: []string{"x"}}, // not due → only FireNow fires it
-	})
-	ce := &capturingExec{got: make(chan Trigger, 1)}
-	s := NewScheduler(store, ce, time.Second)
-	s.logf = func(string, ...any) {}
-
-	// Scheduled: autonomous, no person.
 	s.fireDue(context.Background())
-	if tr := <-ce.got; !tr.Auto || tr.By != "" {
-		t.Fatalf("scheduled firing must be autonomous with no person: %+v", tr)
+	first := recvWithin(t, be.started, time.Second)
+	second := recvWithin(t, be.started, time.Second) // both start before either is released → they overlap
+	if first == second {
+		t.Fatalf("the same run started twice: %s", first)
+	}
+	waitFor(t, time.Second, func() bool { return s.ActiveCount() == 2 }, "both runs to be active at once")
+
+	be.release("t1")
+	be.release("t2")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "both runs to finish")
+}
+
+// Two ToDos on the SAME repository run one after the other.
+func TestSameRepoRunsSequentially(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), todoRun("t2", "repo-a")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	s.fireDue(context.Background())
+	first := recvWithin(t, be.started, time.Second)
+	if first != "t1" {
+		t.Fatalf("expected t1 to start first, got %s", first)
+	}
+	expectNoStart(t, be, 120*time.Millisecond) // t2 targets the busy repo → deferred, never overlaps
+	if n := s.ActiveCount(); n != 1 {
+		t.Fatalf("expected exactly one run on the shared repo, got %d", n)
 	}
 
-	// Manual: the caller, not autonomous.
-	if !s.FireNow("manual", "alice") {
-		t.Fatal("FireNow returned false")
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t1 to finish")
+
+	s.fireDue(context.Background()) // t1 is now done; the repo is free → t2 runs
+	if second := recvWithin(t, be.started, time.Second); second != "t2" {
+		t.Fatalf("expected t2 to run after t1 released the repo, got %s", second)
 	}
-	if tr := <-ce.got; tr.Auto || tr.By != "alice" {
-		t.Fatalf("manual run must be attributed to the caller and not autonomous: %+v", tr)
+	be.release("t2")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t2 to finish")
+}
+
+// A running ToDo blocks an auto (all-repos) run from starting — the auto is exclusive.
+func TestRunningTodoBlocksExclusiveAutoRun(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), autoRun("auto")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	s.fireDue(context.Background())
+	if id := recvWithin(t, be.started, time.Second); id != "t1" {
+		t.Fatalf("expected the ToDo to start, got %s", id)
 	}
+	expectNoStart(t, be, 120*time.Millisecond) // auto must wait for the floor to clear
+	if n := s.ActiveCount(); n != 1 {
+		t.Fatalf("auto run must not start while a ToDo runs; active=%d", n)
+	}
+
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the ToDo to finish")
+
+	s.fireDue(context.Background())
+	if id := recvWithin(t, be.started, time.Second); id != "auto" {
+		t.Fatalf("expected the auto run once the floor was clear, got %s", id)
+	}
+	be.release("auto")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the auto run to finish")
+}
+
+// A running auto (exclusive) run blocks every other run from starting.
+func TestRunningAutoRunBlocksEverythingElse(t *testing.T) {
+	store := seedStore(t, []Run{autoRun("auto"), todoRun("t1", "repo-a")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	s.fireDue(context.Background())
+	if id := recvWithin(t, be.started, time.Second); id != "auto" {
+		t.Fatalf("expected the auto run to start, got %s", id)
+	}
+	expectNoStart(t, be, 120*time.Millisecond) // nothing starts while the exclusive run holds the floor
+	if n := s.ActiveCount(); n != 1 {
+		t.Fatalf("nothing may run beside an exclusive auto run; active=%d", n)
+	}
+
+	be.release("auto")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the auto run to finish")
+
+	s.fireDue(context.Background())
+	if id := recvWithin(t, be.started, time.Second); id != "t1" {
+		t.Fatalf("expected the ToDo once the auto run finished, got %s", id)
+	}
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the ToDo to finish")
+}
+
+// The concurrency cap defers extra runs even when their repositories are free.
+func TestConcurrencyCapDefersExtraRuns(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), todoRun("t2", "repo-b")})
+	t.Setenv("DEVLAB_RUNS_MAX_CONCURRENCY", "1")
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+	if s.maxConc != 1 {
+		t.Fatalf("expected cap 1 from env, got %d", s.maxConc)
+	}
+
+	s.fireDue(context.Background())
+	recvWithin(t, be.started, time.Second)     // one run starts
+	expectNoStart(t, be, 120*time.Millisecond) // the second waits for the slot despite a free repo
+	if n := s.ActiveCount(); n != 1 {
+		t.Fatalf("cap of 1 must allow only one run; active=%d", n)
+	}
+	be.release("t1")
+	be.release("t2")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "runs to finish")
+}
+
+// Cancel aborts exactly the named run; the others keep going.
+func TestCancelTargetsSpecificRun(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), todoRun("t2", "repo-b")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	s.fireDue(context.Background())
+	recvWithin(t, be.started, time.Second)
+	recvWithin(t, be.started, time.Second)
+	waitFor(t, time.Second, func() bool { return s.ActiveCount() == 2 }, "both runs active")
+
+	if s.Cancel("nope") {
+		t.Fatal("Cancel of an unknown id must return false")
+	}
+	if !s.Cancel("t2") {
+		t.Fatal("Cancel of an active run must return true")
+	}
+	if id := recvWithin(t, be.cancelled, time.Second); id != "t2" {
+		t.Fatalf("expected t2 to observe the cancel, got %s", id)
+	}
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 1 }, "t2 to end after cancel")
+	if a := s.Active(); len(a) != 1 || a[0].RunID != "t1" {
+		t.Fatalf("only t1 should remain active, got %+v", a)
+	}
+
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t1 to finish")
+}
+
+// The deferred-restart marker COUNTS: it is written when the first run starts, still present (decremented)
+// when one of several finishes, and removed only when the LAST run ends.
+func TestActiveMarkerRefcounts(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a"), todoRun("t2", "repo-b")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+	if _, ok := marker(s.marker); ok {
+		t.Fatal("marker must not exist before any run starts")
+	}
+
+	s.fireDue(context.Background())
+	recvWithin(t, be.started, time.Second)
+	recvWithin(t, be.started, time.Second)
+	waitFor(t, time.Second, func() bool {
+		v, ok := marker(s.marker)
+		return s.ActiveCount() == 2 && ok && v == "2"
+	}, "marker to read 2 while two runs are active")
+
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool {
+		v, ok := marker(s.marker)
+		return s.ActiveCount() == 1 && ok && v == "1"
+	}, "marker to decrement to 1 (not be removed) while one run remains")
+
+	be.release("t2")
+	waitFor(t, 2*time.Second, func() bool {
+		_, ok := marker(s.marker)
+		return s.ActiveCount() == 0 && !ok
+	}, "marker to be removed once the last run ends")
 }

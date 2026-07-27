@@ -7,7 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RepoResult, ReportDelivery, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RunStep, RunTrigger, RunType } from '@/types';
+import type { RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunTrigger, RunType } from '@/types';
 import { Person } from '@/ui/Person';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
@@ -633,46 +633,6 @@ function ExecutionRow({ ex, selected, onSelect }: { ex: RunExecution; selected: 
   );
 }
 
-/** Surfaces a failed daily-report send so it is visible, not silent. Renders nothing on the happy path
- *  (latest report delivered, or none due yet) — a problem appears only when there is one, and the copy
- *  says it is retried automatically, so no action is implied. Fails quiet: a status-probe error never
- *  breaks the surrounding history view. */
-export function ReportDeliveryBanner() {
-  const source = useMemo(() => getDataSource(), []);
-  const [failed, setFailed] = useState<ReportDelivery | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    source
-      .mercuryReportStatus()
-      .then((r) => {
-        if (!cancelled) setFailed((r.records ?? []).find((x) => x.status === 'failed') ?? null);
-      })
-      .catch(() => {
-        /* quiet — a delivery-status probe must never break the execution history */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [source]);
-
-  if (!failed) return null;
-  return (
-    <div className="flex items-start gap-2 border-b border-warning/30 bg-warning/10 px-3 py-2" role="status">
-      <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-warning" />
-      <div className="min-w-0 text-caption text-text-secondary">
-        <span className="font-medium text-text-primary">The daily report for {failed.day} could not be emailed.</span>{' '}
-        It will be retried automatically{failed.attempts > 1 ? ` (attempt ${failed.attempts})` : ''}.
-        {failed.lastError && (
-          <span className="mt-0.5 block truncate text-text-tertiary" title={failed.lastError}>
-            {failed.lastError}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
 /** The execution history for one surface: every completed execution of its `type` (newest first) with
  *  token/cost, and a detail pane that loads the full result document. Reused identically by the Läufe
  *  and ToDos tabs — only `type` differs. */
@@ -719,7 +679,6 @@ export function ExecutionHistory({ type }: { type: RunType }) {
   return (
     <>
       <div className="flex w-96 shrink-0 flex-col border-r border-separator bg-surface">
-        <ReportDeliveryBanner />
         <div className="flex items-center justify-between gap-2 border-b border-separator px-3 py-2">
           <span className="text-footnote font-medium text-text-primary">Ausführungen</span>
           <Button variant="ghost" size="sm" disabled={refreshing} onClick={refresh}>
@@ -847,9 +806,9 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
+  const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
   const [bump, setBump] = useState(0);
 
@@ -1044,7 +1003,7 @@ function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: 
 
 /** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
  *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
-function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: (runId: string) => void; cancelling: boolean }) {
   const executing = row.state === 'executing';
   return (
     <div className="flex min-h-0 flex-col gap-3">
@@ -1052,7 +1011,7 @@ function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel:
         <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
         <TypeChip type={row.type} />
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+          <Button variant="danger" size="sm" disabled={cancelling} onClick={() => onCancel(row.runId)}>
             {cancelling ? 'Bricht ab…' : 'Abbrechen'}
           </Button>
         )}
@@ -1099,7 +1058,7 @@ export function ActiveRunsOverview({
   className,
 }: {
   inflight: RunInFlight[];
-  onCancel: () => void;
+  onCancel: (runId: string) => void;
   cancelling: boolean;
   className?: string;
 }) {
@@ -1145,7 +1104,12 @@ export function ActiveRunsOverview({
           <span className="truncate">{summary}</span>
         </button>
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+          <Button
+            variant="danger"
+            size="sm"
+            disabled={cancelling}
+            onClick={() => onCancel(inflight.find((r) => r.state === 'executing')!.runId)}
+          >
             {cancelling ? 'Bricht ab…' : 'Abbrechen'}
           </Button>
         )}

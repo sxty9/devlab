@@ -428,9 +428,9 @@ export const mockSource: DataSource = {
   async mercuryRunActive() {
     // The mock has no executor, so nothing is ever genuinely in flight — an empty list is the honest
     // answer (the "Aktive Läufe" overview simply stays quiet in offline/preview mode).
-    return { active: null, inflight: [] };
+    return { active: [], inflight: [] };
   },
-  async mercuryCancelRun() {
+  async mercuryCancelRun(_runId: string) {
     /* mock: no-op */
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {

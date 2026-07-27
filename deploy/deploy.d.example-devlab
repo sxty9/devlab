@@ -17,6 +17,24 @@ set -euo pipefail
 ART="${1:?artifact dir required}"
 ENVN="${2:?env required}"
 
+# Deferred-restart marker: devlabd writes this file while Mercury runs are in flight and removes it only
+# when the LAST run ends (a COUNT, not a toggle — see runs/scheduler.go writeMarkerLocked). Restarting
+# devlabd now would kill every run mid-sweep, so the dev restart below holds off until the marker clears.
+# The in-process auto-merge path defers a self-deploy the same way; this covers a MANUAL/CI deploy too.
+RUNS_MARKER="${DEVLAB_MERCURY_RUNS_ACTIVE_MARKER:-/var/lib/devlab/mercury/runs-active}"
+RUNS_MARKER_WAIT="${DEVLAB_DEPLOY_RUNS_WAIT:-1800}"   # seconds to wait for runs to finish (0 = don't wait)
+
+defer_restart_until_idle() {
+  [[ "$RUNS_MARKER_WAIT" -gt 0 ]] || return 0
+  local deadline=$(( SECONDS + RUNS_MARKER_WAIT ))
+  while [[ -e "$RUNS_MARKER" ]] && (( SECONDS < deadline )); do
+    echo "[deploy devlab] deferring restart — $(cat "$RUNS_MARKER" 2>/dev/null || echo '?') Mercury run(s) active"
+    sleep 10
+  done
+  [[ -e "$RUNS_MARKER" ]] && echo "[deploy devlab] runs still active after ${RUNS_MARKER_WAIT}s — restarting anyway"
+  return 0
+}
+
 # What the runner built for devlab: the daemon binary + the built SPA. (Prebuilt — verify, never make.)
 BIN="$ART/devlabd"          # prebuilt Go binary  (backend/cmd/devlabd)
 WEB="$ART/web"              # prebuilt Vite SPA (buildArtifact writes the SPA to <artifact>/web)
@@ -51,6 +69,8 @@ case "$ENVN" in
       echo "[deploy devlab] dev: restart helper unavailable — restarting directly"
       systemctl restart devlabd
     fi
+    defer_restart_until_idle   # hold off while Mercury runs are in flight (deferred restart)
+    systemctl restart devlabd
     echo "[deploy devlab] dev: done"
     ;;
 
