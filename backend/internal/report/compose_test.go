@@ -43,13 +43,13 @@ func TestTypeLabel(t *testing.T) {
 func sampleItems() []Item {
 	return []Item{
 		{RunName: "Nightly axioms", TypeLabel: "Automatic run", Finished: true, OK: true,
-			Repos:   []RepoLine{{Repo: "devlab", Stage: "deployed"}, {Repo: "aigentic", Stage: "PR opened"}},
+			Repos:    []RepoLine{{Repo: "devlab", Stage: "deployed"}, {Repo: "aigentic", Stage: "PR opened"}},
 			InTokens: 12000, OutTokens: 3400, CostUSD: 0.42},
 		{RunName: "Fix login bug", TypeLabel: "ToDo", Finished: true, OK: false,
-			Repos:   []RepoLine{{Repo: "studiq", Stage: "failed at pushed"}},
+			Repos:    []RepoLine{{Repo: "studiq", Stage: "failed at pushed"}},
 			InTokens: 5000, OutTokens: 900, CostUSD: 0.10},
 		{RunName: "Big migration", TypeLabel: "ToDo", Finished: false, Suspended: true,
-			Repos:   []RepoLine{{Repo: "hostek", Stage: "implemented"}},
+			Repos:    []RepoLine{{Repo: "hostek", Stage: "implemented"}},
 			InTokens: 2000, OutTokens: 100, CostUSD: 0.03},
 	}
 }

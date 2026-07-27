@@ -178,7 +178,7 @@ func TestRunFinishingNextDayGoesToNextDayReport(t *testing.T) {
 	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
 	sender := &fakeSender{}
 
-	a := summary("a", "Same-day run", at(26, 20))          // started & finished the 26th
+	a := summary("a", "Same-day run", at(26, 20)) // started & finished the 26th
 	b := runs.ExecutionSummary{RunID: "b", RunName: "Carry-over migration", ResultID: "r-b",
 		At: at(26, 23), FinishedAt: at(27, 2), OK: true, RepoCount: 1} // started 26th, finished 27th
 	execs := &fakeExecs{summaries: []runs.ExecutionSummary{a, b}}
