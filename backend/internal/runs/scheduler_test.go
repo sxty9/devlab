@@ -575,13 +575,13 @@ func TestRestartPendingQueuesStarts(t *testing.T) {
 	}
 
 	// The drain does not complete while a runs; it does once a is released.
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	if s.AwaitDrain(ctx) {
 		t.Error("drain must not complete while a run is live")
 	}
 	cancel()
 	ge.release("a")
-	dctx, dcancel := context.WithTimeout(t.Context(), 2*time.Second)
+	dctx, dcancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer dcancel()
 	if !s.AwaitDrain(dctx) {
 		t.Error("drain must complete once the floor is empty")
@@ -638,7 +638,9 @@ func TestSetCapacityTakesEffectLive(t *testing.T) {
 	store := seedStore(t, []Run{todoRun("a", "r1", past), todoRun("b", "r2", past), todoRun("c", "r3", past)})
 	ge := newGateExec()
 	s := quiet(NewScheduler(store, ge, time.Second, 1))
-	go s.Run(t.Context()) // the poke path needs the Run loop
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	go s.Run(runCtx) // the poke path needs the Run loop
 
 	waitFor(t, "one admitted at cap 1", func() bool { return s.ActiveCount() == 1 })
 	time.Sleep(30 * time.Millisecond)
