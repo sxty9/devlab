@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, type ReactNode } from 'react';
 import { getDataSource } from '@/data';
-import { MERCURY_TOPICS, type MercuryTopic } from '@/lib/live';
+import { MERCURY_TOPICS, type ExternalChange, type MercuryTopic } from '@/lib/live';
 
 // The SINGLE live-update mechanism for the whole Mercury surface. Exactly one connection is opened
 // (by this provider); every view subscribes to it by topic through useMercuryTopic, rather than each
@@ -76,6 +76,22 @@ export function MercuryLiveProvider({ children }: { children: ReactNode }) {
   }, [source, emit]);
 
   return <Ctx.Provider value={api}>{children}</Ctx.Provider>;
+}
+
+/** Names a foreign change to the record a user is editing, so the update is honest instead of silent
+ *  (task requirement 3). The editor keeps the user's draft regardless; this only surfaces the conflict.
+ *  New UI strings are authored in English (the nightly run translates); see the language convention. */
+export function ExternalChangeBanner({ change }: { change: ExternalChange }) {
+  if (change === 'none') return null;
+  const text =
+    change === 'deleted'
+      ? 'This entry was deleted elsewhere while you were editing. Your changes are kept here.'
+      : 'This entry was changed elsewhere while you were editing. Your changes are kept — saving will overwrite that change.';
+  return (
+    <div className="rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2 text-caption text-warning">
+      {text}
+    </div>
+  );
 }
 
 /** Refetch when the server signals one of `topics` changed. The handler is always the latest closure

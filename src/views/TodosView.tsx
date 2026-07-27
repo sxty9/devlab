@@ -7,6 +7,8 @@ import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { useMercuryTopic, ExternalChangeBanner } from '@/state/mercuryLive';
+import { classifyExternalChange } from '@/lib/live';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -250,6 +252,10 @@ export default function TodosView() {
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
+  // The ToDo snapshot the editor started from, captured when editing began. The editor renders from
+  // THIS (stable) rather than the live list entry, so a live refresh — or even a foreign delete of the
+  // ToDo — never yanks the editor away and discards the user's draft; the conflict is named instead.
+  const [editBase, setEditBase] = useState<Run | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
@@ -276,6 +282,11 @@ export default function TodosView() {
     if (prevActiveRef.current && !cur) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
+
+  // Live: a run/ToDo change anywhere (this session, another window, a run finishing) refreshes the
+  // list without a reload. An open editor keeps its draft (it renders from the editBase snapshot,
+  // keyed by id, so this refetch never remounts it); the selection and scroll position are preserved.
+  useMercuryTopic(['runs'], () => void reload());
 
   // First load owns the full-pane error state; a failing repo list only costs the target picker.
   useEffect(() => {
@@ -326,6 +337,7 @@ export default function TodosView() {
     async (id: string) => {
       setSelectedId(id);
       setMode('view');
+      setEditBase(null);
       await reload();
     },
     [reload],
@@ -334,6 +346,7 @@ export default function TodosView() {
   const handleDeleted = useCallback(async () => {
     setSelectedId(null);
     setMode('view');
+    setEditBase(null);
     await reload();
   }, [reload]);
 
@@ -356,10 +369,22 @@ export default function TodosView() {
 
   let rightPane: ReactNode;
   if (mode === 'create') {
-    rightPane = <TodoEditor base={null} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />;
-  } else if (mode === 'edit' && selectedTodo) {
+    rightPane = <TodoEditor base={null} live={undefined} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />;
+  } else if (mode === 'edit' && editBase) {
+    // Render from the captured snapshot (editBase); pass the current list entry (selectedTodo, null if
+    // deleted elsewhere) only so the editor can NAME a foreign change without touching the draft.
     rightPane = (
-      <TodoEditor key={selectedTodo.id} base={selectedTodo} repos={repos} onCancel={() => setMode('view')} onSaved={handleSaved} />
+      <TodoEditor
+        key={editBase.id}
+        base={editBase}
+        live={selectedTodo}
+        repos={repos}
+        onCancel={() => {
+          setMode('view');
+          setEditBase(null);
+        }}
+        onSaved={handleSaved}
+      />
     );
   } else if (selectedTodo) {
     rightPane = (
@@ -368,7 +393,10 @@ export default function TodosView() {
         todo={selectedTodo}
         repos={repos}
         active={active && active.runId === selectedTodo.id ? active : null}
-        onEdit={() => setMode('edit')}
+        onEdit={() => {
+          setEditBase(selectedTodo);
+          setMode('edit');
+        }}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
         onExecuted={reload}
@@ -688,11 +716,15 @@ const rowValid = (r: TargetRow) => (r.kind === 'existing' ? r.repo.trim().length
  *  or a new one to create), the optional one-time due date, and the active flag. */
 function TodoEditor({
   base,
+  live,
   repos,
   onCancel,
   onSaved,
 }: {
   base: Run | null;
+  /** The current server version of the ToDo being edited (null if deleted elsewhere; undefined when
+   *  creating). Used only to name a foreign change — the draft always comes from `base`. */
+  live?: Run | null;
   repos: Repo[];
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
@@ -808,9 +840,13 @@ function TodoEditor({
     }
   };
 
+  // Name a foreign change to THIS ToDo (edited elsewhere / deleted elsewhere). The draft is untouched.
+  const externalChange = base ? classifyExternalChange(base.updatedAt, live) : 'none';
+
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7">
       <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{base ? 'ToDo bearbeiten' : 'Neues ToDo'}</h1>
+      <ExternalChangeBanner change={externalChange} />
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Name</p>
@@ -973,8 +1009,9 @@ function TodoEditor({
 
 // ── Kalender ──────────────────────────────────────────────────────────────────
 
-/** The auto-updating ToDo-Kalender, rendered by the shared MercuryCalendar. Owns the data: polls
- *  every 60s and refetches whenever a ToDo changes (via `dataVersion`). Only terminated ToDos have a
+/** The auto-updating ToDo-Kalender, rendered by the shared MercuryCalendar. Owns the data and
+ *  refetches whenever a ToDo changes (via `dataVersion`, which the parent bumps on every local edit
+ *  AND on a live-event stream 'runs' notification) — no resting poll. Only terminated ToDos have a
  *  scheduled moment — ToDos without a due date never appear. A single kind here, so no colour split. */
 function TodoCalendar({ dataVersion }: { dataVersion: number }) {
   const source = useMemo(() => getDataSource(), []);
@@ -998,10 +1035,8 @@ function TodoCalendar({ dataVersion }: { dataVersion: number }) {
       }
     };
     void load();
-    const iv = window.setInterval(() => void load(), 60000);
     return () => {
       cancelled = true;
-      window.clearInterval(iv);
     };
   }, [source, dataVersion]);
 

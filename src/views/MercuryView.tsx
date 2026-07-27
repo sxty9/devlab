@@ -1,6 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
-import { MercuryLiveProvider, useMercuryTopic } from '@/state/mercuryLive';
+import { MercuryLiveProvider, useMercuryTopic, ExternalChangeBanner } from '@/state/mercuryLive';
+import type { ExternalChange } from '@/lib/live';
 import { renderMarkdown } from '@/lib/markdown';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
@@ -855,6 +856,12 @@ function AxiomPane({
   // Conformance against the meta-axioms — checked on demand (an aigentic call), never automatically.
   const [conf, setConf] = useState<Conformance | null>(null);
   const [checking, setChecking] = useState(false);
+  // A foreign change to THIS axiom while it is open (edited or deleted elsewhere). In view mode we
+  // simply refresh; in edit mode we name it (the draft is kept) rather than overwrite silently.
+  const [externalChange, setExternalChange] = useState<ExternalChange>('none');
+  // The stored title/body the current edit started from — the fingerprint a foreign change is measured
+  // against (axioms carry no updatedAt). Captured on entering edit, cleared on leaving it.
+  const editBaseline = useRef<{ titel: string; body: string } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -868,6 +875,35 @@ function AxiomPane({
       cancelled = true;
     };
   }, [source, path]);
+
+  // Track the edit baseline so a foreign change can be detected against it.
+  useEffect(() => {
+    if (mode === 'edit') {
+      if (!editBaseline.current && axiom) editBaseline.current = { titel: axiom.titel, body: axiom.body };
+    } else {
+      editBaseline.current = null;
+      setExternalChange('none');
+    }
+  }, [mode, axiom]);
+
+  // Live: this axiom changed elsewhere. In view mode refresh the shown content in place (selection and
+  // scroll are untouched); in edit mode name the conflict without disturbing the open draft.
+  useMercuryTopic(['axioms'], () => {
+    source
+      .mercuryItem(path)
+      .then((a) => {
+        if (mode === 'edit') {
+          const base = editBaseline.current;
+          if (base && (a.titel !== base.titel || a.body !== base.body)) setExternalChange('updated');
+        } else {
+          setAxiom(a);
+        }
+      })
+      .catch(() => {
+        if (mode === 'edit') setExternalChange('deleted');
+        else setErr(true);
+      });
+  });
 
   // "Mit KI optimieren" on an EXISTING record: polish title+body, then open the editor pre-filled so
   // the user reviews the change before it is stored.
@@ -923,6 +959,7 @@ function AxiomPane({
         axiom={axiom}
         section={namespace}
         initial={draft ?? undefined}
+        conflict={externalChange}
         onCancel={() => {
           setDraft(null); // discard an un-saved AI optimization
           setMode('view');
@@ -1055,7 +1092,7 @@ function ConformancePanel({ conf, onFix }: { conf: Conformance; onFix: () => voi
 }
 
 /** Edit an axiom's title and body. Its id, quelle and path are preserved. */
-function EditAxiomForm({ axiom, section, initial, onCancel, onSave }: { axiom: Axiom; section: SchemeNs; initial?: { titel: string; body: string }; onCancel: () => void; onSave: (titel: string, body: string) => Promise<void> }) {
+function EditAxiomForm({ axiom, section, initial, conflict, onCancel, onSave }: { axiom: Axiom; section: SchemeNs; initial?: { titel: string; body: string }; conflict?: ExternalChange; onCancel: () => void; onSave: (titel: string, body: string) => Promise<void> }) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   // `initial` carries an AI-optimized draft from the view's "Mit KI optimieren"; otherwise edit the
@@ -1093,6 +1130,7 @@ function EditAxiomForm({ axiom, section, initial, onCancel, onSave }: { axiom: A
 
   return (
     <div className="mx-auto flex max-w-3xl flex-col gap-3 px-8 py-7">
+      <ExternalChangeBanner change={conflict ?? 'none'} />
       <input
         value={titel}
         onChange={(e) => setTitel(e.target.value)}

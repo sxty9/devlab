@@ -7,6 +7,8 @@ import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { useMercuryTopic, ExternalChangeBanner } from '@/state/mercuryLive';
+import { classifyExternalChange } from '@/lib/live';
 import type {
   Run,
   RunActive,
@@ -74,6 +76,9 @@ export default function RunsView() {
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [mode, setMode] = useState<'view' | 'create' | 'edit'>('view');
+  // The run snapshot the editor started from (see the identical note in TodosView): renders the editor
+  // stably so a live refresh — or a foreign delete — never discards the draft; the conflict is named.
+  const [editBase, setEditBase] = useState<Run | null>(null);
 
   const [aiBusy, setAiBusy] = useState<'fill' | 'finetune' | null>(null);
   const [proposal, setProposal] = useState<{ mode: 'fill' | 'replace'; title: string; proposal: RunProposal } | null>(null);
@@ -105,6 +110,10 @@ export default function RunsView() {
     if (prevActiveRef.current && !cur) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
+
+  // Live: refresh the run list + coverage when a run changes anywhere, or when axioms change (coverage
+  // and the id→title legend derive from them). An open editor keeps its draft; selection is preserved.
+  useMercuryTopic(['runs', 'axioms'], () => void reload());
 
   // First load owns the full-screen error state.
   useEffect(() => {
@@ -169,6 +178,7 @@ export default function RunsView() {
     async (id: string) => {
       setSelectedId(id);
       setMode('view');
+      setEditBase(null);
       await reload();
     },
     [reload],
@@ -177,6 +187,7 @@ export default function RunsView() {
   const handleDeleted = useCallback(async () => {
     setSelectedId(null);
     setMode('view');
+    setEditBase(null);
     await reload();
   }, [reload]);
 
@@ -199,10 +210,22 @@ export default function RunsView() {
 
   let rightPane: ReactNode;
   if (mode === 'create') {
-    rightPane = <RunEditor base={null} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} />;
-  } else if (mode === 'edit' && selectedRun) {
+    rightPane = <RunEditor base={null} live={undefined} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} />;
+  } else if (mode === 'edit' && editBase) {
+    // Render from the captured snapshot; pass the live list entry (null if deleted elsewhere) only so
+    // the editor can name a foreign change without disturbing the draft.
     rightPane = (
-      <RunEditor key={selectedRun.id} base={selectedRun} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} />
+      <RunEditor
+        key={editBase.id}
+        base={editBase}
+        live={selectedRun}
+        coverage={coverage}
+        onCancel={() => {
+          setMode('view');
+          setEditBase(null);
+        }}
+        onSaved={handleSaved}
+      />
     );
   } else if (selectedRun) {
     rightPane = (
@@ -211,7 +234,10 @@ export default function RunsView() {
         run={selectedRun}
         axioms={list.axioms}
         active={active && active.runId === selectedRun.id ? active : null}
-        onEdit={() => setMode('edit')}
+        onEdit={() => {
+          setEditBase(selectedRun);
+          setMode('edit');
+        }}
         onDeleted={handleDeleted}
         onRecomposed={reload}
         onRunStarted={refetchActive}
@@ -599,11 +625,15 @@ function RunDetail({
 /** Create/update form for a run: name, active, schedule and the axiom picker. */
 function RunEditor({
   base,
+  live,
   coverage,
   onCancel,
   onSaved,
 }: {
   base: Run | null;
+  /** Current server version of the run being edited (null if deleted elsewhere; undefined when
+   *  creating). Names a foreign change only — the draft always comes from `base`. */
+  live?: Run | null;
   coverage: RunCoverage;
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
@@ -640,9 +670,12 @@ function RunEditor({
     }
   };
 
+  const externalChange = base ? classifyExternalChange(base.updatedAt, live) : 'none';
+
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7">
       <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{base ? 'Lauf bearbeiten' : 'Neuer Lauf'}</h1>
+      <ExternalChangeBanner change={externalChange} />
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Name</p>
@@ -816,7 +849,8 @@ function AxiomPicker({
 // ── Kalender ──────────────────────────────────────────────────────────────────
 
 /** The auto-updating Laufkalender: a compact month grid plus an agenda of upcoming firings, grouped
- *  by day. Polls every 60s and refetches whenever the run config changes (via `dataVersion`). */
+ *  by day. Refetches whenever the run config changes (via `dataVersion`, which the parent bumps on
+ *  every local edit AND on a live-event stream 'runs' notification) — no resting poll. */
 function CalendarView({ dataVersion }: { dataVersion: number }) {
   const source = useMemo(() => getDataSource(), []);
   const [cal, setCal] = useState<RunCalendar | null>(null);
@@ -838,10 +872,8 @@ function CalendarView({ dataVersion }: { dataVersion: number }) {
       }
     };
     void load();
-    const iv = window.setInterval(() => void load(), 60000);
     return () => {
       cancelled = true;
-      window.clearInterval(iv);
     };
   }, [source, dataVersion]);
 
