@@ -23,6 +23,17 @@ type PendingPR struct {
 	// reads or writes it (those modes only ever touch OVERDUE PRs), so their behavior is unchanged and
 	// zero-value here. Older stored files simply carry the zero time.
 	LastChecked time.Time `json:"lastChecked,omitempty"`
+
+	// Deploy-blocking (full mode). A merged PR whose prod-deploy fails for a PERMANENT reason — the
+	// service is not set up on the target, a missing unit, a bad config — is NOT retried forever. After
+	// a few attempts it is BLOCKED and left for an explicit resume; a TRANSIENT failure (network, the
+	// VPS briefly unreachable) never blocks and simply retries. These fields are the durable record of
+	// that state, surfaced in the UI so a blocked delivery is seen without reading the system log.
+	// report/pr mode never deploys, so they stay zero there. Older stored files carry the zero values.
+	DeployAttempts int       `json:"deployAttempts,omitempty"` // consecutive permanent-failure attempts
+	Blocked        bool      `json:"blocked,omitempty"`        // stop auto-retrying until an explicit resume
+	BlockedReason  string    `json:"blockedReason,omitempty"`  // human cause, naming the service and target
+	BlockedAt      time.Time `json:"blockedAt,omitempty"`      // when the block was recorded
 }
 
 // PRStore persists the pending-PR set (a small JSON file, same discipline as the runs store).
@@ -120,6 +131,27 @@ func (s *PRStore) Touch(repo string, number int, at time.Time) error {
 		return nil
 	}
 	return s.save(cur)
+}
+
+// Update atomically applies mutate to the tracked PR (repo+number) and persists the result — the
+// pool's single read-modify-write primitive. It only LOCATES the record and PERSISTS; every decision
+// about WHAT to change lives inside mutate, at the caller (a passive pool evaluates nothing). Reports
+// whether the PR was found — a no-op with no save if it was already untracked (merged/removed
+// meanwhile). Never creates a PR.
+func (s *PRStore) Update(repo string, number int, mutate func(*PendingPR)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return false, err
+	}
+	for i := range cur {
+		if cur[i].Repo == repo && cur[i].Number == number {
+			mutate(&cur[i])
+			return true, s.save(cur)
+		}
+	}
+	return false, nil
 }
 
 func (s *PRStore) save(prs []PendingPR) error {

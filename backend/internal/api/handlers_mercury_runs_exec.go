@@ -1047,6 +1047,61 @@ func noDeployTargetReason(repoName string) string {
 		filepath.Join(deployScriptDir, repoName) + "); das Repo installiert keinen Dienst, es gibt nichts zu deployen"
 }
 
+// noDeployRepos is the set of repos an operator has marked NOT-TO-BE-DELIVERED to prod
+// (DEVLAB_RUNS_NO_DEPLOY — comma/space/newline/semicolon separated bare repo names, case-insensitive).
+// A merged PR for such a repo triggers NO prod-deploy attempt at all, so a service deliberately not run
+// in prod never produces a failed attempt. This is RUNTIME config (an operator's decision), never a
+// repo-committed instance specific — keeping the repos instance-neutral.
+func noDeployRepos() map[string]bool {
+	out := map[string]bool{}
+	fields := strings.FieldsFunc(os.Getenv("DEVLAB_RUNS_NO_DEPLOY"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == ';'
+	})
+	for _, f := range fields {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" {
+			out[f] = true
+		}
+	}
+	return out
+}
+
+func isNoDeployRepo(name string) bool {
+	return noDeployRepos()[strings.ToLower(strings.TrimSpace(name))]
+}
+
+// shipToProd is the SINGLE gate deciding whether a merged PR's repo should be prod-deployed at all. Two
+// deliberate no-ship cases return ship=false with a human reason and are untracked WITHOUT an attempt,
+// so neither can produce a failed attempt:
+//   - the repo is explicitly not-to-be-delivered (DEVLAB_RUNS_NO_DEPLOY) — an operator's decision; or
+//   - the repo has no vetted deploy script (a library/template/data repo — nothing to ship).
+//
+// Otherwise ship=true and Maintain runs the deploy. Unifying both "don't ship" reasons behind one call
+// keeps a single access point for "is this repo prod-deployable" rather than two parallel checks.
+func (x *runExecutor) shipToProd(name string) (bool, string) {
+	if isNoDeployRepo(name) {
+		return false, "als nicht auszuliefern geführt (DEVLAB_RUNS_NO_DEPLOY) — " + name +
+			" wird bewusst nicht nach prod ausgeliefert"
+	}
+	if !x.deployable(name) {
+		return false, noDeployTargetReason(name)
+	}
+	return true, ""
+}
+
+const defaultMaxDeployAttempts = 3
+
+// maxDeployAttempts is how many consecutive PERMANENT prod-deploy failures a merged PR gets before it is
+// blocked — a small safety margin against a misclassified transient failure. Transient failures never
+// count toward it. DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS overrides; a non-positive value keeps the default.
+func maxDeployAttempts() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxDeployAttempts
+}
+
 // deliveryChain is the ordered pipeline executeRepo walks for a mode — the sequence whose order is
 // BINDING. A halt at a failed step records every LATER stage of this chain as not-executed, so a result
 // states plainly WHERE the chain stopped and that nothing past it was attempted.
@@ -1172,16 +1227,111 @@ var infraErrorMarkers = []string{
 // geklont werden kann" step: the runner distinguishes "the network is down" from "this repo is broken"
 // and reacts differently — the former is transient and retried, the latter is a real per-repo failure.
 func isInfraError(err error) bool {
-	if err == nil {
-		return false
-	}
-	m := strings.ToLower(err.Error())
-	for _, s := range infraErrorMarkers {
-		if strings.Contains(m, s) {
+	return err != nil && hasInfraMarker(err.Error())
+}
+
+// hasInfraMarker reports whether a message carries a connectivity-failure signature. Split out of
+// isInfraError so a deploy failure can be classified on the wrapper's combined OUTPUT (where the real
+// ssh/rsync cause lives) as well as on the Go error. Matched case-insensitively.
+func hasInfraMarker(s string) bool {
+	m := strings.ToLower(s)
+	for _, marker := range infraErrorMarkers {
+		if strings.Contains(m, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// ─── prod-deploy failure classification ─────────────────────────────────────
+//
+// A merged PR's prod-deploy can fail two very different ways, and Maintain must tell them apart: a
+// TRANSIENT connectivity failure (the VPS is briefly unreachable) will succeed on a later tick and is
+// retried; a PERMANENT failure (the service is not set up on the target, a missing unit, a bad config)
+// will fail identically forever and, after a few attempts, blocks. The real cause lives in the deploy
+// wrapper's combined OUTPUT, not in the Go exit-status error — so classification reads the output first.
+
+// deployTransient reports whether a failed prod-deploy is a transient connectivity failure (retry)
+// rather than a permanent one (eventually block). Reuses the sweep's infra-marker set against the
+// wrapper output and the Go error, so an ssh/rsync "connection refused" / "timed out" / "no route to
+// host" is retried while a missing-unit or bad-config failure is not.
+func deployTransient(out string, err error) bool {
+	return hasInfraMarker(out) || isInfraError(err)
+}
+
+// deploySetupMissingMarkers are substrings of a deploy's combined OUTPUT that mean the service is NOT
+// SET UP ON THE TARGET — no unit to (re)start, no vetted per-repo deploy script, missing prod config, or
+// an unknown repo on the receiver — as distinct from a generic build/argument failure. Matched
+// case-insensitively; used only to phrase the block reason, never to decide transient-vs-permanent.
+var deploySetupMissingMarkers = []string{
+	".service not found", // systemctl: the prod unit is not installed on the target
+	"unit not found",
+	"no such unit",
+	"no deploy script",  // wrapper exit 3: no vetted per-repo script on the runner host
+	"prod: missing",     // per-repo script exit 11: missing prod-target / deploy key config
+	"prod: empty target",
+	"no staged artifact", // receiver exit 3: nothing staged / no mapping for this repo on the target
+	"no mapping",
+	"unknown env",
+}
+
+// deploySetupMissing reports whether a permanent deploy failure specifically means "the service is not
+// set up on the target", so the block reason can NAME that cause rather than leave a bare exit code.
+func deploySetupMissing(out string) bool {
+	m := strings.ToLower(out)
+	for _, marker := range deploySetupMissingMarkers {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// deployBlockReason renders a human, service-and-target-naming reason for a blocked prod-deploy — never
+// a bare technical return value (requirement 2). When the output matches a "not set up on the target"
+// signature it says exactly that; otherwise it reports a durable delivery failure with the output tail.
+func deployBlockReason(service, out string, err error) string {
+	target := prodTargetName()
+	detail := lastMeaningfulLine(out, err)
+	if deploySetupMissing(out) {
+		return fmt.Sprintf("Dienst »%s« ist im Ziel »%s« nicht eingerichtet: %s", service, target, detail)
+	}
+	return fmt.Sprintf("Auslieferung von »%s« nach »%s« dauerhaft fehlgeschlagen: %s", service, target, detail)
+}
+
+// prodTargetName is the human name of the delivery target a block reason cites. The concrete host lives
+// server-side (/etc/devlab/prod-target) and is deliberately never exposed to the runner, so the target
+// is named by its ENVIRONMENT ("prod"); DEVLAB_RUNS_PROD_TARGET_NAME overrides for a friendlier label.
+func prodTargetName() string {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_TARGET_NAME")); v != "" {
+		return v
+	}
+	return "prod"
+}
+
+// lastMeaningfulLine pulls the most informative line out of a deploy's combined output for a block
+// reason — the last non-empty line (usually the concrete error), falling back to the Go error — clipped
+// so the reason stays one readable sentence rather than a wall of log.
+func lastMeaningfulLine(out string, err error) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			return clipLine(s)
+		}
+	}
+	if err != nil {
+		return clipLine(err.Error())
+	}
+	return "unbekannter Fehler"
+}
+
+func clipLine(s string) string {
+	const max = 240
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
 }
 
 // githubReachable probes GitHub's API (a cheap, unauthenticated-safe rate-limit GET) to decide whether
@@ -1647,6 +1797,13 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 	blocked := map[string]bool{} // repo → an older PR is still open, so no younger one may auto-merge
 
 	for _, p := range prs {
+		if p.Blocked {
+			// A blocked delivery waits for an EXPLICIT resume — never auto-fetched or retried. Skipping it
+			// here (before any GitHub read) is also what keeps one broken repo from holding up the others:
+			// every other tracked PR is reconciled as usual. Its PR is already merged, so it does not gate
+			// the creation-order queue of any still-open PR.
+			continue
+		}
 		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
 			blocked[p.Repo] = true // still open and unexamined → the queue behind it waits
 			continue               // report/pr: within window → not touched. full: throttled between rechecks.
@@ -1698,26 +1855,62 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
 			x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged) // the PR is merged; prod-deploy follows
-			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
-			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
-			if name := repoNameOf(p.Repo); !x.deployable(name) {
-				x.markDelivered(p, true, false) // merged; there is simply nothing to ship
-				_ = x.s.runPRs.Remove(p.Repo, p.Number)
-				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
-				continue
-			}
-			depLog, derr := x.runProdDeploy(ctx, token, p)
-			if derr != nil {
-				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
-				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
-			}
-			x.markDelivered(p, true, true)
-			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
-			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			x.deployMergedPR(ctx, token, p, now)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
 		}
 	}
+}
+
+// deployMergedPR ships one MERGED PR to prod (full mode) and reconciles the tracked record accordingly:
+//   - a repo that must NOT be shipped (not-to-be-delivered, or no deploy script) is untracked at once,
+//     WITHOUT a deploy attempt — so it can never produce a failed attempt;
+//   - a successful deploy untracks the PR (idempotent untrack-on-success, never a re-merge);
+//   - a TRANSIENT failure (VPS briefly unreachable) keeps it tracked to retry, and does NOT count
+//     toward the block — only genuine outages retry;
+//   - a PERMANENT failure counts one attempt and, once maxDeployAttempts is reached, BLOCKS the PR with
+//     a service-and-target-naming reason and a timestamp, so it stops retrying and waits for an explicit
+//     resume instead of failing identically forever (requirement 1). A blocked PR is skipped by Maintain
+//     before any GitHub read, so it never holds up the other repos (requirement 3).
+func (x *runExecutor) deployMergedPR(ctx context.Context, token string, p runs.PendingPR, now time.Time) {
+	name := repoNameOf(p.Repo)
+	if ship, why := x.shipToProd(name); !ship {
+		x.markDelivered(p, true, false) // merged; there is simply nothing to ship
+		_ = x.s.runPRs.Remove(p.Repo, p.Number)
+		log.Printf("devlabd: %s#%d gemerged — %s → untracked (kein Deploy-Versuch)", p.Repo, p.Number, why)
+		return
+	}
+	depLog, derr := x.runProdDeploy(ctx, token, p)
+	if derr == nil {
+		x.markDelivered(p, true, true)
+		_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+		log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+		return
+	}
+	if deployTransient(depLog, derr) {
+		log.Printf("devlabd: prod-deploy %s#%d transient failure (will retry): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
+		return // keep tracked; retry next eligible tick. Does not count toward the block.
+	}
+	// Permanent failure: count this attempt; block once the threshold is reached (unobservable transition
+	// via the pool's atomic Update — the WHEN-to-block decision stays here, outside the passive pool).
+	reason := deployBlockReason(name, depLog, derr)
+	limit := maxDeployAttempts()
+	var attempts int
+	blocked := false
+	_, _ = x.s.runPRs.Update(p.Repo, p.Number, func(pr *runs.PendingPR) {
+		pr.DeployAttempts++
+		attempts = pr.DeployAttempts
+		if pr.DeployAttempts >= limit {
+			pr.Blocked, pr.BlockedReason, pr.BlockedAt = true, reason, now
+			blocked = true
+		}
+	})
+	if blocked {
+		log.Printf("devlabd: prod-deploy %s#%d BLOCKED after %d attempt(s) — %s", p.Repo, p.Number, attempts, reason)
+		return
+	}
+	log.Printf("devlabd: prod-deploy %s#%d permanent failure %d/%d (retry, then block): %v\n%s",
+		p.Repo, p.Number, attempts, limit, derr, clip(depLog))
 }
 
 // markDelivered records on the run that its PR reached the next rung of the delivery ladder, so the
@@ -2096,4 +2289,87 @@ func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// blockedDeployView is the portioned shape the UI needs for a blocked delivery: enough to identify it
+// (repo, PR number + url, originating run), understand it (reason, attempts, since when) and act on it
+// (resume). Internal scheduling fields (MergeBy/LastChecked) are deliberately omitted.
+type blockedDeployView struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	URL       string    `json:"url"`
+	RunID     string    `json:"runId"`
+	Reason    string    `json:"reason"`
+	Attempts  int       `json:"attempts"`
+	BlockedAt time.Time `json:"blockedAt"`
+}
+
+// runDeploysBlocked lists the deliveries the scheduler has BLOCKED after repeated permanent prod-deploy
+// failures — the UI's window onto a stuck delivery (repo, reason, attempts) that today only the system
+// log reveals. Read-only; the empty list when nothing is blocked or the PR store is absent. The
+// blocked/not-blocked evaluation lives HERE, outside the passive PR pool.
+func (s *Server) runDeploysBlocked(w http.ResponseWriter, r *http.Request) {
+	out := []blockedDeployView{}
+	if s.runPRs != nil {
+		prs, err := s.runPRs.List()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "Auslieferungen konnten nicht gelesen werden")
+			return
+		}
+		for _, p := range prs {
+			if !p.Blocked {
+				continue
+			}
+			out = append(out, blockedDeployView{
+				Repo: p.Repo, Number: p.Number, URL: p.URL, RunID: p.RunID,
+				Reason: p.BlockedReason, Attempts: p.DeployAttempts, BlockedAt: p.BlockedAt,
+			})
+		}
+	}
+	// Freshest problem first, so the newest block is on top.
+	sort.Slice(out, func(i, j int) bool { return out[i].BlockedAt.After(out[j].BlockedAt) })
+	writeJSON(w, http.StatusOK, map[string]any{"blocked": out})
+}
+
+// runDeployResume clears the block on ONE delivery so the next Maintain tick retries its prod-deploy
+// from scratch (the attempt count is reset, giving it the full budget again). This is the explicit,
+// human-driven "Wiederaufnahme" a blocked delivery waits for. 404 when no such blocked delivery is
+// tracked (already resumed, merged, or never blocked).
+func (s *Server) runDeployResume(w http.ResponseWriter, r *http.Request) {
+	if s.runPRs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Auslieferungen-Store nicht verfügbar")
+		return
+	}
+	var body struct {
+		Repo   string `json:"repo"`
+		Number int    `json:"number"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Repo) == "" || body.Number <= 0 {
+		writeErr(w, http.StatusBadRequest, "repo und number sind erforderlich")
+		return
+	}
+	resumed := false
+	found, err := s.runPRs.Update(body.Repo, body.Number, func(p *runs.PendingPR) {
+		if !p.Blocked {
+			return
+		}
+		p.Blocked = false
+		p.BlockedReason = ""
+		p.BlockedAt = time.Time{}
+		p.DeployAttempts = 0 // fresh start — the full attempt budget again
+		resumed = true
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Wiederaufnahme fehlgeschlagen")
+		return
+	}
+	if !found || !resumed {
+		writeErr(w, http.StatusNotFound, "Keine blockierte Auslieferung für dieses Repository/PR")
+		return
+	}
+	log.Printf("devlabd: deploy %s#%d resumed by %s — retried on the next maintain tick", body.Repo, body.Number, actor(r))
+	writeJSON(w, http.StatusOK, map[string]bool{"resumed": true})
 }

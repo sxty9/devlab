@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -192,6 +192,11 @@ export interface DataSource {
   mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
+  /** Deliveries the scheduler has blocked after repeated permanent prod-deploy failures — polled so a
+   *  stuck delivery is visible in the UI (repo, reason, attempts), not only in the system log. */
+  mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;
+  /** Resume ONE blocked delivery: clear the block so the next maintain tick retries its prod-deploy. */
+  mercuryResumeDeploy(repo: string, number: number): Promise<{ resumed: boolean }>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */

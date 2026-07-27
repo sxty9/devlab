@@ -255,6 +255,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
+	// Blocked prod-deliveries: the ones the scheduler stopped auto-retrying after repeated permanent
+	// failures (read), and the explicit per-delivery resume that clears the block (CSRF).
+	mux.HandleFunc("GET /api/mercury/runs/deploys", s.guard(s.runDeploysBlocked))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -272,6 +275,7 @@ func (s *Server) Handler() http.Handler {
 	// Deliveries: roll back a shipped delivery (counter-booking), or reset a repo's dev branch to default.
 	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))
 	mux.HandleFunc("POST /api/mercury/runs/reset", s.guardCSRF(s.runRepoReset))
+	mux.HandleFunc("POST /api/mercury/runs/deploys/resume", s.guardCSRF(s.runDeployResume))
 
 	// ToDo media — images/documents attached to a concrete ToDo, materialized into the agent's
 	// workspace at run time so the AI considers them. Upload/remove mutate (CSRF); raw serves bytes.

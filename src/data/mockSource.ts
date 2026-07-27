@@ -21,6 +21,21 @@ function synthBefore(after: string): string {
 
 const data = (id: string): RepoData => REPO_DATA[id] ?? REPO_DATA[DEFAULT_REPO_ID];
 
+/** One illustrative blocked delivery so the blocked-deploys panel is visible in preview/mock mode. */
+const MOCK_BLOCKED_DEPLOYS = [
+  {
+    repo: 'holistic/scrapr',
+    number: 42,
+    url: '#',
+    runId: 'run_mock',
+    reason: 'Dienst »scrapr« ist im Ziel »prod« nicht eingerichtet: Failed to restart scrapr.service: Unit scrapr.service not found.',
+    attempts: 3,
+    blockedAt: new Date().toISOString(),
+  },
+];
+/** Resumed keys (`repo#number`) — the mock's tiny state so resume actually clears a blocked delivery. */
+const mockResumedDeploys = new Set<string>();
+
 /** The bundled mock data source — the permanent offline/dev fallback. */
 export const mockSource: DataSource = {
   async init() {
@@ -465,6 +480,15 @@ export const mockSource: DataSource = {
   },
   async mercuryCancelRun() {
     /* mock: no-op */
+  },
+  async mercuryBlockedDeploys() {
+    // One illustrative blocked delivery so the panel is visible in preview; resume clears it (below).
+    const blocked = MOCK_BLOCKED_DEPLOYS.filter((d) => !mockResumedDeploys.has(`${d.repo}#${d.number}`));
+    return { blocked };
+  },
+  async mercuryResumeDeploy(repo: string, number: number) {
+    mockResumedDeploys.add(`${repo}#${number}`);
+    return { resumed: true };
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {
     return [];
