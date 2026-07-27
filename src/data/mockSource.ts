@@ -318,7 +318,14 @@ export const mockSource: DataSource = {
     /* mock: no-op */
   },
   async mercuryRunHistory() {
-    return { snapshots: [] };
+    // A believable sample so the offline surface shows the authorship history: a recent change by the
+    // signed-in user, and an older one with no recorded actor ("?") — surfaced as unknown, not guessed.
+    return {
+      snapshots: [
+        { ts: new Date().toISOString(), action: 'update', actor: MOCK_ACTOR, runCount: 2 },
+        { ts: new Date(Date.now() - 864e5).toISOString(), action: 'create', actor: '?', runCount: 1 },
+      ],
+    };
   },
   async mercuryRestoreRunHistory(_ts: string) {
     /* mock: no-op */
