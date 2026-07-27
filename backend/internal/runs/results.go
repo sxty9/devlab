@@ -45,7 +45,13 @@ type Result struct {
 	// shows how each run was tuned. Empty on older results.
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
-	OK     bool   `json:"ok"`
+	// TimeBudget records which per-repo wall-clock budget was IN FORCE for this execution — the RESOLVED
+	// value (a run's own choice, or the service default it followed), not the run's raw field. "0" means
+	// the pass ran without a cap. Stamped when the execution is minted and re-stamped on resume, so the
+	// execution view can name the budget that applied (and, on a timeout, the value that was exceeded).
+	// Empty on results predating this field.
+	TimeBudget string `json:"timeBudget,omitempty"`
+	OK         bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`

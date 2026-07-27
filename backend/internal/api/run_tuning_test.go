@@ -7,38 +7,45 @@ import (
 	"devlab/backend/internal/runs"
 )
 
-// A run/todo may carry an optional model + effort; both are guarded and trimmed. Empty is always fine
-// (it selects the runner default), "ultracode" is accepted as the maximal effort tier, and anything
-// outside the ladder or an arg-smuggling model string is rejected.
+// A run/todo may carry an optional model + effort + time budget; all are guarded and trimmed. Empty is
+// always fine (it selects the runner/service default), "ultracode" is accepted as the maximal effort
+// tier, and anything outside the ladder or an arg-smuggling model string is rejected.
 func TestValidateTuning(t *testing.T) {
 	cases := []struct {
 		name       string
 		model      string
 		effort     string
+		budget     string
 		wantOK     bool
 		wantModel  string // trimmed value after a successful validate
 		wantEffort string
+		wantBudget string
 	}{
-		{name: "both empty", model: "", effort: "", wantOK: true},
+		{name: "all empty", model: "", effort: "", budget: "", wantOK: true},
 		{name: "alias model + max", model: "opus", effort: "max", wantOK: true, wantModel: "opus", wantEffort: "max"},
 		{name: "full id + ultracode", model: "claude-opus-4-8", effort: "ultracode", wantOK: true, wantModel: "claude-opus-4-8", wantEffort: "ultracode"},
 		{name: "fable id", model: "claude-fable-5", effort: "low", wantOK: true, wantModel: "claude-fable-5", wantEffort: "low"},
-		{name: "trims surrounding space", model: "  sonnet  ", effort: "  high  ", wantOK: true, wantModel: "sonnet", wantEffort: "high"},
+		{name: "trims surrounding space", model: "  sonnet  ", effort: "  high  ", budget: "  3h  ", wantOK: true, wantModel: "sonnet", wantEffort: "high", wantBudget: "3h"},
+		{name: "explicit no budget", budget: "0", wantOK: true, wantBudget: "0"},
+		{name: "duration budget", budget: "90m", wantOK: true, wantBudget: "90m"},
 		{name: "unknown effort", model: "opus", effort: "turbo", wantOK: false},
 		{name: "effort with spaces smuggled", model: "opus", effort: "max max", wantOK: false},
 		{name: "model with a flag", model: "opus --dangerously", effort: "", wantOK: false},
 		{name: "model with a slash", model: "../etc", effort: "", wantOK: false},
+		{name: "budget not a duration", budget: "soon", wantOK: false},
+		{name: "negative budget", budget: "-1h", wantOK: false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			b := &runBody{Model: c.model, Effort: c.effort}
+			b := &runBody{Model: c.model, Effort: c.effort, TimeBudget: c.budget}
 			code, _ := validateTuning(b)
 			if (code == 0) != c.wantOK {
-				t.Fatalf("validateTuning(model=%q effort=%q) code=%d, wantOK=%v", c.model, c.effort, code, c.wantOK)
+				t.Fatalf("validateTuning(model=%q effort=%q budget=%q) code=%d, wantOK=%v", c.model, c.effort, c.budget, code, c.wantOK)
 			}
 			if c.wantOK {
-				if b.Model != c.wantModel || b.Effort != c.wantEffort {
-					t.Fatalf("after validate: model=%q effort=%q, want model=%q effort=%q", b.Model, b.Effort, c.wantModel, c.wantEffort)
+				if b.Model != c.wantModel || b.Effort != c.wantEffort || b.TimeBudget != c.wantBudget {
+					t.Fatalf("after validate: model=%q effort=%q budget=%q, want model=%q effort=%q budget=%q",
+						b.Model, b.Effort, b.TimeBudget, c.wantModel, c.wantEffort, c.wantBudget)
 				}
 			}
 		})

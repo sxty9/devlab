@@ -63,6 +63,17 @@ type Run struct {
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
 
+	// TimeBudget is the wall-clock cap for ONE repo's agent pass — the third tuning option beside Model
+	// and Effort, shared by auto and todo. It is a Go duration string ("90m", "3h"). Three states, so the
+	// service default can change without rewriting every run:
+	//   "" (empty)  — no own choice: the run FOLLOWS the service default (Settings.DefaultTimeBudget),
+	//                 tracking it even when it is later changed. This is NOT a stored copy of the default.
+	//   "0"         — an explicit choice to run WITHOUT a cap: only the whole-sweep duration then bounds
+	//                 the pass. A deliberate value (see the axiom-level "no budget is valid"), not an error.
+	//   "3h", "90m" — an explicit budget that overrides the default and is shown as a deviation.
+	// The executor resolves it per fire (repoBudget), so it references the live default rather than a copy.
+	TimeBudget string `json:"timeBudget,omitempty"`
+
 	// auto only
 	Schedule Schedule `json:"schedule"`
 	AxiomIDs []string `json:"axiomIds"`
