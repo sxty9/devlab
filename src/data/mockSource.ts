@@ -428,7 +428,7 @@ export const mockSource: DataSource = {
   async mercuryRunActive() {
     // The mock has no executor, so nothing is ever genuinely in flight — an empty list is the honest
     // answer (the "Aktive Läufe" overview simply stays quiet in offline/preview mode).
-    return { active: [], inflight: [] };
+    return { active: [], inflight: [], restartPending: false };
   },
   async mercuryCancelRun(_runId: string) {
     /* mock: no-op */

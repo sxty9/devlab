@@ -91,11 +91,14 @@ export default function RunsView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
+  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
+  // live-follow view — survive a page reload instead of living only in this component. The global cancel
+  // shows whenever a run is live.
 
   // The runs executing right now are SERVER truth (via useActiveRun), so the active-runs overview — and
   // the live-follow views — survive a page reload instead of living only in this component. Runs are
   // concurrent, so this is a list; cancel targets one specific run by id.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
+  const { active, inflight, restartPending, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
@@ -283,6 +286,7 @@ export default function RunsView() {
         run={selectedRun}
         axioms={list.axioms}
         active={active.find((a) => a.runId === selectedRun.id) ?? null}
+        restartPending={restartPending}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -453,6 +457,7 @@ function RunDetail({
   run,
   axioms,
   active,
+  restartPending,
   onEdit,
   onDeleted,
   onRunStarted,
@@ -460,6 +465,7 @@ function RunDetail({
   run: Run;
   axioms: Record<string, string>;
   active: RunActive | null;
+  restartPending: boolean;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRunStarted: () => void;
@@ -535,8 +541,13 @@ function RunDetail({
     if (runningNow) return;
     setRunningNow(true);
     try {
-      await source.mercuryRunNow(run.id);
-      toast({ title: 'Lauf gestartet', variant: 'success' });
+      const r = await source.mercuryRunNow(run.id);
+      if (r.queued) {
+        // A restart is draining: the run was not started now but will start by itself afterwards.
+        toast({ title: 'Neustart läuft', description: r.message ?? 'Der Lauf wurde eingereiht und startet nach dem Neustart automatisch.', variant: 'default' });
+      } else {
+        toast({ title: 'Lauf gestartet', variant: 'success' });
+      }
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
@@ -588,6 +599,10 @@ function RunDetail({
             {[run.model, run.effort].filter(Boolean).join(' · ')}
           </span>
         )}
+        {restartPending && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">Neustart läuft</span>
+        )}
+        {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
 

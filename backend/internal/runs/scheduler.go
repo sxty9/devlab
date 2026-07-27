@@ -78,6 +78,10 @@ type Scheduler struct {
 	active        map[string]*activeRun
 	claimedRepos  map[string]bool
 	exclusiveHeld bool
+	// A restart was announced: admit nothing further so the floor drains, instead of a new run starting
+	// into the restart and being killed seconds later. Cleared implicitly — a new process starts clean.
+	restartRequested bool
+	restartAt        time.Time
 }
 
 // NewScheduler builds a scheduler. tick defaults to 30s.
@@ -167,6 +171,17 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, r := range all {
+		// A run queued behind a restart starts here, on the first tick of the new process — that is how
+		// the promise "it starts afterwards" is kept, without anyone re-triggering it. Its schedule is not
+		// advanced: the start was asked for out of band.
+		if r.StartPending {
+			s.queueClear(r.ID)
+			if r.Enabled {
+				s.logf("devlabd: run %s war vor dem Neustart eingereiht — wird jetzt gestartet", r.ID)
+				s.tryStart(ctx, r, "scheduler", false)
+			}
+			continue
+		}
 		if !r.Enabled || !isDue(r, now) {
 			continue
 		}
@@ -178,13 +193,78 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 // the HTTP handler returns at once. Returns false if the run cannot start right now — already running,
 // the concurrency cap is reached, an exclusive run holds the floor, or one of its target repos is busy.
 // A manual run does NOT advance the schedule (it is out of band).
-func (s *Scheduler) FireNow(id, actor string) bool {
+func (s *Scheduler) FireNow(id, actor string) StartOutcome {
 	run, ok, err := s.store.Get(id)
 	if err != nil || !ok || !run.Enabled {
-		return false
+		return StartBusy
+	}
+	// A restart is draining: starting now would mean being killed seconds later. Queue the run instead —
+	// it starts by itself once the new process comes up, so the request is never silently dropped.
+	if s.RestartPending() {
+		s.queueStart(id)
+		return StartDeferred
 	}
 	// Detached from any request context so the run outlives the HTTP handler.
-	return s.tryStart(context.Background(), run, actor, false)
+	if s.tryStart(context.Background(), run, actor, false) {
+		return StartFired
+	}
+	return StartBusy
+}
+
+// StartOutcome is what asking for a run to start actually did — started, queued behind an imminent
+// restart, or refused because the floor is full. Three answers, because "false" cannot distinguish
+// "try again later" from "it will start on its own".
+type StartOutcome int
+
+const (
+	StartBusy     StartOutcome = iota // no capacity (cap reached, repo claimed, exclusive run holding)
+	StartFired                        // running now
+	StartDeferred                     // queued: a restart is draining, it starts after it
+)
+
+// queueStart marks the run as waiting for the restart, on the run itself — so the promise "it starts
+// afterwards" survives the process that made it.
+func (s *Scheduler) queueStart(id string) {
+	_, _ = s.store.Patch(func(cur []Run) ([]Run, error) {
+		for i := range cur {
+			if cur[i].ID == id {
+				cur[i].StartPending = true
+			}
+		}
+		return cur, nil
+	})
+}
+
+// drainQueued starts everything queued before the restart and clears the flag. Called once at start-up —
+// the moment the promise is kept.
+func (s *Scheduler) drainQueued(ctx context.Context) {
+	all, err := s.store.List()
+	if err != nil {
+		return
+	}
+	for _, r := range all {
+		if !r.StartPending {
+			continue
+		}
+		s.queueClear(r.ID)
+		if !r.Enabled {
+			continue
+		}
+		s.logf("devlabd: run %s war vor dem Neustart eingereiht — wird jetzt gestartet", r.ID)
+		s.tryStart(ctx, r, "scheduler", false)
+	}
+}
+
+// queueClear removes the pending mark, so a queued start can never fire twice.
+func (s *Scheduler) queueClear(id string) {
+	_, _ = s.store.Patch(func(cur []Run) ([]Run, error) {
+		for i := range cur {
+			if cur[i].ID == id {
+				cur[i].StartPending = false
+			}
+		}
+		return cur, nil
+	})
 }
 
 // tryStart admits a run under the concurrency + exclusivity rules and, if admitted, launches it in its
@@ -215,6 +295,9 @@ func (s *Scheduler) tryStart(parent context.Context, r Run, actor string, advanc
 func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.restartRequested {
+		return false // a restart is imminent: admit nothing, let the floor drain
+	}
 	if _, ok := s.active[r.ID]; ok {
 		return false // already running — never double-start the same run
 	}
@@ -460,7 +543,6 @@ func (s *Scheduler) writeMarkerLocked() {
 	}
 }
 
-
 // triggerFor turns the scheduler's own knowledge of a firing into the authorship stamp: a scheduled
 // firing is autonomous, a manual one carries the person who asked for it.
 func triggerFor(actor string, scheduled bool) Trigger {
@@ -468,4 +550,70 @@ func triggerFor(actor string, scheduled bool) Trigger {
 		return Trigger{Auto: true}
 	}
 	return Trigger{By: actor}
+}
+
+// RequestRestart announces an imminent restart: from this moment no further run is admitted, so the
+// floor drains instead of a new run starting into the restart. It returns the id of a run still
+// executing, or "" when it is safe to restart right now. Idempotent.
+func (s *Scheduler) RequestRestart() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.restartRequested {
+		s.restartRequested = true
+		s.restartAt = time.Now()
+	}
+	for id := range s.active {
+		return id
+	}
+	return ""
+}
+
+// RestartPending reports whether a restart was announced and the floor is still draining.
+func (s *Scheduler) RestartPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restartRequested
+}
+
+// Reconcile is the start-up self-heal: an execution that a crash or restart interrupted is unfinished on
+// disk, and nothing would ever pick it up again on its own. Re-firing its run resumes that same
+// execution (the executor skips the repos already done), so interrupted work continues instead of
+// sitting there forever — and never as a second, duplicating execution.
+func (s *Scheduler) Reconcile(results *Results, window time.Duration) {
+	if results == nil {
+		return
+	}
+	all, err := s.store.List()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-window)
+	for _, r := range all {
+		if !r.Enabled || r.Suspended != nil {
+			continue // suspended runs resume on their own schedule
+		}
+		if _, ok := results.FindResumable(r.ID, cutoff); !ok {
+			continue
+		}
+		s.logf("devlabd: run %s hat eine unvollständige Ausführung — wird fortgesetzt", r.ID)
+		s.queueStart(r.ID)
+	}
+}
+
+// AwaitDrain waits for the in-flight runs to finish, bounded by ctx. Returns true when the floor is
+// empty, false when the grace elapsed first — a restart is never blocked indefinitely, and a run that
+// outlasts it is carried over rather than killed. Call RequestRestart first: this only waits.
+func (s *Scheduler) AwaitDrain(ctx context.Context) bool {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for {
+		if s.ActiveCount() == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return s.ActiveCount() == 0
+		case <-t.C:
+		}
+	}
 }

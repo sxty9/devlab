@@ -67,6 +67,12 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	// Graceful restart: a `systemctl restart` (SIGTERM) is the restart signal. Gate new runs and let any
+	// in-flight run drain (bounded) BEFORE tearing anything down — so the restart never kills a run that
+	// just started, and no new run can begin once the restart is imminent. The HTTP server stays up
+	// through the drain so a trigger arriving meanwhile is queued (and told so), not refused silently.
+	// Only then cancel the scheduler and shut the server.
+	server.DrainForRestart()
 	schedCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

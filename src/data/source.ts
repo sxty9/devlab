@@ -186,11 +186,11 @@ export interface DataSource {
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if it cannot start
    *  right now (concurrency cap reached, an exclusive auto run holds the floor, or a target repo busy). */
-  mercuryRunNow(id: string): Promise<{ started: boolean }>;
+  mercuryRunNow(id: string): Promise<{ started: boolean; queued?: boolean; message?: string }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
    *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
    *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[] }>;
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[]; restartPending?: boolean }>;
   /** Abort ONE specific run in progress by id (kill-switch); the others keep running. */
   mercuryCancelRun(runId: string): Promise<void>;
 

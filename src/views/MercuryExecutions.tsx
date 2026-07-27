@@ -806,10 +806,11 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; restartPending: boolean; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
   const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
+  const [restartPending, setRestartPending] = useState(false);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -821,6 +822,7 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
         if (!cancelled) {
           setActive(r.active);
           setInflight(r.inflight ?? []);
+          setRestartPending(!!r.restartPending);
         }
       } catch {
         /* transient — keep the last known state */
@@ -837,7 +839,7 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
     };
   }, [source, bump]);
 
-  return { active, inflight, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, inflight, restartPending, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
 
 /** Poll a run's result document, following it live while `live` (every 2s); once it settles it fetches

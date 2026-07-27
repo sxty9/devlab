@@ -107,6 +107,7 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
 | `DEVLAB_RUNS_DEV_BRANCH` | `mercury-dev` | Name des **persistenten dev-Integrationsbranches** je Repo, den der Runner wachsen lässt und den der dev-Deploy ausliefert. Nie der Standard-Branch (aus dem prod bei Merge beliefert wird). |
+| `DEVLAB_RUNS_DRAIN_GRACE` | `30s` | Beim Neustart (`systemctl restart` → SIGTERM) wartet devlabd so lange auf das Auslaufen des aktiven Laufs, bevor es diesen für den Carry-over abbricht. Neue Läufe werden ab der Neustart-Anforderung **gar nicht mehr** gestartet (sie werden eingereiht), unabhängig von diesem Wert. Sollte innerhalb von `TimeoutStopSec` (siehe `devlabd.service`, `120s`) liegen. |
 
 ### Wachsender dev-Stand statt Zusammensetzen
 

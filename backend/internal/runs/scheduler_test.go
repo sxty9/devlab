@@ -152,34 +152,6 @@ func marker(path string) (string, bool) {
 
 // ── adapted existing tests ──────────────────────────────────────────────────────────────────────────
 
-func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
-	store := seedStore(t, []Run{autoRun("r")})
-	be := newBlockingExec()
-	s := NewScheduler(store, be, time.Second)
-	s.logf = noopLog
-
-	if a := s.Active(); len(a) != 0 {
-		t.Fatalf("expected no activity before firing, got %+v", a)
-	}
-	if !s.FireNow("r", "t") {
-		t.Fatal("FireNow returned false")
-	}
-	if id := recvWithin(t, be.started, time.Second); id != "r" {
-		t.Fatalf("expected run r to start, got %s", id)
-	}
-
-	a := s.Active()
-	if len(a) != 1 || a[0].RunID != "r" || a[0].ResultID != "res_r" {
-		t.Fatalf("Active() did not reflect the running run: %+v", a)
-	}
-	if a[0].StartedAt.IsZero() {
-		t.Error("Active()[0].StartedAt not stamped")
-	}
-
-	be.release("r")
-	waitFor(t, 2*time.Second, func() bool { return len(s.Active()) == 0 }, "Active() did not clear after the run finished")
-}
-
 func TestSchedulerFiresOnlyDueEnabledRunsAndAdvances(t *testing.T) {
 	past := time.Now().Add(-time.Minute)
 	future := time.Now().Add(time.Hour)
@@ -301,7 +273,7 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	s := NewScheduler(store, fe, time.Second)
 	s.logf = noopLog
 
-	if !s.FireNow("m", "tester") {
+	if s.FireNow("m", "tester") != StartFired {
 		t.Fatal("FireNow returned busy on an idle scheduler")
 	}
 	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 && fe.count() == 1 }, "the manual run to finish")

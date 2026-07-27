@@ -59,6 +59,12 @@ const (
 	// defaultMaxRunDuration caps an entire sweep's wall-clock. Belt-and-braces beside the per-repo
 	// runAgentTimeout: even 19 repos each just under 60m would otherwise run ~19h. 0 via env = off.
 	defaultMaxRunDuration = 4 * time.Hour
+
+	// defaultDrainGrace bounds how long a restart waits for the in-flight run to finish before forcing
+	// it to carry over. Kept short: a run seconds from done finishes cleanly; a long one carries over
+	// and self-heals on the next start — so a restart is never blocked for long, and a hanging run can
+	// never prevent it. Should stay within systemd's TimeoutStopSec (see deploy/devlabd.service).
+	defaultDrainGrace = 30 * time.Second
 )
 
 // agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
@@ -119,6 +125,17 @@ func resumeEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_LIMIT_RESUME")), "off")
 }
 
+// drainGrace reads the restart drain budget from the environment. DEVLAB_RUNS_DRAIN_GRACE overrides;
+// 0/invalid keeps the default.
+func drainGrace() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DRAIN_GRACE")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultDrainGrace
+}
+
 // StartScheduler arms the run scheduler iff configured. Absent config → it logs and stays dormant
 // (the management layer keeps working). Wired from main() with a cancelable context.
 func (s *Server) StartScheduler(ctx context.Context) {
@@ -164,9 +181,28 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
-	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
-		mode, user, tokenUser, autoMerge, tick)
+	// Startup self-heal: before the ticker runs, re-queue any execution a prior restart/crash interrupted
+	// so it resumes by itself (skipping the repos already done) — no one has to re-trigger it.
+	s.scheduler.Reconcile(s.runResults, strandedWindow)
+	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s drainGrace=%s",
+		mode, user, tokenUser, autoMerge, tick, drainGrace())
 	go s.scheduler.Run(ctx)
+}
+
+// DrainForRestart is the graceful-restart hook wired from main() on SIGTERM: it gates new runs and waits
+// (bounded by the drain grace) for any in-flight run to finish before the process exits. Together with
+// the scheduler's admission gate this makes "a restart proceeds" and "a run begins" mutually exclusive —
+// a restart never kills a run mid-flight, and no run can start once the restart is imminent. A run that
+// outlasts the grace is carried over (it self-heals on the next start), so a restart is never blocked
+// indefinitely. No-op when the scheduler is not armed.
+func (s *Server) DrainForRestart() {
+	if s.scheduler == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drainGrace())
+	defer cancel()
+	s.scheduler.RequestRestart()
+	s.scheduler.AwaitDrain(ctx)
 }
 
 // runExecutor implements runs.Executor: the per-repo pipeline + auto-merge maintenance.
@@ -1977,11 +2013,20 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	if !s.scheduler.FireNow(id, actor(r)) {
+	switch s.scheduler.FireNow(id, actor(r)) {
+	case runs.StartFired:
+		writeJSON(w, http.StatusOK, map[string]bool{"started": true})
+	case runs.StartDeferred:
+		// A restart is draining: the run is NOT started now (nothing may begin once a restart is
+		// imminent) but was queued and starts by itself after the restart. Report it (202) so the
+		// trigger learns a restart is under way — never a silent drop.
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"started": false, "queued": true,
+			"message": "Ein Neustart läuft — der Lauf wurde eingereiht und startet nach dem Neustart automatisch",
+		})
+	default: // runs.StartBusy
 		writeErr(w, http.StatusConflict, "Kann gerade nicht starten — Auslastung erreicht oder ein Ziel-Repository ist belegt; bitte warten")
-		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
 // runActive reports the run executing in THIS process right now — its id, the live result id (once the
@@ -2002,10 +2047,16 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // Cheap (no scheme scan), so it is safe to poll frequently.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
 	active := []runs.Activity{}
+	restartPending := false
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
+		restartPending = s.scheduler.RestartPending() // so the UI (and a would-be trigger) sees a restart is under way
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":         active,
+		"inflight":       s.assembleInFlight(active),
+		"restartPending": restartPending, // so the UI (and a would-be trigger) sees a restart is under way
+	})
 }
 
 // inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,

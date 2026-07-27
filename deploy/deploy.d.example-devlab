@@ -70,6 +70,10 @@ case "$ENVN" in
       systemctl restart devlabd
     fi
     defer_restart_until_idle   # hold off while Mercury runs are in flight (deferred restart)
+    # SIGTERM is the restart signal: devlabd gates new Mercury runs and drains the in-flight one before
+    # exiting (bounded by DEVLAB_RUNS_DRAIN_GRACE, within TimeoutStopSec), so this restart never kills a
+    # run mid-flight and no run can start once the restart is imminent. An interrupted run self-heals on
+    # boot. No wait/marker needed here — the mutual exclusion lives in devlabd, not this script.
     systemctl restart devlabd
     echo "[deploy devlab] dev: done"
     ;;
