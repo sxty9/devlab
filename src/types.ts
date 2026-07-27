@@ -522,15 +522,23 @@ export interface RunResultRef {
   prUrl?: string;
   merged?: boolean;
   prodDeployed?: boolean;
+  /** The execution paused on the Claude usage limit and is waiting to resume (mirrors runs.ResultRef).
+   *  It is the FURTHEST rung — a paused run reads as "pausiert", never as failed. */
+  suspended?: boolean;
+  /** When the paused execution will resume, if known. */
+  resumeAt?: string;
 }
 
 /** The delivery ladder, mirroring runs.Stage on the server: the furthest rung actually reached.
  *  Deliberately NOT a green "Erledigt" — a run whose PR is still open has delivered nothing yet. */
 export type RunStage = 'failed' | 'suspended' | 'implemented' | 'dev-deployed' | 'pr-open' | 'merged' | 'prod-deployed';
 
-/** Derives the stage from a result reference (most-advanced rung first). */
+/** Derives the stage from a result reference (most-advanced rung first). Suspension wins over every other
+ *  rung — exactly as runs.ResultRef.Stage() orders it — so a run paused on the usage limit reads honestly
+ *  as "pausiert" instead of "fehlgeschlagen". */
 export function runStage(ref: RunResultRef | null | undefined): RunStage | null {
   if (!ref) return null;
+  if (ref.suspended) return 'suspended';
   if (ref.prodDeployed) return 'prod-deployed';
   if (ref.merged) return 'merged';
   if (!ref.ok) return 'failed';
@@ -608,6 +616,33 @@ export interface Delivery {
   revertedAt?: string;
   revertedBy?: string;
   revertOf?: string;
+}
+
+/** The outcome of rolling back a delivery (counter-booking). Mirrors api.RollbackOutcome. A rollback
+ *  never destroys the original delivery: it either counter-books it (a new reversing commit on dev, plus
+ *  a stacked reversing PR when the original was already merged), closes its still-open PR, is a no-op
+ *  because the effect was already gone, or — when later work built on it — raises a concrete ToDo to
+ *  unpick it by hand instead of guessing at a mangled revert. */
+export interface RollbackOutcome {
+  deliveryId: string;
+  reverted: boolean;
+  /** The delivery had already been rolled back — nothing to do. */
+  alreadyReverted?: boolean;
+  /** Later deliveries build on this one, so a clean revert is impossible; a ToDo was raised instead. */
+  conflict?: boolean;
+  /** The delivery's effect was already absent from dev (an idempotent no-op). */
+  noChange?: boolean;
+  /** The concrete ToDo raised to counter-book by hand (only on `conflict`). */
+  todoId?: string;
+  /** How many later open deliveries sit on this one (only on `conflict`). */
+  laterOpen?: number;
+  /** The still-open PR that was closed with a justification, if any. */
+  closedPr?: number;
+  /** The reversing PR opened for an already-merged delivery, if any. */
+  reversalPrUrl?: string;
+  reversalDeliveryId?: string;
+  /** dev was re-deployed after the counter-booking. */
+  deployed?: boolean;
 }
 
 export interface RunResult {

@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, Delivery, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RollbackOutcome, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -192,6 +192,22 @@ export interface DataSource {
   mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
+
+  // ── Deliveries (the addressable record of what each run shipped per repo) ───
+  /** The delivery ledger — every addressable unit of work a run shipped to a repo (commit range +
+   *  stacked PR + status), newest first. `repo` (owner/name) narrows to one repository; omitted = all.
+   *  This is the readable state behind "which deliveries exist per repo and how far each got". */
+  mercuryDeliveries(repo?: string): Promise<{ deliveries: Delivery[] }>;
+  /** Roll back one delivery by counter-booking it (a reversing commit on dev; a stacked reversing PR
+   *  when it was already merged; the still-open PR closed otherwise). Reversible and non-destructive —
+   *  the original delivery is kept and only marked reverted. When later work built on the delivery a
+   *  clean revert is impossible, so a concrete ToDo is raised instead (see `conflict` in the outcome).
+   *  503 if the executor is unconfigured, 404 for an unknown delivery. */
+  mercuryRollbackDelivery(id: string): Promise<RollbackOutcome>;
+  /** Reset a repository's dev branch back to its default branch — the explicit way back. Force-publishes
+   *  dev and re-delivers it; every Mercury delivery not yet merged is dropped from dev (they stay on their
+   *  own branches/PRs and can be re-run). 503 if the executor is unconfigured. */
+  mercuryResetRepo(repo: string): Promise<{ ok: boolean; log: string }>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */

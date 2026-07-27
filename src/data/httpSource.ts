@@ -313,6 +313,16 @@ export const httpSource: DataSource = {
   async mercuryCancelRun() {
     await json<void>(await post('/api/mercury/runs/cancel', {}));
   },
+  async mercuryDeliveries(repo) {
+    const q = repo ? `?repo=${encodeURIComponent(repo)}` : '';
+    return json(await request(`/api/mercury/runs/deliveries${q}`));
+  },
+  async mercuryRollbackDelivery(id) {
+    return json(await post(`/api/mercury/runs/deliveries/${enc(id)}/rollback`, {}));
+  },
+  async mercuryResetRepo(repo) {
+    return json(await post('/api/mercury/runs/reset', { repo }));
+  },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(
       await post(`/api/mercury/runs/${enc(id)}/attachments`, { filename, contentB64 }),

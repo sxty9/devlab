@@ -1,4 +1,4 @@
-import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, Delivery, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -20,6 +20,25 @@ function synthBefore(after: string): string {
 }
 
 const data = (id: string): RepoData => REPO_DATA[id] ?? REPO_DATA[DEFAULT_REPO_ID];
+
+/** A believable delivery ledger for offline/preview mode: two repos with a spread of stages (merged,
+ *  open, reverted) so the Lieferungen surface and its rollback / dev-reset actions can be exercised
+ *  without a backend. Mutable so a mock rollback visibly flips a delivery's status within the session. */
+const mockDeliveries: Delivery[] = (() => {
+  const repoA = REPOS[0]?.fullName ?? 'sxty9/devlab';
+  const repoB = REPOS[1]?.fullName ?? 'sxty9/holistic';
+  const ago = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+  const d = (o: Partial<Delivery> & Pick<Delivery, 'id' | 'repo' | 'status' | 'createdAt'>): Delivery => ({
+    runId: 'run_auto_demo', resultId: 'res_demo', runName: 'Nightly axiom sweep',
+    branch: `mercury-run/run_auto_demo/${o.id}`, devBranch: 'mercury-dev', baseBranch: 'main',
+    fromCommit: 'a1b2c3d4e5f6', toCommit: 'f6e5d4c3b2a1', ...o,
+  });
+  return [
+    d({ id: 'dlv_mock1', repo: repoA, status: 'merged', createdAt: ago(72), prNumber: 128, prUrl: `https://github.com/${repoA}/pull/128` }),
+    d({ id: 'dlv_mock2', repo: repoA, status: 'open', createdAt: ago(20), prNumber: 131, prUrl: `https://github.com/${repoA}/pull/131`, baseBranch: 'mercury-run/run_auto_demo/dlv_mock1' }),
+    d({ id: 'dlv_mock3', repo: repoB, status: 'open', runId: 'run_todo_demo', runName: 'ToDo: Kalender-Union', createdAt: ago(6), prNumber: 74, prUrl: `https://github.com/${repoB}/pull/74` }),
+  ];
+})();
 
 /** The bundled mock data source — the permanent offline/dev fallback. */
 export const mockSource: DataSource = {
@@ -465,6 +484,31 @@ export const mockSource: DataSource = {
   },
   async mercuryCancelRun() {
     /* mock: no-op */
+  },
+  async mercuryDeliveries(repo?: string) {
+    const list = repo ? mockDeliveries.filter((d) => d.repo === repo) : mockDeliveries;
+    // Newest first, matching the backend's display order.
+    return { deliveries: [...list].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)) };
+  },
+  async mercuryRollbackDelivery(id: string) {
+    const d = mockDeliveries.find((x) => x.id === id);
+    if (!d) return { deliveryId: id, reverted: false };
+    if (d.status === 'reverted') return { deliveryId: id, reverted: false, alreadyReverted: true };
+    const wasMerged = d.status === 'merged';
+    d.status = 'reverted';
+    d.revertedAt = new Date().toISOString();
+    d.revertedBy = 'dev';
+    // A merged delivery gets a stacked reversing PR; an open one has its PR closed.
+    return wasMerged
+      ? { deliveryId: id, reverted: true, reversalPrUrl: `${d.prUrl}#revert`, reversalDeliveryId: `dlv_rev_${id.replace('dlv_', '')}`, deployed: true }
+      : { deliveryId: id, reverted: true, closedPr: d.prNumber, deployed: true };
+  },
+  async mercuryResetRepo(repo: string) {
+    // Drop every not-yet-merged Mercury delivery from dev, mirroring the real reset.
+    for (const d of mockDeliveries) {
+      if (d.repo === repo && d.status === 'open') d.status = 'closed';
+    }
+    return { ok: true, log: `dev branch mercury-dev reset to main\n(mock) dev re-deployed for ${repo}` };
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {
     return [];
