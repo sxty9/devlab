@@ -668,7 +668,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// non-fatal: the state simply keeps going without the very newest default until a run resolves it.
 	if err := ex.FoldInBranch(ctx, wt, branch); err != nil {
 		if errors.Is(err, workspace.ErrMergeConflict) {
-			step("fold", "Standard-Branch "+branch+" nicht konfliktfrei einfaltbar — dev-Stand ohne die neuesten "+branch+"-Änderungen fortgeführt", runs.StepFailed)
+			step("fold", "Standard-Branch "+branch+" nicht konfliktfrei einfaltbar — dev-Stand ohne die neuesten "+branch+"-Änderungen fortgeführt", runs.StepNotApplicable)
 		} else {
 			rr.Error = "Standard-Branch einfalten: " + err.Error()
 			return rr, repoSignal{}
@@ -709,7 +709,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		if tip, e := ex.RevParse(ctx, wt, "HEAD"); e == nil {
 			rr.DevCommit = tip
 		}
-		rr.OK = true
+		rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
 		return rr, repoSignal{}
 	}
 
@@ -720,6 +720,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 	if err != nil {
 		rr.Error = "implement: " + err.Error()
+		recordNotExecuted(&rr, x.mode, "implement", saver)
 		return rr, repoSignal{}
 	}
 	applyUsage(&rr, final) // the agent's report already streamed into the implement step
@@ -761,7 +762,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	if !devAdvanced {
 		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", runs.StepOK)
-		rr.OK = true
+		rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
 		return rr, repoSignal{}
 	}
 
@@ -770,25 +771,32 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// already IS the source record. PROD is untouched here — it ships only from a MERGED default branch
 	// (Maintain, req 6).
 	//
-	// Finding C: the build runs UNPRIVILEGED here; the root wrapper only installs+restarts. Finding B: the
-	// self repo is NEVER dev-deployed (restarting THIS devlabd would kill the running sweep). A dev-deploy
-	// failure is NON-fatal. A skip that is expected (self repo, switched off, no deploy target) is a
-	// SUCCESSFUL step carrying its reason; only a real build/install failure is red.
+	// Finding C: the build runs UNPRIVILEGED here; the root wrapper only installs+restarts. The two outcomes
+	// are split honestly: a dev-deploy that does NOT APPLY (switched off, or no vetted deploy target for
+	// this repo) is recorded as not-applicable and the chain CONTINUES — it is never a green success. A
+	// dev-deploy that genuinely FAILS (build or install) HALTS the chain: push and PR are marked
+	// not-executed and no PR is opened, so a delivery never sits on top of code that does not run on dev.
 	switch {
 	case x.mode != "full":
 		// report/pr never deploy at all — no step, as before.
 	case !x.shouldDevDeploy(repo.ID):
-		step("dev-deploy", devDeploySkipReason(repo.ID), runs.StepOK)
+		step("dev-deploy", devDeploySkipReason(repo.ID), runs.StepNotApplicable)
 	case !x.deployable(repo.Name):
-		step("dev-deploy", noDeployTargetReason(repo.Name), runs.StepOK)
+		step("dev-deploy", noDeployTargetReason(repo.Name), runs.StepNotApplicable)
 	default:
 		// No folding of open PRs any more: the dev branch IS the accumulated state, so what is built here
 		// is by construction the sum of everything delivered so far. Assembling a state per deploy — the
 		// old approach — is what let features disappear whenever one PR did not merge cleanly.
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
-			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), runs.StepFailed)
+			step("dev-deploy", "Build fehlgeschlagen: "+berr.Error(), runs.StepFailed)
+			rr.Error = "dev-deploy (Build): " + berr.Error()
+			recordNotExecuted(&rr, x.mode, "dev-deploy", saver)
+			return rr, repoSignal{}
 		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
 			step("dev-deploy", depLog+"\n"+derr.Error(), runs.StepFailed)
+			rr.Error = "dev-deploy: " + derr.Error()
+			recordNotExecuted(&rr, x.mode, "dev-deploy", saver)
+			return rr, repoSignal{}
 		} else {
 			step("dev-deploy", depLog+"\nAusgelieferter Stand: "+devBranch+"@"+short(finalTip), runs.StepOK)
 			rr.Deployed = true
@@ -812,7 +820,9 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		pushRefs = append(pushRefs, deliveryBranch)
 	}
 	if _, err := ex.PushRefs(ctx, wt, token, false, pushRefs...); err != nil {
+		step("push", strings.Join(pushRefs, ", ")+"\n"+err.Error(), runs.StepFailed)
 		rr.Error = "push: " + err.Error()
+		recordNotExecuted(&rr, x.mode, "push", saver)
 		return rr, repoSignal{}
 	}
 	step("push", strings.Join(pushRefs, ", "), runs.StepOK)
@@ -821,7 +831,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		// The dev branch advanced only by folding in the default branch — dev now serves it, but there is
 		// no PR-worthy unit of the runner's OWN work, so no delivery and no PR.
 		step("implement", "nur Standard-Branch eingefaltet — dev-Stand aktualisiert ("+devBranch+"@"+short(finalTip)+"), kein eigener Beitrag", runs.StepOK)
-		rr.OK = true
+		rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
 		return rr, repoSignal{}
 	}
 
@@ -861,7 +871,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 
 	// PROD-DEPLOY is intentionally NOT done here — prod ships only from a MERGED default branch (Maintain,
 	// req 6). dev already serves the grown state above.
-	rr.OK = true
+	rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
 	return rr, repoSignal{}
 }
 
@@ -945,6 +955,44 @@ func hasDeployTarget(repoName string) bool {
 func noDeployTargetReason(repoName string) string {
 	return "kein Deploy-Ziel — für " + repoName + " ist kein geprüftes Deploy-Skript hinterlegt (" +
 		filepath.Join(deployScriptDir, repoName) + "); das Repo installiert keinen Dienst, es gibt nichts zu deployen"
+}
+
+// deliveryChain is the ordered pipeline executeRepo walks for a mode — the sequence whose order is
+// BINDING. A halt at a failed step records every LATER stage of this chain as not-executed, so a result
+// states plainly WHERE the chain stopped and that nothing past it was attempted.
+func deliveryChain(mode string) []string {
+	switch mode {
+	case "report":
+		return []string{"analyze"}
+	case "full":
+		return []string{"implement", "dev-deploy", "push", "pr"}
+	default: // pr
+		return []string{"implement", "push", "pr"}
+	}
+}
+
+// recordNotExecuted appends a not-executed step for every stage of the delivery chain AFTER `failed` that
+// has no recorded step yet — the binding-order guarantee made explicit: once a step fails the rest is
+// never attempted, and it is shown as not-executed (never skipped, and never a hollow success). The
+// reason states plainly, in the user's language, that the chain was halted by the failed step.
+func recordNotExecuted(rr *runs.RepoResult, mode, failed string, saver *liveSaver) {
+	have := make(map[string]bool, len(rr.Steps))
+	for i := range rr.Steps {
+		have[rr.Steps[i].Name] = true
+	}
+	reason := "nicht ausgeführt — vorheriger Schritt fehlgeschlagen (" + failed + "); die Kette wurde angehalten"
+	past := false
+	for _, name := range deliveryChain(mode) {
+		if name == failed {
+			past = true
+			continue
+		}
+		if !past || have[name] {
+			continue
+		}
+		rr.Steps = append(rr.Steps, runs.Step{Name: name, Status: runs.StepNotExecuted, Log: reason, At: time.Now().UTC()})
+	}
+	saver.force()
 }
 
 // repoNameOf reduces an owner/repo full name to the bare repo name the deploy allowlist is keyed by.
