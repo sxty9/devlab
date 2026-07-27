@@ -21,6 +21,42 @@ import (
 // AI-planning buttons with review/apply, config history). Execution (the scheduler) is a separate,
 // gated phase; the stored results are read here but written there.
 
+// runView is a run plus derived state the store itself does not hold: a staleness flag (its snapshot no
+// longer matches the scheme inputs) and the run's still-open pull requests awaiting their merge to main.
+// The pending-PR list is what keeps a ToDo visibly IN the active list until the main-merge is through:
+// it is not "erledigt" the instant a PR opens — it is "in Arbeit, wartet auf Merge" until the PR lands.
+type runView struct {
+	runs.Run
+	Stale      bool            `json:"stale"`
+	PendingPRs []pendingPRView `json:"pendingPrs,omitempty"`
+}
+
+// pendingPRView is one of a run's open PRs (repo + number + URL) surfaced to the UI so it can show the
+// awaiting-merge state and link straight to the PR.
+type pendingPRView struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+}
+
+// pendingPRsByRun groups the tracked (not-yet-merged) PRs by their run id, so a run/ToDo can be shown as
+// awaiting its merge. A passive read of the PR pool — no evaluation lives in the pool itself. Empty when
+// the store is unavailable.
+func (s *Server) pendingPRsByRun() map[string][]pendingPRView {
+	out := map[string][]pendingPRView{}
+	if s.runPRs == nil {
+		return out
+	}
+	prs, err := s.runPRs.List()
+	if err != nil {
+		return out
+	}
+	for _, p := range prs {
+		out[p.RunID] = append(out[p.RunID], pendingPRView{Repo: p.Repo, Number: p.Number, URL: p.URL})
+	}
+	return out
+}
+
 // runCatalog scans the scheme store once: every axiom by its stable id (as the RunAxiom shape used for
 // composition), the id→path index (coverage badges), and all global Laufregeln. Mirrors
 // buildRolloutBlock's scan; reuses fetchRecord.
@@ -136,7 +172,12 @@ func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": orEmptyRuns(all), "axioms": titleLegend(byID)})
+	prsByRun := s.pendingPRsByRun()
+	views := make([]runView, 0, len(all))
+	for _, run := range all {
+		views = append(views, runView{Run: run, PendingPRs: prsByRun[run.ID]})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": views, "axioms": titleLegend(byID)})
 }
 
 // runsCoverage reports which axioms are already backed by a run (badges in the picker) + the id→path
@@ -190,7 +231,7 @@ func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"run":    run,
+		"run":    runView{Run: run, PendingPRs: s.pendingPRsByRun()[run.ID]},
 		"axioms": titleLegend(byID),
 	})
 }

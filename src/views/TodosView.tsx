@@ -522,6 +522,11 @@ export default function TodosView() {
 
 /** One row in the left list: name, target, due date, plus a disabled pill. The list holds only
  *  never-run ToDos, so no "done" state appears here — executed ToDos live in the History tab. */
+/** A ToDo is only "erledigt" once its work has reached main. While it has open PRs still awaiting their
+ *  merge it is not done yet — it stays in the active list, shown as "wartet auf Merge". */
+const awaitingMerge = (todo: Run) => !todo.done && (todo.pendingPrs?.length ?? 0) > 0;
+
+/** One row in the left list: name, target, due date, plus done/awaiting-merge/disabled pills. */
 function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; onSelect: () => void }) {
   return (
     <button
@@ -537,6 +542,15 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
           {todo.name}
         </span>
         <StageBadge todo={todo} />
+        {todo.done ? (
+          <span className="flex shrink-0 items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 text-caption font-medium text-success">
+            <CheckIcon className="h-3 w-3" /> Erledigt
+          </span>
+        ) : (
+          awaitingMerge(todo) && (
+            <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">wartet auf Merge</span>
+          )
+        )}
         {!todo.enabled && (
           <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">deaktiviert</span>
         )}
@@ -677,10 +691,34 @@ function TodoDetail({
             {[todo.model, todo.effort].filter(Boolean).join(' · ')}
           </span>
         )}
+        {awaitingMerge(todo) && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">wartet auf Merge</span>
+        )}
         <span>Termin: {dueLabel(todo)}</span>
       </div>
 
       <Authorship className="mt-3" createdBy={todo.createdBy} updatedBy={todo.updatedBy} />
+      {awaitingMerge(todo) && (
+        <section className="mt-4 rounded-card border border-warning/30 bg-warning/5 p-3">
+          <p className="text-footnote text-text-secondary">
+            Umgesetzt — {todo.pendingPrs!.length === 1 ? 'der Pull Request wartet' : 'die Pull Requests warten'} auf den Merge nach main. Erst
+            danach gilt das ToDo als erledigt.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+            {todo.pendingPrs!.map((pr) => (
+              <a
+                key={`${pr.repo}#${pr.number}`}
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-caption font-medium text-accent hover:underline"
+              >
+                {pr.repo}#{pr.number} öffnen
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="mt-6">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Aufgabe</p>

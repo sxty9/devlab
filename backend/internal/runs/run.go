@@ -184,6 +184,13 @@ type ResultRef struct {
 	// Who this execution acted for: autonomous, or the person who asked for it.
 	Trigger     Trigger `json:"trigger,omitempty"`
 	RequestedBy string  `json:"requestedBy,omitempty"`
+
+	// PRsOpen marks a FINISHED execution that opened one or more pull requests still awaiting their merge
+	// to main. It gates a ToDo's completion: a ToDo is not "erledigt" the instant its PR is opened — it
+	// stays in the active list until the main-merge is through, at which point Maintain flips Done. It is
+	// meaningless on a suspended/carried-over ref (those are not finished) and false for a report-mode or
+	// no-change execution (nothing to merge → done at once).
+	PRsOpen bool `json:"prsOpen,omitempty"`
 }
 
 // Stage is the furthest rung of the delivery ladder an execution reached. It is derived, never stored:

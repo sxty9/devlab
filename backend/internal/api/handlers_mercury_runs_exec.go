@@ -473,6 +473,24 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 	res.OK = overallOK
 	save()
 	return res.Ref(), nil
+	return runs.ResultRef{
+		ResultID: res.ResultID, At: res.StartedAt, OK: overallOK, RepoCount: len(res.Repos),
+		InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
+		// A ToDo that opened PRs is not "done" yet — it awaits its merge to main (Maintain flips Done then).
+		PRsOpen: anyOpenPR(res.Repos),
+	}, nil
+}
+
+// anyOpenPR reports whether the finished sweep opened at least one pull request (a repo carrying a PR
+// URL). It is the "did this execution leave work awaiting a merge" signal that keeps a ToDo in the
+// active list until the main-merge is through, rather than checking it off the moment a PR is opened.
+func anyOpenPR(repos []runs.RepoResult) bool {
+	for _, rr := range repos {
+		if rr.PRUrl != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // resumeOrNew continues an interrupted execution, or mints a fresh one. Three interruption kinds resume
@@ -1494,6 +1512,12 @@ func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.
 // a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
 // success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
+	// Self-healing runs every tick, independent of any tracked PR: a wedged run that has blown past the
+	// hard duration ceiling is cancelled so it stops blocking every future trigger, and crash-orphaned
+	// husks are reaped so nothing lingers forever as a running "Leiche". Both keep the pipeline restartable.
+	x.cancelWedgedRun()
+	x.reapOrphanedHusks()
+
 	prs, err := x.s.runPRs.List()
 	if err != nil || len(prs) == 0 {
 		return
@@ -1548,6 +1572,11 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 				x.markDelivery(p.Repo, p.Number, runs.DeliveryClosed)
 			}
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
+			// A PR that reached main (merged) is what checks a ToDo off; a PR CLOSED without merging is a
+			// rejection — the ToDo stays open so it can be restarted, never silently marked done.
+			if cur.Merged {
+				x.markTodoDoneIfAllMerged(p.RunID)
+			}
 		case prMerge:
 			// One merge per repo per tick, whatever the outcome: a failed merge leaves the older PR open
 			// (its queue must wait), and a successful one has just moved the default branch — GitHub needs
@@ -1562,6 +1591,7 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			x.markDelivered(p, true, false)
 			if x.mode != "full" {
 				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
+				x.markTodoDoneIfAllMerged(p.RunID)      // reached main → the ToDo may now be checked off
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
@@ -1571,6 +1601,7 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			if name := repoNameOf(p.Repo); !x.deployable(name) {
 				x.markDelivered(p, true, false) // merged; there is simply nothing to ship
 				_ = x.s.runPRs.Remove(p.Repo, p.Number)
+				x.markTodoDoneIfAllMerged(p.RunID) // merged (deploy is a no-op here) → done once all merged
 				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
 				continue
 			}
@@ -1581,6 +1612,7 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			}
 			x.markDelivered(p, true, true)
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+			x.markTodoDoneIfAllMerged(p.RunID)      // reached main AND shipped → the ToDo may now be checked off
 			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
@@ -1610,6 +1642,111 @@ func (x *runExecutor) markDelivered(p runs.PendingPR, merged, prod bool) {
 		}
 		return cur, nil
 	})
+}
+
+// markTodoDoneIfAllMerged checks a ToDo off ONCE the main-merge is through: called right after one of a
+// run's PRs merges, it verifies NO pending PR of that run remains, and only then flips the ToDo's Done.
+// This is the "in die History erst, wenn der main-Merge durch ist" rule — a ToDo opened as several PRs
+// stays in the active list until the LAST one lands. A no-op for auto runs (they are recurring, never
+// "done") and when the stores are absent.
+func (x *runExecutor) markTodoDoneIfAllMerged(runID string) {
+	if x.s == nil || x.s.runs == nil || x.s.runPRs == nil || runID == "" {
+		return
+	}
+	pending, err := x.s.runPRs.List()
+	if err != nil {
+		return
+	}
+	for _, p := range pending {
+		if p.RunID == runID {
+			return // more of this run's PRs are still awaiting their merge
+		}
+	}
+	_, _ = x.s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
+		for i := range cur {
+			if cur[i].ID == runID && cur[i].IsTodo() && !cur[i].Done {
+				cur[i].Done = true
+				log.Printf("devlabd: ToDo %s abgeschlossen — alle PRs sind auf main gemergt", runID)
+			}
+		}
+		return cur, nil
+	})
+}
+
+// wedgedRunGrace is how far past the hard duration ceiling a run may linger before it is treated as
+// wedged and cancelled. A healthy run self-terminates at maxRunDuration via its own context deadline;
+// only a genuinely stuck one survives past ceiling + grace, and it would otherwise hold the "one run at
+// a time" lock forever, making EVERY future trigger return "es läuft bereits". The grace absorbs clock
+// skew and shutdown lag so a run that is merely finishing up is never cancelled.
+const wedgedRunGrace = 30 * time.Minute
+
+// orphanHuskGrace is how long an unfinished ToDo husk may sit untouched before it is reaped. A crash or
+// devlabd restart mid-run leaves a husk whose steps read "läuft" forever; unlike an auto run (which
+// resumes on its next scheduled fire) a fired-once ToDo has nothing to pick it up, so it is a "Leiche".
+// The grace lets a fast restart resume it first (a manual re-run within the window still continues it).
+const orphanHuskGrace = 15 * time.Minute
+
+// cancelWedgedRun self-heals a stuck run: if the run in flight has blown past the hard duration ceiling
+// by more than the grace, it is cancelled (the existing kill-switch) so it releases the single-run lock
+// and triggers work again. No-op when no ceiling is configured (can't tell wedged from legitimately long)
+// or nothing is running.
+func (x *runExecutor) cancelWedgedRun() {
+	if x.s == nil || x.s.scheduler == nil {
+		return
+	}
+	ceiling := maxRunDuration()
+	if ceiling <= 0 {
+		return
+	}
+	a := x.s.scheduler.Active()
+	if a == nil {
+		return
+	}
+	if runWedged(a.StartedAt, ceiling, time.Now()) {
+		log.Printf("devlabd: run %s läuft seit %s (> Grenze %s) — als hängend abgebrochen, damit wieder gestartet werden kann",
+			a.RunID, time.Since(a.StartedAt).Round(time.Minute), ceiling)
+		x.s.scheduler.Cancel()
+	}
+}
+
+// runWedged reports whether a run started at startedAt has exceeded the hard ceiling by more than the
+// grace and is therefore stuck. Pure so the threshold is unit-tested without a live scheduler; a zero
+// ceiling (cap disabled) or zero start is never wedged.
+func runWedged(startedAt time.Time, ceiling time.Duration, now time.Time) bool {
+	if ceiling <= 0 || startedAt.IsZero() {
+		return false
+	}
+	return now.Sub(startedAt) > ceiling+wedgedRunGrace
+}
+
+// reapOrphanedHusks finalizes crash-orphaned ToDo husks so nothing lingers as a running "Leiche" and the
+// ToDo becomes cleanly restartable. Only fire-once ToDos are swept: an auto run resumes a stranded husk on
+// its next scheduled fire, and a suspended run resumes when its window resets — neither is orphaned. The
+// currently-live run is skipped, and only husks untouched past the grace are reaped, so an in-flight or
+// just-restarted resume is never disturbed.
+func (x *runExecutor) reapOrphanedHusks() {
+	if x.s == nil || x.s.runs == nil || x.s.runResults == nil {
+		return
+	}
+	live := ""
+	if x.s.scheduler != nil {
+		if a := x.s.scheduler.Active(); a != nil {
+			live = a.RunID
+		}
+	}
+	all, err := x.s.runs.List()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-orphanHuskGrace)
+	for _, run := range all {
+		if !run.IsTodo() || run.ID == live || run.Suspended != nil {
+			continue
+		}
+		if husk, ok := x.s.runResults.FindStaleHusk(run.ID, cutoff); ok {
+			x.reap(husk, "unterbrochen (Absturz/Neustart) — als fehlgeschlagen abgeschlossen; jetzt neu startbar")
+		}
+	}
 }
 
 // prAction is Maintain's decision for one tracked PR after it has been fetched.
