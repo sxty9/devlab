@@ -346,12 +346,23 @@ export interface Conformance {
   unavailable?: boolean; // the checker (aigentic) was unreachable — treated as conforming
 }
 
+/** Who created and last changed an axiom — from DevLab's local authorship pool, never the shared,
+ *  instance-neutral axioms repo. Absent fields ⇒ unknown (an axiom predating authorship tracking). */
+export interface AxiomAuthor {
+  createdBy?: string;
+  createdAt?: string;
+  updatedBy?: string;
+  updatedAt?: string;
+}
+
 /** A parsed axiom record: front-matter fields + the body markdown. */
 export interface Axiom {
   id: string;
   titel: string;
   quelle?: string;
   body: string;
+  /** Authorship joined from the local pool by the stable id (absent ⇒ unknown). */
+  author?: AxiomAuthor;
 }
 
 // ── Mercury — Automatische Läufe (scheduled autonomous run instances) ─────────
@@ -414,6 +425,11 @@ export interface Run {
   promptHash?: string;
   createdAt: string;
   updatedAt: string;
+  /** Holistic username of who first created this run/ToDo and who last changed it — kept separate so
+   *  the creator stays visible after someone else edits. Empty on records predating authorship (shown
+   *  as "unknown", never back-filled). */
+  createdBy?: string;
+  updatedBy?: string;
   nextFireAt?: string;
   lastFiredAt?: string;
   lastResult?: RunResultRef;
@@ -507,6 +523,13 @@ export interface RunSnapshotMeta {
   runCount: number;
 }
 
+/** How an execution was set going: autonomous (a scheduled firing) or a named person (a manual
+ *  run-now). Both empty ⇒ the origin was not recorded (shown as unknown, never guessed). */
+export interface RunTrigger {
+  auto?: boolean;
+  by?: string;
+}
+
 export interface RunResultRef {
   resultId: string;
   at: string;
@@ -522,6 +545,9 @@ export interface RunResultRef {
   prUrl?: string;
   merged?: boolean;
   prodDeployed?: boolean;
+  /** How this execution started, and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 /** The delivery ladder, mirroring runs.Stage on the server: the furthest rung actually reached.
@@ -624,6 +650,9 @@ export interface RunResult {
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 /** The run executing right now, as the server sees it: its id, the live result id, and when it started
@@ -697,6 +726,9 @@ export interface RunExecution {
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 /** One turn of the free-form run-planning chat. */

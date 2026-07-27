@@ -209,7 +209,9 @@ export const httpSource: DataSource = {
   },
   async mercuryItem(path) {
     const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
-    return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
+    // Authorship comes back as a sibling of the axiom (local pool, joined by id); fold it onto the axiom.
+    const body = await json<{ axiom: import('@/types').Axiom; author?: import('@/types').AxiomAuthor }>(r);
+    return { ...body.axiom, author: body.author };
   },
   async mercuryAddAxiom(titel, body, section, force) {
     const r = await post('/api/mercury/axiom', { titel, body, section, force });

@@ -33,6 +33,11 @@ import (
 // ErrExists is returned by Put when the record is already there and overwrite was not asked for.
 var ErrExists = errors.New("record exists")
 
+// ErrNoStore is returned when the constitution store was never configured — a dev/preview process
+// without a link store, or a test that exercises a handler which only touches other data. Returning it
+// keeps every caller on the ordinary error path instead of dereferencing a nil store.
+var ErrNoStore = errors.New("constitution store not configured")
+
 // ErrNotFound is returned when a path holds no record.
 var ErrNotFound = errors.New("record not found")
 
@@ -202,6 +207,9 @@ func (s *Store) credential() (string, error) {
 // List returns every record path under prefix (empty = all), sorted — the same flat, sorted shape the
 // tree projection is built from.
 func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
+	if s == nil {
+		return nil, ErrNoStore
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ensure(ctx, false); err != nil {
@@ -238,6 +246,9 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 
 // Get returns one record's bytes. found is false (with a nil error) when the path holds none.
 func (s *Store) Get(ctx context.Context, path string) ([]byte, bool, error) {
+	if s == nil {
+		return nil, false, ErrNoStore
+	}
 	if err := safePath(path); err != nil {
 		return nil, false, err
 	}
@@ -259,6 +270,9 @@ func (s *Store) Get(ctx context.Context, path string) ([]byte, bool, error) {
 // Put writes a record. overwrite=false refuses to replace an existing one (ErrExists), which is what
 // makes "create" distinguishable from "edit" at the store level rather than by a racy pre-check.
 func (s *Store) Put(ctx context.Context, path, content, message, actor string, overwrite bool) error {
+	if s == nil {
+		return ErrNoStore
+	}
 	if err := safePath(path); err != nil {
 		return err
 	}
@@ -278,6 +292,9 @@ func (s *Store) Put(ctx context.Context, path, content, message, actor string, o
 
 // Delete removes a record, or a whole category when path names a directory.
 func (s *Store) Delete(ctx context.Context, path, message, actor string) error {
+	if s == nil {
+		return ErrNoStore
+	}
 	if err := safePath(path); err != nil {
 		return err
 	}
@@ -293,6 +310,9 @@ func (s *Store) Delete(ctx context.Context, path, message, actor string) error {
 // Move relocates a record or a category. Its content travels with the path, so an axiom keeps its id
 // (and every run referencing it) across a re-filing.
 func (s *Store) Move(ctx context.Context, from, to, message, actor string) error {
+	if s == nil {
+		return ErrNoStore
+	}
 	if err := safePath(from); err != nil {
 		return err
 	}

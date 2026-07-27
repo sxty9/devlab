@@ -9,8 +9,10 @@ import (
 	"encoding/base32"
 	"net/http"
 	"strings"
+	"time"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/axiomauthors"
 	"devlab/backend/internal/mercury"
 )
 
@@ -117,6 +119,14 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	if ns == mercury.NsAxiome {
 		s.kickAutoAssign(r)
 	}
+	// Record who authored this axiom in DevLab's local pool (never in the shared axioms repo). A create
+	// stamps both the creator and the last-editor to the same person.
+	now := time.Now().UTC()
+	who := actor(r)
+	s.axiomAuthors.Mutate(ax.ID, func(a axiomauthors.Author) axiomauthors.Author {
+		a.CreatedBy, a.CreatedAt, a.UpdatedBy, a.UpdatedAt = who, now, who, now
+		return a
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
 		"id":         ax.ID,

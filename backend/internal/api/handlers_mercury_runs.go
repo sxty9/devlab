@@ -369,11 +369,12 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	who := actor(r)
 	run := runs.Run{
 		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
 		Model: body.Model, Effort: body.Effort,
 		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
-		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+		CreatedAt: now.UTC(), UpdatedAt: now.UTC(), CreatedBy: who, UpdatedBy: who,
 	}
 	composeInto(&run, byID, laufregeln, now.UTC())
 	// Optimise the branch description with AI only when the raw name is too thin to slugify; best-effort,
@@ -386,7 +387,7 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 			run.NextFireAt = &nf
 		}
 	}
-	if _, err := s.runs.Mutate("create", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
+	if _, err := s.runs.Mutate("create", who, func(cur []runs.Run) ([]runs.Run, error) {
 		return append(cur, run), nil
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gespeichert werden")
@@ -420,8 +421,9 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 	// is never held across the aigentic round-trip). Recomputing on every edit keeps it consistent: a name
 	// that is now good enough clears it (""), a still-thin one refreshes it.
 	branchDesc := s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), body.Name, body.Task)
+	who := actor(r)
 	var updated runs.Run
-	if _, err := s.runs.Mutate("update", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
+	if _, err := s.runs.Mutate("update", who, func(cur []runs.Run) ([]runs.Run, error) {
 		idx := indexOfRun(cur, id)
 		if idx < 0 {
 			return nil, runs.ErrNotFound // abort before any write; no spurious save/snapshot
@@ -441,6 +443,7 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		cur[idx].Repo, cur[idx].NewRepo = "", ""
 		cur[idx].DueAt = body.DueAt
 		cur[idx].UpdatedAt = now.UTC()
+		cur[idx].UpdatedBy = who // last editor; CreatedBy is deliberately left as the original creator
 		composeInto(&cur[idx], byID, laufregeln, now.UTC())
 		if cur[idx].Enabled && !cur[idx].IsTodo() {
 			if nf, e := cur[idx].Schedule.Next(now); e == nil {
@@ -664,11 +667,12 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	who := actor(r)
 	planned := make([]runs.Run, 0, len(body.Plan.Runs))
 	for _, pr := range body.Plan.Runs {
 		run := runs.Run{
 			ID: runs.NewID(), Name: pr.Name, Enabled: true, Schedule: toSchedule(pr.Schedule),
-			AxiomIDs: dedupStrings(pr.AxiomIDs), CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+			AxiomIDs: dedupStrings(pr.AxiomIDs), CreatedAt: now.UTC(), UpdatedAt: now.UTC(), CreatedBy: who, UpdatedBy: who,
 		}
 		composeInto(&run, byID, laufregeln, now.UTC())
 		if nf, e := run.Schedule.Next(now); e == nil {
@@ -677,7 +681,7 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		planned = append(planned, run)
 	}
 	action := "apply-" + body.Mode
-	if _, err := s.runs.Mutate(action, actor(r), func(cur []runs.Run) ([]runs.Run, error) {
+	if _, err := s.runs.Mutate(action, who, func(cur []runs.Run) ([]runs.Run, error) {
 		if body.Mode == "replace" {
 			return planned, nil
 		}
@@ -685,6 +689,26 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		out := append([]runs.Run(nil), cur...)
 		for _, np := range planned {
 			out, _, _ = upsertPlannedRun(out, np, byID, laufregeln, now.UTC())
+			idx := -1
+			for i := range out {
+				if strings.EqualFold(out[i].Name, np.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				out = append(out, np)
+				continue
+			}
+			out[idx].AxiomIDs = dedupStrings(append(out[idx].AxiomIDs, np.AxiomIDs...))
+			out[idx].UpdatedAt = now.UTC()
+			out[idx].UpdatedBy = who // the proposal extended an existing run; record who applied it
+			composeInto(&out[idx], byID, laufregeln, now.UTC())
+			if out[idx].Enabled {
+				if nf, e := out[idx].Schedule.Next(now); e == nil {
+					out[idx].NextFireAt = &nf
+				}
+			}
 		}
 		return out, nil
 	}); err != nil {
