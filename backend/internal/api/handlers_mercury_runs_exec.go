@@ -811,7 +811,11 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		deliveryID = runs.NewDeliveryID()
 		deliveryBranch = "mercury-run/" + run.ID + "/" + deliveryID
 		if err := ex.BranchAt(ctx, wt, deliveryBranch, "HEAD"); err != nil {
+			// Branch prep is part of publishing — a failure here halts the chain under the push stage so a
+			// genuinely errored repo never mislabels push as merely not-applicable.
+			step("push", "Lieferungs-Branch anlegen: "+err.Error(), runs.StepFailed)
 			rr.Error = "Lieferungs-Branch: " + err.Error()
+			recordNotExecuted(&rr, x.mode, "push", saver)
 			return rr, repoSignal{}
 		}
 	}
