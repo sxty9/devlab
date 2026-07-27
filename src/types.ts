@@ -454,6 +454,13 @@ export interface RunSnapshotMeta {
   runCount: number;
 }
 
+/** How an execution was set going: autonomous (a scheduled firing) or a named person (a manual
+ *  run-now). Both empty ⇒ the origin was not recorded (shown as unknown, never guessed). */
+export interface RunTrigger {
+  auto?: boolean;
+  by?: string;
+}
+
 export interface RunResultRef {
   resultId: string;
   at: string;
@@ -462,6 +469,9 @@ export interface RunResultRef {
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
+  /** How this execution started, and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 export interface RunStep {
@@ -505,6 +515,9 @@ export interface RunResult {
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 /** The run executing right now, as the server sees it: its id, the live result id, and when it started
@@ -545,6 +558,9 @@ export interface RunExecution {
   outputTokens: number;
   costUsd: number;
   numTurns: number;
+  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
+  trigger?: RunTrigger;
+  requestedBy?: string;
 }
 
 /** One turn of the free-form run-planning chat. */

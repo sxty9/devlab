@@ -154,6 +154,8 @@ type ResultRef struct {
 	CostUSD      float64    `json:"costUsd,omitempty"`
 	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
+	Trigger      Trigger    `json:"trigger,omitempty"`   // how it started: autonomous, or a named person
+	RequestedBy  string     `json:"requestedBy,omitempty"`
 }
 
 type file struct {

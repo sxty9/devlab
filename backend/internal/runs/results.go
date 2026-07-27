@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+// Trigger records how an execution was set going. A scheduled (autonomous) firing sets Auto and
+// leaves By empty — an autonomous run is NEVER attributed to a person. A manual "run now" sets By to
+// the initiating username. It is snapshotted onto the Result at start so the execution history shows
+// its origin honestly even after the run is deleted. An all-zero Trigger (Auto false, By empty) means
+// the origin was not recorded (a result predating this) — surfaced as unknown, never guessed.
+type Trigger struct {
+	Auto bool   `json:"auto,omitempty"`
+	By   string `json:"by,omitempty"`
+}
+
 // Result is one execution of a run: the per-repo pipeline outcomes. Stored under the run id and kept
 // even after the run is deleted — logs are historized and persistent, viewable via the orphan-logs
 // listing. The scheduler/executor (Phase 2) writes these; the management layer only reads them.
@@ -38,7 +48,13 @@ type Result struct {
 	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
 	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
 	Mode string `json:"mode,omitempty"`
-	OK   bool   `json:"ok"`
+	// Trigger records how THIS execution started: autonomous (a scheduled firing) or a named person (a
+	// manual run-now). RequestedBy is the run/ToDo's creator, snapshotted at start — so an autonomous
+	// execution still names the person it acts on behalf of (a person's ToDo run by the runner names
+	// both). Both are empty on results written before authorship was tracked (surfaced as unknown).
+	Trigger     Trigger `json:"trigger,omitempty"`
+	RequestedBy string  `json:"requestedBy,omitempty"`
+	OK          bool    `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
@@ -150,6 +166,7 @@ func (r *Results) ListForRun(runID string) ([]ResultRef, error) {
 			ResultID: res.ResultID, At: res.StartedAt, OK: res.OK, RepoCount: len(res.Repos),
 			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
 			Suspended: res.Suspended, ResumeAt: res.ResumeAt,
+			Trigger: res.Trigger, RequestedBy: res.RequestedBy,
 		})
 	}
 	// Newest first, by the real time (not the string id — trimmed RFC3339Nano fractions mis-sort).
@@ -257,6 +274,10 @@ type ExecutionSummary struct {
 	OutputTokens int        `json:"outputTokens"`
 	CostUSD      float64    `json:"costUsd"`
 	NumTurns     int        `json:"numTurns"`
+	// Trigger + RequestedBy: how the execution started (autonomous vs a named person) and the run's
+	// author it acted for — snapshotted so the global history shows origin even after the run is gone.
+	Trigger     Trigger `json:"trigger,omitempty"`
+	RequestedBy string  `json:"requestedBy,omitempty"`
 }
 
 // All returns every stored execution across all runs (including runs since deleted), newest first —
@@ -286,6 +307,7 @@ func (r *Results) All() ([]ExecutionSummary, error) {
 				At: res.StartedAt, FinishedAt: res.FinishedAt, OK: res.OK, RepoCount: len(res.Repos),
 				Suspended: res.Suspended, ResumeAt: res.ResumeAt,
 				InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD, NumTurns: res.NumTurns,
+				Trigger: res.Trigger, RequestedBy: res.RequestedBy,
 			})
 		}
 	}

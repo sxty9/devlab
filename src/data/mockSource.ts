@@ -337,6 +337,9 @@ export const mockSource: DataSource = {
       outputTokens: 0,
       costUsd: 0,
       numTurns: 0,
+      // An autonomous run that still names the person it acted for (the "name both" case).
+      trigger: { auto: true },
+      requestedBy: MOCK_ACTOR,
     };
   },
   async mercuryRunCalendar(_days?: number, _type?: import('@/types').RunType) {

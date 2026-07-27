@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunTrigger, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -34,6 +35,32 @@ export function TokenStat({ input, output, cost }: { input?: number; output?: nu
       {input != null && <span title="Eingabe-Tokens">↓ {fmtNum(input)}</span>}
       {output != null && <span title="Ausgabe-Tokens">↑ {fmtNum(output)}</span>}
       {cost != null && <span className="font-medium text-text-secondary">{fmtCost(cost)}</span>}
+    </span>
+  );
+}
+
+/** Who set an execution going, from the single Person component: an autonomous run is shown as the
+ *  runner (a bot, never a person) and still names the person it acted for — so a person's ToDo run by
+ *  the runner names BOTH. A manual run-now shows its caller. An execution with no recorded origin
+ *  shows as unknown, never guessed. */
+export function ExecutionOrigin({ trigger, requestedBy, className }: { trigger?: RunTrigger; requestedBy?: string; className?: string }) {
+  const auto = !!trigger?.auto;
+  return (
+    <span className={cn('flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-caption text-text-tertiary', className)}>
+      {auto ? (
+        <>
+          <Person autonomous autonomousLabel="Autonomous" size="sm" />
+          {requestedBy && (
+            <>
+              <span aria-hidden>· for</span>
+              <Person username={requestedBy} size="sm" />
+            </>
+          )}
+        </>
+      ) : (
+        // Manual run-now → the caller who triggered it; a legacy result (no origin) reads as unknown.
+        <Person username={trigger?.by} size="sm" />
+      )}
     </span>
   );
 }
@@ -412,6 +439,7 @@ function ExecutionDetailBody({ res }: { res: RunResult }) {
             {fmtDateTime(res.startedAt)}
             {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
           </p>
+          <ExecutionOrigin className="mt-1.5" trigger={res.trigger} requestedBy={res.requestedBy} />
         </div>
         <OkPill ok={res.ok} />
       </div>
@@ -481,6 +509,7 @@ function ExecutionRow({ ex, selected, onSelect }: { ex: RunExecution; selected: 
       <span className="text-caption text-text-tertiary">
         {fmtDateTime(ex.at)} · {ex.repoCount} Repos
       </span>
+      <ExecutionOrigin trigger={ex.trigger} requestedBy={ex.requestedBy} />
       <TokenStat input={ex.inputTokens} output={ex.outputTokens} cost={ex.costUsd} />
     </button>
   );
@@ -638,6 +667,7 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
               <ChevronRightIcon className={cn('h-3.5 w-3.5 shrink-0 text-text-tertiary transition-transform duration-fast', open && 'rotate-90')} />
               <span className="text-footnote text-text-secondary">{fmtDateTime(r.at)}</span>
               <OkPill ok={r.ok} />
+              <ExecutionOrigin trigger={r.trigger} requestedBy={r.requestedBy} />
               <TokenStat input={r.inputTokens} output={r.outputTokens} cost={r.costUsd} />
             </button>
             {open && <InlineExecutionDetail key={r.resultId} runId={runId} resultId={r.resultId} />}

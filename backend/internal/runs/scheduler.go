@@ -18,11 +18,13 @@ var ErrRunAborted = errors.New("run aborted by kill-switch")
 // (auto-merging overdue PRs). It is injected by the api layer so the runs package never imports it —
 // the runs package owns scheduling + persistence, the api layer owns side effects.
 type Executor interface {
-	// Execute runs a run end-to-end. report is invoked as soon as the execution's result id is known
-	// (freshly minted or resumed) so the scheduler can publish it as the live Activity — the UI locates
-	// the in-flight result document by that id. The scheduler always passes a non-nil report; it may go
-	// uncalled if the run fails before a result exists.
-	Execute(ctx context.Context, run Run, report func(resultID string)) (ResultRef, error)
+	// Execute runs a run end-to-end. trigger records how this firing was set going (autonomous vs a
+	// named person) and is stamped onto a freshly-minted result; a resumed result keeps its original
+	// trigger. report is invoked as soon as the execution's result id is known (freshly minted or
+	// resumed) so the scheduler can publish it as the live Activity — the UI locates the in-flight
+	// result document by that id. The scheduler always passes a non-nil report; it may go uncalled if
+	// the run fails before a result exists.
+	Execute(ctx context.Context, run Run, trigger Trigger, report func(resultID string)) (ResultRef, error)
 	Maintain(ctx context.Context)
 }
 
@@ -206,7 +208,14 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 		}
 		s.curMu.Unlock()
 	}
-	ref, err := s.exec.Execute(ctx, run, report)
+	// A scheduled firing (advance) is autonomous — never a person; a manual run-now (FireNow, advance
+	// false) is attributed to the caller. A resume keeps its original trigger (the executor only stamps
+	// a fresh result), so a manual run that later auto-resumes stays attributed to its initiator.
+	trigger := Trigger{Auto: true}
+	if !advance {
+		trigger = Trigger{By: actor}
+	}
+	ref, err := s.exec.Execute(ctx, run, trigger, report)
 	if err != nil {
 		s.logf("devlabd: run %s execution error: %v", id, err)
 	}
