@@ -40,9 +40,8 @@ const (
 	deployWrapper = "/usr/local/sbin/devlab-deploy"
 	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
 	// no deploy target at all — see hasDeployTarget.
-	deployScriptDir     = "/etc/devlab/deploy.d"
-	defaultAgentTimeout = 60 * time.Minute // a full implement pass can be long
-	runnerPreamble      = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
+	deployScriptDir = "/etc/devlab/deploy.d"
+	runnerPreamble  = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
 		"unresolved operational gaps follow the Laufregeln (log a non-blocking skip, do not stop). Make " +
 		"focused, correct, well-tested changes and summarise precisely what you did."
@@ -56,22 +55,28 @@ const (
 	// is ~24h (daily) or ~7d (weekly) later — a shorter window would reject it and refire from scratch,
 	// duplicating every PR. 10 days covers weekly with margin while still abandoning truly ancient husks.
 	strandedWindow = 10 * 24 * time.Hour
-	// defaultMaxRunDuration caps an entire sweep's wall-clock. Belt-and-braces beside the per-repo
-	// runAgentTimeout: even 19 repos each just under 60m would otherwise run ~19h. 0 via env = off.
+	// defaultMaxRunDuration caps an entire sweep's wall-clock. Belt-and-braces beside the per-repo time
+	// budget: many repos each just under their budget would otherwise run for hours. 0 via env = off.
 	defaultMaxRunDuration = 4 * time.Hour
 )
 
-// agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
-// service from nothing — that hit the ceiling and was killed mid-implement, leaving an empty repo, no
-// PR and no usable output. So the cap is configurable (DEVLAB_RUNS_AGENT_TIMEOUT); an explicit "0"
-// removes it entirely, leaving the whole-sweep duration cap as the only bound.
-func runAgentTimeout() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
-			return d
-		}
+// errBudgetExceeded is the cancellation cause attached to a repo's agent context when ITS OWN time
+// budget runs out (context.WithTimeoutCause). It lets runAgentLive tell a per-repo budget timeout apart
+// from the whole-sweep duration cap or a deliberate abort — both of which also surface as a cancelled
+// context — so only a real budget overrun is reported as one.
+var errBudgetExceeded = errors.New("Zeitbudget überschritten")
+
+// effectiveTimeBudget resolves the time budget that governs ONE repo's agent pass for this run: the
+// run's own choice if it made one, else the service default. A run with no own choice REFERENCES the
+// default — it is resolved fresh here every pass, so a change to the default moves the run too. The
+// returned duration is 0 for "no cap" (only the whole-sweep duration then bounds the pass); overridden
+// reports whether the value came from the run (a deliberate deviation) rather than the default.
+func (x *runExecutor) effectiveTimeBudget(run runs.Run) (d time.Duration, overridden bool) {
+	if b, ok := parseBudget(run.TimeBudget); ok {
+		return b, true
 	}
-	return defaultAgentTimeout
+	def, _ := x.s.defaultTimeBudget()
+	return def, false
 }
 
 // maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
@@ -465,8 +470,10 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 	fresh := func() runs.Result {
 		start := time.Now()
 		model, _, _ := tuningFor(run).resolve() // the engine this execution is minted with (re-stamped on resume, see consider)
+		budget, _ := x.effectiveTimeBudget(run) // resolved from the run's choice or the service default
 		return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
-			Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
+			Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort,
+			TimeBudget: budgetLabel(budget), StartedAt: start.UTC(),
 			PromptHash: run.PromptHash, Prompt: run.Prompt}
 	}
 	consider := func(existing runs.Result) (runs.Result, bool, bool) {
@@ -478,7 +485,8 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 		// fire), so re-stamp the engine label to match — else a legacy husk shows no model, and one whose
 		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
 		m, _, _ := tuningFor(run).resolve()
-		existing.Model, existing.Effort = m, run.Effort
+		budget, _ := x.effectiveTimeBudget(run)
+		existing.Model, existing.Effort, existing.TimeBudget = m, run.Effort, budgetLabel(budget)
 		return existing, true, false
 	}
 	if run.Suspended != nil && run.Suspended.ResultID != "" {
@@ -557,6 +565,12 @@ type repoSignal struct {
 	hasReset bool
 	infra    bool
 	infraErr string
+	// budgetExceeded marks a repo whose agent pass hit ITS OWN time budget (not the sweep cap, not an
+	// abort). budget is the value that applied, so the caller can name it honestly. Unlike a limit or an
+	// infra signal the repo IS recorded (as a budget-timed-out failure) — a deliberate cap is not a
+	// reason to resume-and-retry.
+	budgetExceeded bool
+	budget         time.Duration
 }
 
 func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, isNewRepo bool, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
@@ -634,18 +648,26 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Base = head
 	}
 
+	// The time budget for THIS repo's agent pass — the run's own choice or, referenced live, the service
+	// default. 0 = no cap (the whole-sweep duration is then the only bound). A cause on the context lets
+	// runAgentLive report a budget overrun honestly instead of as a raw kill.
+	budget, _ := x.effectiveTimeBudget(run)
 	actx, cancel := context.WithCancel(ctx)
-	if d := runAgentTimeout(); d > 0 {
+	if budget > 0 {
 		cancel()
-		actx, cancel = context.WithTimeout(ctx, d)
+		actx, cancel = context.WithTimeoutCause(ctx, budget, errBudgetExceeded)
 	}
 	defer cancel()
 
 	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
 	if x.mode == "report" {
-		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
+		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver, budget)
 		if lim.limited {
 			return rr, lim
+		}
+		if lim.budgetExceeded {
+			rr.Error = budgetTimeoutError(lim.budget) // honest: an exceeded budget, not a raw kill
+			return rr, repoSignal{}
 		}
 		if err != nil {
 			rr.Error = "analyze: " + err.Error()
@@ -709,9 +731,13 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
-	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
+	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver, budget)
 	if lim.limited {
 		return rr, lim
+	}
+	if lim.budgetExceeded {
+		rr.Error = budgetTimeoutError(lim.budget) // honest: an exceeded budget, not a raw kill
+		return rr, repoSignal{}
 	}
 	if err != nil {
 		rr.Error = "implement: " + err.Error()
@@ -1323,10 +1349,34 @@ func (a *agentStep) fail(logtxt string) {
 	a.saver.force()
 }
 
+// failBudget finalizes a step ended by its own time budget honestly: the transcript up to the deadline
+// (what the pass achieved) is KEPT, headed by a plain note naming the budget — never replaced by a raw
+// kill signal. This is the "ehrliche Rückmeldung": a timed-out run says it timed out, and shows how far
+// it got, rather than surfacing a technical error.
+func (a *agentStep) failBudget(budget time.Duration) {
+	s := &a.rr.Steps[a.idx]
+	note := budgetTimeoutNote(budget)
+	if prog := a.tr.clipped(); strings.TrimSpace(prog) != "" {
+		note += "\n\n— Bis dahin erreicht —\n" + prog
+	}
+	s.Running, s.OK, s.Log = false, false, clip(note)
+	a.saver.force()
+}
+
+// budgetTimeoutNote / budgetTimeoutError name a time-budget overrun the same way everywhere: the step
+// log carries the note (followed by what was achieved), the repo error carries the one-liner.
+func budgetTimeoutNote(budget time.Duration) string {
+	return "⏱ Zeitbudget von " + compactDuration(budget) + " überschritten — der Durchlauf wurde beim Zeitablauf beendet."
+}
+
+func budgetTimeoutError(budget time.Duration) string {
+	return budgetTimeoutNote(budget) + " Was bis dahin erreicht wurde, steht im Bericht."
+}
+
 // runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
 // (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
 // (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver, budget time.Duration) (final []byte, lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
 	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
 	final = resultEvent(out)
@@ -1334,6 +1384,13 @@ func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, 
 		return final, l, aerr // leave the step running; the repo is not recorded
 	}
 	if aerr != nil {
+		// A pass killed by ITS OWN time budget (cause == errBudgetExceeded — which sets it apart from the
+		// whole-sweep cap or a deliberate abort) is not a technical failure. Report it as an exceeded
+		// budget and keep the transcript, so the run still names what it achieved before the deadline.
+		if budget > 0 && errors.Is(context.Cause(actx), errBudgetExceeded) {
+			ag.failBudget(budget)
+			return final, repoSignal{budgetExceeded: true, budget: budget}, aerr
+		}
 		ag.fail(agentError(aerr))
 		return final, repoSignal{}, aerr
 	}

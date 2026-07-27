@@ -45,7 +45,13 @@ type Result struct {
 	// shows how each run was tuned. Empty on older results.
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
-	OK     bool   `json:"ok"`
+	// TimeBudget is the per-repo agent time budget that governed THIS execution, stamped when the
+	// execution is minted and re-stamped on resume — like Model/Effort — so the Ausführungsansicht can
+	// name the budget that actually applied (and a timed-out run can be read as a budget overrun, not a
+	// bare failure). It is the RESOLVED label: "0" = no cap, else a compact duration ("3h"). Empty on
+	// results predating this field.
+	TimeBudget string `json:"timeBudget,omitempty"`
+	OK         bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
