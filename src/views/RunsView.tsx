@@ -7,7 +7,8 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { useMercuryTopic } from '@/state/mercuryLive';
+import { ExternalChangeBanner, useMercuryTopic } from '@/state/mercuryLive';
+import { classifyExternalChange } from '@/lib/live';
 import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, RestartPendingBadge, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
@@ -681,6 +682,10 @@ function RunEditor({
   const [schedule, setSchedule] = useState<RunSchedule>(base?.schedule ?? { kind: 'daily', timeOfDay: '03:00' });
   const [axiomIds, setAxiomIds] = useState<string[]>(base?.axiomIds ?? []);
   const [busy, setBusy] = useState(false);
+  // Name (not silently overwrite) a foreign edit of THIS run while it is being edited (req 11): the draft
+  // is kept (local state, captured on mount); the banner just warns that saving will overwrite that change.
+  const baseUpdatedAt = useRef(base?.updatedAt);
+  const externalChange = classifyExternalChange(baseUpdatedAt.current, base);
 
   const weeklyOk = schedule.kind !== 'weekly' || (schedule.weekdays?.length ?? 0) > 0;
   const valid = name.trim().length > 0 && axiomIds.length > 0 && weeklyOk;
@@ -709,6 +714,8 @@ function RunEditor({
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-5 px-8 py-7">
       <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{base ? 'Lauf bearbeiten' : 'Neuer Lauf'}</h1>
+
+      <ExternalChangeBanner change={externalChange} />
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Name</p>
