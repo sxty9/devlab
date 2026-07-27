@@ -41,7 +41,7 @@ const (
 	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
 	// no deploy target at all — see hasDeployTarget.
 	deployScriptDir     = "/etc/devlab/deploy.d"
-	defaultAgentTimeout = 60 * time.Minute // a full implement pass can be long
+	defaultAgentTimeout = 3 * time.Hour // built-in per-repo budget — enough to build a service from scratch
 	runnerPreamble      = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
 		"unresolved operational gaps follow the Laufregeln (log a non-blocking skip, do not stop). Make " +
@@ -61,15 +61,58 @@ const (
 	defaultMaxRunDuration = 4 * time.Hour
 )
 
-// agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
-// service from nothing — that hit the ceiling and was killed mid-implement, leaving an empty repo, no
-// PR and no usable output. So the cap is configurable (DEVLAB_RUNS_AGENT_TIMEOUT); an explicit "0"
-// removes it entirely, leaving the whole-sweep duration cap as the only bound.
-func runAgentTimeout() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+// parseBudget parses a time-budget string the way the whole runner understands it: a Go duration that is
+// non-negative, where "0" is the valid "no cap" choice. Empty or malformed → not a usable value (false),
+// so the caller falls back. Shared by the service-default resolver and the per-run resolver.
+func parseBudget(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		return 0, false
+	}
+	return d, true
+}
+
+// humanBudget renders a budget duration compactly for display and for stamping onto a Result: "0" for no
+// cap, otherwise only the non-zero h/m/s units ("3h", "1h30m", "30m") — unlike time.Duration.String,
+// which always carries trailing zero units ("3h0m0s").
+func humanBudget(d time.Duration) string {
+	if d <= 0 {
+		return "0"
+	}
+	var b strings.Builder
+	if h := d / time.Hour; h > 0 {
+		fmt.Fprintf(&b, "%dh", h)
+	}
+	if m := (d % time.Hour) / time.Minute; m > 0 {
+		fmt.Fprintf(&b, "%dm", m)
+	}
+	if s := (d % time.Minute) / time.Second; s > 0 {
+		fmt.Fprintf(&b, "%ds", s)
+	}
+	if b.Len() == 0 {
+		return d.String() // sub-second budget — unusual, but report it honestly
+	}
+	return b.String()
+}
+
+// serviceDefaultBudget is the per-repo agent wall-clock budget a run FOLLOWS when it made no own choice —
+// the service-level default, and the one the axioms say belongs at the central config surface. It is now
+// runtime-configurable: the persisted Settings value (edited without a restart) wins; the legacy
+// DEVLAB_RUNS_AGENT_TIMEOUT env var is honoured next as an operator override for deployments that still
+// set it; otherwise the built-in three hours. A run without its own budget resolves against THIS each
+// fire, so changing the default takes effect for every such run — no run stores a copy of it.
+func serviceDefaultBudget(st *runs.Settings) time.Duration {
+	if st != nil {
+		if d, ok := parseBudget(st.Get().DefaultTimeBudget); ok {
 			return d
 		}
+	}
+	if d, ok := parseBudget(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); ok {
+		return d
 	}
 	return defaultAgentTimeout
 }
@@ -635,7 +678,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 
 	actx, cancel := context.WithCancel(ctx)
-	if d := runAgentTimeout(); d > 0 {
+	if d := serviceDefaultBudget(x.s.settings); d > 0 {
 		cancel()
 		actx, cancel = context.WithTimeout(ctx, d)
 	}

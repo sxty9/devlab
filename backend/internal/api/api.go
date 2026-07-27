@@ -40,6 +40,7 @@ type Server struct {
 	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
+	settings    *runs.Settings        // service-level config (the central config surface): the default time budget runs follow
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
 	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
@@ -84,6 +85,7 @@ func New(v *auth.Verifier) *Server {
 		runNotices:  runs.NewNoticeStore(),
 		attachments: runs.NewAttachmentStore(),
 		axiomChecks: runs.NewAxiomChecks(),
+		settings:    runs.NewSettings(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
@@ -234,6 +236,12 @@ func (s *Server) Handler() http.Handler {
 	// One-time constitution migration: decompose the original axiom document into atoms and commit
 	// each into the constitution repo. Dry-run by default (?apply=true writes).
 	mux.HandleFunc("POST /api/mercury/migrate", s.guardCSRF(s.mercuryMigrate))
+
+	// Service-level configuration — the runner's central config surface (today: the default time budget
+	// every run follows without its own choice). Kept apart from the per-run CRUD below: this is the
+	// service default, not any single run's tuning. Read under guard; write under guardCSRF.
+	mux.HandleFunc("GET /api/mercury/config", s.guard(s.mercuryConfigGet))
+	mux.HandleFunc("PUT /api/mercury/config", s.guardCSRF(s.mercuryConfigSet))
 
 	// Automatische Läufe — run instances: scheduled autonomous runs over all holistic repos, whose
 	// prompt is composed from their axioms + all global Laufregeln. Reads under guard; store writes
