@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
+import { MercuryLiveProvider } from '@/state/mercuryLive';
 import { renderMarkdown } from '@/lib/markdown';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
@@ -107,7 +108,18 @@ const NS_EMPTY: Record<SchemeNs, string> = {
  *  new one; the user re-files, renames, edits and deletes by hand), the implementation rules, and
  *  the scheduled runs. The tree is a projection of the constitution's own Git repository, served
  *  through DevLab's single /api/mercury access point. */
+/** MercuryView wraps the whole surface in the ONE live-update provider so the axiom tree, runs, ToDos and
+ *  executions refresh themselves without polling. Mounted here (inside the tab view) → the stream opens on
+ *  entering Mercury and closes on leaving, so a closed surface causes no ongoing load. */
 export function MercuryView() {
+  return (
+    <MercuryLiveProvider>
+      <MercuryViewInner />
+    </MercuryLiveProvider>
+  );
+}
+
+function MercuryViewInner() {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
 

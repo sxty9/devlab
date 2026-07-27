@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Dropdown, DropdownItem } from '@/ui/Dropdown';
@@ -825,10 +826,12 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
   const [slots, setSlots] = useState<SlotOverview | null>(null);
   const [bump, setBump] = useState(0);
 
+  // Live-driven, not polled (req 12: a resting view causes no ongoing load): fetch once on mount / focus /
+  // a live tick. The `active`, `progress` and `deliveries` topics all bear on what is running right now.
+  useMercuryTopic(['active', 'progress', 'deliveries'], () => setBump((b) => b + 1));
   useEffect(() => {
     let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
+    void (async () => {
       try {
         const r = await source.mercuryRunActive();
         if (!cancelled) {
@@ -839,14 +842,11 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
       } catch {
         /* transient — keep the last known state */
       }
-      if (!cancelled) timer = window.setTimeout(poll, 2500);
-    };
-    void poll();
+    })();
     const onFocus = () => setBump((b) => b + 1); // re-check when the tab regains focus
     window.addEventListener('focus', onFocus);
     return () => {
       cancelled = true;
-      if (timer) window.clearTimeout(timer);
       window.removeEventListener('focus', onFocus);
     };
   }, [source, bump]);
@@ -1028,24 +1028,23 @@ export function useBlockedDeploys(): { blocked: BlockedDeploy[]; refetch: () => 
   const [blocked, setBlocked] = useState<BlockedDeploy[]>([]);
   const [bump, setBump] = useState(0);
 
+  // Live-driven: the `deliveries` topic fires when a deploy blocks or is resumed (req 9); fetch once on
+  // mount / focus / that tick, with no resting poll (req 12).
+  useMercuryTopic(['deliveries'], () => setBump((b) => b + 1));
   useEffect(() => {
     let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
+    void (async () => {
       try {
         const r = await source.mercuryBlockedDeploys();
         if (!cancelled) setBlocked(r.blocked ?? []);
       } catch {
         /* transient — keep the last known state */
       }
-      if (!cancelled) timer = window.setTimeout(poll, 5000);
-    };
-    void poll();
+    })();
     const onFocus = () => setBump((b) => b + 1);
     window.addEventListener('focus', onFocus);
     return () => {
       cancelled = true;
-      if (timer) window.clearTimeout(timer);
       window.removeEventListener('focus', onFocus);
     };
   }, [source, bump]);

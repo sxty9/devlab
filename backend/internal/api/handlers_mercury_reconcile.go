@@ -25,6 +25,9 @@ import (
 // rendered block to the debounced auto-rollout. Callers pass touchedClaudeMd=true exactly when the write
 // created/changed/removed a record under axiome/ or regeln/ (the two namespaces the CLAUDE.md carries).
 func (s *Server) reconcileAfterWrite(ctx context.Context, cookie string, touchedClaudeMd bool) {
+	// The axiom tree just changed — every open surface refreshes itself (this is the single point every
+	// add/edit/move/delete/moveCategory/migrate-apply flows through; reorder publishes at its own site).
+	s.publishAxioms()
 	byID, laufregeln, axiome, regeln, err := s.scanForReconcile(ctx, cookie)
 	if err != nil {
 		log.Printf("devlabd: mercury reconcile scan failed (skipped): %v", err)

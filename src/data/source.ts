@@ -1,4 +1,5 @@
 import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunConfig, RunResult, RunResultRef, RunSnapshotMeta, RunType, SlotOverview, StartResult, StartStrategy, User, VisionFile } from '@/types';
+import type { MercuryTopic } from '@/lib/live';
 
 export interface DiffPayload {
   before: string;
@@ -198,6 +199,10 @@ export interface DataSource {
   mercuryRunConfig(): Promise<RunConfig>;
   /** Set the number of execution slots — takes effect immediately, no restart. 0 reverts to the seed. */
   mercurySetRunConfig(maxConcurrent: number): Promise<{ maxConcurrent: number }>;
+  /** Subscribe to the ONE live change-stream: `onTopic` fires with the topic that changed. Returns an
+   *  unsubscribe, or NULL when the source cannot push (mock/offline) — the provider then falls back to a
+   *  gentle poll. */
+  mercuryEvents(onTopic: (topic: MercuryTopic) => void): (() => void) | null;
   /** The deliveries blocked on a permanent prod-deploy failure — waiting for an explicit resume. */
   mercuryBlockedDeploys(): Promise<{ blocked: BlockedDeploy[] }>;
   /** Clear the block on one delivery so its prod-deploy is retried (full attempt budget again). */

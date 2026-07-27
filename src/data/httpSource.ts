@@ -1,3 +1,4 @@
+import { openLiveStream, type LiveEventSource } from '@/lib/live';
 import {
   AuthRequiredError,
   type BranchResult,
@@ -325,6 +326,18 @@ export const httpSource: DataSource = {
   },
   async mercurySetRunConfig(maxConcurrent: number) {
     return json(await post('/api/mercury/runs/config', { maxConcurrent }, 'PUT'));
+  },
+  mercuryEvents(onTopic) {
+    if (typeof EventSource === 'undefined') return null; // no push transport → provider polls
+    const stream = openLiveStream(
+      '/api/mercury/events',
+      { onTopic },
+      {
+        create: (url) => new EventSource(url, { withCredentials: true }) as unknown as LiveEventSource,
+        refresh: refreshSession, // a raw EventSource can't re-mint an expired cookie; do it before retry
+      },
+    );
+    return () => stream.close();
   },
   async mercuryBlockedDeploys() {
     return json(await request('/api/mercury/runs/deploys'));

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // A Delivery is the UNIT of work a run produced at one repository (req 8): the exact commit range it
@@ -82,9 +84,13 @@ func NewDeliveryID() string {
 type DeliveryStore struct {
 	path string
 	mu   sync.Mutex
+	pub  *live.Broker // optional: publishes a "deliveries" tick after every save (nil-safe)
 }
 
 func NewDeliveryStore() *DeliveryStore { return &DeliveryStore{path: deliveriesPath()} }
+
+// SetPublisher wires the change-stream broker so every ledger change publishes a "deliveries" tick.
+func (s *DeliveryStore) SetPublisher(b *live.Broker) { s.pub = b }
 
 func deliveriesPath() string {
 	if p := os.Getenv("DEVLAB_MERCURY_RUNS_DELIVERIES"); p != "" {
@@ -295,5 +301,9 @@ func (s *DeliveryStore) save(ds []Delivery) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.pub.Publish(live.TopicDeliveries) // an open delivery/blocked-deploy surface refreshes (nil-safe)
+	return nil
 }

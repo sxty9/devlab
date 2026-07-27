@@ -95,6 +95,7 @@ export const dataSource: DataSource = {
   mercuryDeferRun: (id) => impl.mercuryDeferRun(id),
   mercuryRunConfig: () => impl.mercuryRunConfig(),
   mercurySetRunConfig: (maxConcurrent) => impl.mercurySetRunConfig(maxConcurrent),
+  mercuryEvents: (onTopic) => impl.mercuryEvents(onTopic),
   mercuryBlockedDeploys: () => impl.mercuryBlockedDeploys(),
   mercuryResumeDeploy: (repo, number) => impl.mercuryResumeDeploy(repo, number),
   mercuryUploadAttachment: (id, filename, contentB64) => impl.mercuryUploadAttachment(id, filename, contentB64),

@@ -19,6 +19,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
@@ -43,6 +44,7 @@ type Server struct {
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	live        *live.Broker          // the ONE change-stream: publishers push topic ticks, /events fans them out
 	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
 	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
 	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
@@ -89,8 +91,14 @@ func New(v *auth.Verifier) *Server {
 		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
 		axiomChecks: runs.NewAxiomChecks(),
+		live:        live.NewBroker(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
+	// One change-stream for the whole Mercury surface: the run store publishes every config/runtime change
+	// so open views refresh themselves without polling. The scheduler wires its own publisher in
+	// StartScheduler; the delivery ledger and axiom handlers publish at their call sites.
+	s.runs.SetPublisher(s.live)
+	s.deliveries.SetPublisher(s.live)
 	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
 	// identity the autonomous pipeline commits with — so an edit works whether or not the person making
 	// it has linked GitHub themselves. With no link store (dev/preview, no encryption key) there is no
@@ -211,6 +219,9 @@ func (s *Server) Handler() http.Handler {
 	// axiomrepo). Read tier (the tree and a record); both are served from the local working copy.
 	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
 	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+	// The ONE live change-stream: one open connection keeps the whole Mercury surface current without
+	// polling. A GET (behind the session guard, no CSRF).
+	mux.HandleFunc("GET /api/mercury/events", s.guard(s.mercuryEvents))
 	// Add an axiom: aigentic classifies it into the tree, DevLab commits it to the constitution repo.
 	// CSRF-guarded; the push uses the runner's linked account (see New), so the caller needs no GitHub
 	// link of their own.
@@ -511,6 +522,14 @@ const (
 // requireRealGitHub rejects a feature that needs a real per-user GitHub account when running under
 // dev-bypass (the sandbox has no per-user token). Writes a 400 and returns false in that case.
 // `feature` names the plural subject, e.g. "Previews", "Pull requests".
+// publish pushes one topic onto the live change-stream (nil-safe). Called from a handler's success path so
+// every open Mercury surface refreshes itself without polling.
+func (s *Server) publish(topic string) { s.live.Publish(topic) }
+
+// publishAxioms announces that the axiom/rule tree changed. NB: the rollout does NOT publish — it exports
+// the constitution outward, it does not change the axiom inventory the surface reads.
+func (s *Server) publishAxioms() { s.live.Publish(live.TopicAxioms) }
+
 func (s *Server) requireRealGitHub(w http.ResponseWriter, feature string) bool {
 	if s.v.DevBypass() {
 		writeErr(w, http.StatusBadRequest, feature+" need a linked GitHub account")

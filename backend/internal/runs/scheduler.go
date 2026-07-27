@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // ErrRunAborted is the cancellation cause the kill-switch (Cancel) attaches to a run's context. It lets
@@ -82,7 +84,12 @@ type Scheduler struct {
 	claimedRepos map[string]bool       // repo-key → a live run is working it (ToDo target OR auto's current repo)
 
 	poke chan struct{} // nudged by SetCapacity so a raised cap admits waiting runs at once, not next tick
+	pub  *live.Broker  // optional: publishes an "active" tick whenever the live-run set changes (nil-safe)
 }
+
+// SetPublisher wires the change-stream broker so a run starting / reporting its result id / ending
+// publishes an "active" tick — the UI follows live runs without polling.
+func (s *Scheduler) SetPublisher(b *live.Broker) { s.pub = b }
 
 // NewScheduler builds a scheduler. tick defaults to 30s; maxConcurrent to DefaultMaxConcurrent.
 func NewScheduler(store *Store, exec Executor, tick time.Duration, maxConcurrent int) *Scheduler {
@@ -220,6 +227,7 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) 
 	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC(), Overload: ar.overload}
 	s.active[r.ID] = ar
 	markActive(len(s.active))
+	s.pub.Publish(live.TopicActive) // a run went live (nil-safe)
 	return true
 }
 
@@ -287,6 +295,7 @@ func (s *Scheduler) release(id string) {
 	n := len(s.active)
 	s.mu.Unlock()
 	markActive(n)
+	s.pub.Publish(live.TopicActive) // a run ended (nil-safe)
 }
 
 // RepoClaimKey normalises a repo identifier into the scheduler's per-repo claim key, so a ToDo's target
@@ -319,6 +328,7 @@ func (s *Scheduler) reportResult(id, resultID string) {
 		ar.activity.ResultID = resultID
 	}
 	s.mu.Unlock()
+	s.pub.Publish(live.TopicActive) // the live result id is now known → the UI can follow it (nil-safe)
 }
 
 // FireNow triggers a run immediately (manual "Jetzt ausführen"), detached from the caller's request so

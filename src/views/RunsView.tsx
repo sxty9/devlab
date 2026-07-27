@@ -7,6 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
@@ -107,6 +108,11 @@ export default function RunsView() {
       toast({ title: 'Läufe konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // Live list refresh (req 9/10): a run/ToDo change (from this session, another window, an automatic run,
+  // or a second instance) or an axiom change (coverage derives from axioms) reloads the list in place —
+  // selection and scroll are separate state, so nothing jumps (req 12).
+  useMercuryTopic(['runs', 'axioms'], () => void reload());
 
   // When ANY run finishes (an id leaves the active set), refresh the list so lastResult/next-fire/
   // ToDo-done update. Set-diff, not a single id — several runs execute concurrently now.

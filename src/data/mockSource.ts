@@ -495,6 +495,9 @@ export const mockSource: DataSource = {
     mockRunSlots = maxConcurrent < 1 ? 2 : maxConcurrent;
     return { maxConcurrent: mockRunSlots };
   },
+  mercuryEvents() {
+    return null; // no server to push from → the provider falls back to a gentle poll
+  },
   async mercuryBlockedDeploys() {
     const blocked = MOCK_BLOCKED_DEPLOYS.filter((d) => !mockResumedDeploys.has(`${d.repo}#${d.number}`));
     return { blocked };

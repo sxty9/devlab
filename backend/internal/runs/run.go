@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // ErrNotFound is returned by a Mutate closure that matched no run, so Mutate aborts before writing —
@@ -233,6 +235,7 @@ type Store struct {
 	path string
 	hist *History
 	mu   sync.Mutex
+	pub  *live.Broker // optional: publishes a "runs" tick after every successful change (nil-safe)
 }
 
 // NewStore builds the store (and its history) from the environment. It never errors — a missing file
@@ -240,6 +243,9 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{path: runsPath(), hist: NewHistory()}
 }
+
+// SetPublisher wires the change-stream broker so every successful Mutate/Patch publishes a "runs" tick.
+func (s *Store) SetPublisher(b *live.Broker) { s.pub = b }
 
 func runsPath() string {
 	if p := os.Getenv("DEVLAB_MERCURY_RUNS"); p != "" {
@@ -309,6 +315,7 @@ func (s *Store) Mutate(action, actor string, fn func([]Run) ([]Run, error)) ([]R
 		return nil, err
 	}
 	s.hist.snapshot(action, actor, next) // best-effort: a history write must never lose the mutation
+	s.pub.Publish(live.TopicRuns)        // an open surface refreshes itself (nil-safe)
 	return next, nil
 }
 
@@ -316,8 +323,12 @@ func (s *Store) Mutate(action, actor string, fn func([]Run) ([]Run, error)) ([]R
 // attaching a result) that are not user config edits, so the restore history stays meaningful.
 func (s *Store) Patch(fn func([]Run) ([]Run, error)) ([]Run, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.apply(fn)
+	next, err := s.apply(fn)
+	s.mu.Unlock()
+	if err == nil {
+		s.pub.Publish(live.TopicRuns) // runtime-state change (schedule advanced, result attached, queued)
+	}
+	return next, err
 }
 
 // apply loads, applies fn, and atomically saves. The caller holds s.mu.

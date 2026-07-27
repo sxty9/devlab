@@ -7,6 +7,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
@@ -296,6 +297,9 @@ export default function TodosView() {
       toast({ title: 'ToDos konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // Live list refresh (req 9/10): a ToDo/run change from anywhere reloads the list in place.
+  useMercuryTopic(['runs'], () => void reload());
 
   // When ANY run finishes (an id leaves the active set), refresh so ToDo done/last-result state updates.
   const prevActiveRef = useRef<string[]>([]);

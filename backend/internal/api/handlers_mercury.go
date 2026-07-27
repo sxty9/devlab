@@ -63,6 +63,7 @@ func (s *Server) mercuryReorder(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Reihenfolge konnte nicht gespeichert werden")
 		return
 	}
+	s.publishAxioms()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
