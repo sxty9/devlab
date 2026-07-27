@@ -17,24 +17,6 @@ set -euo pipefail
 ART="${1:?artifact dir required}"
 ENVN="${2:?env required}"
 
-# Deferred-restart marker: devlabd writes this file while Mercury runs are in flight and removes it only
-# when the LAST run ends (a COUNT, not a toggle — see runs/scheduler.go writeMarkerLocked). Restarting
-# devlabd now would kill every run mid-sweep, so the dev restart below holds off until the marker clears.
-# The in-process auto-merge path defers a self-deploy the same way; this covers a MANUAL/CI deploy too.
-RUNS_MARKER="${DEVLAB_MERCURY_RUNS_ACTIVE_MARKER:-/var/lib/devlab/mercury/runs-active}"
-RUNS_MARKER_WAIT="${DEVLAB_DEPLOY_RUNS_WAIT:-1800}"   # seconds to wait for runs to finish (0 = don't wait)
-
-defer_restart_until_idle() {
-  [[ "$RUNS_MARKER_WAIT" -gt 0 ]] || return 0
-  local deadline=$(( SECONDS + RUNS_MARKER_WAIT ))
-  while [[ -e "$RUNS_MARKER" ]] && (( SECONDS < deadline )); do
-    echo "[deploy devlab] deferring restart — $(cat "$RUNS_MARKER" 2>/dev/null || echo '?') Mercury run(s) active"
-    sleep 10
-  done
-  [[ -e "$RUNS_MARKER" ]] && echo "[deploy devlab] runs still active after ${RUNS_MARKER_WAIT}s — restarting anyway"
-  return 0
-}
-
 # What the runner built for devlab: the daemon binary + the built SPA. (Prebuilt — verify, never make.)
 BIN="$ART/devlabd"          # prebuilt Go binary  (backend/cmd/devlabd)
 WEB="$ART/web"              # prebuilt Vite SPA (buildArtifact writes the SPA to <artifact>/web)
@@ -47,33 +29,14 @@ case "$ENVN" in
     # (rsync --delete updates in place — the site is never emptied mid-copy — and prunes stale assets.)
     #
     # devlab is the ONE repo whose dev-deploy restarts the very process that drives Mercury runs. The
-    # install itself is harmless (a running process keeps its loaded image), so it happens now; only the
-    # RESTART is disruptive and is therefore handed to devlab-restart-idle, which waits for the run slot
-    # to free up. It runs as a TRANSIENT UNIT (systemd-run) so it lives outside devlabd's control group
-    # and survives the restart it performs — a plain background child would be killed with the unit.
+    # mutual exclusion lives IN devlabd, not here: SIGTERM makes it gate new runs and drain the in-flight
+    # ones (bounded by DEVLAB_RUNS_DRAIN_GRACE, within TimeoutStopSec) before it exits, and a run that is
+    # interrupted anyway self-heals on the next start. So this script simply restarts — one mechanism,
+    # owned by the service that knows what is running.
     echo "[deploy devlab] dev: install prebuilt binary + web"
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     mkdir -p /var/lib/devlab/www
     rsync -a --delete "$WEB"/ /var/lib/devlab/www/
-    IDLE_HELPER=/usr/local/sbin/devlab-restart-idle
-    if [[ -x "$IDLE_HELPER" ]] && command -v systemd-run >/dev/null 2>&1; then
-      # A fixed unit name makes this idempotent: while one deferred restart is pending, further deploys
-      # simply ride along with it instead of queueing a restart each.
-      if systemd-run --collect --quiet --unit=devlabd-restart-idle "$IDLE_HELPER" 2>/dev/null; then
-        echo "[deploy devlab] dev: restart scheduled (fires as soon as no run is in flight)"
-      else
-        echo "[deploy devlab] dev: a deferred restart is already pending — installed bytes ride along"
-      fi
-    else
-      # No helper installed (older box): keep the historical behaviour rather than skipping the restart.
-      echo "[deploy devlab] dev: restart helper unavailable — restarting directly"
-      systemctl restart devlabd
-    fi
-    defer_restart_until_idle   # hold off while Mercury runs are in flight (deferred restart)
-    # SIGTERM is the restart signal: devlabd gates new Mercury runs and drains the in-flight one before
-    # exiting (bounded by DEVLAB_RUNS_DRAIN_GRACE, within TimeoutStopSec), so this restart never kills a
-    # run mid-flight and no run can start once the restart is imminent. An interrupted run self-heals on
-    # boot. No wait/marker needed here — the mutual exclusion lives in devlabd, not this script.
     systemctl restart devlabd
     echo "[deploy devlab] dev: done"
     ;;
