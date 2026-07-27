@@ -51,7 +51,7 @@ func (s *Server) mercuryRollout(w http.ResponseWriter, r *http.Request) {
 	// Build the generated block once from the live store.
 	block, err := s.buildRolloutBlock(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	splice := func(old string) string { return mercury.SpliceMarker(old, block) }

@@ -36,6 +36,16 @@ var ErrExists = errors.New("record exists")
 // ErrNotFound is returned when a path holds no record.
 var ErrNotFound = errors.New("record not found")
 
+// ErrNoToken means no GitHub credential could be obtained to reach the repository (no linked account,
+// or an empty token). It is kept distinct from ErrUnavailable so the surface can say "link an account"
+// rather than "the network is down" — and, crucially, so neither is ever mistaken for "no axioms".
+var ErrNoToken = errors.New("no GitHub token for the axiom repository")
+
+// ErrUnavailable means the repository itself could not be reached — the clone or a required refresh
+// failed (no network, remote gone, bad URL). A read that hits this returns the error, never an empty
+// constitution, so "unreachable" and "genuinely empty" stay distinguishable.
+var ErrUnavailable = errors.New("axiom repository unavailable")
+
 // TokenFunc yields the GitHub token to push with. It is a function, not a value, so a token that is
 // rotated (or linked only later) is picked up without restarting the service.
 type TokenFunc func() (string, error)
@@ -43,25 +53,45 @@ type TokenFunc func() (string, error)
 // Store is the working copy of the constitution repository.
 type Store struct {
 	dir      string    // local clone
-	fullName string    // owner/repo
+	fullName string    // owner/repo, or a filesystem/URL remote used verbatim (see localRemote)
 	token    TokenFunc // push credentials
 	branch   string
+
+	// local is true when fullName is a filesystem path or explicit URL rather than an owner/repo pair:
+	// the remote is then used verbatim and no GitHub credential is injected. Real deployments pass
+	// owner/repo (local=false); tests pass a bare-repo path (local=true), which is what lets an
+	// out-of-package test drive the store against a genuine git remote with no auth plumbing.
+	local bool
 
 	mu        sync.Mutex
 	lastFetch time.Time
 	cloned    bool
 
-	// plain skips the Authorization header, for a remote that needs none (a local path in tests).
-	plain bool
+	// onBeforePush is a test seam: when non-nil it is invoked inside the write critical section, after
+	// our commit and just before the push. Production leaves it nil; a test sets it to land a competing
+	// commit on the remote first, deterministically exercising the reject-refresh-retry path.
+	onBeforePush func()
 }
 
 // fetchTTL bounds how stale a read may be. Writes always refresh first, so this only matters when a
 // SECOND instance (e.g. prod beside dev) edits the constitution concurrently.
 const fetchTTL = 30 * time.Second
 
+// maxWriteAttempts caps the reject-refresh-retry loop. Each losing attempt re-reads the remote's newest
+// state before re-applying, so a write is never silently lost — it either lands on the fresh state or,
+// only after this many genuine collisions, fails loudly.
+const maxWriteAttempts = 5
+
 // New builds the store. Nothing touches the network until the first use.
 func New(dir, fullName string, token TokenFunc) *Store {
-	return &Store{dir: dir, fullName: fullName, token: token, branch: "main"}
+	return &Store{dir: dir, fullName: fullName, token: token, branch: "main", local: localRemote(fullName)}
+}
+
+// localRemote reports whether fullName is a filesystem path or explicit URL (used verbatim, no auth)
+// rather than a GitHub owner/repo pair (cloned over https with the injected token).
+func localRemote(fullName string) bool {
+	return strings.HasPrefix(fullName, "/") || strings.HasPrefix(fullName, ".") ||
+		strings.HasPrefix(fullName, "file://")
 }
 
 // Dir is the local clone's path (exposed for diagnostics).
@@ -75,10 +105,10 @@ func (s *Store) FullName() string { return s.fullName }
 func (s *Store) git(ctx context.Context, args ...string) (string, error) {
 	var token string
 	full := []string{"-C", s.dir, "-c", "user.name=Mercury", "-c", "user.email=mercury@holistic.local"}
-	if !s.plain {
-		t, err := s.token()
+	if !s.local {
+		t, err := s.credential()
 		if err != nil {
-			return "", fmt.Errorf("kein GitHub-Token für das Axiom-Repository: %w", err)
+			return "", err
 		}
 		token = t
 		full = append(full, "-c", "credential.helper=",
@@ -113,10 +143,13 @@ func (s *Store) ensure(ctx context.Context, force bool) error {
 		return nil
 	}
 	if _, err := s.git(ctx, "fetch", "--prune", "origin"); err != nil {
-		if force {
-			return err
+		if !force {
+			return nil // a read may serve the local state through a network blip
 		}
-		return nil // a read may serve the local state through a network blip
+		if errors.Is(err, ErrNoToken) {
+			return err // a credential problem must not be masked as a generic outage
+		}
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	if _, err := s.git(ctx, "reset", "--hard", "origin/"+s.branch); err != nil {
 		return err
@@ -131,11 +164,11 @@ func (s *Store) clone(ctx context.Context) error {
 	}
 	var token string
 	args := []string{}
-	url := s.fullName // a local path remote (tests) is used verbatim
-	if !s.plain {
-		t, err := s.token()
+	url := s.fullName // a local path / URL remote is used verbatim
+	if !s.local {
+		t, err := s.credential()
 		if err != nil {
-			return fmt.Errorf("kein GitHub-Token für das Axiom-Repository: %w", err)
+			return err
 		}
 		token = t
 		args = append(args, "-c", "credential.helper=",
@@ -148,9 +181,22 @@ func (s *Store) clone(ctx context.Context) error {
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		return errors.New(redact(strings.TrimSpace(errb.String()), token))
+		return fmt.Errorf("%w: %s", ErrUnavailable, redact(strings.TrimSpace(errb.String()), token))
 	}
 	return nil
+}
+
+// credential fetches the push token, mapping a missing or empty token onto ErrNoToken so the surface
+// can tell "no account linked" apart from "the remote is unreachable".
+func (s *Store) credential() (string, error) {
+	t, err := s.token()
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrNoToken, err)
+	}
+	if strings.TrimSpace(t) == "" {
+		return "", ErrNoToken
+	}
+	return t, nil
 }
 
 // List returns every record path under prefix (empty = all), sorted — the same flat, sorted shape the
@@ -269,13 +315,14 @@ func (s *Store) Move(ctx context.Context, from, to, message, actor string) error
 	})
 }
 
-// write is the single write path: refresh → apply → commit → push, retried once against a remote that
-// moved underneath us. A change that produces no diff commits nothing (idempotent, like the rollout).
+// write is the single write path: refresh → apply → commit → push, retried against a remote that moved
+// underneath us. Each retry re-reads the newest remote state and re-applies on top, so a write is never
+// silently lost. A change that produces no diff commits nothing (idempotent, like the rollout).
 func (s *Store) write(ctx context.Context, message, actor string, apply func() error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < maxWriteAttempts; attempt++ {
 		if err := s.ensure(ctx, true); err != nil {
 			return err
 		}
@@ -295,18 +342,22 @@ func (s *Store) write(ctx context.Context, message, actor string, apply func() e
 		if _, err := s.git(ctx, "commit", "-m", full); err != nil {
 			return err
 		}
+		if s.onBeforePush != nil {
+			s.onBeforePush()
+		}
 		if _, err := s.git(ctx, "push", "origin", "HEAD:"+s.branch); err == nil {
 			s.lastFetch = time.Time{} // force the next read to see our own commit's remote state
 			return nil
-		} else if attempt == 1 {
+		} else if attempt == maxWriteAttempts-1 {
 			return err
 		}
-		// Someone else pushed first: drop our commit, take their state, and apply again.
+		// Someone else pushed first: drop our local commit so the next ensure can fast-forward to their
+		// state, then re-apply our change on top. Nothing of ours is lost — only re-based.
 		if _, rerr := s.git(ctx, "reset", "--hard", "HEAD~1"); rerr != nil {
 			return rerr
 		}
 	}
-	return errors.New("push nach zwei Versuchen abgelehnt")
+	return fmt.Errorf("push rejected after %d attempts (constitution repository under heavy contention)", maxWriteAttempts)
 }
 
 // safePath rejects anything that could escape the repository or hit its git directory.
