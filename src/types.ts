@@ -399,6 +399,7 @@ export interface Run {
   enabled: boolean;
   model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
+  timeBudget?: string; // per-repo wall-clock cap; absent = follow the service default, '0' = no cap, else a duration ('3h')
   schedule: RunSchedule;
   axiomIds: string[];
   // todo only
@@ -428,11 +429,20 @@ export interface RunInput {
   enabled: boolean;
   model?: string; // Claude model id/alias; '' or absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
+  timeBudget?: string; // per-repo wall-clock cap; '' = follow the service default, '0' = no cap, else a duration ('3h')
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
   targets?: RunTarget[]; // todo only — one or more destinations (existing and/or new repos)
   dueAt?: string | null; // todo only — optional one-time due date
+}
+
+/** The runner's service-level configuration — the central config surface, apart from any single run's
+ *  tuning. Today one value: the default per-repo time budget a run follows when it made no own choice.
+ *  GET resolves a blank to the value actually in force, so this is always a concrete duration ('3h'), or
+ *  '0' for a deliberate no-cap default. */
+export interface MercuryConfig {
+  defaultTimeBudget: string;
 }
 
 export interface RunList {
@@ -586,6 +596,10 @@ export interface RunResult {
    *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
   model?: string;
   effort?: string;
+  /** The per-repo time budget IN FORCE for this execution — the resolved value (a run's own choice, or
+   *  the service default it followed), not the run's raw field. '0' = ran without a cap. Absent on older
+   *  executions. Shown in the execution view, and named as the value exceeded on a budget timeout. */
+  timeBudget?: string;
   ok: boolean;
   repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed

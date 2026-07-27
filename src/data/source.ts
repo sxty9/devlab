@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryConfig, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -158,6 +158,11 @@ export interface DataSource {
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;
+  /** The runner's service-level configuration (the central config surface): the default per-repo time
+   *  budget a run follows when it made no own choice. GET resolves it to the value actually in force. */
+  mercuryConfig(): Promise<MercuryConfig>;
+  /** Change the runner's service-level configuration; returns the resolved config. */
+  mercurySetConfig(config: MercuryConfig): Promise<MercuryConfig>;
   /** Ask AI to plan the not-yet-covered axioms into runs (reviewable; writes nothing). */
   mercuryRunAiFill(): Promise<RunProposal>;
   /** Ask AI to regroup the current runs (reviewable; writes nothing). */

@@ -1,4 +1,4 @@
-import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
+import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryConfig, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
@@ -316,6 +316,14 @@ export const mockSource: DataSource = {
     const idx = runStore.findIndex((r) => r.id === id);
     if (idx >= 0) runStore.splice(idx, 1);
   },
+  async mercuryConfig() {
+    return { ...mockConfig }; // fresh copy, like the other mock reads
+  },
+  async mercurySetConfig(config: MercuryConfig) {
+    // Mirror the backend: a blank default resolves back to the built-in three hours (never left empty).
+    mockConfig = { defaultTimeBudget: (config.defaultTimeBudget ?? '').trim() || '3h' };
+    return { ...mockConfig };
+  },
   async mercuryRunAiFill() {
     return { proposal: { runs: [] }, axioms: {} };
   },
@@ -432,6 +440,10 @@ const mockId = (prefix: string) => `${prefix}_mock${(mockSeq += 1)}`;
 /** ToDos + Läufe, discriminated by `type` — the one store the backend keeps in runs.json. Starts empty,
  *  like a fresh instance; create/update/delete below keep it in sync so the list reflects every change. */
 const runStore: Run[] = [];
+
+/** The runner's service-level config (central config surface) — the default time budget runs follow.
+ *  Starts at the built-in three hours, like a fresh backend; mercurySetConfig mutates it. */
+let mockConfig: MercuryConfig = { defaultTimeBudget: '3h' };
 
 /** The automatic axiom→run assignment feed — seeded with one believable entry so the panel is visible in
  *  preview; dismiss/clear mutate it. The real feed is written by the backend's background assigner. */

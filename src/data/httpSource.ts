@@ -270,6 +270,12 @@ export const httpSource: DataSource = {
   async mercuryDeleteRun(id) {
     await json<void>(await request(`/api/mercury/runs/${enc(id)}`, withCsrf({ method: 'DELETE' })));
   },
+  async mercuryConfig() {
+    return json(await request('/api/mercury/config'));
+  },
+  async mercurySetConfig(config) {
+    return json(await post('/api/mercury/config', config, 'PUT'));
+  },
   async mercuryRunAiFill() {
     return json(await post('/api/mercury/runs/ai-fill', {}));
   },
