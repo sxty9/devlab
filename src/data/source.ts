@@ -175,10 +175,13 @@ export interface DataSource {
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
-  mercuryRunNow(id: string): Promise<{ started: boolean }>;
+  /** Start a run now. `started` when it began; `queued` when a restart is draining, in which case the
+   *  run was recorded to start by itself after the restart (never silently dropped) and `message` says so. */
+  mercuryRunNow(id: string): Promise<{ started: boolean; queued?: boolean; message?: string }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. */
-  mercuryRunActive(): Promise<{ active: RunActive | null }>;
+   *  page reload, and polled to follow it live. `restartPending` is true while a restart is draining
+   *  (no new run starts until it completes), so the UI can say so. */
+  mercuryRunActive(): Promise<{ active: RunActive | null; restartPending?: boolean }>;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
 

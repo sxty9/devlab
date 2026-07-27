@@ -254,7 +254,7 @@ export default function TodosView() {
 
   // The ToDo executing right now is SERVER truth (via useActiveRun) — so the "aktiv" state and the
   // live-follow view survive a page reload. The cancel affordance shows whenever a run is live.
-  const { active, refetch: refetchActive } = useActiveRun();
+  const { active, restartPending, refetch: refetchActive } = useActiveRun();
   const running = active != null;
   const [cancelling, setCancelling] = useState(false);
 
@@ -368,6 +368,7 @@ export default function TodosView() {
         todo={selectedTodo}
         repos={repos}
         active={active && active.runId === selectedTodo.id ? active : null}
+        restartPending={restartPending}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -503,6 +504,7 @@ function TodoDetail({
   todo,
   repos,
   active,
+  restartPending,
   onEdit,
   onDeleted,
   onRunStarted,
@@ -511,6 +513,7 @@ function TodoDetail({
   todo: Run;
   repos: Repo[];
   active: RunActive | null;
+  restartPending: boolean;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRunStarted: () => void;
@@ -586,8 +589,13 @@ function TodoDetail({
     if (runningNow) return;
     setRunningNow(true);
     try {
-      await source.mercuryRunNow(todo.id);
-      toast({ title: 'ToDo gestartet', variant: 'success' });
+      const r = await source.mercuryRunNow(todo.id);
+      if (r.queued) {
+        // A restart is draining: the ToDo was not started now but will start by itself afterwards.
+        toast({ title: 'Neustart läuft', description: r.message ?? 'Das ToDo wurde eingereiht und startet nach dem Neustart automatisch.', variant: 'default' });
+      } else {
+        toast({ title: 'ToDo gestartet', variant: 'success' });
+      }
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
@@ -621,6 +629,9 @@ function TodoDetail({
         <span className={cn('rounded px-1.5 py-0.5 font-medium', todo.enabled ? 'bg-success/15 text-success' : 'bg-fill/15 text-text-tertiary')}>
           {todo.enabled ? 'Aktiv' : 'Deaktiviert'}
         </span>
+        {restartPending && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">Neustart läuft</span>
+        )}
         {todo.done && (
           <span className="flex items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 font-medium text-success">
             <CheckIcon className="h-3 w-3" /> Erledigt

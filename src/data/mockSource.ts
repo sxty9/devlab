@@ -349,7 +349,7 @@ export const mockSource: DataSource = {
     return { started: true };
   },
   async mercuryRunActive() {
-    return { active: null };
+    return { active: null, restartPending: false };
   },
   async mercuryCancelRun() {
     /* mock: no-op */

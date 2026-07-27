@@ -653,9 +653,10 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; refetch: () => void } {
+export function useActiveRun(): { active: RunActive | null; restartPending: boolean; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
   const [active, setActive] = useState<RunActive | null>(null);
+  const [restartPending, setRestartPending] = useState(false);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -664,7 +665,10 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
     const poll = async () => {
       try {
         const r = await source.mercuryRunActive();
-        if (!cancelled) setActive(r.active);
+        if (!cancelled) {
+          setActive(r.active);
+          setRestartPending(!!r.restartPending);
+        }
       } catch {
         /* transient — keep the last known state */
       }
@@ -680,7 +684,7 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
     };
   }, [source, bump]);
 
-  return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, restartPending, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
 
 /** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already
