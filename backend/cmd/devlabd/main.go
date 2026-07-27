@@ -45,6 +45,9 @@ func main() {
 	// in-flight run drains before the process exits.
 	schedCtx, schedCancel := context.WithCancel(context.Background())
 	server.StartScheduler(schedCtx)
+	// The daily run-report emailer shares the scheduler's lifetime and gating: at the close of a day
+	// on which runs executed, it mails the owner a summary of what they did.
+	server.StartReporter(schedCtx)
 
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {

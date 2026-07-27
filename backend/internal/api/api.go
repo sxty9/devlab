@@ -18,6 +18,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/report"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
@@ -27,18 +28,19 @@ const version = "0.1.0"
 // Server wires the verifier + repo base + per-user GitHub link store + workspace manager into
 // HTTP handlers.
 type Server struct {
-	v           *auth.Verifier
-	reposBase   string
-	links       *links.Store // nil when no encryption key is configured (dev/preview sandbox)
-	workspaces  *workspace.Manager
-	comments    *comments.Store       // nil if the comments dir can't be created
-	chats       *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
-	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
-	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
-	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
-	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
-	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
-	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
+	v            *auth.Verifier
+	reposBase    string
+	links        *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	workspaces   *workspace.Manager
+	comments     *comments.Store       // nil if the comments dir can't be created
+	chats        *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
+	runs         *runs.Store           // Mercury's Automatische Läufe — run instances + config history
+	runResults   *runs.Results         // per-execution results/logs (written by the executor, read here)
+	runPRs       *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	attachments  *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	scheduler    *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	reportLedger *report.Ledger        // passive record of delivered/failed daily run reports (StartReporter drives sending)
+	staticDir    string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
@@ -66,17 +68,18 @@ func New(v *auth.Verifier) *Server {
 		chatStore = nil
 	}
 	return &Server{
-		v:           v,
-		reposBase:   base,
-		links:       store,
-		workspaces:  workspace.NewManager(),
-		comments:    cstore,
-		chats:       chatStore,
-		runs:        runs.NewStore(),
-		runResults:  runs.NewResults(),
-		runPRs:      runs.NewPRStore(),
-		attachments: runs.NewAttachmentStore(),
-		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
+		v:            v,
+		reposBase:    base,
+		links:        store,
+		workspaces:   workspace.NewManager(),
+		comments:     cstore,
+		chats:        chatStore,
+		runs:         runs.NewStore(),
+		runResults:   runs.NewResults(),
+		runPRs:       runs.NewPRStore(),
+		attachments:  runs.NewAttachmentStore(),
+		reportLedger: report.NewLedger(),
+		staticDir:    os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 }
 
@@ -210,6 +213,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
 	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
+	// Delivery status of the daily run-report email (so a failed send is visible, not silent).
+	mux.HandleFunc("GET /api/mercury/runs/report-status", s.guard(s.runsReportStatus))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
