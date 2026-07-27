@@ -379,7 +379,7 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
 
 /** The full execution document as a page: title, totals, then the repos as a GitLab-style pipeline or a
  *  detailed list (toggle). The right pane of an aggregate ExecutionHistory. */
-export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: string }) {
+export function ExecutionDetail({ runId, resultId, hideHeader }: { runId: string; resultId: string; hideHeader?: boolean }) {
   const source = useMemo(() => getDataSource(), []);
   const [res, setRes] = useState<RunResult | null>(null);
   const [err, setErr] = useState(false);
@@ -400,27 +400,31 @@ export function ExecutionDetail({ runId, resultId }: { runId: string; resultId: 
   if (err) return <p className="px-8 py-7 text-footnote text-text-secondary">Diese Ausführung konnte nicht geladen werden.</p>;
   if (!res) return <p className="px-8 py-7 text-footnote text-text-tertiary">Lädt…</p>;
 
-  return <ExecutionDetailBody res={res} />;
+  return <ExecutionDetailBody res={res} hideHeader={hideHeader} />;
 }
 
 /** The execution body: title, totals, prompt, then the repos as a GitLab-style pipeline (default) or a
- *  detailed per-repo list, toggled by the viewer. Both read the same recorded steps. */
-function ExecutionDetailBody({ res }: { res: RunResult }) {
+ *  detailed per-repo list, toggled by the viewer. Both read the same recorded steps. `hideHeader` drops
+ *  the title/date/status block and the outer padding for embedding under chrome that already carries
+ *  them (the calendar's detail modal), leaving the totals, prompt and pipeline. */
+function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?: boolean }) {
   const [view, setView] = useState<'pipeline' | 'list'>('pipeline');
   return (
-    <article className="mx-auto max-w-5xl px-8 py-7">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
-          <p className="mt-1 text-footnote text-text-secondary">
-            {fmtDateTime(res.startedAt)}
-            {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
-          </p>
+    <article className={cn('mx-auto max-w-5xl', hideHeader ? '' : 'px-8 py-7')}>
+      {!hideHeader && (
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
+            <p className="mt-1 text-footnote text-text-secondary">
+              {fmtDateTime(res.startedAt)}
+              {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
+            </p>
+          </div>
+          <OkPill ok={res.ok} />
         </div>
-        <OkPill ok={res.ok} />
-      </div>
+      )}
 
-      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+      <div className={cn('flex flex-wrap items-center justify-between gap-3', !hideHeader && 'mt-4')}>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
           <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
           <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
