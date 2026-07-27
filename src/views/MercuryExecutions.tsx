@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
@@ -508,6 +509,17 @@ export function ExecutionHistory({ type }: { type: RunType }) {
     };
   }, [source, type]);
 
+  // Live: a run finishing (or any run/ToDo change) refreshes the list silently — no spinner, no toast,
+  // and the selected execution stays selected — so the history stays current without a reload.
+  useMercuryTopic(['runs'], () => {
+    source
+      .mercuryRunExecutions(type)
+      .then((r) => setExecutions(r.executions))
+      .catch(() => {
+        /* transient — keep what's on screen */
+      });
+  });
+
   const refresh = async () => {
     if (refreshing) return;
     setRefreshing(true);
@@ -648,39 +660,40 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
   );
 }
 
-/** Poll the server for the run executing right now (its id + live result id), or null. This is the
- *  single source of truth for "a run is live": read on mount it RESTORES the running state after a page
- *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
- *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
- *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
+/** The run executing right now (its id + live result id), or null — the single source of truth for
+ *  "a run is live". Fetched once on mount so it RESTORES the running state after a page reload, then
+ *  kept current by the live-event stream (the 'active' topic fires on start / result-id known / end)
+ *  rather than a resting poll. refetch() forces an immediate re-check — e.g. right after starting or
+ *  cancelling a run — so the UI reacts without waiting for the server event. */
 export function useActiveRun(): { active: RunActive | null; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
   const [active, setActive] = useState<RunActive | null>(null);
-  const [bump, setBump] = useState(0);
+  const cancelledRef = useRef(false);
+
+  const fetchActive = useCallback(async () => {
+    try {
+      const r = await source.mercuryRunActive();
+      if (!cancelledRef.current) setActive(r.active);
+    } catch {
+      /* transient — keep the last known state */
+    }
+  }, [source]);
 
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const r = await source.mercuryRunActive();
-        if (!cancelled) setActive(r.active);
-      } catch {
-        /* transient — keep the last known state */
-      }
-      if (!cancelled) timer = window.setTimeout(poll, 2500);
-    };
-    void poll();
-    const onFocus = () => setBump((b) => b + 1); // re-check when the tab regains focus
+    cancelledRef.current = false;
+    void fetchActive(); // on mount: restores a run that was already live before this view opened
+    const onFocus = () => void fetchActive(); // re-check on focus (covers an event missed while hidden)
     window.addEventListener('focus', onFocus);
     return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
+      cancelledRef.current = true;
       window.removeEventListener('focus', onFocus);
     };
-  }, [source, bump]);
+  }, [fetchActive]);
 
-  return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  // The push stream replaces the old 2.5s poll: refetch exactly when the live-run pointer changed.
+  useMercuryTopic(['active'], () => void fetchActive());
+
+  return { active, refetch: fetchActive };
 }
 
 /** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already
@@ -692,29 +705,32 @@ export function LiveExecution({ runId, resultId, live }: { runId: string; result
   const [res, setRes] = useState<RunResult | null>(null);
   const [err, setErr] = useState(false);
   const resRef = useRef<RunResult | null>(null);
+  const cancelledRef = useRef(false);
+
+  const fetchResult = useCallback(async () => {
+    try {
+      const r = await source.mercuryRunResult(runId, resultId);
+      if (!cancelledRef.current) {
+        resRef.current = r;
+        setRes(r);
+        setErr(false);
+      }
+    } catch {
+      if (!cancelledRef.current && !resRef.current) setErr(true); // only surface if we never got a document
+    }
+  }, [source, runId, resultId]);
 
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const r = await source.mercuryRunResult(runId, resultId);
-        if (!cancelled) {
-          resRef.current = r;
-          setRes(r);
-          setErr(false);
-        }
-      } catch {
-        if (!cancelled && !resRef.current) setErr(true); // only surface if we never got a document
-      }
-      if (!cancelled && live) timer = window.setTimeout(poll, 2000);
-    };
-    void poll();
+    cancelledRef.current = false;
+    void fetchResult(); // on mount, when the target changes, and once more when it settles (live→false)
     return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
+      cancelledRef.current = true;
     };
-  }, [source, runId, resultId, live]);
+  }, [fetchResult, live]);
+
+  // While live, follow the execution via the stream: 'progress' fires as the transcript grows and
+  // 'active' when the pointer changes — no 2s poll. Once settled (live=false) we subscribe to nothing.
+  useMercuryTopic(live ? ['progress', 'active'] : [], () => void fetchResult());
 
   if (!res) {
     return <p className="text-footnote text-text-tertiary">{err ? 'Live-Ausführung wird vorbereitet…' : 'Lädt…'}</p>;

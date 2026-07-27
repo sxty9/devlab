@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
+import { MercuryLiveProvider, useMercuryTopic } from '@/state/mercuryLive';
 import { renderMarkdown } from '@/lib/markdown';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
@@ -104,8 +105,21 @@ const NS_EMPTY: Record<SchemeNs, string> = {
 
 /** Mercury — the centre for the Holistic axioms, in three parts: the axioms (aigentic auto-sorts a
  *  new one; the user re-files, renames, edits and deletes by hand), the implementation rules, and
- *  the scheduled runs. It owns no store — the tree is a projection of aigentic's scheme graveyard. */
+ *  the scheduled runs. It owns no store — the tree is a projection of aigentic's scheme graveyard.
+ *
+ *  It also hosts the ONE live-update stream (MercuryLiveProvider) for the whole surface — mounted here
+ *  so it opens on entering Mercury and closes on leaving (this view unmounts on a tab switch), so a
+ *  closed surface causes no ongoing load. Every child (tree, runs, ToDos, calendars, history, the
+ *  live-run pointer) subscribes to that one stream by topic. */
 export function MercuryView() {
+  return (
+    <MercuryLiveProvider>
+      <MercuryViewInner />
+    </MercuryLiveProvider>
+  );
+}
+
+function MercuryViewInner() {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
 
@@ -210,6 +224,11 @@ export function MercuryView() {
       cancelled = true;
     };
   }, [reload]);
+
+  // Live: refresh the tree when axioms/rules change elsewhere (this session, another window, a run).
+  // Selection, per-row expansion (keyed by path) and the sidebar scroll position are separate state,
+  // so a tree refetch leaves them intact — the update is calm.
+  useMercuryTopic(['axioms'], () => void reload());
 
   if (failed) {
     return (
