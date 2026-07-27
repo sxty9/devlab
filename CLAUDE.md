@@ -21,31 +21,32 @@ _Automatisch aus Mercury ausgerollt. Nicht direkt bearbeiten; ändere die Axiome
 - **Atomare Zugriffe** — Jeder lesende und schreibende Datenzugriff erfolgt atomar — unteilbar und ohne beobachtbaren Zwischenzustand.
 - **Zugangspunkt wiederverwenden** — Existiert für eine Entität bereits ein Zugangspunkt, ist er zwingend wiederzuverwenden. Parallele Datenpfade zur selben Entität werden niemals angelegt.
 
-### architecture / symmetry
-- **Symmetrische Geschwister** — Parallele Oberflächen, die auf derselben Maschinerie oder Domäne beruhen und bewusst nebeneinander bestehen, stellen einen symmetrischen Funktionsumfang bereit — dieselben Operationen, Ansichten und Zugangspunkte. Keine Oberfläche führt eine Funktion, die eine gleichgeordnete ohne fachlichen Grund entbehrt; divergiert der Umfang, wird er zum volleren Satz hin ausgeglichen, sofern die fehlende Funktion nicht strukturell unanwendbar ist.
-
 ### architecture / uniformity
 - **CLI** — Jeder Service stellt eine CLI bereit. Sie folgt in Syntax und Semantik strikt dem einheitlichen Holistic-CLI-Standard, sodass alle Service-CLIs sich gleich bedienen lassen.
 - **Code-Struktur** — Aufbau, Layout, Namenskonventionen und Repository-Grundgerüst eines Service entsprechen exakt denen der übrigen Holistic-Services. Struktur ist service-übergreifend uniform.
 
 ### environment
 - **Account-Löschung** — Der Account-Löschvorgang bündelt seine Optionen an einer Stelle und legt explizit fest, wie verbleibende Userdaten behandelt werden.
+- **Drag & Drop für Dateisammlungen** — UI-Elemente, die eine Sammlung von Dateien und/oder Ordnern repräsentieren, müssen browserseitiges Drag & Drop unterstützen.
 - **Einfügen aus der Zwischenablage** — An jedem Knotenpunkt, an dem Dateien zum Erfüllen einer Aufgabe unmittelbar hochgeladen werden können, wird zusätzlich das Einfügen aus der Zwischenablage bereitgestellt. Datei-Dialog und Zwischenablage sind gleichwertige Eingabewege desselben Zugangspunkts.
 - **Mehrsprachigkeit** — Alle sprachlichen Inhalte werden zeitnah in sämtliche unterstützten Holistic-Sprachen übersetzt. Die Sprache ist im UI jederzeit wählbar.
 - **Rechtelose Dienste verborgen** — Dienste, zu denen ein User keine Rechte besitzt, werden ihm im Dashboard nicht angezeigt.
 - **Rechtsklick-Menüs** — Wo ein Kontextmenü sinnvoll ist, wird es bereitgestellt — mit zweckmäßigen, nicht überflüssigen Einträgen, im Einklang mit dem Minimalism-Maxim.
 - **Service-übergreifende Tabs** — Tabs sind nicht an einen einzelnen Service gebunden: Mehrere Services können denselben Tab gemeinsam gestalten, und die Umgebung unterstützt dies.
 - **Tastaturnavigation in Listenelementen** — Alle listenartigen UI-Elemente, die mehrere Objekte enthalten, müssen sämtliche gängigen Tastaturkürzel unterstützen – insbesondere Kombinationen mit Cmd/Strg.
+- **Tiefe Implementierung von KI-Optionen** — Bei nichttrivialen Aufgaben sollen Usern KI-Optionen zur Verfügung stehen. Dies umfasst die gesamte Holistic-Servicelandschaft. Als Standard gilt hier der "Ask AI" Button, der durch den aigentic Service routet .Solange KI einen generelleren Use Case erfüllt, soll dieser "Ask AI" Standard verwendet werden. Im Falle eines spezifischeren Einsatzes, darf von diesem abgewägt werden.
 - **Zustandserhalt beim Reload** — Aktualisiert der User eine Seite im Browser, ist der zuvor gewählte Zustand wiederherzustellen — derselbe Tab, dieselbe Ansicht und dieselbe Session (etwa ein Service-Tab oder eine Chat-Session). Der User arbeitet an derselben Stelle weiter und muss nicht erneut selbst dorthin navigieren.
 
 ### interfaces
-- **Kennzeichnungspflicht für KI-Modellantworten** — Jede Antwort auf einen KI-Prompt ist mit dem verwendeten Modell zu kennzeichnen.
+- **KI-Token-Verbrauch** — Jeder Dienst stellt KI-Token-Verbrauch ausschließlich über definierte Schnittstellen bereit. Dies ermöglicht zentrale Kontrolle des Token-Verbrauchs sowie systematische Datenanalyse.
 - **Konfiguration** — Jeder Service stellt seine Konfiguration als vollständige Schnittstelle bereit. Sämtliche Konfiguration und Einstellung — insbesondere durch Admins — erfolgt gebündelt im zentralen Dashboard in einem eigenen Tab, analog zur zentralen Rechteverwaltung, jedoch für Konfigurationen statt Rechte. Falsch eingeordnete Konfiguration wird umgehend dorthin umgeordnet. In den Service-Tabs steht die User-Experience im Zentrum; sie werden nicht mit Konfiguration überfrachtet.
 - **Leistungsbeanspruchung** — Jeder Service stellt seine Leistungsbeanspruchung als vollständige Schnittstelle bereit — seinen Bedarf an Rechenzeit, Arbeitsspeicher und weiteren Betriebsressourcen. Die Beanspruchung wird gebündelt im zentralen Dashboard sichtbar, analog zur zentralen Rechteverwaltung, sodass Last und Kapazität service-übergreifend beurteilt werden können. Der Service meldet seinen Verbrauch; die Bewertung liegt außerhalb. In den Service-Tabs steht die User-Experience im Zentrum, nicht die Last-Telemetrie.
 - **MCP** — Jeder Service stellt seine Fähigkeiten als vollständige MCP-Schnittstelle bereit — als Model-Context-Protocol-Server, über den Agenten die Funktionen des Service nutzen. Der Server ist einheitlich benannt und über die zentrale Infrastruktur adressierbar, analog zur zentralen Rechteverwaltung; seine Adresse liegt server-seitig und nie im Request, sodass kein manipulierter Aufruf einen Agenten auf einen fremden Host lenkt. Jede über MCP angebotene Fähigkeit ist durch das Rechtesystem gedeckt.
 - **Rechte** — Jeder Service stellt seine Rechte als vollständige Schnittstelle bereit — als Rechte-Manifest für die zentrale Rechteverwaltung. Jedes Recht ist symmetrisch aufgebaut und eins zu eins durch eine Systemgruppe gedeckt; Feingranularität nur dort, wo sie fachlich zwingend geboten ist. Vergabe und Verwaltung erfolgen gebündelt in der zentralen Rechteverwaltung, nicht in den einzelnen Service-Tabs. So bleibt das Rechtesystem über alle Services einheitlich und symmetrisch.
 - **Speichernutzung** — Jeder Service stellt seine Speichernutzung als vollständige Schnittstelle bereit — welche Daten er in welchem Umfang hält. Die Nutzung wird gebündelt im zentralen Dashboard sichtbar, analog zur zentralen Rechteverwaltung, sodass Belegung und Wachstum service-übergreifend nachvollziehbar sind. Der Service meldet nur; die Auswertung liegt außerhalb. In den Service-Tabs steht die User-Experience im Zentrum, nicht die Speicher-Telemetrie.
-- **Tiefe Implementierung von KI-Optionen** — Bei nichttrivialen Aufgaben sollen Usern KI-Optionen zur Verfügung stehen. Dies umfasst die gesamte Holistic-Servicelandschaft. Als Standard gilt hier der "Ask AI" Button, der durch den aigentic Service routet .Solange KI einen generelleren Use Case erfüllt, soll dieser "Ask AI" Standard verwendet werden. Im Falle eines spezifischeren Einsatzes, darf von diesem abgewägt werden.
+
+### (allgemein)
+- **Kennzeichnungspflicht für KI-Modellantworten** — Jede Antwort auf einen KI-Prompt ist mit dem verwendeten Modell zu kennzeichnen.
 
 ### lawbooks
 - **Bewusst designt** — Ein axiomatisches System wird bewusst als Ganzes entworfen, nicht historisch gewachsen. Organische Evolution wird vermieden; die Struktur ist absichtsvoll gestaltet.
@@ -78,13 +79,16 @@ _Automatisch aus Mercury ausgerollt. Nicht direkt bearbeiten; ändere die Axiome
 - **user-antwort** — Zusammenfassungen/Antworten kann den Usern sind kurz und knapp und folgen klarer Struktur: Live & deployed; noch nicht gepusht; Antworten auf Fragen (falls User fragen stellt)
 
 ### environment
-- **Passwordless sudo vorausgesetzt** — Passwordless sudo ist für Claude auf dem Server aktiviert; dies ist beim Implementieren generell vorauszusetzen
+- **HSL – Holistic Services Landscape** — HSL (Holistic Services Landscape) bezeichnet die Gesamtheit aus der Holistic-Instanz und allen Diensten, die Bestandteil des Holistic Dashboards sind.
+- **Passwordless sudo vorausgesetzt** — Passwordless sudo ist systemseitig für den Agenten aktiviert und bei der Implementierung generell vorauszusetzen.
 
 ### process
-- **Deploy-Disziplin** — Ein neuer Service, ein Feature oder ein Bugfix wird unmittelbar live deployt. Signalisiert der Tonfall des Users, dass der Stand behalten wird oder zum nächsten Feature/Bug übergegangen wird, erfolgt zusätzlich automatisch der Push auf main (mainpush). Dies ist eine konkrete Vorgehensweise WÄHREND der Implementierung, keine nachträgliche Prüfung.
+- **Browser-Aufgaben delegieren** — Sobald der User eine Aufgabe im Browser ausführen muss, generiere unmittelbar einen einsatzbereiten Prompt für Claude for Chrome, der die Aufgabe eigenständig übernimmt.
 - **Implementierung auf Englisch** — Implementiere ausschließlich in Englisch. Holistic ist multilingual, doch die Übersetzung in alle weiteren Sprachen erfolgt nachgelagert im Nightly Run; dies hält den Token-Verbrauch wirtschaftlich.
+- **Implementierung über Mercury** — Jede KI-gestützte Implementierung läuft über Mercury, damit sie erfasst, nachvollziehbar und an die Auslieferungskette gebunden ist. Wird eine interaktive Sitzung geöffnet, um zu implementieren, so implementiert diese Sitzung nicht selbst: Sie legt die Aufgabe als konkretes ToDo an und führt es unmittelbar aus. Sind alle Ausführungsplätze belegt, wird ein laufender Vorgang zurückgestellt, um dem ToDo Platz zu machen. Die Ausführung liefert unmittelbar aus; die Zusammenführung in den Standard-Branch erfolgt über den regulären, geordneten Weg. So folgt auch die von Hand angestoßene Arbeit derselben Kette und ist vollständig erfasst.
 - **Klärungspflicht** — Stelle bei Architektur- und Designfragen sowie bei jeder Unklarheit umgehend Rückfragen an den User, auch ohne explizite Aufforderung im Prompt und insbesondere im Hinblick auf die strikte Einhaltung der Maximen.
 - **Mehrere Anforderungen ohne Rückbestätigung umsetzen** — Übermittelt der Nutzer mehrere Anforderungen in separaten Prompts, sind diese unmittelbar umzusetzen, ohne zuvor eine erneute Bestätigung einzuholen.
+- **Mehrstufige Implementierung ohne Unterbrechung** — Mehrstufige Implementierungen werden ohne Rückfragen vollständig bis zur letzten Phase durchgeführt, sofern keine offenen Fragen bestehen. Die Überprüfung durch den Nutzer erfolgt erst nach Abschluss aller Phasen.
 
 ### (allgemein)
 - **Self-Healing** — Holistic ist self-healing: Werden beim Implementieren oder Testen Komplikationen, Fehler oder Bugs aufgedeckt, sind diese automatisch mitzufixen.
