@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // ErrRunAborted is the cancellation cause the kill-switch (Cancel) attaches to a run's context. It lets
@@ -95,7 +97,15 @@ type Scheduler struct {
 	active        map[string]*activeRun
 	claimedRepos  map[string]bool
 	exclusiveHeld bool
+
+	// pub broadcasts a "live-run set changed" signal on start / result-id known / end, so open UIs track
+	// the running runs without a resting poll. Optional (nil = no-op). Set by SetPublisher.
+	pub *live.Broker
 }
+
+// SetPublisher wires the live-change broker so the scheduler notifies open UIs when a run starts, gets
+// its result id, or ends. Nil is allowed (publishing off).
+func (s *Scheduler) SetPublisher(b *live.Broker) { s.pub = b }
 
 // NewScheduler builds a scheduler. tick defaults to 30s.
 func NewScheduler(store *Store, exec Executor, tick time.Duration) *Scheduler {
@@ -318,6 +328,7 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) 
 	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC(), Exclusive: ar.exclusive, Overload: ar.overload}
 	s.active[r.ID] = ar
 	markActive(len(s.active))
+	s.pub.Publish(live.TopicActive) // a run just went live
 	return true
 }
 
@@ -427,6 +438,7 @@ func (s *Scheduler) release(id string) {
 		delete(s.claimedRepos, k)
 	}
 	markActive(len(s.active))
+	s.pub.Publish(live.TopicActive) // a run ended (its slot freed)
 }
 
 // claimKeys is the set of repository keys a ToDo occupies while it runs — one per target, an existing
@@ -505,6 +517,7 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 			ar.activity.ResultID = resultID
 		}
 		s.mu.Unlock()
+		s.pub.Publish(live.TopicActive) // the live result id is now known — point the UI at it
 	}
 	ref, err := s.exec.Execute(ctx, run, report)
 	if err != nil {

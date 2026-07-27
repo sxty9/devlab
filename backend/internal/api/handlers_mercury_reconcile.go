@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/runs"
 )
@@ -25,6 +26,12 @@ import (
 // rendered block to the debounced auto-rollout. Callers pass touchedClaudeMd=true exactly when the write
 // created/changed/removed a record under axiome/ or regeln/ (the two namespaces the CLAUDE.md carries).
 func (s *Server) reconcileAfterWrite(ctx context.Context, cookie string, touchedClaudeMd bool) {
+	// The axiom write has already committed by the time we get here (every caller writes, then reconciles),
+	// so notify open UIs the tree changed regardless of whether the derived-artefact reconcile below
+	// succeeds. This is the single publish point for the axiom-tree mutations (edit/move/delete/category/
+	// migrate/add); reorder publishes separately (it does not reconcile). The run recomposition below
+	// flows through runs.Store, which publishes TopicRuns on its own.
+	s.publish(live.TopicAxioms)
 	byID, laufregeln, axiome, regeln, err := s.scanForReconcile(ctx, cookie)
 	if err != nil {
 		log.Printf("devlabd: mercury reconcile scan failed (skipped): %v", err)

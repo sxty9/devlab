@@ -19,6 +19,7 @@ import (
 	"devlab/backend/internal/comments"
 	"devlab/backend/internal/discover"
 	"devlab/backend/internal/links"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/workspace"
 )
@@ -46,8 +47,13 @@ type Server struct {
 	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
 	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
 	runExec     *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
+	live        *live.Broker          // Mercury's single change-notification bus (SSE fan-out); never nil
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
+
+// publish emits a Mercury change-topic to every open UI stream. Nil-safe on the broker, so it is always
+// callable. Kept as a one-liner so mutation handlers can announce a change in a single line.
+func (s *Server) publish(topic string) { s.live.Publish(topic) }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
 // The link store needs DEVLAB_LINK_ENC_KEY_FILE; when absent (dev-bypass/preview), GitHub linking
@@ -73,6 +79,14 @@ func New(v *auth.Verifier) *Server {
 		log.Printf("devlabd: chat store disabled: %v", err)
 		chatStore = nil
 	}
+	// The single change-notification bus. Wired into the run store and delivery ledger so every mutation
+	// through them notifies open UIs; the scheduler is wired in StartScheduler, the axiom handlers publish
+	// directly. One bus, many publishers — the one live mechanism the whole Mercury surface shares.
+	broker := live.NewBroker()
+	runStore := runs.NewStore()
+	runStore.SetPublisher(broker) // every run/ToDo mutation now notifies open UIs
+	deliveries := runs.NewDeliveryStore()
+	deliveries.SetPublisher(broker) // every delivery-ledger change notifies open UIs
 	s := &Server{
 		v:           v,
 		reposBase:   base,
@@ -80,13 +94,14 @@ func New(v *auth.Verifier) *Server {
 		workspaces:  workspace.NewManager(),
 		comments:    cstore,
 		chats:       chatStore,
-		runs:        runs.NewStore(),
+		runs:        runStore,
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
 		runNotices:  runs.NewNoticeStore(),
-		deliveries:  runs.NewDeliveryStore(),
+		deliveries:  deliveries,
 		attachments: runs.NewAttachmentStore(),
 		axiomChecks: runs.NewAxiomChecks(),
+		live:        broker,
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
@@ -209,6 +224,10 @@ func (s *Server) Handler() http.Handler {
 	// axiomrepo). Read tier (the tree and a record); both are served from the local working copy.
 	mux.HandleFunc("GET /api/mercury/tree", s.guard(s.mercuryTree))
 	mux.HandleFunc("GET /api/mercury/item", s.guard(s.mercuryItem))
+	// The single live-update stream (Server-Sent Events): one long-lived connection per open Mercury
+	// surface over which the server pushes coarse "topic X changed" notifications. Read-tier (a GET, no
+	// CSRF); the client refetches through the normal read endpoints on each notification.
+	mux.HandleFunc("GET /api/mercury/events", s.guard(s.mercuryEvents))
 	// Add an axiom: aigentic classifies it into the tree, DevLab commits it to the constitution repo.
 	// CSRF-guarded; the push uses the runner's linked account (see New), so the caller needs no GitHub
 	// link of their own.

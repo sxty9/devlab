@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"devlab/backend/internal/axiomrepo"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -63,6 +64,7 @@ func (s *Server) mercuryReorder(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Reihenfolge konnte nicht gespeichert werden")
 		return
 	}
+	s.publish(live.TopicAxioms) // reorder does not reconcile, so publish the tree change here
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

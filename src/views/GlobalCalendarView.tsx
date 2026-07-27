@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { MercuryCalendar } from './MercuryCalendar';
 import type { RunCalendar } from '@/types';
 
@@ -16,29 +17,25 @@ export default function GlobalCalendarView() {
   const [failed, setFailed] = useState<string | null>(null);
   const gotDataRef = useRef(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        // No type filter → both automatic runs and ToDos.
-        const c = await source.mercuryRunCalendar(30);
-        if (!cancelled) {
-          setCal(c);
-          gotDataRef.current = true;
-          setFailed(null);
-        }
-      } catch (e) {
-        // Once a calendar is on screen a transient poll error must not blank it out.
-        if (!cancelled && !gotDataRef.current) setFailed(msg(e));
-      }
-    };
-    void load();
-    const iv = window.setInterval(() => void load(), 60000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
+  const load = useCallback(async () => {
+    try {
+      // No type filter → both automatic runs and ToDos.
+      const c = await source.mercuryRunCalendar(30);
+      setCal(c);
+      gotDataRef.current = true;
+      setFailed(null);
+    } catch (e) {
+      // Once a calendar is on screen a transient error must not blank it out.
+      if (!gotDataRef.current) setFailed(msg(e));
+    }
   }, [source]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  // Live: the calendar reflects the run/ToDo schedules and their past executions — a 'runs' change
+  // (created, edited, scheduled, done) refreshes it on its own, replacing the old 60s poll (req 9, 12).
+  useMercuryTopic(['runs'], () => void load());
 
   if (failed) {
     return (

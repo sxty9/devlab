@@ -7,6 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, RestartPendingBanner, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
@@ -105,6 +106,10 @@ export default function RunsView() {
       toast({ title: 'Läufe konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // Live: a run/ToDo changed elsewhere (created, edited, scheduled, a result attached, done) → refresh
+  // the list on its own. Selection and scroll are separate state, so the refetch is calm (req 9, 12).
+  useMercuryTopic(['runs'], () => void reload());
 
   // When the set of active runs changes (one finished, deferred, or started), refresh the list so
   // lastResult / next-fire / ToDo-done update on their own.
@@ -991,29 +996,25 @@ function CalendarView({ dataVersion }: { dataVersion: number }) {
   const [failed, setFailed] = useState<string | null>(null);
   const gotDataRef = useRef(false);
 
+  const load = useCallback(async () => {
+    try {
+      // Auto runs only — this is the Automatische-Läufe calendar; ToDos have their own (the global
+      // calendar unites both). Mirrors the History tab's type="auto".
+      const c = await source.mercuryRunCalendar(30, 'auto');
+      setCal(c);
+      gotDataRef.current = true;
+      setFailed(null);
+    } catch (e) {
+      if (!gotDataRef.current) setFailed(msg(e));
+    }
+  }, [source]);
+
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        // Auto runs only — this is the Automatische-Läufe calendar; ToDos have their own (the global
-        // calendar unites both). Mirrors the History tab's type="auto".
-        const c = await source.mercuryRunCalendar(30, 'auto');
-        if (!cancelled) {
-          setCal(c);
-          gotDataRef.current = true;
-          setFailed(null);
-        }
-      } catch (e) {
-        if (!cancelled && !gotDataRef.current) setFailed(msg(e));
-      }
-    };
     void load();
-    const iv = window.setInterval(() => void load(), 60000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [source, dataVersion]);
+  }, [load, dataVersion]);
+  // Live: a 'runs' change (schedule advanced, new run, execution recorded) refreshes the calendar on its
+  // own — replacing the old 60s poll (req 9, 12).
+  useMercuryTopic(['runs'], () => void load());
 
   if (failed) {
     return (

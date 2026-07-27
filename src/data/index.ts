@@ -91,6 +91,7 @@ export const dataSource: DataSource = {
   mercuryChat: (messages) => impl.mercuryChat(messages),
   mercuryRunNow: (id, opts) => impl.mercuryRunNow(id, opts),
   mercuryRunActive: () => impl.mercuryRunActive(),
+  mercuryEvents: (onTopic) => impl.mercuryEvents(onTopic),
   mercuryCancelRun: (id) => impl.mercuryCancelRun(id),
   mercuryDeferRun: (id) => impl.mercuryDeferRun(id),
   mercuryBlockedDeploys: () => impl.mercuryBlockedDeploys(),

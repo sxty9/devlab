@@ -7,6 +7,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, RestartPendingBanner, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
@@ -294,6 +295,10 @@ export default function TodosView() {
       toast({ title: 'ToDos konnten nicht geladen werden', description: msg(e), variant: 'danger' });
     }
   }, [source, toast]);
+
+  // Live: a run/ToDo changed elsewhere (created, edited, a result attached, done) → refresh the list on
+  // its own. Selection and scroll are separate state, so the refetch is calm (req 9, 12).
+  useMercuryTopic(['runs'], () => void reload());
 
   // When the set of active runs changes (one finished, deferred, or started), refresh so the ToDo's
   // done/last-result state updates on its own.
@@ -1080,28 +1085,24 @@ function TodoCalendar({ dataVersion }: { dataVersion: number }) {
   const [failed, setFailed] = useState<string | null>(null);
   const gotDataRef = useRef(false);
 
+  const load = useCallback(async () => {
+    try {
+      const c = await source.mercuryRunCalendar(30, 'todo');
+      setCal(c);
+      gotDataRef.current = true;
+      setFailed(null);
+    } catch (e) {
+      // Once a calendar is on screen a transient error must not blank it out.
+      if (!gotDataRef.current) setFailed(msg(e));
+    }
+  }, [source]);
+
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const c = await source.mercuryRunCalendar(30, 'todo');
-        if (!cancelled) {
-          setCal(c);
-          gotDataRef.current = true;
-          setFailed(null);
-        }
-      } catch (e) {
-        // Once a calendar is on screen a transient poll error must not blank it out.
-        if (!cancelled && !gotDataRef.current) setFailed(msg(e));
-      }
-    };
     void load();
-    const iv = window.setInterval(() => void load(), 60000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(iv);
-    };
-  }, [source, dataVersion]);
+  }, [load, dataVersion]);
+  // Live: a 'runs' change (a ToDo scheduled, run, or checked off) refreshes the calendar on its own —
+  // replacing the old 60s poll (req 9, 12).
+  useMercuryTopic(['runs'], () => void load());
 
   if (failed) {
     return (

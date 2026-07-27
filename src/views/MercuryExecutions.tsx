@@ -8,6 +8,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
+import { useMercuryTopic } from '@/state/mercuryLive';
 import type { BlockedDeploy, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RunSlotOverview, RunStartDecision, RepoResult, RunStep, RunType } from '@/types';
 import {
   deriveJobs,
@@ -910,27 +911,22 @@ export function useActiveRun(): {
   const [slots, setSlots] = useState<RunSlotOverview>(EMPTY_SLOTS);
   const [bump, setBump] = useState(0);
 
+  const fetchNow = useCallback(async () => {
+    try {
+      const r = await source.mercuryRunActive();
+      setSlots({ ...EMPTY_SLOTS, ...r, active: r.active ?? [], inflight: r.inflight ?? [] });
+    } catch {
+      /* transient — keep the last known state */
+    }
+  }, [source]);
+
+  // Initial load + on an explicit refetch (a start/cancel/defer just happened → refresh immediately).
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const r = await source.mercuryRunActive();
-        if (!cancelled) setSlots({ ...EMPTY_SLOTS, ...r, active: r.active ?? [], inflight: r.inflight ?? [] });
-      } catch {
-        /* transient — keep the last known state */
-      }
-      if (!cancelled) timer = window.setTimeout(poll, 2500);
-    };
-    void poll();
-    const onFocus = () => setBump((b) => b + 1); // re-check when the tab regains focus
-    window.addEventListener('focus', onFocus);
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [source, bump]);
+    void fetchNow();
+  }, [fetchNow, bump]);
+  // Live: the running set (active) or a run's state (runs — suspended/deferred/done) changed → refetch.
+  // No resting poll: the one stream pushes, and falls back to a gentle all-topics poll only offline.
+  useMercuryTopic(['active', 'runs'], () => void fetchNow());
 
   const active = slots.active;
   const activeFor = useCallback((runId: string): RunActive | null => active.find((a) => a.runId === runId) ?? null, [active]);
@@ -945,27 +941,21 @@ export function useBlockedDeploys(): { blocked: BlockedDeploy[]; refetch: () => 
   const [blocked, setBlocked] = useState<BlockedDeploy[]>([]);
   const [bump, setBump] = useState(0);
 
+  const fetchNow = useCallback(async () => {
+    try {
+      const r = await source.mercuryBlockedDeploys();
+      setBlocked(r.blocked ?? []);
+    } catch {
+      /* transient — keep the last known state */
+    }
+  }, [source]);
+
+  // Initial load + on an explicit refetch (a resume just happened).
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      try {
-        const r = await source.mercuryBlockedDeploys();
-        if (!cancelled) setBlocked(r.blocked ?? []);
-      } catch {
-        /* transient — keep the last known state */
-      }
-      if (!cancelled) timer = window.setTimeout(poll, 5000);
-    };
-    void poll();
-    const onFocus = () => setBump((b) => b + 1);
-    window.addEventListener('focus', onFocus);
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [source, bump]);
+    void fetchNow();
+  }, [fetchNow, bump]);
+  // Live: a delivery-ledger change (a deploy blocked or resumed) → refetch. No resting poll.
+  useMercuryTopic(['deliveries'], () => void fetchNow());
 
   return { blocked, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
@@ -1049,31 +1039,29 @@ function useLiveResult(runId: string, resultId: string, live: boolean): { res: R
   const [err, setErr] = useState(false);
   const resRef = useRef<RunResult | null>(null);
 
+  const fetchNow = useCallback(async () => {
+    try {
+      const r = await source.mercuryRunResult(runId, resultId);
+      resRef.current = r;
+      setRes(r);
+      setErr(false);
+    } catch {
+      if (!resRef.current) setErr(true); // only surface if we never got a document
+    }
+  }, [source, runId, resultId]);
+
+  // Fetch once when the followed result changes; reset the view first so a switch never shows stale data.
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
     resRef.current = null;
     setRes(null);
     setErr(false);
-    const poll = async () => {
-      try {
-        const r = await source.mercuryRunResult(runId, resultId);
-        if (!cancelled) {
-          resRef.current = r;
-          setRes(r);
-          setErr(false);
-        }
-      } catch {
-        if (!cancelled && !resRef.current) setErr(true); // only surface if we never got a document
-      }
-      if (!cancelled && live) timer = window.setTimeout(poll, 2000);
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [source, runId, resultId, live]);
+    void fetchNow();
+  }, [fetchNow]);
+
+  // Live: follow the running execution via the one stream instead of a 2s poll. 'progress' fires as the
+  // agent advances; 'active' catches the transition to finished. Only subscribed while `live`, and torn
+  // down on unmount — a settled or closed view causes no ongoing load (task requirement 12).
+  useMercuryTopic(live ? ['progress', 'active'] : [], () => void fetchNow());
 
   return { res, err };
 }

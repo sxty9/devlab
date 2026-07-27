@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/live"
 )
 
 // A Delivery is the UNIT of work a run produced at one repository (req 8): the exact commit range it
@@ -76,7 +78,14 @@ func NewDeliveryID() string {
 type DeliveryStore struct {
 	path string
 	mu   sync.Mutex
+	// pub broadcasts a "deliveries changed" signal after every successful ledger write (a delivery
+	// recorded, a PR outcome mirrored, a counter-booking), so open UIs refetch the Lieferungen surface
+	// without polling. Optional (nil = no-op) — set by SetPublisher.
+	pub *live.Broker
 }
+
+// SetPublisher wires the live-change broker so ledger writes notify open UIs. nil is allowed.
+func (s *DeliveryStore) SetPublisher(b *live.Broker) { s.pub = b }
 
 func NewDeliveryStore() *DeliveryStore { return &DeliveryStore{path: deliveriesPath()} }
 
@@ -289,5 +298,9 @@ func (s *DeliveryStore) save(ds []Delivery) error {
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	s.pub.Publish(live.TopicDeliveries) // the ledger changed → open UIs refetch the Lieferungen surface
+	return nil
 }
