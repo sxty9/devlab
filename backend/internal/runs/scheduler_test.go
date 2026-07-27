@@ -2,6 +2,7 @@ package runs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,12 @@ func (b *blockingExec) Execute(ctx context.Context, run Run, report func(string)
 		return ResultRef{ResultID: "res_" + run.ID, OK: true}, nil
 	case <-ctx.Done():
 		b.cancelled <- run.ID
+		// Mirror the real executor: a DEFER stands the run down as a resumable, deferred suspension
+		// (resumes ASAP at the next free slot); any other cancel is a plain abort/shutdown.
+		if errors.Is(context.Cause(ctx), ErrRunDeferred) {
+			now := time.Now()
+			return ResultRef{ResultID: "res_" + run.ID, Suspended: true, ResumeAt: &now, Reason: ReasonDeferred}, nil
+		}
 		return ResultRef{ResultID: "res_" + run.ID, OK: false}, ctx.Err()
 	}
 }
@@ -497,4 +504,335 @@ func TestActiveMarkerRefcounts(t *testing.T) {
 		_, ok := marker(s.marker)
 		return s.ActiveCount() == 0 && !ok
 	}, "marker to be removed once the last run ends")
+}
+
+// ── slot management: defer & resume (task points 1, 7) ────────────────────────────────────────────────
+
+// Defer stands a live run down: it frees its slot and re-arms as a DEFERRED suspension (the same pause
+// concept as the usage limit), immediately due so it reclaims the next free slot and resumes the SAME
+// execution — never counting a usage-limit attempt.
+func TestDeferReArmsRunAsResumableDeferredSuspension(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("t1", "repo-a")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	if !s.FireNow("t1", "user") {
+		t.Fatal("FireNow on an idle scheduler must start the run")
+	}
+	recvWithin(t, be.started, time.Second)
+	waitFor(t, time.Second, func() bool { return s.ActiveCount() == 1 }, "t1 to be active")
+
+	if s.Defer("nope") {
+		t.Fatal("Defer of an unknown id must return false")
+	}
+	if !s.Defer("t1") {
+		t.Fatal("Defer of an active run must return true")
+	}
+	if id := recvWithin(t, be.cancelled, time.Second); id != "t1" {
+		t.Fatalf("t1 must observe the defer, got %s", id)
+	}
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t1 to release its slot")
+
+	r, _, _ := store.Get("t1")
+	if r.Suspended == nil || r.Suspended.Reason != ReasonDeferred {
+		t.Fatalf("t1 must be re-armed as a deferred suspension, got %+v", r.Suspended)
+	}
+	if !r.Suspended.IsDeferred() {
+		t.Error("IsDeferred() must recognise a deferred suspension")
+	}
+	if r.Suspended.ResultID != "res_t1" {
+		t.Fatalf("the suspension must point at the open result, got %q", r.Suspended.ResultID)
+	}
+	if r.Suspended.Attempts != 0 {
+		t.Errorf("a defer must NOT consume a usage-limit attempt, got %d", r.Suspended.Attempts)
+	}
+	if !isDue(r, time.Now()) {
+		t.Error("a deferred run is immediately due — it competes for the next free slot")
+	}
+
+	// The freed slot lets it resume: fireDue re-admits it and hands the executor a Suspended run (a resume
+	// of the same execution, not a fresh start).
+	s.fireDue(context.Background())
+	if id := recvWithin(t, be.started, time.Second); id != "t1" {
+		t.Fatalf("expected t1 to resume, got %s", id)
+	}
+	be.release("t1")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the resume to finish")
+
+	r2, _, _ := store.Get("t1")
+	if r2.Suspended != nil {
+		t.Errorf("the suspension must be cleared after a completed resume, got %+v", r2.Suspended)
+	}
+	if !r2.Done {
+		t.Error("a ToDo that finished on resume must be checked off")
+	}
+}
+
+// progressExec drives the defer→resume round-trip against a REAL results store, honouring the executor
+// contract: it records each repo it completes into the result and, on resume (handed a Suspended run),
+// continues the SAME result and SKIPS the repos already recorded. After each repo it waits on a gate so
+// the test can inject a defer at a known point. This proves a deferred run resumes at the same place and
+// never repeats completed work (task point 7).
+type progressExec struct {
+	results *Results
+	repos   []string // the sweep, in order
+
+	mu        sync.Mutex
+	worked    map[string][]string // runID → repos actually worked, across ALL passes
+	afterRepo chan string         // one signal per completed repo
+	proceed   chan struct{}       // test lets the executor continue to the next repo
+}
+
+func newProgressExec(results *Results, repos ...string) *progressExec {
+	return &progressExec{
+		results: results, repos: repos,
+		worked:    map[string][]string{},
+		afterRepo: make(chan string, 16),
+		proceed:   make(chan struct{}, 16),
+	}
+}
+
+func (p *progressExec) Maintain(context.Context) {}
+
+func (p *progressExec) Execute(ctx context.Context, run Run, report func(string)) (ResultRef, error) {
+	var res Result
+	if run.Suspended != nil && run.Suspended.ResultID != "" {
+		if existing, ok, _ := p.results.Get(run.ID, run.Suspended.ResultID); ok {
+			res = existing // resume the open result
+		}
+	}
+	if res.ResultID == "" {
+		res = Result{RunID: run.ID, ResultID: "res_" + run.ID, StartedAt: time.Now()}
+	}
+	res.Suspended, res.ResumeAt = false, nil
+	report(res.ResultID)
+	_ = p.results.Save(res)
+
+	done := res.DoneRepos()
+	for _, repo := range p.repos {
+		if done[repo] {
+			continue // a resume skips exactly the repos already completed
+		}
+		p.mu.Lock()
+		p.worked[run.ID] = append(p.worked[run.ID], repo)
+		p.mu.Unlock()
+		res.Repos = append(res.Repos, RepoResult{Repo: repo, OK: true})
+		_ = p.results.Save(res) // persist after every repo, like the real executor
+
+		p.afterRepo <- repo
+		select {
+		case <-p.proceed:
+		case <-ctx.Done():
+			if errors.Is(context.Cause(ctx), ErrRunDeferred) {
+				now := time.Now()
+				res.Suspended, res.ResumeAt = true, &now
+				_ = p.results.Save(res)
+				return ResultRef{ResultID: res.ResultID, Suspended: true, ResumeAt: &now, Reason: ReasonDeferred}, nil
+			}
+			return ResultRef{ResultID: res.ResultID, OK: false}, ctx.Err()
+		}
+	}
+	res.FinishedAt = time.Now()
+	res.OK = true
+	_ = p.results.Save(res)
+	return ResultRef{ResultID: res.ResultID, OK: true}, nil
+}
+
+func TestDeferResumeSkipsCompletedRepos(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "results"))
+	results := NewResults()
+	store := seedStore(t, []Run{todoRun("t1", "repo-a")})
+	pe := newProgressExec(results, "r1", "r2", "r3")
+	s := NewScheduler(store, pe, time.Second)
+	s.logf = noopLog
+
+	if !s.FireNow("t1", "user") {
+		t.Fatal("FireNow must start the run")
+	}
+	// It completes r1, then waits at the gate.
+	if repo := recvWithin(t, pe.afterRepo, time.Second); repo != "r1" {
+		t.Fatalf("expected r1 first, got %s", repo)
+	}
+	// Defer mid-sweep — after r1 is done but before r2.
+	if !s.Defer("t1") {
+		t.Fatal("Defer must return true for an active run")
+	}
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "t1 to defer and free its slot")
+
+	r, _, _ := store.Get("t1")
+	if r.Suspended == nil || !r.Suspended.IsDeferred() {
+		t.Fatalf("t1 must be a deferred suspension after the defer, got %+v", r.Suspended)
+	}
+
+	// Resume: it must pick up at r2 and never redo r1.
+	s.fireDue(context.Background())
+	if repo := recvWithin(t, pe.afterRepo, 2*time.Second); repo != "r2" {
+		t.Fatalf("resume must continue at r2 (r1 already done), got %s", repo)
+	}
+	pe.proceed <- struct{}{} // r2 → r3
+	if repo := recvWithin(t, pe.afterRepo, 2*time.Second); repo != "r3" {
+		t.Fatalf("expected r3 next, got %s", repo)
+	}
+	pe.proceed <- struct{}{} // r3 → finish
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "the resume to finish")
+
+	pe.mu.Lock()
+	worked := append([]string(nil), pe.worked["t1"]...)
+	pe.mu.Unlock()
+	want := []string{"r1", "r2", "r3"} // r1 exactly once — never repeated on the resume
+	if strings.Join(worked, ",") != strings.Join(want, ",") {
+		t.Fatalf("deferred run repeated or skipped work: worked %v, want %v", worked, want)
+	}
+
+	r2, _, _ := store.Get("t1")
+	if !r2.Done || r2.Suspended != nil {
+		t.Errorf("t1 must finish cleanly after the resume: done=%v suspended=%+v", r2.Done, r2.Suspended)
+	}
+}
+
+// ── slot management: overload (task points 2, 4, 5, 7) ────────────────────────────────────────────────
+
+// Overload takes a TEMPORARY extra slot past the cap, and the slot self-heals when the run ends — the
+// standing ceiling is never raised.
+func TestOverloadAdmitsPastCapAndSelfHeals(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("a", "repo-a"), todoRun("b", "repo-b"), todoRun("c", "repo-c")})
+	t.Setenv("DEVLAB_RUNS_MAX_CONCURRENCY", "1")
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	if !s.FireNow("a", "user") {
+		t.Fatal("a must start on the idle scheduler")
+	}
+	recvWithin(t, be.started, time.Second)
+
+	if s.FireNow("b", "user") {
+		t.Fatal("b must NOT start normally — the cap of 1 is reached")
+	}
+	expectNoStart(t, be, 120*time.Millisecond)
+
+	if !s.StartOverload("b", "user") {
+		t.Fatal("overload must start b in a temporary extra slot past the cap")
+	}
+	if id := recvWithin(t, be.started, time.Second); id != "b" {
+		t.Fatalf("expected b to overload-start, got %s", id)
+	}
+	waitFor(t, time.Second, func() bool { return s.ActiveCount() == 2 }, "a + overloaded b to run past cap 1")
+
+	flags := map[string]bool{}
+	for _, act := range s.Active() {
+		flags[act.RunID] = act.Overload
+	}
+	if !flags["b"] || flags["a"] {
+		t.Fatalf("only b must carry the overload flag, got %+v", flags)
+	}
+
+	// Self-heal: b's extra slot vanishes when it ends — the cap is 1 again, so c still waits behind a.
+	be.release("b")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 1 }, "overloaded b to release its extra slot")
+	if s.FireNow("c", "user") {
+		t.Fatal("the overload must not raise the standing ceiling — at cap 1, c must wait behind a")
+	}
+
+	be.release("a")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "a to finish")
+}
+
+// Overload never crosses the two hard limits (task point 5): it refuses to put two runs on the same
+// repository, and it refuses to join an exclusive auto run.
+func TestOverloadRefusedOnRepoConflict(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("a", "repo-x"), todoRun("b", "repo-x"), todoRun("c", "repo-y")})
+	t.Setenv("DEVLAB_RUNS_MAX_CONCURRENCY", "1")
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	if !s.FireNow("a", "user") {
+		t.Fatal("a must start")
+	}
+	recvWithin(t, be.started, time.Second)
+
+	if s.StartOverload("b", "user") {
+		t.Fatal("overload MUST be refused — b targets repo-x, which a already holds")
+	}
+	expectNoStart(t, be, 120*time.Millisecond)
+
+	if !s.StartOverload("c", "user") {
+		t.Fatal("overload of c (free repo) must be allowed")
+	}
+	if id := recvWithin(t, be.started, time.Second); id != "c" {
+		t.Fatalf("expected c to overload-start, got %s", id)
+	}
+
+	be.release("a")
+	be.release("c")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "runs to finish")
+}
+
+func TestOverloadRefusedUnderExclusiveAuto(t *testing.T) {
+	store := seedStore(t, []Run{autoRun("auto"), todoRun("t", "repo-a")})
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+
+	if !s.FireNow("auto", "user") {
+		t.Fatal("auto must start")
+	}
+	recvWithin(t, be.started, time.Second)
+
+	if s.StartOverload("t", "user") {
+		t.Fatal("overload MUST be refused while an exclusive auto run holds the whole floor")
+	}
+	expectNoStart(t, be, 120*time.Millisecond)
+
+	be.release("auto")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "auto to finish")
+}
+
+// Admissibility classifies exactly WHY a run cannot start, and names the runs that must stand down to
+// unblock it — the input to the start-decision options and the automatic suggestion.
+func TestAdmissibilityClassifiesBlocks(t *testing.T) {
+	store := seedStore(t, []Run{todoRun("a", "repo-x"), todoRun("b", "repo-x"), todoRun("c", "repo-y"), autoRun("auto")})
+	t.Setenv("DEVLAB_RUNS_MAX_CONCURRENCY", "1")
+	be := newBlockingExec()
+	s := NewScheduler(store, be, time.Second)
+	s.logf = noopLog
+	getRun := func(id string) Run { r, _, _ := store.Get(id); return r }
+
+	if b := s.Admissibility(getRun("a")); b.Reason != "" {
+		t.Fatalf("an idle scheduler must admit, got %q", b.Reason)
+	}
+
+	if !s.FireNow("a", "user") {
+		t.Fatal("a must start")
+	}
+	recvWithin(t, be.started, time.Second)
+
+	if b := s.Admissibility(getRun("a")); b.Reason != AdmitRunning {
+		t.Fatalf("a is live → %q, want %q", b.Reason, AdmitRunning)
+	}
+	if b := s.Admissibility(getRun("b")); b.Reason != AdmitRepoBusy || len(b.Conflicts) != 1 || b.Conflicts[0] != "a" {
+		t.Fatalf("b shares repo-x with a → want repo-busy conflict [a], got %+v", b)
+	}
+	if b := s.Admissibility(getRun("c")); b.Reason != AdmitCap || len(b.Conflicts) != 0 {
+		t.Fatalf("c has a free repo but the cap is full → want cap/no-conflict, got %+v", b)
+	}
+	if b := s.Admissibility(getRun("auto")); b.Reason != AdmitExclusive || len(b.Conflicts) != 1 || b.Conflicts[0] != "a" {
+		t.Fatalf("auto needs an empty floor → want exclusive conflict [a], got %+v", b)
+	}
+
+	be.release("a")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "a to finish")
+
+	if !s.FireNow("auto", "user") {
+		t.Fatal("auto must start on the clear floor")
+	}
+	recvWithin(t, be.started, time.Second)
+	if b := s.Admissibility(getRun("c")); b.Reason != AdmitExclusive || len(b.Conflicts) != 1 || b.Conflicts[0] != "auto" {
+		t.Fatalf("a running auto run blocks c exclusively → want conflict [auto], got %+v", b)
+	}
+	be.release("auto")
+	waitFor(t, 2*time.Second, func() bool { return s.ActiveCount() == 0 }, "auto to finish")
 }

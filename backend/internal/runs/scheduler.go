@@ -19,6 +19,13 @@ import (
 // rather than redoing every repo into duplicate PRs.
 var ErrRunAborted = errors.New("run aborted by kill-switch")
 
+// ErrRunDeferred is the cancellation cause Defer attaches to a run's context. It tells the executor to
+// stand down WITHOUT finalising and WITHOUT falling back to a plain shutdown carry-over: it re-arms the
+// run as a deferred suspension (the same pause concept as the usage limit) so it gives up its slot,
+// keeps every completed repo, and resumes the SAME execution at the next free slot. Distinct from
+// ErrRunAborted (stop for good) and from a plain context cancel (process shutdown).
+var ErrRunDeferred = errors.New("run deferred to free a slot")
+
 // Executor runs a run end-to-end (across all target repos) and performs periodic maintenance
 // (auto-merging overdue PRs). It is injected by the api layer so the runs package never imports it —
 // the runs package owns scheduling + persistence, the api layer owns side effects.
@@ -41,6 +48,11 @@ type Activity struct {
 	RunName   string    `json:"runName,omitempty"`
 	ResultID  string    `json:"resultId,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
+	// Exclusive is set for an auto (all-repos) run — it holds the whole floor. Overload is set for a run
+	// admitted in a temporary extra slot BEYOND the cap (task point 2); the extra slot vanishes when the
+	// run ends (task point 4). Both surface so the overview can portion "belegt / frei / Überladung".
+	Exclusive bool `json:"exclusive,omitempty"`
+	Overload  bool `json:"overload,omitempty"`
 }
 
 // activeRun is the live bookkeeping for one in-flight run: its published Activity, its kill-switch, and
@@ -49,6 +61,7 @@ type activeRun struct {
 	activity  Activity
 	cancel    context.CancelCauseFunc
 	exclusive bool     // holds the whole-floor claim (an auto run sweeps every repo)
+	overload  bool     // admitted in a temporary extra slot beyond the cap — self-heals on release
 	claims    []string // the repository keys a ToDo occupies while it runs
 }
 
@@ -170,7 +183,7 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 		if !r.Enabled || !isDue(r, now) {
 			continue
 		}
-		s.tryStart(ctx, r, "scheduler", true) // scheduled: advance the schedule
+		s.tryStart(ctx, r, "scheduler", true, false) // scheduled: advance the schedule, never overload
 	}
 }
 
@@ -184,14 +197,30 @@ func (s *Scheduler) FireNow(id, actor string) bool {
 		return false
 	}
 	// Detached from any request context so the run outlives the HTTP handler.
-	return s.tryStart(context.Background(), run, actor, false)
+	return s.tryStart(context.Background(), run, actor, false, false)
+}
+
+// StartOverload starts a run in a TEMPORARY extra slot beyond the concurrency cap (task point 2:
+// "überladen"). It is the ONLY admission path that ignores the cap — and only the cap: it still refuses
+// to put two runs on the same repository or to run alongside an exclusive auto run (task point 5, the
+// limits overload never crosses). The extra slot is not persisted anywhere and disappears the instant
+// this run ends (task point 4), so repeated overloads can never quietly raise the standing ceiling.
+// Returns false if it still cannot start (this run is already live, a target repo is busy, or an
+// exclusive run holds the floor).
+func (s *Scheduler) StartOverload(id, actor string) bool {
+	run, ok, err := s.store.Get(id)
+	if err != nil || !ok || !run.Enabled {
+		return false
+	}
+	return s.tryStart(context.Background(), run, actor, false, true)
 }
 
 // tryStart admits a run under the concurrency + exclusivity rules and, if admitted, launches it in its
-// own goroutine. Returns whether the run was started.
-func (s *Scheduler) tryStart(parent context.Context, r Run, actor string, advance bool) bool {
+// own goroutine. Returns whether the run was started. overload lets it take a temporary slot past the
+// cap (never past the repo/exclusivity limits).
+func (s *Scheduler) tryStart(parent context.Context, r Run, actor string, advance, overload bool) bool {
 	rctx, cancel := context.WithCancelCause(parent)
-	if !s.admit(r, cancel) {
+	if !s.admit(r, cancel, overload) {
 		cancel(nil)
 		return false
 	}
@@ -200,6 +229,22 @@ func (s *Scheduler) tryStart(parent context.Context, r Run, actor string, advanc
 		defer cancel(nil)
 		s.runOnce(rctx, r.ID, actor, advance)
 	}()
+	return true
+}
+
+// Defer stands a live run down to free its slot (task point 1): it cancels that run with ErrRunDeferred,
+// which the executor turns into a deferred SUSPENSION — the run keeps every completed repo and resumes
+// the same execution at the next free slot, redoing only the repo it was mid-way through. Returns false
+// if that run is not currently running. An explicit user choice; the automatic suggestion is computed a
+// layer up (it needs per-run progress from the results pool).
+func (s *Scheduler) Defer(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ar := s.active[id]
+	if ar == nil || ar.cancel == nil {
+		return false
+	}
+	ar.cancel(ErrRunDeferred)
 	return true
 }
 
@@ -212,24 +257,28 @@ func (s *Scheduler) tryStart(parent context.Context, r Run, actor string, advanc
 //     runs never work the same repository at once.
 //
 // It returns false (reserving nothing) when the run cannot start now, so the caller leaves it due.
-func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc) bool {
+//
+// overload lifts ONLY the cap check (task point 2) — the two limits above urgency (task point 5) always
+// hold: an overload never joins an exclusive floor and never lands on a claimed repository. An auto run
+// is inherently exclusive, so it never overloads (it needs an empty floor regardless).
+func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.active[r.ID]; ok {
 		return false // already running — never double-start the same run
 	}
-	if len(s.active) >= s.maxConc {
-		return false // cap reached
+	if !overload && len(s.active) >= s.maxConc {
+		return false // cap reached (overload takes a temporary extra slot past it)
 	}
 	if s.exclusiveHeld {
-		return false // an exclusive (auto) run holds the floor — nothing else starts
+		return false // an exclusive (auto) run holds the floor — nothing else starts, not even an overload
 	}
-	ar := &activeRun{cancel: cancel}
+	ar := &activeRun{cancel: cancel, overload: overload}
 	if r.IsTodo() {
 		keys := claimKeys(r)
 		for _, k := range keys {
 			if s.claimedRepos[k] {
-				return false // a target repo is busy → defer this ToDo, don't block on it
+				return false // a target repo is busy → defer this ToDo, don't block on it (overload can't cross this)
 			}
 		}
 		for _, k := range keys {
@@ -237,17 +286,105 @@ func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc) bool {
 		}
 		ar.claims = keys
 	} else {
+		if overload {
+			return false // an auto run is exclusive by nature — there is no "extra exclusive slot" to grant
+		}
 		if len(s.active) > 0 {
 			return false // auto is exclusive — wait until the floor is clear
 		}
 		s.exclusiveHeld = true
 		ar.exclusive = true
 	}
-	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC()}
+	ar.activity = Activity{RunID: r.ID, RunName: r.Name, StartedAt: time.Now().UTC(), Exclusive: ar.exclusive, Overload: ar.overload}
 	s.active[r.ID] = ar
 	s.writeMarkerLocked()
 	return true
 }
+
+// AdmitBlock classifies WHY a run cannot start right now, so the start-decision layer can offer the right
+// choices (task point 2) and target the right suggestion (task point 3). Reason is "" when the run would
+// admit immediately; otherwise one of the constants below. Conflicts lists the live run ids that must
+// stand down to unblock this one — the exclusive holder, or the runs occupying a needed repository. For a
+// plain cap block any run frees a slot, so Conflicts is empty there.
+type AdmitBlock struct {
+	Reason    string
+	Conflicts []string
+}
+
+// Admission block reasons.
+const (
+	AdmitRunning   = "running"   // this run is already live
+	AdmitExclusive = "exclusive" // an auto run holds the whole floor
+	AdmitRepoBusy  = "repo-busy" // a target repository is occupied by another run
+	AdmitCap       = "cap"       // every slot is taken (but no repo/exclusivity conflict)
+)
+
+// Admissibility reports whether r could start now and, if not, why — WITHOUT reserving anything. It
+// mirrors admit's checks in the same priority order. The repo-busy and exclusive blocks stand above the
+// cap: they cannot be overloaded past (task point 5), so they are reported even when the cap also blocks.
+func (s *Scheduler) Admissibility(r Run) AdmitBlock {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.active[r.ID]; ok {
+		return AdmitBlock{Reason: AdmitRunning}
+	}
+	if s.exclusiveHeld {
+		var holder []string
+		for id, ar := range s.active {
+			if ar.exclusive {
+				holder = append(holder, id)
+			}
+		}
+		return AdmitBlock{Reason: AdmitExclusive, Conflicts: holder}
+	}
+	if r.IsTodo() {
+		if busy := s.repoConflicts(claimKeys(r)); len(busy) > 0 {
+			return AdmitBlock{Reason: AdmitRepoBusy, Conflicts: busy}
+		}
+	} else if len(s.active) > 0 {
+		// A fresh auto run needs an empty floor; every live run stands between it and starting.
+		return AdmitBlock{Reason: AdmitExclusive, Conflicts: s.activeIDsLocked()}
+	}
+	if len(s.active) >= s.maxConc {
+		return AdmitBlock{Reason: AdmitCap}
+	}
+	return AdmitBlock{}
+}
+
+// repoConflicts returns the ids of live runs whose claimed repositories intersect keys. The caller holds
+// s.mu. Used to name exactly which runs to defer to free a needed repository (task point 3).
+func (s *Scheduler) repoConflicts(keys []string) []string {
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[k] = true
+	}
+	seen := map[string]bool{}
+	var out []string
+	for id, ar := range s.active {
+		for _, k := range ar.claims {
+			if want[k] && !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// activeIDsLocked lists every live run id (sorted). The caller holds s.mu.
+func (s *Scheduler) activeIDsLocked() []string {
+	out := make([]string, 0, len(s.active))
+	for id := range s.active {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Capacity is the nominal concurrency ceiling (the number of standing slots), so the overview can show
+// "belegt / frei" against it. Overloads run BEYOND this and are counted separately.
+func (s *Scheduler) Capacity() int { return s.maxConc }
 
 // release frees the slot, claims and exclusivity a run held once its goroutine ends.
 func (s *Scheduler) release(id string) {
@@ -357,15 +494,25 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 				continue
 			}
 			if ref.Suspended {
-				attempts := 1
+				reason := ref.Reason
+				if reason == "" {
+					reason = ReasonUsageLimit
+				}
+				// A defer is a deliberate stand-down, not a failed retry — it must NOT consume the
+				// usage-limit give-up budget (else repeatedly deferring an urgent run would eventually make
+				// it give up). Only a usage-limit pause counts an attempt.
+				attempts := 0
 				if cur[i].Suspended != nil {
-					attempts = cur[i].Suspended.Attempts + 1
+					attempts = cur[i].Suspended.Attempts
+				}
+				if reason == ReasonUsageLimit {
+					attempts++
 				}
 				resumeAt := now
 				if ref.ResumeAt != nil {
 					resumeAt = *ref.ResumeAt
 				}
-				cur[i].Suspended = &Suspension{ResumeAt: resumeAt, ResultID: ref.ResultID, Attempts: attempts, Reason: "usage-limit"}
+				cur[i].Suspended = &Suspension{ResumeAt: resumeAt, ResultID: ref.ResultID, Attempts: attempts, Reason: reason}
 				t := now
 				cur[i].LastFiredAt = &t
 				continue

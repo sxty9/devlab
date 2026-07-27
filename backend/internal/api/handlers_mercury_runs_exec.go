@@ -252,6 +252,11 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	save()
 
 	fail := func(msg string) (runs.ResultRef, error) {
+		// A defer that lands during pre-sweep setup (token, reachability, discovery) must still stand the
+		// run down as resumable, never finalise it as failed — honour it before recording a failure.
+		if deferredNow(ctx) {
+			return x.suspendDeferred(run, &res, save)
+		}
 		res.FinishedAt = time.Now().UTC()
 		res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false, Error: msg})
 		save()
@@ -261,6 +266,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	// result and skips the done repos — for transient infrastructure failures (no network) that must not
 	// be recorded as a permanent, "run complete" failure. It is the infra sibling of fail().
 	carryOver := func(reason string) (runs.ResultRef, error) {
+		// A defer arriving during setup carries over too, but as an explicit deferred suspension so the
+		// run resumes at the next free slot rather than only via the stranded-resume path (which never
+		// refires a ToDo).
+		if deferredNow(ctx) {
+			return x.suspendDeferred(run, &res, save)
+		}
 		res.OK = false
 		save()
 		log.Printf("devlabd: run %s carried over before completing (%s) — next fire resumes it", run.ID, reason)
@@ -374,10 +385,14 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		}
 		if ctx.Err() != nil {
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
-			// ErrRunAborted as the cause) finalises the run — "abort" means stop, not resume. Our own
-			// sweep-duration cap (DeadlineExceeded) and a process shutdown (a plain cancel with no abort
-			// cause) instead CARRY OVER: leave the result unfinished so the next fire resumes it and
-			// skips the done repos, rather than refiring from scratch and duplicating every PR.
+			// ErrRunAborted as the cause) finalises the run — "abort" means stop, not resume. A DEFER
+			// (ErrRunDeferred) stands the run down as a resumable suspension so it reclaims the next free
+			// slot. Our own sweep-duration cap (DeadlineExceeded) and a process shutdown (a plain cancel
+			// with no cause) instead CARRY OVER: leave the result unfinished so the next fire resumes it
+			// and skips the done repos, rather than refiring from scratch and duplicating every PR.
+			if deferredNow(ctx) {
+				return x.suspendDeferred(run, &res, save)
+			}
 			if errors.Is(context.Cause(ctx), runs.ErrRunAborted) {
 				res.Repos = append(res.Repos, runs.RepoResult{Repo: repo.ID, OK: false, Error: "abgebrochen"})
 				overallOK = false
@@ -389,6 +404,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		}
 		rr, lim := x.executeRepo(ctx, run, repo, x.promptFor(run, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
+		// A DEFER during this repo (its agent was killed by the cancel) stands the run down as a resumable
+		// suspension. Do NOT record the half-done repo — it retries cleanly when the run resumes in its
+		// next free slot, skipping only the repos already completed.
+		if deferredNow(ctx) {
+			return x.suspendDeferred(run, &res, save)
+		}
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
 			// do NOT hammer the rest — suspend the whole execution until the window resets. Trip the wave
@@ -551,6 +572,35 @@ func (x *runExecutor) suspend(run runs.Run, res *runs.Result, resumeAt time.Time
 	return runs.ResultRef{ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
 		InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
 		Suspended: true, ResumeAt: &resumeAt}, nil
+}
+
+// deferredNow reports whether the run's context was cancelled specifically to DEFER it (free its slot),
+// as opposed to a kill-switch abort, a shutdown, or the sweep-duration cap. The cause propagates through
+// the duration-capped child context, so this is correct whether ctx is the raw run context or the wrapped
+// one.
+func deferredNow(ctx context.Context) bool {
+	return ctx.Err() != nil && errors.Is(context.Cause(ctx), runs.ErrRunDeferred)
+}
+
+// suspendDeferred persists the partial execution as a DEFERRED suspension and returns a suspended
+// ResultRef whose Reason is "deferred" and whose ResumeAt is now — so the scheduler re-arms it as
+// immediately due and it resumes the SAME execution (skipping the repos already recorded) at the next
+// free slot. It reuses the very machinery the usage limit uses (task point 1: no second pause concept),
+// differing only in reason and in resuming ASAP rather than at a window reset. Unlike the usage-limit
+// suspend it never gives up on an attempt budget — a defer is a deliberate user stand-down, not a failed
+// retry.
+func (x *runExecutor) suspendDeferred(run runs.Run, res *runs.Result, save func()) (runs.ResultRef, error) {
+	now := time.Now().UTC()
+	res.Suspended = true
+	res.ResumeAt = &now
+	save()
+	log.Printf("devlabd: run %s deferred after %d repos — slot released, resumes the same execution at the next free slot",
+		run.ID, len(res.Repos))
+	return runs.ResultRef{
+		ResultID: res.ResultID, At: res.StartedAt, OK: false, RepoCount: len(res.Repos),
+		InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
+		Suspended: true, ResumeAt: &now, Reason: runs.ReasonDeferred,
+	}, nil
 }
 
 // repoSignal reports why a repo step stopped in a way that must NOT be recorded as a terminal repo

@@ -85,15 +85,33 @@ type Run struct {
 	Suspended *Suspension `json:"suspended,omitempty"`
 }
 
-// Suspension records that a run hit the usage limit and should resume automatically. It points at the
-// open execution (ResultID) so resume continues it instead of starting fresh, and counts attempts so a
-// pathological loop (limit hit every resume) eventually gives up rather than spinning forever.
+// Suspension reasons. A suspension is the ONE pause concept the system has — a run that gave up its
+// execution slot but kept its progress and will resume the SAME execution (skipping done repos). Two
+// things trigger it, told apart by Reason:
+//
+//	ReasonUsageLimit — the Claude subscription window is exhausted; resume when it resets (ResumeAt in
+//	                   the future). Counts toward the give-up attempt budget.
+//	ReasonDeferred   — a deliberate stand-down to free a slot for something more urgent; resume at the
+//	                   next free slot (ResumeAt = now, so it is immediately due and competes for a slot).
+//	                   A user action, not a failure — it never counts toward the attempt budget.
+const (
+	ReasonUsageLimit = "usage-limit"
+	ReasonDeferred   = "deferred"
+)
+
+// Suspension records that a run paused and should resume automatically. It points at the open execution
+// (ResultID) so resume continues it instead of starting fresh, and counts attempts so a pathological
+// usage-limit loop (limit hit every resume) eventually gives up rather than spinning forever.
 type Suspension struct {
 	ResumeAt time.Time `json:"resumeAt"`
 	ResultID string    `json:"resultId"`
 	Attempts int       `json:"attempts"`
-	Reason   string    `json:"reason,omitempty"` // e.g. "usage-limit"
+	Reason   string    `json:"reason,omitempty"` // ReasonUsageLimit (default when empty) | ReasonDeferred
 }
+
+// IsDeferred reports whether this suspension is a deliberate defer (freed its slot) rather than a
+// usage-limit wait — the two share the SAME machinery but read and resume differently.
+func (s *Suspension) IsDeferred() bool { return s != nil && s.Reason == ReasonDeferred }
 
 // IsTodo reports whether this is a one-time concrete task rather than a recurring axiom run.
 func (r Run) IsTodo() bool { return r.Type == TypeTodo }
@@ -145,8 +163,12 @@ type ResultRef struct {
 	InputTokens  int        `json:"inputTokens,omitempty"`
 	OutputTokens int        `json:"outputTokens,omitempty"`
 	CostUSD      float64    `json:"costUsd,omitempty"`
-	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
+	Suspended    bool       `json:"suspended,omitempty"` // execution paused (usage limit or a deliberate defer)
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
+	// Reason names WHY the execution paused, carried up so the scheduler stamps the matching
+	// Suspension.Reason: "usage-limit" (wait out the window) or "deferred" (gave up its slot, resumes at
+	// the next free one). Empty is read as "usage-limit" for back-compat.
+	Reason string `json:"reason,omitempty"`
 }
 
 type file struct {
