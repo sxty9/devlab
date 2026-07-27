@@ -399,6 +399,10 @@ export interface Run {
   enabled: boolean;
   model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
+  // Per-repo agent time budget. Absent = no own choice: follows the service default (3h) and moves with it.
+  // 'off' = no cap (only the whole-sweep duration bounds it); else a duration ('90m', '6h'). Set = a
+  // deliberate deviation from the default, shown as one.
+  timeBudget?: string;
   schedule: RunSchedule;
   axiomIds: string[];
   // todo only
@@ -428,6 +432,7 @@ export interface RunInput {
   enabled: boolean;
   model?: string; // Claude model id/alias; '' or absent = runner default (opus)
   effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
+  timeBudget?: string; // '' or absent = service default (3h); 'off' = no cap; else a duration ('90m', '6h')
   schedule?: RunSchedule; // auto only
   axiomIds?: string[]; // auto only
   task?: string; // todo only
@@ -624,6 +629,9 @@ export interface RunResult {
    *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
   model?: string;
   effort?: string;
+  /** The per-repo agent time budget that governed THIS execution — the resolved value ('3h', '90m') or
+   *  'off' for no cap. Absent on executions recorded before it was captured. */
+  timeBudget?: string;
   ok: boolean;
   repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed

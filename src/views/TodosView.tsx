@@ -8,7 +8,7 @@ import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { ActiveRunsOverview, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
-import { RunTuningFields } from './RunTuning';
+import { RunTuningFields, formatBudget } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
@@ -640,9 +640,9 @@ function TodoDetail({
           {todo.enabled ? 'Aktiv' : 'Deaktiviert'}
         </span>
         <StageBadge todo={todo} />
-        {(todo.model || todo.effort) && (
+        {(todo.model || todo.effort || todo.timeBudget) && (
           <span className="rounded bg-fill/10 px-1.5 py-0.5 font-medium text-text-secondary">
-            {[todo.model, todo.effort].filter(Boolean).join(' · ')}
+            {[todo.model, todo.effort, todo.timeBudget && formatBudget(todo.timeBudget)].filter(Boolean).join(' · ')}
           </span>
         )}
         <span>Termin: {dueLabel(todo)}</span>
@@ -733,6 +733,7 @@ function TodoEditor({
   const [task, setTask] = useState(base?.task ?? '');
   const [model, setModel] = useState(base?.model ?? '');
   const [effort, setEffort] = useState(base?.effort ?? '');
+  const [budget, setBudget] = useState(base?.timeBudget ?? '');
   const [rows, setRows] = useState<TargetRow[]>(() => initialTargetRows(base));
   // How the ToDo runs. A fresh ToDo defaults to "now" (create → execute at once); editing reflects the
   // stored plan — a due date is "scheduled", none is "ondemand". "now" is a save-time action, not a
@@ -818,6 +819,7 @@ function TodoEditor({
       enabled,
       model,
       effort,
+      timeBudget: budget,
       task: task.trim(),
       dueAt: dueIso,
       targets,
@@ -1031,7 +1033,14 @@ function TodoEditor({
         <span className="text-footnote text-text-primary">Aktiv</span>
       </label>
 
-      <RunTuningFields model={model} effort={effort} onModelChange={setModel} onEffortChange={setEffort} />
+      <RunTuningFields
+        model={model}
+        effort={effort}
+        budget={budget}
+        onModelChange={setModel}
+        onEffortChange={setEffort}
+        onBudgetChange={setBudget}
+      />
 
       <div className="flex items-center gap-2">
         <Button variant="primary" size="sm" disabled={!valid || busy} onClick={save}>
