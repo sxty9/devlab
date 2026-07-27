@@ -7,13 +7,14 @@ import { Splash } from '@/shell/Splash';
 import RunsView from './RunsView';
 import TodosView from './TodosView';
 import GlobalCalendarView from './GlobalCalendarView';
+import MercuryDeliveries from './MercuryDeliveries';
 import MercuryChat from './MercuryChat';
 import { fmtDateTime } from './MercuryExecutions';
 import { cn } from '@/lib/cn';
-import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon } from '@/ui/icons';
+import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon, LayersIcon } from '@/ui/icons';
 import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation, RolloutReport } from '@/types';
 
-type SectionId = 'axiome' | 'regeln' | 'laeufe' | 'todos' | 'kalender';
+type SectionId = 'axiome' | 'regeln' | 'laeufe' | 'todos' | 'kalender' | 'lieferungen';
 
 // The scheme-backed namespaces (each is a tree). `meta` (Meta-Axiome) lives as a sub-tab under the
 // Axiome section rather than as its own sidebar entry, so it is a namespace but not a SectionId.
@@ -83,6 +84,10 @@ const SECTIONS: { id: SectionId; label: string; icon: (p: { className?: string }
   // The global calendar unites the automatic runs and the ToDos (colour-separated); like todos it is
   // not scheme-backed, so it owns its pane and has no tree.
   { id: 'kalender', label: 'Kalender', icon: RocketIcon, empty: '' },
+  // Lieferungen — the addressable record of what every run shipped, per repository (both Läufe and ToDos
+  // land here). Cross-cutting like the calendar: not scheme-backed, owns its pane, and is the single place
+  // to roll a delivery back or reset a repo's dev state.
+  { id: 'lieferungen', label: 'Lieferungen', icon: LayersIcon, empty: '' },
 ];
 
 // Adding is symmetric across the scheme-backed namespaces — same form, only the namespace differs.
@@ -145,8 +150,9 @@ export function MercuryView() {
 
   // Drag-and-drop, mirroring the mail service: drop INTO a category (re-nest), or before/after a
   // sibling (reorder within the same parent, else re-nest into the target's branch).
-  // `todos` is not scheme-backed (it has no namespace/tree) — TodosView owns that section entirely.
-  const roots = tree && section !== 'todos' && section !== 'kalender' ? tree[activeNs] ?? [] : [];
+  // `todos`/`kalender`/`lieferungen` are not scheme-backed (they have no namespace/tree) — each view owns
+  // its own pane entirely.
+  const roots = tree && section !== 'todos' && section !== 'kalender' && section !== 'lieferungen' ? tree[activeNs] ?? [] : [];
 
   const reNest = useCallback(
     async (item: DragItem, targetCat: string) => {
@@ -229,7 +235,8 @@ export function MercuryView() {
   const runsMode = section === 'laeufe' && laeufeTab === 'laeufe';
   const todosMode = section === 'todos';
   const calendarMode = section === 'kalender';
-  const treeMode = !runsMode && !todosMode && !calendarMode;
+  const deliveriesMode = section === 'lieferungen';
+  const treeMode = !runsMode && !todosMode && !calendarMode && !deliveriesMode;
 
   return (
     <MercuryDnD.Provider value={{ drag, setDrag, onMove }}>
@@ -363,9 +370,11 @@ export function MercuryView() {
         )}
       </aside>
 
-      <main className={cn('min-h-0 flex-1 bg-bg-base', runsMode || todosMode || calendarMode ? 'flex' : 'dl-scroll overflow-y-auto')}>
+      <main className={cn('min-h-0 flex-1 bg-bg-base', runsMode || todosMode || calendarMode || deliveriesMode ? 'flex' : 'dl-scroll overflow-y-auto')}>
         {calendarMode ? (
           <GlobalCalendarView />
+        ) : deliveriesMode ? (
+          <MercuryDeliveries />
         ) : todosMode ? (
           <TodosView />
         ) : runsMode ? (
