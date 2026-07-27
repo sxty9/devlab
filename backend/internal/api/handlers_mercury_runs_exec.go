@@ -190,6 +190,9 @@ type runExecutor struct {
 	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
 	// /etc that a test can neither create nor rely on.
 	deployTargetFn func(repoName string) bool
+	// deleteBranchFn stubs the GitHub ref-delete so the merged-delivery-branch prune can be exercised
+	// without a real token or network.
+	deleteBranchFn func(ctx context.Context, token, fullName, branch string) error
 
 	// Rollback/reset seams — the git counter-booking runs against a real per-user workspace (sudo), and
 	// the PR ops hit GitHub; both are stubbed in tests so the rollback DECISION logic (conflict → ToDo,
@@ -883,6 +886,11 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			return rr, repoSignal{}
 		}
 	}
+	// The dev branch is pushed as a BACKUP, never as a way onto the default branch: it is the ONLY durable
+	// record of work that is already built but not yet merged, so if a workspace is lost the accumulated dev
+	// state can still be recovered from the remote. It is deliberately never raised as a pull request and
+	// never deleted (unlike a delivery branch, which is pruned once merged) — one per repo, the same name
+	// (mercury-dev) everywhere. The ONLY path onto the default branch is the per-delivery branch and its PR.
 	pushRefs := []string{devBranch}
 	if deliveryBranch != "" {
 		pushRefs = append(pushRefs, deliveryBranch)
@@ -1733,14 +1741,23 @@ func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.
 // a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
 // success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
-	prs, err := x.s.runPRs.List()
-	if err != nil || len(prs) == 0 {
-		return
-	}
 	token, err := x.token()
 	if err != nil {
 		return
 	}
+	if prs, err := x.s.runPRs.List(); err == nil && len(prs) > 0 {
+		x.maintainMergePRs(ctx, token, prs)
+	}
+	// Prune the branches those merges made redundant. This runs even when no PR is pending right now, so
+	// the accumulated backlog of already-merged delivery branches is still swept away (req 25) — the
+	// persistent dev branch always exempt.
+	x.pruneMergedDeliveryBranches(ctx, token)
+}
+
+// maintainMergePRs auto-merges due PRs in creation order (per repo) and, in full mode, prod-deploys the
+// merged ones. Split out of Maintain so the branch-prune sweep can run independently of whether any PR is
+// pending this tick.
+func (x *runExecutor) maintainMergePRs(ctx context.Context, token string, prs []runs.PendingPR) {
 	now := time.Now()
 	recheck := prRecheck()
 
@@ -1816,6 +1833,45 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			// full-mode recheck: still open within its window → nothing to do yet.
 		}
 	}
+}
+
+// pruneMergedDeliveryBranches deletes the per-delivery snapshot branch of every delivery whose work has
+// reached the default branch — i.e. whose ledger status is merged. Driven by the ledger, not by git commit
+// identity, so a squash- or rebase-merge (whose commits do not appear verbatim on the default branch) is
+// pruned all the same: what counts is that the content arrived, which is exactly what "merged" records.
+//
+// The persistent dev branch (mercury-dev) is EXEMPT — it is never a delivery's snapshot branch, and the
+// devBranchName guard makes that explicit. It is the only durable backup of built-but-unmerged work and
+// must never be deleted. Each branch is deleted at most once (the BranchPruned flag), so a steady-state
+// ledger costs one in-memory scan and no GitHub calls.
+func (x *runExecutor) pruneMergedDeliveryBranches(ctx context.Context, token string) {
+	if x.s == nil || x.s.deliveries == nil {
+		return
+	}
+	all, err := x.s.deliveries.List()
+	if err != nil {
+		return
+	}
+	dev := devBranchName()
+	for _, d := range all {
+		if d.Status != runs.DeliveryMerged || d.BranchPruned || d.Branch == "" || d.Branch == dev {
+			continue
+		}
+		if err := x.deleteBranch(ctx, token, d.Repo, d.Branch); err != nil {
+			log.Printf("devlabd: could not prune merged delivery branch %s@%s (will retry): %v", d.Repo, d.Branch, err)
+			continue // leave BranchPruned false → retried next tick
+		}
+		_ = x.s.deliveries.Update(d.ID, func(dl *runs.Delivery) { dl.BranchPruned = true })
+		log.Printf("devlabd: pruned merged delivery branch %s@%s (delivery %s)", d.Repo, d.Branch, d.ID)
+	}
+}
+
+// deleteBranch dispatches to the injected seam when present (tests), else the real GitHub ref-delete.
+func (x *runExecutor) deleteBranch(ctx context.Context, token, fullName, branch string) error {
+	if x.deleteBranchFn != nil {
+		return x.deleteBranchFn(ctx, token, fullName, branch)
+	}
+	return github.DeleteBranch(ctx, token, fullName, branch)
 }
 
 // deployMergedPR ships one merged run PR to prod, distinguishing permanent from transient failure so a
