@@ -2,7 +2,10 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -211,6 +214,77 @@ func TestMaxDeployAttempts(t *testing.T) {
 	t.Setenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS", "0")
 	if got := maxDeployAttempts(); got != defaultMaxDeployAttempts {
 		t.Errorf("non-positive override ignored: got %d, want %d", got, defaultMaxDeployAttempts)
+	}
+}
+
+// ─── Blocked-deploy API (visibility + resume) ───────────────────────────────
+
+// TestRunDeploysBlockedAndResume pins requirement 3 (visibility) and the explicit resume: GET /deploys
+// returns exactly the blocked deliveries with repo/reason/attempts, resume clears the block (resetting
+// the attempt budget), and a resume of an untracked PR is a 404.
+func TestRunDeploysBlockedAndResume(t *testing.T) {
+	store := tempPRStore(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := store.Add(runs.PendingPR{
+		Repo: "o/svc", Number: 9, URL: "http://pr/9", RunID: "run_x",
+		Blocked: true, BlockedReason: "Dienst »svc« ist im Ziel »prod« nicht eingerichtet", BlockedAt: now, DeployAttempts: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(runs.PendingPR{Repo: "o/other", Number: 1, MergeBy: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err) // a healthy pending PR must NOT show up as blocked
+	}
+	s := &Server{runPRs: store}
+
+	listBlocked := func() []blockedDeployView {
+		rec := httptest.NewRecorder()
+		s.runDeploysBlocked(rec, httptest.NewRequest(http.MethodGet, "/api/mercury/runs/deploys", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET deploys status %d", rec.Code)
+		}
+		var body struct {
+			Blocked []blockedDeployView `json:"blocked"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Blocked
+	}
+	resume := func(payload string) int {
+		rec := httptest.NewRecorder()
+		s.runDeployResume(rec, httptest.NewRequest(http.MethodPost, "/api/mercury/runs/deploys/resume", strings.NewReader(payload)))
+		return rec.Code
+	}
+
+	blocked := listBlocked()
+	if len(blocked) != 1 {
+		t.Fatalf("want exactly 1 blocked delivery, got %d (%+v)", len(blocked), blocked)
+	}
+	if b := blocked[0]; b.Repo != "o/svc" || b.Number != 9 || b.Attempts != 3 || b.Reason == "" || b.URL != "http://pr/9" {
+		t.Errorf("blocked view carries wrong data: %+v", b)
+	}
+
+	if code := resume(`{"repo":"o/svc","number":999}`); code != http.StatusNotFound {
+		t.Errorf("resume of an untracked PR: want 404, got %d", code)
+	}
+	if code := resume(`{"repo":"o/other","number":1}`); code != http.StatusNotFound {
+		t.Errorf("resume of a non-blocked PR: want 404, got %d", code)
+	}
+	if code := resume(`{"repo":"o/svc","number":9}`); code != http.StatusOK {
+		t.Fatalf("resume of the blocked PR: want 200, got %d", code)
+	}
+
+	// The block is fully cleared and the attempt budget reset.
+	prs, _ := store.List()
+	for _, p := range prs {
+		if p.Repo == "o/svc" && p.Number == 9 {
+			if p.Blocked || p.DeployAttempts != 0 || p.BlockedReason != "" || !p.BlockedAt.IsZero() {
+				t.Errorf("resume must fully clear the block, got %+v", p)
+			}
+		}
+	}
+	if after := listBlocked(); len(after) != 0 {
+		t.Errorf("after resume nothing should be blocked, got %+v", after)
 	}
 }
 

@@ -210,6 +210,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/calendar", s.guard(s.runsCalendar))
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
 	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
+	mux.HandleFunc("GET /api/mercury/runs/deploys", s.guard(s.runDeploysBlocked))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -224,6 +225,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
 	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
+	mux.HandleFunc("POST /api/mercury/runs/deploys/resume", s.guardCSRF(s.runDeployResume))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
 
 	// ToDo media — images/documents attached to a concrete ToDo, materialized into the agent's

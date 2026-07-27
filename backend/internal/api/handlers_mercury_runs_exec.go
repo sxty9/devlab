@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1708,4 +1709,87 @@ func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// blockedDeployView is the portioned shape the UI needs for a blocked delivery: enough to identify it
+// (repo, PR number + url, originating run), understand it (reason, attempts, since when) and act on it
+// (resume). Internal scheduling fields (MergeBy/LastChecked) are deliberately omitted.
+type blockedDeployView struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	URL       string    `json:"url"`
+	RunID     string    `json:"runId"`
+	Reason    string    `json:"reason"`
+	Attempts  int       `json:"attempts"`
+	BlockedAt time.Time `json:"blockedAt"`
+}
+
+// runDeploysBlocked lists the deliveries the scheduler has BLOCKED after repeated permanent prod-deploy
+// failures — the UI's window onto a stuck delivery (repo, reason, attempts) that today only the system
+// log reveals. Read-only; the empty list when nothing is blocked or the PR store is absent. The
+// blocked/not-blocked evaluation lives HERE, outside the passive PR pool.
+func (s *Server) runDeploysBlocked(w http.ResponseWriter, r *http.Request) {
+	out := []blockedDeployView{}
+	if s.runPRs != nil {
+		prs, err := s.runPRs.List()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "Auslieferungen konnten nicht gelesen werden")
+			return
+		}
+		for _, p := range prs {
+			if !p.Blocked {
+				continue
+			}
+			out = append(out, blockedDeployView{
+				Repo: p.Repo, Number: p.Number, URL: p.URL, RunID: p.RunID,
+				Reason: p.BlockedReason, Attempts: p.DeployAttempts, BlockedAt: p.BlockedAt,
+			})
+		}
+	}
+	// Freshest problem first, so the newest block is on top.
+	sort.Slice(out, func(i, j int) bool { return out[i].BlockedAt.After(out[j].BlockedAt) })
+	writeJSON(w, http.StatusOK, map[string]any{"blocked": out})
+}
+
+// runDeployResume clears the block on ONE delivery so the next Maintain tick retries its prod-deploy
+// from scratch (the attempt count is reset, giving it the full budget again). This is the explicit,
+// human-driven "Wiederaufnahme" a blocked delivery waits for. 404 when no such blocked delivery is
+// tracked (already resumed, merged, or never blocked).
+func (s *Server) runDeployResume(w http.ResponseWriter, r *http.Request) {
+	if s.runPRs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Auslieferungen-Store nicht verfügbar")
+		return
+	}
+	var body struct {
+		Repo   string `json:"repo"`
+		Number int    `json:"number"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Repo) == "" || body.Number <= 0 {
+		writeErr(w, http.StatusBadRequest, "repo und number sind erforderlich")
+		return
+	}
+	resumed := false
+	found, err := s.runPRs.Update(body.Repo, body.Number, func(p *runs.PendingPR) {
+		if !p.Blocked {
+			return
+		}
+		p.Blocked = false
+		p.BlockedReason = ""
+		p.BlockedAt = time.Time{}
+		p.DeployAttempts = 0 // fresh start — the full attempt budget again
+		resumed = true
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Wiederaufnahme fehlgeschlagen")
+		return
+	}
+	if !found || !resumed {
+		writeErr(w, http.StatusNotFound, "Keine blockierte Auslieferung für dieses Repository/PR")
+		return
+	}
+	log.Printf("devlabd: deploy %s#%d resumed by %s — retried on the next maintain tick", body.Repo, body.Number, actor(r))
+	writeJSON(w, http.StatusOK, map[string]bool{"resumed": true})
 }
