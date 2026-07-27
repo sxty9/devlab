@@ -578,7 +578,11 @@ func TestSetCapacityTakesEffectLive(t *testing.T) {
 	store := seedStore(t, []Run{todoRun("a", "r1", past), todoRun("b", "r2", past), todoRun("c", "r3", past)})
 	ge := newGateExec()
 	s := quiet(NewScheduler(store, ge, time.Second, 1))
-	go s.Run(t.Context()) // the poke path needs the Run loop
+	// t.Context() (go1.24+) auto-cancels at test cleanup; the module targets go1.23, so do the same by hand
+	// with a cleanup-cancelled context, keeping the Run loop stoppable without the newer API.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go s.Run(ctx) // the poke path needs the Run loop
 
 	waitFor(t, "one admitted at cap 1", func() bool { return s.ActiveCount() == 1 })
 	time.Sleep(30 * time.Millisecond)
