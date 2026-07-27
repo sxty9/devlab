@@ -156,6 +156,12 @@ type ResultRef struct {
 	CostUSD      float64    `json:"costUsd,omitempty"`
 	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
+	// PRsOpen marks a FINISHED execution that opened one or more pull requests still awaiting their merge
+	// to main. It gates a ToDo's completion: a ToDo is not "erledigt" the instant its PR is opened — it
+	// stays in the active list until the main-merge is through, at which point Maintain flips Done. It is
+	// meaningless on a suspended/carried-over ref (those are not finished) and false for a report-mode or
+	// no-change execution (nothing to merge → done at once).
+	PRsOpen bool `json:"prsOpen,omitempty"`
 }
 
 type file struct {

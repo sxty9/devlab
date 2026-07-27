@@ -292,6 +292,10 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 				if cur[i].IsTodo() {
 					// A ToDo fires once: drop the due date up front so a crash mid-run can't refire it.
 					cur[i].DueAt = nil
+					// A fresh fire is a (re)start: clear a prior completion so a re-run of an already-done
+					// ToDo re-enters the active list and runs through the whole pipeline again. Done is set
+					// afresh below (or by Maintain on merge) once THIS execution reaches main.
+					cur[i].Done = false
 				} else if advance {
 					if nf, e := cur[i].Schedule.Next(now); e == nil {
 						cur[i].NextFireAt = &nf
@@ -342,8 +346,12 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 				r := ref
 				cur[i].LastResult = &r
 			}
-			if cur[i].IsTodo() && ref.OK {
-				cur[i].Done = true // a completed ToDo is checked off; a failed one stays open
+			// A ToDo is checked off ONLY once its work has actually reached main. A successful execution
+			// that opened PRs is NOT done yet — it stays in the active list awaiting merge, and Maintain
+			// flips Done when the last of its PRs merges. A successful execution with nothing to merge
+			// (report mode, or no changes) is done at once. A failed one always stays open.
+			if cur[i].IsTodo() && ref.OK && !ref.PRsOpen {
+				cur[i].Done = true
 			}
 			// A resume that finished after a long suspension may have left NextFireAt in the past;
 			// re-anchor it forward so it doesn't immediately catch-up fire.

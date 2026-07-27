@@ -204,6 +204,63 @@ func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 	}
 }
 
+// TestSchedulerTodoDoneOnlyWhenNoPRsOpen pins the "in die History erst nach dem Merge"-rule: a ToDo whose
+// execution opened PRs is NOT checked off — it stays in the active list awaiting its merge — while a ToDo
+// with nothing to merge (report mode / no changes → PRsOpen false) is done at once.
+func TestSchedulerTodoDoneOnlyWhenNoPRsOpen(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{
+		{ID: "a", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
+		{ID: "b", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
+	})
+	fe := &scriptedExec{resps: []ResultRef{
+		{ResultID: "r", OK: true, PRsOpen: true},  // a — opened PRs, awaits merge
+		{ResultID: "r", OK: true, PRsOpen: false}, // b — nothing to merge
+	}}
+	s := NewScheduler(store, fe, time.Second)
+	s.logf = func(string, ...any) {}
+
+	s.fireDue(context.Background())
+
+	a, _, _ := store.Get("a")
+	if a.Done {
+		t.Error("a ToDo with open PRs must stay in the list (not done) until the main-merge is through")
+	}
+	b, _, _ := store.Get("b")
+	if !b.Done {
+		t.Error("a ToDo with nothing to merge must be checked off at once")
+	}
+}
+
+// TestSchedulerFireNowRestartsDoneTodo pins the restart: manually re-running an already-erledigt ToDo
+// reopens it (Done cleared) and — because the fresh run opens PRs — it awaits merge again rather than
+// snapping straight back to done. This is the "wieder anstartbar" path for a completed/stuck ToDo.
+func TestSchedulerFireNowRestartsDoneTodo(t *testing.T) {
+	store := seedStore(t, []Run{{ID: "t", Type: TypeTodo, Enabled: true, Done: true, Task: "x"}})
+	fe := &scriptedExec{resps: []ResultRef{{ResultID: "r", OK: true, PRsOpen: true}}}
+	s := NewScheduler(store, fe, time.Second)
+	s.logf = func(string, ...any) {}
+
+	if !s.FireNow("t", "tester") {
+		t.Fatal("FireNow returned busy on an idle scheduler")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fe.mu.Lock()
+		done := len(fe.calls) >= 1
+		fe.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // let the detached result-attach patch land
+	got, _, _ := store.Get("t")
+	if got.Done {
+		t.Error("re-running a done ToDo must reopen it (Done cleared), not leave it checked off")
+	}
+}
+
 func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	future := time.Now().Add(time.Hour)
 	store := seedStore(t, []Run{
