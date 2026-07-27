@@ -7,8 +7,17 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunTrigger, RunType } from '@/types';
+import type { RepoResult, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RunStep, RunTrigger, RunType } from '@/types';
 import { Person } from '@/ui/Person';
+import {
+  deriveJobs,
+  isReportExecution,
+  stepStatus,
+  PIPELINE_STAGES,
+  REPORT_STAGES,
+  type Job,
+  type JobStatus,
+} from './mercuryPipeline';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -101,13 +110,17 @@ export function EmptyPlaceholder({ text }: { text: string }) {
   );
 }
 
-/** One step (analyze/implement/push/pr/deploy). analyze/implement carry the agent's report (`log`),
- *  shown as a collapsible Bericht. While a step is `running`, its log is the agent's LIVE transcript:
- *  the step auto-expands, renders the transcript preformatted (not markdown) and follows the tail. */
+/** One step (analyze/implement/dev-deploy/push/pr) with its honest status. analyze/implement carry the
+ *  agent's report (`log`), shown as a collapsible Bericht; while `running`, that log is the agent's LIVE
+ *  transcript (auto-expanded, preformatted, tail-followed). A not-applicable or not-executed step instead
+ *  states its short reason inline, in the user's language — never hidden, never mistaken for a success.
+ *  The status dot is distinct per state, so what happened is legible without reading any text. */
 export function StepRow({ step }: { step: RunStep }) {
   const running = !!step.running;
+  const status = running ? 'running' : stepStatus(step);
+  const skipped = status === 'not-applicable' || status === 'not-executed';
   const [open, setOpen] = useState(false);
-  const hasReport = !!step.log;
+  const hasReport = !!step.log && !skipped; // a skip's short reason sits inline, not behind a disclosure
   const show = running || open; // a running step is always expanded — the point is to watch it
   const logRef = useRef<HTMLPreElement>(null);
 
@@ -115,6 +128,28 @@ export function StepRow({ step }: { step: RunStep }) {
   useEffect(() => {
     if (running && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [running, step.log]);
+
+  const dot = cn(
+    'h-2 w-2 shrink-0 rounded-full',
+    running
+      ? 'animate-pulse bg-warning'
+      : status === 'ok'
+        ? 'bg-success'
+        : status === 'failed'
+          ? 'bg-danger'
+          : status === 'not-applicable'
+            ? 'bg-transparent ring-1 ring-inset ring-text-tertiary' // hollow — does not apply here
+            : 'bg-text-tertiary/40', // not-executed — dim, nothing happened
+  );
+  const rightLabel = running
+    ? 'läuft…'
+    : status === 'not-applicable'
+      ? 'nicht anwendbar'
+      : status === 'not-executed'
+        ? 'nicht ausgeführt'
+        : hasReport
+          ? 'Bericht'
+          : '';
 
   return (
     <div>
@@ -129,10 +164,13 @@ export function StepRow({ step }: { step: RunStep }) {
         ) : (
           <span className="w-3.5 shrink-0" />
         )}
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', running ? 'animate-pulse bg-warning' : step.ok ? 'bg-success' : 'bg-danger')} />
+        <span className={dot} />
         <span className="flex-1 truncate text-footnote font-medium text-text-secondary">{step.name}</span>
-        <span className="shrink-0 text-caption text-text-tertiary">{running ? 'läuft…' : hasReport ? 'Bericht' : ''}</span>
+        <span className="shrink-0 text-caption text-text-tertiary">{rightLabel}</span>
       </button>
+      {/* A skipped step is auskunftsfähig: its short reason (what was not done and why) sits inline, in the
+          user's language — plainly visible, never confusable with a success. */}
+      {skipped && step.log && <p className="ml-6 mt-0.5 text-caption text-text-tertiary">{step.log}</p>}
       {show &&
         (running ? (
           <pre
@@ -258,83 +296,23 @@ export function PromptDisclosure({ prompt }: { prompt?: string }) {
 //
 // The SAME pipeline renders a LIVE run: the repo in flight (RunResult.live) is appended as a row, its
 // running stage pulses (`running`), and clicking it drops into the agent's live transcript — so watching
-// a run is not a separate view but the pipeline itself, moving. Stages the running repo has not reached
-// yet read as `pending`, not `skipped`.
+// a run is not a separate view but the pipeline itself, moving. Stages a running repo has not reached yet
+// read as `pending`; on a finished repo an unreached stage reads as `not-applicable`.
+//
+// The stage list and the honest step→job mapping (deriveJobs, with the four terminal states) live in
+// ./mercuryPipeline — pure and unit-tested; only the per-status styling below is view-side.
 
-type JobStatus = 'success' | 'failed' | 'skipped' | 'manual' | 'pending' | 'running';
-
-interface PipelineStage {
-  key: string;
-  label: string;
-  manual?: boolean;
-}
-
-// The full dev/prod pipeline. A report-mode execution (read-only analysis) collapses to a single stage.
-const PIPELINE_STAGES: PipelineStage[] = [
-  { key: 'implement', label: 'Implement' },
-  { key: 'dev-deploy', label: 'Dev-Deploy' },
-  { key: 'push', label: 'Push' },
-  { key: 'pr', label: 'PR' },
-  { key: 'merge', label: 'Merge', manual: true },
-  { key: 'prod-deploy', label: 'Prod-Deploy' },
-];
-const REPORT_STAGES: PipelineStage[] = [{ key: 'analyze', label: 'Analyze' }];
-const RUN_STEP_KEYS = ['implement', 'dev-deploy', 'push', 'pr'];
-
-interface Job {
-  status: JobStatus;
-  log?: string;
-  href?: string;
-}
-
-// deriveJobs maps one repo's recorded steps onto the canonical stage chain, GitLab-style: a recorded step
-// is success/failed by its ok flag (or `running` while in flight); once something fails the later run
-// stages are skipped; a run stage with no step is either a bypass (no changes → no push/PR) or, when the
-// repo errored before any step ran (e.g. a clone failure leaves no steps), the failure point. Merge is a
-// manual gate while a PR is open; Prod-Deploy is pending until the PR merges and the repo reports
-// deployed. For a repo still RUNNING, stages it has not reached yet are `pending`, not `skipped`.
-function deriveJobs(repo: RepoResult, stages: PipelineStage[]): Job[] {
-  const byName = new Map((repo.steps ?? []).map((s) => [s.name, s]));
-  const anyRunStep = RUN_STEP_KEYS.some((k) => byName.has(k));
-  const live = !!repo.running;
-  // For a still-running repo, a stage with no recorded step has not happened YET, so it is pending — the
-  // agent will get to it — rather than a deliberately skipped bypass.
-  const unreached: JobStatus = live ? 'pending' : 'skipped';
-  let terminal = false;
-  return stages.map((stage) => {
-    const step = byName.get(stage.key);
-    if (step) {
-      if (step.running) return { status: 'running', log: step.log || undefined };
-      if (!step.ok) terminal = true;
-      return { status: step.ok ? 'success' : 'failed', log: step.log || undefined };
-    }
-    if (stage.key === 'merge') {
-      if (repo.prUrl) return { status: 'manual', href: repo.prUrl };
-      return { status: terminal ? 'skipped' : unreached };
-    }
-    if (stage.key === 'prod-deploy') {
-      if (repo.deployed) return { status: 'success' };
-      if (repo.prUrl) return { status: 'pending' };
-      return { status: terminal ? 'skipped' : unreached };
-    }
-    if (!RUN_STEP_KEYS.includes(stage.key) || terminal) return { status: terminal ? 'skipped' : unreached };
-    // No recorded step for this run stage and nothing has failed yet: the failure point when the repo
-    // errored before recording any step (clone/setup), otherwise a bypassed (or not-yet-reached) stage.
-    if (repo.error && !anyRunStep) {
-      terminal = true;
-      return { status: 'failed', log: repo.error };
-    }
-    return { status: unreached };
-  });
-}
-
+// Each of the four terminal states gets a visually DISTINCT dot — solid green (executed), solid red
+// (failed), a hollow ring (not-applicable) and a dim fill (not-executed) — so the outcome is legible at a
+// glance, without reading the label. running/pending/manual are the live and gate states beside them.
 const JOB_STYLES: Record<JobStatus, { dot: string; pill: string; label: string }> = {
   running: { dot: 'bg-warning', pill: 'border-warning/40 bg-warning/10 text-warning', label: 'läuft' },
-  success: { dot: 'bg-success', pill: 'border-success/30 bg-success/10 text-success', label: 'OK' },
-  failed: { dot: 'bg-danger', pill: 'border-danger/30 bg-danger/10 text-danger', label: 'Fehler' },
+  success: { dot: 'bg-success', pill: 'border-success/30 bg-success/10 text-success', label: 'ausgeführt' },
+  failed: { dot: 'bg-danger', pill: 'border-danger/30 bg-danger/10 text-danger', label: 'fehlgeschlagen' },
+  'not-applicable': { dot: 'bg-transparent ring-1 ring-inset ring-text-tertiary', pill: 'border-separator bg-surface text-text-tertiary', label: 'nicht anwendbar' },
+  'not-executed': { dot: 'bg-text-tertiary/40', pill: 'border-separator bg-surface/60 text-text-tertiary/80', label: 'nicht ausgeführt' },
   manual: { dot: 'bg-accent', pill: 'border-accent/40 bg-accent/10 text-accent', label: 'manuell' },
   pending: { dot: 'bg-warning', pill: 'border-warning/30 bg-warning/10 text-warning', label: 'ausstehend' },
-  skipped: { dot: 'bg-fill', pill: 'border-separator bg-surface text-text-tertiary', label: 'übersprungen' },
 };
 
 function JobPill({ job, selected, onSelect }: { job: Job; selected: boolean; onSelect: () => void }) {
@@ -371,14 +349,10 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
   // Finished repos, then the one in flight (if any) as the trailing, live row.
   const rows = useMemo(() => [...(result.repos ?? []), ...(result.live ? [result.live] : [])], [result.repos, result.live]);
 
-  // Report execution iff at least one repo actually analyzed AND none ran a real pipeline step. This must
-  // NOT treat a run where every repo failed before any step (e.g. a clone/DNS outage → empty steps) as
-  // "report" — that would collapse to a single Analyze stage and hide the failures. Such a run has no
-  // analyze step anywhere, so it correctly falls through to the pipeline, where the failure shows as
-  // implement=failed. The live row counts too, so a live report run reads as report from its first step.
-  const hasAnalyze = rows.some((r) => (r.steps ?? []).some((s) => s.name === 'analyze'));
-  const hasRunStep = rows.some((r) => (r.steps ?? []).some((s) => RUN_STEP_KEYS.includes(s.name)));
-  const isReport = hasAnalyze && !hasRunStep;
+  // Report execution iff a repo analyzed and none ran a real pipeline step (isReportExecution guards the
+  // clone/DNS-outage case, so an all-failed sweep is not mistaken for report and made to hide its
+  // failures). The live row counts too, so a live report run reads as report from its first step.
+  const isReport = isReportExecution(rows);
   const stages = isReport ? REPORT_STAGES : PIPELINE_STAGES;
 
   // Derive every row's jobs once, then locate the job in flight (first running one) to follow live.
@@ -408,8 +382,8 @@ export function ExecutionPipeline({ result }: { result: RunResult }) {
   const selRepo = sel && rows[sel.repo] ? rows[sel.repo] : null;
   const selJob = sel && grid[sel.repo] ? grid[sel.repo][sel.stage] : null;
   const legend: JobStatus[] = runningAt
-    ? ['running', 'success', 'failed', 'manual', 'pending', 'skipped']
-    : ['success', 'failed', 'manual', 'pending', 'skipped'];
+    ? ['running', 'success', 'failed', 'not-applicable', 'not-executed', 'manual', 'pending']
+    : ['success', 'failed', 'not-applicable', 'not-executed', 'manual', 'pending'];
 
   return (
     <div className="flex flex-col gap-3">

@@ -129,15 +129,73 @@ type RepoResult struct {
 	NumTurns     int     `json:"numTurns,omitempty"`
 }
 
-// Step is one stage of the per-repo pipeline (analyze | implement | push | pr | deploy).
+// StepStatus is a pipeline step's honest outcome. A step is EXECUTED and succeeded, EXECUTED and failed,
+// structurally NOT-APPLICABLE to this repo, or NOT-EXECUTED because an earlier step failed. Only StepOK
+// is a success — a not-applicable step is NEVER reported as one (that false green was how a service that
+// never re-deployed passed for delivered). A failed step HALTS the chain (every later step becomes
+// not-executed); a not-applicable step lets the chain continue.
+type StepStatus string
+
+const (
+	StepOK            StepStatus = "ok"             // ran and succeeded
+	StepFailed        StepStatus = "failed"         // ran and failed — halts the chain
+	StepNotApplicable StepStatus = "not-applicable" // does not apply to this repo — chain continues
+	StepNotExecuted   StepStatus = "not-executed"   // never attempted — an earlier step failed
+)
+
+// IsSuccess is true only for a genuinely executed, successful step. A not-applicable step is neither a
+// success nor a failure; this single guard is what keeps a skipped step from ever rendering as green.
+func (s StepStatus) IsSuccess() bool { return s == StepOK }
+
+// Step is one stage of the per-repo pipeline (analyze | implement | dev-deploy | push | pr).
 type Step struct {
 	Name string `json:"name"`
 	// Running marks a step still in progress — the agent step carries its streaming transcript in Log
 	// while Running is true, and the finished report once it clears. Set only on a Live repo's steps.
-	Running bool      `json:"running,omitempty"`
-	OK      bool      `json:"ok"`
-	Log     string    `json:"log,omitempty"`
-	At      time.Time `json:"at"`
+	Running bool       `json:"running,omitempty"`
+	Status  StepStatus `json:"status"`
+	Log     string     `json:"log,omitempty"`
+	At      time.Time  `json:"at"`
+}
+
+// UnmarshalJSON reads a Step, mapping a LEGACY result file — which stored a bool `ok` instead of the
+// four-state `status` — onto Status so history recorded before the honest states still renders:
+// ok:true → StepOK, ok:false → StepFailed. New results are written with `status` only, no redundant `ok`.
+func (s *Step) UnmarshalJSON(b []byte) error {
+	type wire struct {
+		Name    string     `json:"name"`
+		Running bool       `json:"running"`
+		Status  StepStatus `json:"status"`
+		OK      *bool      `json:"ok"` // legacy, pre-status
+		Log     string     `json:"log"`
+		At      time.Time  `json:"at"`
+	}
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	*s = Step{Name: w.Name, Running: w.Running, Status: w.Status, Log: w.Log, At: w.At}
+	if s.Status == "" && w.OK != nil {
+		if *w.OK {
+			s.Status = StepOK
+		} else {
+			s.Status = StepFailed
+		}
+	}
+	return nil
+}
+
+// StepsSucceeded reports whether a repo's recorded steps describe a clean chain: not one of them failed
+// or was left not-executed. This is the honest reading of "a repository counts as successfully processed
+// only if no step failed; a result with not-executed steps is no success". A not-applicable (or a
+// still-running) step does not, on its own, sink the chain.
+func StepsSucceeded(steps []Step) bool {
+	for _, s := range steps {
+		if s.Status == StepFailed || s.Status == StepNotExecuted {
+			return false
+		}
+	}
+	return true
 }
 
 // Results stores execution results at runs-results/<runId>/<resultId>.json.

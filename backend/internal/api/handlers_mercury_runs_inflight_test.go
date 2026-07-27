@@ -39,7 +39,7 @@ func TestAssembleInFlight(t *testing.T) {
 		RunID: "run_exec", ResultID: "rid_exec", StartedAt: now,
 		Repos: []runs.RepoResult{{Repo: "a", OK: true}},
 		Live: &runs.RepoResult{Repo: "b", Running: true, Steps: []runs.Step{
-			{Name: "analyze", OK: true},
+			{Name: "analyze", Status: runs.StepOK},
 			{Name: "implement", Running: true, Log: "…working"},
 		}},
 		InputTokens: 100, OutputTokens: 50, CostUSD: 0.25, NumTurns: 7,
