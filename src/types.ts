@@ -699,6 +699,8 @@ export interface StartResult {
   queued?: boolean;
   overloaded?: boolean;
   deferred?: string;
+  restartPending?: boolean; // queued because a devlabd restart is draining
+  message?: string;
   plan?: RunResumePlan;
   decision?: StartDecision;
 }

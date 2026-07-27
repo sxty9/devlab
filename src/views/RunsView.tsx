@@ -8,7 +8,7 @@ import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { useMercuryTopic } from '@/state/mercuryLive';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, RestartPendingBadge, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -90,7 +90,7 @@ export default function RunsView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
-  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
+  const { active, inflight, slots, restartPending, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [deferringId, setDeferringId] = useState<string | null>(null);
   const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
@@ -326,6 +326,7 @@ export default function RunsView() {
           ))}
         </div>
         <div className="ml-auto flex items-center gap-3">
+          <RestartPendingBadge pending={restartPending} />
           <SlotCapacityConfig onChanged={refetchActive} />
           <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} className="max-w-xs" />
         </div>

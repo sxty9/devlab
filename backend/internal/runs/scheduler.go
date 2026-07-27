@@ -78,10 +78,11 @@ type Scheduler struct {
 	tick  time.Duration
 	logf  func(string, ...any)
 
-	mu           sync.Mutex
-	maxConc      int                   // concurrency cap — live-adjustable via SetCapacity
-	active       map[string]*activeRun // runID → its live state; len is the active-run marker
-	claimedRepos map[string]bool       // repo-key → a live run is working it (ToDo target OR auto's current repo)
+	mu               sync.Mutex
+	maxConc          int                   // concurrency cap — live-adjustable via SetCapacity
+	active           map[string]*activeRun // runID → its live state; len is the active-run marker
+	claimedRepos     map[string]bool       // repo-key → a live run is working it (ToDo target OR auto's current repo)
+	restartRequested bool                  // a devlabd restart is draining → admit refuses new starts (they queue)
 
 	poke chan struct{} // nudged by SetCapacity so a raised cap admits waiting runs at once, not next tick
 	pub  *live.Broker  // optional: publishes an "active" tick whenever the live-run set changes (nil-safe)
@@ -132,6 +133,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 // suspended (on the usage limit, or deferred to free a slot) overrides its schedule entirely — it is due
 // exactly when its ResumeAt passes, and resumes the same execution rather than starting a new one.
 func isDue(r Run, now time.Time) bool {
+	if r.StartPending {
+		return true // queued during a restart → fire once now that the fresh process is up
+	}
 	if r.Suspended != nil {
 		return !r.Suspended.ResumeAt.After(now)
 	}
@@ -198,6 +202,9 @@ func (s *Scheduler) execute(ctx context.Context, cancel context.CancelCauseFunc,
 func (s *Scheduler) admit(r Run, cancel context.CancelCauseFunc, overload bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.restartRequested {
+		return false // draining for a restart — a new start is queued (StartPending), not started now
+	}
 	if _, dup := s.active[r.ID]; dup {
 		return false // already executing — never double-start
 	}
@@ -281,6 +288,59 @@ func (s *Scheduler) SetCapacity(n int) {
 		default: // a nudge is already pending — one admission pass covers it
 		}
 	}
+}
+
+// RequestRestart marks that a devlabd restart is imminent: from now on no new run is admitted (a trigger
+// arriving meanwhile is queued via QueueStart, not refused), so the process can drain and restart cleanly.
+// It returns the id of a still-executing run, or "" if the floor is already empty. Idempotent. It
+// publishes an "active" tick so open surfaces refetch and show "Neustart läuft" during the drain window.
+func (s *Scheduler) RequestRestart() string {
+	s.mu.Lock()
+	s.restartRequested = true
+	var liveID string
+	for id := range s.active {
+		liveID = id
+		break
+	}
+	s.mu.Unlock()
+	s.pub.Publish(live.TopicActive)
+	return liveID
+}
+
+// RestartPending reports whether a restart is draining — the signal the /active endpoint and the UI read.
+func (s *Scheduler) RestartPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restartRequested
+}
+
+// AwaitDrain blocks until no run is executing (the floor is empty) or ctx is done. Returns true if it
+// drained, false if the grace elapsed first (the still-running run is carried over on the plain cancel, not
+// killed). The HTTP server stays up throughout, so a trigger arriving during the drain is queued and told.
+func (s *Scheduler) AwaitDrain(ctx context.Context) bool {
+	for {
+		if s.ActiveCount() == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// QueueStart persists a StartPending flag on a run so a start requested DURING a restart drain fires once
+// automatically after the restart (isDue honours it). The value survives the restart in runs.json.
+func (s *Scheduler) QueueStart(id string) {
+	_, _ = s.store.Patch(func(cur []Run) ([]Run, error) {
+		for i := range cur {
+			if cur[i].ID == id {
+				cur[i].StartPending = true
+			}
+		}
+		return cur, nil
+	})
 }
 
 // release frees a run's slot (its repo claims / the exclusive floor) and updates the active-run marker.
@@ -393,6 +453,7 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 				}
 				t := now
 				cur[i].LastFiredAt = &t
+				cur[i].StartPending = false // a queued (during-restart) start fires exactly once
 				if cur[i].IsTodo() {
 					// A ToDo fires once: drop the due date up front so a crash mid-run can't refire it.
 					cur[i].DueAt = nil

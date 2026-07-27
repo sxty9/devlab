@@ -181,6 +181,40 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	go s.scheduler.Run(ctx)
 }
 
+// DrainForRestart is called on SIGTERM BEFORE the scheduler context is cancelled and the HTTP server shut
+// down. It gates new starts (RequestRestart → they queue as StartPending and the trigger is told
+// "Neustart läuft") and gives an in-flight run a bounded grace to finish before the restart, rather than
+// carrying it over. The HTTP server stays up throughout so a trigger arriving during the drain is queued
+// and answered, not refused.
+func (s *Server) DrainForRestart() {
+	if s.scheduler == nil {
+		return
+	}
+	liveID := s.scheduler.RequestRestart()
+	if liveID == "" {
+		return // floor already empty — restart at once
+	}
+	log.Printf("devlabd: restart requested — draining (grace %s), run %s in flight", drainGrace(), liveID)
+	ctx, cancel := context.WithTimeout(context.Background(), drainGrace())
+	defer cancel()
+	if s.scheduler.AwaitDrain(ctx) {
+		log.Printf("devlabd: runs drained — restarting")
+	} else {
+		log.Printf("devlabd: drain grace elapsed — restarting; the in-flight run carries over and resumes")
+	}
+}
+
+// drainGrace bounds how long a restart waits for the in-flight run to finish (DEVLAB_RUNS_DRAIN_GRACE
+// overrides; default 5m). Past it the restart proceeds and the run carries over (never killed).
+func drainGrace() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DRAIN_GRACE")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Minute
+}
+
 // runExecutor implements runs.Executor: the per-repo pipeline + auto-merge maintenance.
 type runExecutor struct {
 	s    *Server
@@ -2249,6 +2283,17 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	// the default continues an interrupted execution if one exists (req 1). The optional body carries a
 	// slot strategy (req 5): queue (einreihen) / defer (einen Vorgang zurückstellen) / overload (ein
 	// zusätzlicher Platz nur für diese Ausführung).
+	// A restart is draining: queue the start (it survives the restart and fires once after) and say so,
+	// rather than starting a run that the imminent restart would only carry over.
+	if s.scheduler.RestartPending() {
+		s.scheduler.QueueStart(id)
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"started": false, "queued": true, "restartPending": true,
+			"message": "Ein Neustart läuft — der Lauf wurde eingereiht und startet nach dem Neustart automatisch",
+		})
+		return
+	}
+
 	strategy, deferRunID, bodyFresh := decodeRunNowBody(r)
 	q := r.URL.Query().Get("fresh")
 	fresh := bodyFresh || q == "1" || strings.EqualFold(q, "true")
@@ -2314,13 +2359,16 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // parallel data path.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
 	active := []runs.Activity{}
+	restartPending := false
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
+		restartPending = s.scheduler.RestartPending()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"active":   active,
-		"inflight": s.assembleInFlight(active),
-		"slots":    s.slotOverview(active), // capacity/used/free/overload + deferred runs with resume points
+		"active":         active,
+		"inflight":       s.assembleInFlight(active),
+		"slots":          s.slotOverview(active), // capacity/used/free/overload + deferred runs with resume points
+		"restartPending": restartPending,         // a devlabd restart is draining → a start now is queued
 	})
 }
 

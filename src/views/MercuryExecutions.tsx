@@ -50,13 +50,19 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
         return;
       }
       setDecision(null);
-      const title = r.queued
-        ? `${noun} eingereiht`
-        : r.plan?.action === 'resume'
-          ? `${noun} fortgesetzt`
-          : `${noun} neu gestartet`;
-      const description = r.queued ? 'Startet, sobald ein Platz frei ist.' : r.plan?.reason;
-      toast({ title, description, variant: 'success' });
+      const title = r.restartPending
+        ? 'Neustart läuft'
+        : r.queued
+          ? `${noun} eingereiht`
+          : r.plan?.action === 'resume'
+            ? `${noun} fortgesetzt`
+            : `${noun} neu gestartet`;
+      const description = r.restartPending
+        ? (r.message ?? `Der ${noun} wurde eingereiht und startet nach dem Neustart automatisch.`)
+        : r.queued
+          ? 'Startet, sobald ein Platz frei ist.'
+          : r.plan?.reason;
+      toast({ title, description, variant: r.restartPending ? 'default' : 'success' });
       onStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
@@ -819,11 +825,12 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview | null; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview | null; restartPending: boolean; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
   const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
   const [slots, setSlots] = useState<SlotOverview | null>(null);
+  const [restartPending, setRestartPending] = useState(false);
   const [bump, setBump] = useState(0);
 
   // Live-driven, not polled (req 12: a resting view causes no ongoing load): fetch once on mount / focus /
@@ -838,6 +845,7 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
           setActive(r.active ?? []);
           setInflight(r.inflight ?? []);
           setSlots(r.slots ?? null);
+          setRestartPending(!!r.restartPending);
         }
       } catch {
         /* transient — keep the last known state */
@@ -851,7 +859,21 @@ export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; 
     };
   }, [source, bump]);
 
-  return { active, inflight, slots, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, inflight, slots, restartPending, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** A small badge shown while a devlabd restart is draining — so a start requested meanwhile is
+ *  recognizable as queued (it will run automatically after the restart). */
+export function RestartPendingBadge({ pending }: { pending: boolean }) {
+  if (!pending) return null;
+  return (
+    <span
+      className="rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning"
+      title="Ein Neustart läuft — jetzt angeforderte Starts werden eingereiht und laufen danach automatisch."
+    >
+      Neustart läuft
+    </span>
+  );
 }
 
 /** The execution floor at a glance (req 8): slots used/free, temporary overloads, and the deferred runs

@@ -52,6 +52,10 @@ SupplementaryGroups=holistic
 ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8781
 Restart=on-failure
 RestartSec=3
+# On stop (a self-deploy restart), devlabd gates new starts and DRAINS the in-flight Mercury run before
+# exiting (bounded by DEVLAB_RUNS_DRAIN_GRACE, default 5m). Give systemd headroom past that grace so it
+# does not SIGKILL devlabd mid-drain; if you raise the grace, raise this to match.
+TimeoutStopSec=360
 
 # Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable secret
 # makes devlabd refuse to start in SSO mode (fail closed) rather than accept forged tokens.

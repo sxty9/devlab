@@ -100,6 +100,11 @@ type Run struct {
 	// While set it OVERRIDES the schedule (the run does not fire on NextFireAt), and the scheduler
 	// resumes the SAME execution — only the not-yet-done repos — once ResumeAt passes.
 	Suspended *Suspension `json:"suspended,omitempty"`
+
+	// StartPending marks a start that was requested while a devlabd restart was draining: it is PERSISTED
+	// so it survives the restart, and the fresh process fires it once at start-up (isDue honours it), then
+	// clears it. This is how a trigger arriving during a restart is queued rather than refused.
+	StartPending bool `json:"startPending,omitempty"`
 }
 
 // Suspension records that a run's execution paused mid-way and should resume automatically. It points at

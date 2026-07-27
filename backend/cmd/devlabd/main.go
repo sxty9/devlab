@@ -64,6 +64,12 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
+	// Gate new starts and drain any in-flight run BEFORE cancelling the scheduler / shutting the HTTP
+	// server down. The server stays up through the drain, so a trigger arriving meanwhile is queued and
+	// told "Neustart läuft" rather than refused. Mutual exclusion now lives here, so the deploy script
+	// needs no wait/marker dance — one restart, owned where "what is running" is known.
+	server.DrainForRestart()
+
 	schedCancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

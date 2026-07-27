@@ -190,7 +190,7 @@ export interface DataSource {
   /** Every run executing right now (server truth) — several run concurrently. Read on mount so live runs
    *  survive a page reload, and polled to follow them. `inflight` is the transparent list of every run
    *  currently being worked (executing + suspended) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview }>;
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview; restartPending?: boolean }>;
   /** Abort a SPECIFIC run in progress by id (kill-switch) — other concurrent runs keep going. */
   mercuryCancelRun(id: string): Promise<void>;
   /** Stand a SPECIFIC run down to free its slot — it keeps its progress and resumes at the next free slot. */

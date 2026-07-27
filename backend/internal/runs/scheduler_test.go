@@ -549,6 +549,66 @@ func TestDeferReArmsRunAsResumable(t *testing.T) {
 // FireNowStart is a tiny test convenience: start a run, ignoring the resume plan.
 func (s *Scheduler) FireNowStart(id string) bool { _, ok := s.FireNow(id, "t", false); return ok }
 
+// TestRestartPendingQueuesStarts: while a restart drains, no new run is admitted; a start is queued
+// (StartPending), and the drain waits for the in-flight run then completes.
+func TestRestartPendingQueuesStarts(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{todoRun("a", "r1", past), todoRun("b", "r2", past)})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 4))
+
+	s.FireNowStart("a")
+	waitFor(t, "a live", func() bool { return s.ActiveCount() == 1 })
+
+	if liveID := s.RequestRestart(); liveID != "a" {
+		t.Errorf("RequestRestart should name the in-flight run, got %q", liveID)
+	}
+	if !s.RestartPending() {
+		t.Error("RestartPending must be true after RequestRestart")
+	}
+	if s.FireNowStart("b") {
+		t.Error("no new run may start while a restart is draining")
+	}
+	s.QueueStart("b")
+	if b, _, _ := store.Get("b"); !b.StartPending || !isDue(b, time.Now()) {
+		t.Error("a queued start must be StartPending and due")
+	}
+
+	// The drain does not complete while a runs; it does once a is released.
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	if s.AwaitDrain(ctx) {
+		t.Error("drain must not complete while a run is live")
+	}
+	cancel()
+	ge.release("a")
+	dctx, dcancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer dcancel()
+	if !s.AwaitDrain(dctx) {
+		t.Error("drain must complete once the floor is empty")
+	}
+}
+
+// TestStartPendingFiresAfterRestart: the fresh process fires a persisted StartPending run once and clears
+// the flag (so it does not re-fire).
+func TestStartPendingFiresAfterRestart(t *testing.T) {
+	store := seedStore(t, []Run{{ID: "q", Type: TypeTodo, Enabled: true, Targets: []Target{{Repo: "r1"}}, StartPending: true}})
+	ge := newGateExec()
+	s := quiet(NewScheduler(store, ge, time.Second, 2))
+
+	s.fireDue(context.Background())
+	waitFor(t, "queued start fired", func() bool { return len(ge.startedIDs()) == 1 })
+	ge.release("q")
+	waitFor(t, "cleared", func() bool { q, _, _ := store.Get("q"); return !q.StartPending && s.ActiveCount() == 0 })
+
+	// A second pass must not re-fire it.
+	s.fireDue(context.Background())
+	time.Sleep(20 * time.Millisecond)
+	if n := len(ge.startedIDs()); n != 1 {
+		t.Errorf("a queued start must fire exactly once, got %d", n)
+	}
+	settle(t, s)
+}
+
 // TestSchedulerTenConcurrent (req 15 test 1): with ten slots, ten different-repo ToDos all run at once.
 func TestSchedulerTenConcurrent(t *testing.T) {
 	past := time.Now().Add(-time.Minute)

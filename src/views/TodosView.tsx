@@ -8,7 +8,7 @@ import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
 import { useMercuryTopic } from '@/state/mercuryLive';
-import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, RestartPendingBadge, SlotCapacityConfig, SlotsOverview, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
@@ -282,7 +282,7 @@ export default function TodosView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
   // affordance lives in that overview.
-  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
+  const { active, inflight, slots, restartPending, refetch: refetchActive } = useActiveRun();
   const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [deferringId, setDeferringId] = useState<string | null>(null);
   const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
@@ -483,6 +483,7 @@ export default function TodosView() {
                   </Button>
                 </div>
                 {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
+                <RestartPendingBadge pending={restartPending} />
                 <SlotCapacityConfig onChanged={refetchActive} />
                 <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} />
               </div>
