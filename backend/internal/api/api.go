@@ -39,6 +39,7 @@ type Server struct {
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
 	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
+	runSettings *runs.SettingsStore   // live, UI-adjustable runs settings (currently: the number of execution slots)
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
@@ -83,6 +84,7 @@ func New(v *auth.Verifier) *Server {
 		runs:        runs.NewStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
+		runSettings: runs.NewSettingsStore(),
 		runNotices:  runs.NewNoticeStore(),
 		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
@@ -255,6 +257,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
+	// Execution-slot configuration (req 13): the service's config interface for the number of slots. The
+	// literal `config` segment is registered before the {id} route so it is never captured as a run id.
+	mux.HandleFunc("GET /api/mercury/runs/config", s.guard(s.runConfig))
+	mux.HandleFunc("PUT /api/mercury/runs/config", s.guardCSRF(s.runSetConfig))
+	// Blocked prod-deploys: the deliveries that failed permanently and wait for an explicit resume. The
+	// literal `deploys` segment is registered before the {id} route so it is never captured as a run id.
+	mux.HandleFunc("GET /api/mercury/runs/deploys", s.guard(s.runDeploysBlocked))
+	mux.HandleFunc("POST /api/mercury/runs/deploys/resume", s.guardCSRF(s.runDeployResume))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -267,7 +277,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))
 	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
-	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
+	// Cancel targets a SPECIFIC run by id — several run concurrently. Defer stands a run down to free its
+	// slot (keeps progress, resumes at the next free slot).
+	mux.HandleFunc("POST /api/mercury/runs/{id}/cancel", s.guardCSRF(s.runCancel))
+	mux.HandleFunc("POST /api/mercury/runs/{id}/defer", s.guardCSRF(s.runDefer))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
 	// Deliveries: roll back a shipped delivery (counter-booking), or reset a repo's dev branch to default.
 	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))

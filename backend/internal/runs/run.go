@@ -108,15 +108,27 @@ type Run struct {
 	Suspended *Suspension `json:"suspended,omitempty"`
 }
 
-// Suspension records that a run hit the usage limit and should resume automatically. It points at the
-// open execution (ResultID) so resume continues it instead of starting fresh, and counts attempts so a
-// pathological loop (limit hit every resume) eventually gives up rather than spinning forever.
+// Suspension records that a run's execution paused mid-way and should resume automatically. It points at
+// the open execution (ResultID) so resume continues it — skipping the repos already done — instead of
+// starting fresh, and counts usage-limit attempts so a pathological loop (limit hit every resume)
+// eventually gives up rather than spinning forever. Reason distinguishes the two causes that share this
+// ONE mechanism (no second pause concept): a subscription usage-limit pause, or a deliberate defer that
+// freed a slot. A deferred suspension is immediately due (ResumeAt=now) and never consumes an attempt.
 type Suspension struct {
 	ResumeAt time.Time `json:"resumeAt"`
 	ResultID string    `json:"resultId"`
 	Attempts int       `json:"attempts"`
-	Reason   string    `json:"reason,omitempty"` // e.g. "usage-limit"
+	Reason   string    `json:"reason,omitempty"` // ReasonUsageLimit | ReasonDeferred ("" reads as usage-limit)
 }
+
+// The two reasons a run is suspended mid-execution — both resume the SAME execution, reason-agnostically.
+const (
+	ReasonUsageLimit = "usage-limit" // paused because the Claude subscription window is exhausted
+	ReasonDeferred   = "deferred"    // stood down to free a slot; immediately due, resumes at the next free one
+)
+
+// IsDeferred reports whether this suspension is a slot-freeing defer rather than a usage-limit pause.
+func (s *Suspension) IsDeferred() bool { return s != nil && s.Reason == ReasonDeferred }
 
 // IsTodo reports whether this is a one-time concrete task rather than a recurring axiom run.
 func (r Run) IsTodo() bool { return r.Type == TypeTodo }
@@ -174,8 +186,9 @@ type ResultRef struct {
 	InputTokens  int        `json:"inputTokens,omitempty"`
 	OutputTokens int        `json:"outputTokens,omitempty"`
 	CostUSD      float64    `json:"costUsd,omitempty"`
-	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
+	Suspended    bool       `json:"suspended,omitempty"` // execution paused (usage limit or a slot-freeing defer)
 	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
+	Reason       string     `json:"reason,omitempty"`    // why it paused: ReasonUsageLimit | ReasonDeferred ("" = usage-limit)
 
 	Deployed     bool   `json:"deployed,omitempty"`     // at least one repo went live on dev
 	PRUrl        string `json:"prUrl,omitempty"`        // the PR this execution opened (first, if several)

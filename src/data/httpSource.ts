@@ -305,13 +305,32 @@ export const httpSource: DataSource = {
     return json(await post('/api/mercury/chat', { messages }));
   },
   async mercuryRunNow(id, opts) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run${opts?.fresh ? '?fresh=1' : ''}`, {}));
+    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {
+      fresh: !!opts?.fresh,
+      strategy: opts?.strategy,
+      deferRunId: opts?.deferRunId,
+    }));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
-  async mercuryCancelRun() {
-    await json<void>(await post('/api/mercury/runs/cancel', {}));
+  async mercuryCancelRun(id: string) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/cancel`, {}));
+  },
+  async mercuryDeferRun(id: string) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
+  },
+  async mercuryRunConfig() {
+    return json(await request('/api/mercury/runs/config'));
+  },
+  async mercurySetRunConfig(maxConcurrent: number) {
+    return json(await post('/api/mercury/runs/config', { maxConcurrent }, 'PUT'));
+  },
+  async mercuryBlockedDeploys() {
+    return json(await request('/api/mercury/runs/deploys'));
+  },
+  async mercuryResumeDeploy(repo, number) {
+    return json(await post('/api/mercury/runs/deploys/resume', { repo, number }));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(

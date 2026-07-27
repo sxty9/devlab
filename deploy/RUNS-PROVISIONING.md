@@ -101,7 +101,7 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | Env | Default | Bedeutung |
 |---|---|---|
 | `DEVLAB_RUNS_MAX_DURATION` | `4h` | Obergrenze Wall-Clock **pro Lauf-Versuch**. Reststrecke wird auf den nächsten Termin übertragen (nicht neu begonnen). **`0` = AUS (unbegrenzt)** — nicht „keine Läufe"; Läufe stoppt man mit `MODE=off`. |
-| `DEVLAB_RUNS_MAX_COST_USD` | `0` (aus) | Kosten­deckel **pro Versuch** (nicht kumulativ). Weicher Deckel: der laufende Repo überschreitet ggf. um seine eigenen Kosten. Reststrecke wird übertragen. Nur wirksam, wenn der Claude-CLI `total_cost_usd` liefert (bei Abo-Auth ggf. `0` → dann wirkungslos; einmal prüfen). |
+| `DEVLAB_RUNS_MAX_CONCURRENT` | `2` | **Startwert** für die Zahl gleichzeitiger Ausführungsplätze. Nur ein Seed: die Zahl wird in der Oberfläche eingestellt (wirkt sofort ohne Neustart) und überlebt dort einen Neustart; der Env-Wert gilt nur, solange nichts eingestellt wurde. Nie zwei Vorgänge im selben Repository — unabhängig von der Zahl. |
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
@@ -122,8 +122,11 @@ Standard-Branch), zeigt also nur ihre eigenen Änderungen. Zwei bewusste Handlun
 - `POST /api/mercury/runs/reset` `{"repo":"owner/name"}` — **ausdrückliches Zurücksetzen** von
   `mercury-dev` auf den Standard-Branch (verwirft den akkumulierten dev-Stand, force-push).
 
-> **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
-> klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.
+> **Kein Kostendeckel — bewusst.** Die Ausführung wird über die **Abo-Nutzung** begrenzt (Pause am
+> Abo-Limit samt Wiederaufnahme) und über die **Laufzeit** (`MAX_DURATION`), nicht über einen Geldbetrag.
+> Das Abo bringt keine Zusatzkosten pro Lauf, und das bezahlte Kontingent soll ausgeschöpft werden statt
+> künstlich beschnitten. Der Verbrauch (Eingabe-/Ausgabe-Token, rechnerischer Gegenwert) wird weiterhin
+> vollständig gemessen und angezeigt — nur das **Abbrechen** anhand eines Dollar-Werts entfällt.
 
 **Empfehlung:** erst `report` gegen einen echten Lauf testen (erzeugt nur Berichte), dann `pr`
 (Branch + PR, nichts wird gemergt/deployt bis du prüfst), erst dann `full`.
@@ -136,13 +139,12 @@ pusht einen Branch und öffnet einen Pull Request. Gemergt und deployt wird nich
 | Stellschraube | Wert | Begründung |
 |---|---|---|
 | `DEVLAB_RUNS_MODE` | `pr` | implementiert und öffnet PRs; kein unbeaufsichtigtes Deploy |
-| `DEVLAB_RUNS_MAX_COST_USD` | `50` | ein ungedeckelter Sweep über ~19 Repos wurde auf $150–300 **pro Nacht** geschätzt; die Reststrecke wird per Carry-over fortgesetzt, nicht verworfen |
 | `DEVLAB_RUNS_MAX_DURATION` | `4h` | Start 02:00 → Ende spätestens 06:00 |
 | `DEVLAB_RUNS_AUTOMERGE` | `720h` | 30 Tage Prüffrist, explizit gesetzt statt implizit aus dem Code |
 
-> Der Kostendeckel wirkt nur, wenn der Claude-CLI `total_cost_usd` liefert — bei Abo-Auth kann das
-> `0` sein und der Deckel liefe leer. **Geprüft am 2026-07-20:** ein realer Lauf meldete `$0.8953`,
-> die Kostenmeldung funktioniert und der Deckel greift.
+> Der Verbrauch (`total_cost_usd`, sofern der Claude-CLI ihn liefert) wird weiterhin gemessen und in der
+> Ausführungsansicht gezeigt — er begrenzt die Ausführung aber **nicht**. **Geprüft am 2026-07-20:** ein
+> realer Lauf meldete `$0.8953`; die Kostenmeldung funktioniert (rein informativ).
 
 ### Voraussetzungen für `full` (noch offen)
 

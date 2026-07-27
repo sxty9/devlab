@@ -646,6 +646,77 @@ export interface RunActive {
   runId: string;
   resultId: string;
   startedAt: string;
+  exclusive?: boolean; // an auto run holding the whole floor
+  overload?: boolean; // admitted past the cap in a temporary slot
+}
+
+/** The runs subsystem's live configuration — currently the number of execution slots. `configured` is
+ *  false while it runs on the env/default seed (no UI value set yet). */
+export interface RunConfig {
+  maxConcurrent: number;
+  maxConcurrentSeed: number;
+  configured: boolean;
+}
+
+/** How a start proceeds when all slots are busy. */
+export type StartStrategy = 'queue' | 'defer' | 'overload';
+
+/** One deferred run and where it will resume (its continuation point). */
+export interface DeferredRun {
+  runId: string;
+  runName?: string;
+  resultId?: string;
+  done: number;
+  total?: number;
+  resumePoint: string;
+}
+
+/** The execution floor at a glance: slots total/used/free, temporary overloads, and deferred runs. */
+export interface SlotOverview {
+  capacity: number;
+  used: number;
+  free: number;
+  overload: number;
+  deferred: DeferredRun[];
+}
+
+/** The system's reasoned recommendation of which run to defer to make room. */
+export interface DeferSuggestion {
+  runId: string;
+  runName?: string;
+  reason: string;
+}
+
+/** Returned when a start is blocked because the floor is full: what blocks it, the ways forward, a
+ *  suggested defer, and the current slot picture. */
+export interface StartDecision {
+  blocked: string; // 'cap' | 'repo-busy' | 'exclusive'
+  options: StartStrategy[];
+  suggestion?: DeferSuggestion;
+  slots: SlotOverview;
+}
+
+/** The outcome of triggering a run: it started (with a resume plan), was queued, overloaded, or — when the
+ *  floor is full and no strategy was chosen — a decision to act on. */
+export interface StartResult {
+  started?: boolean;
+  queued?: boolean;
+  overloaded?: boolean;
+  deferred?: string;
+  plan?: RunResumePlan;
+  decision?: StartDecision;
+}
+
+/** A delivery blocked on a permanent prod-deploy failure — retried a few times, then held for an explicit
+ *  resume so one broken repo can't retry forever or hold up the others. */
+export interface BlockedDeploy {
+  repo: string; // owner/name
+  number: number; // the merged PR number the delivery belongs to
+  url: string;
+  runId: string;
+  reason: string; // human cause, naming the service and the target
+  attempts: number; // permanent-failure attempts before it blocked
+  blockedAt: string;
 }
 
 /** What a trigger decided to do, reported back so the difference between continuing an interrupted

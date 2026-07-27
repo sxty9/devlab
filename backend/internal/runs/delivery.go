@@ -49,6 +49,12 @@ type Delivery struct {
 	RevertedAt *time.Time `json:"revertedAt,omitempty"`
 	RevertedBy string     `json:"revertedBy,omitempty"`
 	RevertOf   string     `json:"revertOf,omitempty"`
+
+	// BranchPruned records that the per-delivery snapshot Branch has been deleted (its work reached the
+	// default branch — a merged delivery's branch has served its purpose). It gates the branch-prune sweep
+	// so each branch is deleted exactly once and a steady-state ledger is not re-swept every tick. The
+	// delivery record itself is never destroyed — only its now-redundant Git branch is.
+	BranchPruned bool `json:"branchPruned,omitempty"`
 }
 
 // DeliveryStatus tracks a delivery's lifecycle. It mirrors the PR outcome for the common path and adds

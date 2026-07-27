@@ -149,17 +149,6 @@ func budgetAwareError(actx context.Context, budget time.Duration, err error) str
 	return err.Error()
 }
 
-// maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
-// (remaining repos are left for the next scheduled run). 0 (the default) = no ceiling.
-func maxCostUSD() float64 {
-	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_COST_USD")); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			return f
-		}
-	}
-	return 0
-}
-
 // maxRunDuration caps the wall-clock of one whole sweep. DEVLAB_RUNS_MAX_DURATION overrides;
 // an explicit "0" disables the cap.
 func maxRunDuration() time.Duration {
@@ -192,6 +181,19 @@ func maxResumes() int {
 
 func resumeEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_LIMIT_RESUME")), "off")
+}
+
+// maxConcurrentRuns is the seed for the concurrency cap (how many runs execute at once). DEVLAB_RUNS_MAX_
+// CONCURRENT overrides; a non-positive/absent value leaves the scheduler's conservative default. This is
+// only the STARTING value — the cap is configurable live at runtime (see the settings store), env just
+// seeds it.
+func maxConcurrentRuns() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_CONCURRENT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			return n
+		}
+	}
+	return 0 // 0 → NewScheduler applies its default
 }
 
 // StartScheduler arms the run scheduler iff configured. Absent config → it logs and stays dormant
@@ -238,9 +240,17 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
-	s.scheduler = runs.NewScheduler(s.runs, x, tick)
-	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
-		mode, user, tokenUser, autoMerge, tick)
+	// Seed the concurrency cap: a configured setting wins (req 13 — set in the UI, survives a restart);
+	// otherwise the env value seeds it; otherwise the scheduler's conservative default.
+	maxConc := maxConcurrentRuns()
+	if s.runSettings != nil {
+		if rs, err := s.runSettings.Get(); err == nil && rs.MaxConcurrent > 0 {
+			maxConc = rs.MaxConcurrent
+		}
+	}
+	s.scheduler = runs.NewScheduler(s.runs, x, tick, maxConc)
+	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s maxConcurrent=%d",
+		mode, user, tokenUser, autoMerge, tick, maxConc)
 	go s.scheduler.Run(ctx)
 }
 
@@ -276,6 +286,9 @@ type runExecutor struct {
 	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
 	// /etc that a test can neither create nor rely on.
 	deployTargetFn func(repoName string) bool
+	// deleteBranchFn stubs the GitHub ref-delete so the merged-delivery-branch prune can be exercised
+	// without a real token or network.
+	deleteBranchFn func(ctx context.Context, token, fullName, branch string) error
 
 	// Rollback/reset seams — the git counter-booking runs against a real per-user workspace (sudo), and
 	// the PR ops hit GitHub; both are stubbed in tests so the rollback DECISION logic (conflict → ToDo,
@@ -408,14 +421,17 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		todoAtts = x.loadAttachments(run)
 	}
 
-	// Cap the whole sweep's wall-clock (belt-and-braces beside the per-repo timeout). A resume inherits
-	// the remaining spend budget via the accumulated res.CostUSD, but a fresh duration budget.
+	// Cap the whole sweep's wall-clock (belt-and-braces beside the per-repo timeout). A resume inherits a
+	// fresh duration budget. There is deliberately NO spend ceiling: the only limits that bind are the
+	// subscription usage limit (which pauses the run and resumes it when the window resets) and this
+	// duration bound. A dollar cap measured a cost that does not exist — the flat-rate subscription bills
+	// nothing per run — so it only left paid quota unused; spend is still MEASURED (res.CostUSD below),
+	// just never used to abort.
 	if d := maxRunDuration(); d > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
-	costCeiling := maxCostUSD()
 
 	done := res.DoneRepos()          // repos already handled in a previous attempt (resume skips them)
 	overallOK := res.OK || !resuming // seed from the partial result's running state
@@ -441,28 +457,32 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		save()
 	}
 
-	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
-	// since this attempt began, so a carried-over run resumes with a fresh budget and always makes
-	// progress (a cumulative cap would re-trip forever on the loaded res.CostUSD and deadlock).
-	attemptStartCost := res.CostUSD
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
+	// Per-repo coordination (req 14): an auto run occupies ONE slot and claims each repo through the
+	// scheduler just before working it, releasing it after — so a repo momentarily busy (held by another
+	// run) is put to the BACK of the worklist and retried, not skipped, and ToDos in other repos run
+	// alongside. A ToDo already holds its target claims (reserved at admission), so it does not re-claim.
+	perRepoClaim := !run.IsTodo() && x.s != nil && x.s.scheduler != nil
+	worklist := make([]model.Repo, 0, len(repos))
 	for _, repo := range repos {
-		if done[repo.ID] {
-			continue // completed in an earlier attempt of this same execution
+		if !done[repo.ID] { // skip repos completed in an earlier attempt of this same execution
+			worklist = append(worklist, repo)
 		}
-		// Spend ceiling for THIS attempt: stop before starting another expensive repo. Carry over — the
-		// remaining repos continue on the next scheduled run, not redone-from-scratch (which would
-		// duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by its
-		// own cost (soft cap).
-		if costCeiling > 0 && res.CostUSD-attemptStartCost >= costCeiling {
-			log.Printf("devlabd: run %s hit the per-run cost ceiling ($%.2f this attempt ≥ $%.2f) after %d repos — carrying the rest to the next run",
-				run.ID, res.CostUSD-attemptStartCost, costCeiling, len(res.Repos))
-			carriedOver = true
-			break
-		}
+	}
+	busyStreak := 0 // consecutive repos found busy this cycle → all remaining busy ⇒ wait, don't spin
+
+	for len(worklist) > 0 {
+		repo := worklist[0]
+		worklist = worklist[1:]
+
 		if ctx.Err() != nil {
+			// A DEFER (freeing a slot) re-arms the run as an immediately-due deferred suspension — it keeps
+			// its progress and resumes at the next free slot. Checked first: it is a stand-down, not a stop.
+			if deferredNow(ctx) {
+				return x.suspendDeferred(&res, save)
+			}
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
 			// ErrRunAborted as the cause) finalises the run — "abort" means stop, not resume. Our own
 			// sweep-duration cap (DeadlineExceeded) and a process shutdown (a plain cancel with no abort
@@ -477,7 +497,32 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 			carriedOver = true
 			break
 		}
+
+		var releaseRepo func()
+		if perRepoClaim {
+			key := runs.RepoClaimKey(repo.ID)
+			if !x.s.scheduler.TryClaimRepo(run.ID, key) {
+				worklist = append(worklist, repo) // busy — put it at the back and come back (req 14)
+				busyStreak++
+				if busyStreak >= len(worklist) {
+					// A whole cycle found every remaining repo busy — wait briefly (bounded by the sweep
+					// duration cap via ctx) rather than spinning, then retry.
+					busyStreak = 0
+					select {
+					case <-ctx.Done():
+					case <-time.After(2 * time.Second):
+					}
+				}
+				continue
+			}
+			busyStreak = 0
+			releaseRepo = func() { x.s.scheduler.ReleaseRepo(run.ID, key) }
+		}
+
 		rr, lim := x.executeRepo(ctx, run, repo, newRepoName[repo.ID] != "", x.promptFor(run, repo.ID, newRepoName[repo.ID], todoAtts), token, ghLogin, ghID, todoAtts, &res, saver)
+		if releaseRepo != nil {
+			releaseRepo() // free the repo the instant this one settles, so another run can take it
+		}
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
@@ -503,6 +548,19 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 		//     wastefully, a pr/full repo into a DUPLICATE PR);
 		//   • a failed repo that already opened a PR (full-mode deploy-fail leaves rr.PRUrl set) must be
 		//     recorded so resume skips it — dropping it would re-open a duplicate PR.
+		if deferredNow(ctx) {
+			// Deferred mid-repo: record the repo only if it durably completed (opened a PR / succeeded), so
+			// resume skips it; otherwise drop it (retries clean on resume). Then re-arm as deferred.
+			if rr.OK || rr.PRUrl != "" {
+				rr.Running = false
+				res.Repos = append(res.Repos, rr)
+				res.InputTokens += rr.InputTokens
+				res.OutputTokens += rr.OutputTokens
+				res.CostUSD += rr.CostUSD
+				res.NumTurns += rr.NumTurns
+			}
+			return x.suspendDeferred(&res, save)
+		}
 		if !rr.OK && rr.PRUrl == "" && ctx.Err() != nil && !errors.Is(context.Cause(ctx), runs.ErrRunAborted) {
 			log.Printf("devlabd: run %s interrupted mid-repo %s (%v) — carrying over", run.ID, repo.ID, ctx.Err())
 			carriedOver = true
@@ -659,6 +717,28 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 // suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
 // budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
 // the scheduler clears the suspension and stops retrying).
+// deferredNow reports whether the context was cancelled by a Defer (freeing a slot) rather than an abort
+// or a shutdown.
+func deferredNow(ctx context.Context) bool {
+	return ctx.Err() != nil && errors.Is(context.Cause(ctx), runs.ErrRunDeferred)
+}
+
+// suspendDeferred re-arms the execution as an IMMEDIATELY-DUE deferred suspension (Reason=deferred,
+// ResumeAt=now): it keeps all progress and reclaims the next free slot, resuming the SAME execution and
+// skipping the repos already done. It reuses the ONE suspension mechanism — no second pause concept — and
+// never consumes a usage-limit attempt (the scheduler only counts attempts for a real usage-limit pause).
+func (x *runExecutor) suspendDeferred(res *runs.Result, save func()) (runs.ResultRef, error) {
+	now := time.Now().UTC()
+	res.Suspended = true
+	res.ResumeAt = &now
+	save()
+	ref := res.Ref() // copies Suspended + ResumeAt from res
+	ref.Reason = runs.ReasonDeferred
+	ref.OK = false
+	log.Printf("devlabd: run %s deferred to free a slot — resumes at the next free slot", res.RunID)
+	return ref, nil
+}
+
 func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
@@ -986,6 +1066,11 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			return rr, repoSignal{}
 		}
 	}
+	// The dev branch is pushed as a BACKUP, never as a way onto the default branch: it is the ONLY durable
+	// record of work that is already built but not yet merged, so if a workspace is lost the accumulated dev
+	// state can still be recovered from the remote. It is deliberately never raised as a pull request and
+	// never deleted (unlike a delivery branch, which is pruned once merged) — one per repo, the same name
+	// (mercury-dev) everywhere. The ONLY path onto the default branch is the per-delivery branch and its PR.
 	pushRefs := []string{devBranch}
 	if deliveryBranch != "" {
 		pushRefs = append(pushRefs, deliveryBranch)
@@ -1248,21 +1333,150 @@ var infraErrorMarkers = []string{
 	"operation timed out",
 }
 
+// hasInfraMarker reports whether a message carries a connectivity-failure signature. Split out of
+// isInfraError so the SAME classification can run over a deploy wrapper's combined OUTPUT (where the real
+// ssh/rsync cause lives) as well as over a Go error's text.
+func hasInfraMarker(s string) bool {
+	m := strings.ToLower(s)
+	for _, marker := range infraErrorMarkers {
+		if strings.Contains(m, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // isInfraError reports whether an error is an infrastructure/connectivity failure (host can't reach
 // GitHub) rather than a problem with the specific repo or the work. This is the "gucken, WARUM nicht
 // geklont werden kann" step: the runner distinguishes "the network is down" from "this repo is broken"
 // and reacts differently — the former is transient and retried, the latter is a real per-repo failure.
 func isInfraError(err error) bool {
-	if err == nil {
-		return false
-	}
-	m := strings.ToLower(err.Error())
-	for _, s := range infraErrorMarkers {
-		if strings.Contains(m, s) {
+	return err != nil && hasInfraMarker(err.Error())
+}
+
+// deployTransient tells a temporary prod-deploy failure (network hiccup, target briefly unreachable —
+// keep retrying, never counts toward a block) from a permanent one (everything else — count an attempt,
+// block after a few). It inspects the wrapper's combined OUTPUT first, because the real ssh/rsync cause
+// lives there, then the Go exit-status error.
+func deployTransient(out string, err error) bool {
+	return hasInfraMarker(out) || isInfraError(err)
+}
+
+// deploySetupMissingMarkers are signatures that a prod-deploy failed because the service is NOT SET UP on
+// the target — the unit isn't installed, no vetted deploy script exists, no prod target/key is configured,
+// nothing was staged. Used ONLY to phrase the block reason honestly ("nicht eingerichtet") — never to
+// decide transient-vs-permanent (all of these are permanent).
+var deploySetupMissingMarkers = []string{
+	".service not found", // systemctl: the prod unit is not installed on the target
+	"unit not found",
+	"no such unit",
+	"no deploy script",   // wrapper exit 3: no vetted per-repo script on the runner host
+	"prod: missing",      // per-repo script exit 11: missing prod-target / deploy key config
+	"prod: empty target",
+	"no staged artifact", // receiver exit 3: nothing staged / no mapping for this repo on the target
+	"no mapping",
+	"unknown env",
+}
+
+func deploySetupMissing(out string) bool {
+	m := strings.ToLower(out)
+	for _, marker := range deploySetupMissingMarkers {
+		if strings.Contains(m, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// deployBlockReason phrases a human cause naming the service and the target, so a blocked delivery reads
+// as "Dienst X ist im Ziel Y nicht eingerichtet: …" rather than a bare exit code.
+func deployBlockReason(service, out string, err error) string {
+	target := prodTargetName()
+	detail := lastMeaningfulLine(out, err)
+	if deploySetupMissing(out) {
+		return fmt.Sprintf("Dienst »%s« ist im Ziel »%s« nicht eingerichtet: %s", service, target, detail)
+	}
+	return fmt.Sprintf("Auslieferung von »%s« nach »%s« dauerhaft fehlgeschlagen: %s", service, target, detail)
+}
+
+// prodTargetName is the human name of the prod target for reasons/logs (DEVLAB_RUNS_PROD_TARGET_NAME
+// overrides). Instance-neutral: a name, never a host.
+func prodTargetName() string {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_TARGET_NAME")); v != "" {
+		return v
+	}
+	return "prod"
+}
+
+// lastMeaningfulLine returns the last non-blank line of the deploy output (the actual failure), or the
+// Go error text if the output was empty — clipped so a reason never dumps a whole log.
+func lastMeaningfulLine(out string, err error) string {
+	lines := strings.Split(out, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			return clipLine(s)
+		}
+	}
+	if err != nil {
+		return clipLine(err.Error())
+	}
+	return "unbekannter Fehler"
+}
+
+func clipLine(s string) string {
+	const max = 240
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
+}
+
+// noDeployRepos parses DEVLAB_RUNS_NO_DEPLOY — bare repo names a service prod deliberately does NOT run —
+// into a case-insensitive set. Separators: comma, space, newline, tab, semicolon.
+func noDeployRepos() map[string]bool {
+	out := map[string]bool{}
+	fields := strings.FieldsFunc(os.Getenv("DEVLAB_RUNS_NO_DEPLOY"), func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == ';'
+	})
+	for _, f := range fields {
+		if f = strings.ToLower(strings.TrimSpace(f)); f != "" {
+			out[f] = true
+		}
+	}
+	return out
+}
+
+func isNoDeployRepo(name string) bool {
+	return noDeployRepos()[strings.ToLower(strings.TrimSpace(name))]
+}
+
+// defaultMaxDeployAttempts / maxDeployAttempts bound how many PERMANENT prod-deploy failures a merged PR
+// suffers before it is blocked (waits for an explicit resume). DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS overrides;
+// a non-positive value keeps the default.
+const defaultMaxDeployAttempts = 3
+
+func maxDeployAttempts() int {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MAX_DEPLOY_ATTEMPTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxDeployAttempts
+}
+
+// shipToProd is the SINGLE gate deciding whether a merged PR's repo should be prod-deployed at all. Two
+// no-ship cases, unified: a repo explicitly listed as not-to-be-delivered (DEVLAB_RUNS_NO_DEPLOY), and a
+// repo with no deploy target configured. Either way the caller untracks the PR with NO deploy attempt.
+func (x *runExecutor) shipToProd(name string) (bool, string) {
+	if isNoDeployRepo(name) {
+		return false, "als nicht auszuliefern geführt (DEVLAB_RUNS_NO_DEPLOY) — " + name +
+			" wird bewusst nicht nach prod ausgeliefert"
+	}
+	if !x.deployable(name) {
+		return false, noDeployTargetReason(name)
+	}
+	return true, ""
 }
 
 // githubReachable probes GitHub's API (a cheap, unauthenticated-safe rate-limit GET) to decide whether
@@ -1707,14 +1921,23 @@ func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.
 // a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
 // success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
-	prs, err := x.s.runPRs.List()
-	if err != nil || len(prs) == 0 {
-		return
-	}
 	token, err := x.token()
 	if err != nil {
 		return
 	}
+	if prs, err := x.s.runPRs.List(); err == nil && len(prs) > 0 {
+		x.maintainMergePRs(ctx, token, prs)
+	}
+	// Prune the branches those merges made redundant. This runs even when no PR is pending right now, so
+	// the accumulated backlog of already-merged delivery branches is still swept away (req 25) — the
+	// persistent dev branch always exempt.
+	x.pruneMergedDeliveryBranches(ctx, token)
+}
+
+// maintainMergePRs auto-merges due PRs in creation order (per repo) and, in full mode, prod-deploys the
+// merged ones. Split out of Maintain so the branch-prune sweep can run independently of whether any PR is
+// pending this tick.
+func (x *runExecutor) maintainMergePRs(ctx context.Context, token string, prs []runs.PendingPR) {
 	now := time.Now()
 	recheck := prRecheck()
 
@@ -1728,6 +1951,12 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 	blocked := map[string]bool{} // repo → an older PR is still open, so no younger one may auto-merge
 
 	for _, p := range prs {
+		if p.Blocked {
+			// A delivery blocked on a permanent prod-deploy failure waits for an EXPLICIT resume — it is
+			// never re-fetched or retried, and (being already merged) it does not gate the merge queue, so
+			// one broken repo can't hold up the others.
+			continue
+		}
 		if !shouldCheckPR(x.mode, now, p.MergeBy, p.LastChecked, recheck) {
 			blocked[p.Repo] = true // still open and unexamined → the queue behind it waits
 			continue               // report/pr: within window → not touched. full: throttled between rechecks.
@@ -1779,26 +2008,99 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
 			x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged) // the PR is merged; prod-deploy follows
-			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
-			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
-			if name := repoNameOf(p.Repo); !x.deployable(name) {
-				x.markDelivered(p, true, false) // merged; there is simply nothing to ship
-				_ = x.s.runPRs.Remove(p.Repo, p.Number)
-				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
-				continue
-			}
-			depLog, derr := x.runProdDeploy(ctx, token, p)
-			if derr != nil {
-				log.Printf("devlabd: prod-deploy %s#%d failed (will retry the deploy): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
-				continue // keep tracked; retry the DEPLOY next eligible tick (never re-merge)
-			}
-			x.markDelivered(p, true, true)
-			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
-			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			x.deployMergedPR(ctx, token, p, now)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
 		}
 	}
+}
+
+// pruneMergedDeliveryBranches deletes the per-delivery snapshot branch of every delivery whose work has
+// reached the default branch — i.e. whose ledger status is merged. Driven by the ledger, not by git commit
+// identity, so a squash- or rebase-merge (whose commits do not appear verbatim on the default branch) is
+// pruned all the same: what counts is that the content arrived, which is exactly what "merged" records.
+//
+// The persistent dev branch (mercury-dev) is EXEMPT — it is never a delivery's snapshot branch, and the
+// devBranchName guard makes that explicit. It is the only durable backup of built-but-unmerged work and
+// must never be deleted. Each branch is deleted at most once (the BranchPruned flag), so a steady-state
+// ledger costs one in-memory scan and no GitHub calls.
+func (x *runExecutor) pruneMergedDeliveryBranches(ctx context.Context, token string) {
+	if x.s == nil || x.s.deliveries == nil {
+		return
+	}
+	all, err := x.s.deliveries.List()
+	if err != nil {
+		return
+	}
+	dev := devBranchName()
+	for _, d := range all {
+		if d.Status != runs.DeliveryMerged || d.BranchPruned || d.Branch == "" || d.Branch == dev {
+			continue
+		}
+		if err := x.deleteBranch(ctx, token, d.Repo, d.Branch); err != nil {
+			log.Printf("devlabd: could not prune merged delivery branch %s@%s (will retry): %v", d.Repo, d.Branch, err)
+			continue // leave BranchPruned false → retried next tick
+		}
+		_ = x.s.deliveries.Update(d.ID, func(dl *runs.Delivery) { dl.BranchPruned = true })
+		log.Printf("devlabd: pruned merged delivery branch %s@%s (delivery %s)", d.Repo, d.Branch, d.ID)
+	}
+}
+
+// deleteBranch dispatches to the injected seam when present (tests), else the real GitHub ref-delete.
+func (x *runExecutor) deleteBranch(ctx context.Context, token, fullName, branch string) error {
+	if x.deleteBranchFn != nil {
+		return x.deleteBranchFn(ctx, token, fullName, branch)
+	}
+	return github.DeleteBranch(ctx, token, fullName, branch)
+}
+
+// deployMergedPR ships one merged run PR to prod, distinguishing permanent from transient failure so a
+// broken delivery blocks (waits for a resume) instead of retrying forever. The flow:
+//   - shipToProd gate: a not-to-be-delivered repo, or one with no deploy target, is untracked with NO
+//     attempt (there is nothing to try).
+//   - success: untrack (idempotent) and mark the delivery prod-live.
+//   - transient failure (network / target briefly unreachable): keep tracked, retry next tick, DO NOT
+//     count it — a passing network hiccup must never exhaust the block budget.
+//   - permanent failure: count one attempt atomically; once DeployAttempts reaches maxDeployAttempts the
+//     PR is blocked with a reason that names the service and target.
+func (x *runExecutor) deployMergedPR(ctx context.Context, token string, p runs.PendingPR, now time.Time) {
+	name := repoNameOf(p.Repo)
+	if ship, why := x.shipToProd(name); !ship {
+		x.markDelivered(p, true, false) // merged; there is simply nothing to ship
+		_ = x.s.runPRs.Remove(p.Repo, p.Number)
+		log.Printf("devlabd: %s#%d gemerged — %s → untracked (kein Deploy-Versuch)", p.Repo, p.Number, why)
+		return
+	}
+	depLog, derr := x.runProdDeploy(ctx, token, p)
+	if derr == nil {
+		x.markDelivered(p, true, true)
+		_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+		log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+		return
+	}
+	if deployTransient(depLog, derr) {
+		log.Printf("devlabd: prod-deploy %s#%d transient failure (will retry, no count): %v\n%s", p.Repo, p.Number, derr, clip(depLog))
+		return // keep tracked; retry the DEPLOY next eligible tick (never re-merge, never count)
+	}
+	// Permanent failure: count this attempt; block once the threshold is reached.
+	reason := deployBlockReason(name, depLog, derr)
+	limit := maxDeployAttempts()
+	attempts := 0
+	blockedNow := false
+	_, _ = x.s.runPRs.Update(p.Repo, p.Number, func(pr *runs.PendingPR) {
+		pr.DeployAttempts++
+		attempts = pr.DeployAttempts
+		if pr.DeployAttempts >= limit {
+			pr.Blocked, pr.BlockedReason, pr.BlockedAt = true, reason, now
+			blockedNow = true
+		}
+	})
+	if blockedNow {
+		log.Printf("devlabd: prod-deploy %s#%d BLOCKED after %d attempt(s) — %s", p.Repo, p.Number, attempts, reason)
+		return
+	}
+	log.Printf("devlabd: prod-deploy %s#%d permanent failure %d/%d (retry, then block): %v\n%s",
+		p.Repo, p.Number, attempts, limit, derr, clip(depLog))
 }
 
 // markDelivered records on the run that its PR reached the next rung of the delivery ladder, so the
@@ -2014,21 +2316,65 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok, err := s.runs.Get(id); err != nil || !ok {
+	run, ok, err := s.runs.Get(id)
+	if err != nil || !ok {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	// ?fresh=1 explicitly discards any interrupted execution and starts over (req 4); the default (no flag)
-	// continues an interrupted execution if one exists (req 1). Either way the returned plan says which
-	// happened and why, so the difference is visible to whoever triggered the run (req 2).
+	// ?fresh=1 (or {"fresh":true}) explicitly discards any interrupted execution and starts over (req 4);
+	// the default continues an interrupted execution if one exists (req 1). The optional body carries a
+	// slot strategy (req 5): queue (einreihen) / defer (einen Vorgang zurückstellen) / overload (ein
+	// zusätzlicher Platz nur für diese Ausführung).
+	strategy, deferRunID, bodyFresh := decodeRunNowBody(r)
 	q := r.URL.Query().Get("fresh")
-	fresh := q == "1" || strings.EqualFold(q, "true")
-	plan, started := s.scheduler.FireNow(id, actor(r), fresh)
-	if !started {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
-		return
+	fresh := bodyFresh || q == "1" || strings.EqualFold(q, "true")
+	who := actor(r)
+
+	switch strategy {
+	case "", "start":
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
+			return
+		}
+		// Blocked. A run already executing is a plain conflict; anything else (cap / repo-busy / exclusive)
+		// returns a decision the caller can act on — einreihen, zurückstellen, or überladen.
+		block := s.scheduler.Admissibility(run)
+		if block.Reason == runs.AdmitRunning {
+			writeErr(w, http.StatusConflict, "Dieser Lauf läuft bereits")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"started": false, "decision": s.buildStartDecision(block)})
+	case "queue":
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
+			return
+		}
+		s.markRunDueNow(id) // leave it due → the scheduler starts it at the next free slot
+		writeJSON(w, http.StatusOK, map[string]any{"queued": true})
+	case "overload":
+		if plan, started := s.scheduler.StartOverload(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "overloaded": true, "plan": plan})
+			return
+		}
+		writeErr(w, http.StatusConflict, "Überladen nicht möglich — zwei Vorgänge im selben Repository oder ein exklusiver Lauf bleiben ausgeschlossen")
+	case "defer":
+		if strings.TrimSpace(deferRunID) == "" {
+			writeErr(w, http.StatusBadRequest, "deferRunId ist für die Strategie 'defer' erforderlich")
+			return
+		}
+		if !s.scheduler.Defer(deferRunID) {
+			writeErr(w, http.StatusConflict, "Der zurückzustellende Lauf ist nicht aktiv")
+			return
+		}
+		if plan, started := s.scheduler.FireNow(id, who, fresh); started {
+			writeJSON(w, http.StatusOK, map[string]any{"started": true, "deferred": deferRunID, "plan": plan})
+			return
+		}
+		s.markRunDueNow(id) // the freed slot may be reclaimed by the deferred run's immediate resume; queue then
+		writeJSON(w, http.StatusOK, map[string]any{"queued": true, "deferred": deferRunID})
+	default:
+		writeErr(w, http.StatusBadRequest, "unbekannte Strategie")
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
 }
 
 // runActive reports the run executing in THIS process right now — its id, the live result id (once the
@@ -2043,11 +2389,15 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
 // parallel data path.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
+	active := []runs.Activity{}
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":   active,
+		"inflight": s.assembleInFlight(active),
+		"slots":    s.slotOverview(active), // capacity/used/free/overload + deferred runs with resume points
+	})
 }
 
 // inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,
@@ -2077,11 +2427,11 @@ type inFlightRun struct {
 	NumTurns     int     `json:"numTurns"`
 }
 
-// assembleInFlight builds the transparent list of runs the system is currently working: the one
-// EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
-// limit). Each entry is enriched from its live result document so the overview shows the current
-// repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
-func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+// assembleInFlight builds the transparent list of runs the system is currently working: EVERY run
+// EXECUTING right now (from the live Activities — several may run concurrently) followed by every
+// SUSPENDED run (paused on the usage limit or deferred). Each entry is enriched from its live result
+// document so the overview shows the current repo/step, progress and spend at a glance. Read-only.
+func (s *Server) assembleInFlight(active []runs.Activity) []inFlightRun {
 	out := []inFlightRun{}
 	if s.runs == nil {
 		return out
@@ -2094,25 +2444,27 @@ func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
 	for _, r := range all {
 		byID[r.ID] = r
 	}
+	executing := make(map[string]bool, len(active))
 
-	// 1) The run executing right now (at most one — the scheduler runs runs serially).
-	if active != nil {
-		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
-		st := active.StartedAt
+	// 1) Every run executing right now (concurrent).
+	for _, a := range active {
+		executing[a.RunID] = true
+		e := inFlightRun{RunID: a.RunID, State: "executing", ResultID: a.ResultID}
+		st := a.StartedAt
 		e.StartedAt = &st
-		if run, ok := byID[active.RunID]; ok {
+		if run, ok := byID[a.RunID]; ok {
 			e.RunName = run.Name
 			e.Type = string(runs.NormalizeType(run.Type))
 			e.ReposTotal = todoRepoTotal(run)
 		}
-		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		s.enrichInFlight(&e, a.RunID, a.ResultID)
 		out = append(out, e)
 	}
 
-	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
-	//    double-count the executing one (a run cannot be both).
+	// 2) Every run suspended mid-execution (usage limit or deferred) — genuinely in flight, just paused.
+	//    Never double-count one that is executing right now (a run cannot be both).
 	for _, run := range all {
-		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+		if run.Suspended == nil || executing[run.ID] {
 			continue
 		}
 		e := inFlightRun{
@@ -2166,15 +2518,94 @@ func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
 	}
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts a SPECIFIC run in progress (kill-switch). With concurrent runs the target is named by
+// {id} — other live runs keep going.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// blockedDeployView is one blocked delivery, portioned for the surface: which service/PR, why it is
+// blocked, how many permanent attempts it took, and since when. Read-only projection of the PR pool.
+type blockedDeployView struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	URL       string    `json:"url"`
+	RunID     string    `json:"runId"`
+	Reason    string    `json:"reason"`
+	Attempts  int       `json:"attempts"`
+	BlockedAt time.Time `json:"blockedAt"`
+}
+
+// runDeploysBlocked lists the deliveries blocked on a permanent prod-deploy failure — the ones waiting for
+// an explicit resume. Newest block first; an empty list, never null.
+func (s *Server) runDeploysBlocked(w http.ResponseWriter, r *http.Request) {
+	out := []blockedDeployView{}
+	if s.runPRs != nil {
+		prs, err := s.runPRs.List()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "Auslieferungen konnten nicht gelesen werden")
+			return
+		}
+		for _, p := range prs {
+			if !p.Blocked {
+				continue
+			}
+			out = append(out, blockedDeployView{
+				Repo: p.Repo, Number: p.Number, URL: p.URL, RunID: p.RunID,
+				Reason: p.BlockedReason, Attempts: p.DeployAttempts, BlockedAt: p.BlockedAt,
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BlockedAt.After(out[j].BlockedAt) })
+	writeJSON(w, http.StatusOK, map[string]any{"blocked": out})
+}
+
+// runDeployResume clears the block on one delivery so Maintain retries its prod-deploy on the next tick,
+// with the full attempt budget again. This is the ONLY way a blocked delivery moves — the block waits for
+// exactly this deliberate action.
+func (s *Server) runDeployResume(w http.ResponseWriter, r *http.Request) {
+	if s.runPRs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Auslieferungen-Store nicht verfügbar")
+		return
+	}
+	var body struct {
+		Repo   string `json:"repo"`
+		Number int    `json:"number"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	if strings.TrimSpace(body.Repo) == "" || body.Number <= 0 {
+		writeErr(w, http.StatusBadRequest, "repo und number sind erforderlich")
+		return
+	}
+	resumed := false
+	found, err := s.runPRs.Update(body.Repo, body.Number, func(p *runs.PendingPR) {
+		if !p.Blocked {
+			return
+		}
+		p.Blocked = false
+		p.BlockedReason = ""
+		p.BlockedAt = time.Time{}
+		p.DeployAttempts = 0 // fresh start — the full attempt budget again
+		resumed = true
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Wiederaufnahme fehlgeschlagen")
+		return
+	}
+	if !found || !resumed {
+		writeErr(w, http.StatusNotFound, "Keine blockierte Auslieferung für dieses Repository/PR")
+		return
+	}
+	log.Printf("devlabd: deploy %s#%d resumed by %s — retried on the next maintain tick", body.Repo, body.Number, actor(r))
+	writeJSON(w, http.StatusOK, map[string]bool{"resumed": true})
 }

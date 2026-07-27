@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -15,6 +17,10 @@ import (
 )
 
 const rolloutTimeout = 12 * time.Minute
+
+// rolloutBranchPrefix is the head-branch prefix that identifies a constitution-rollout PR. One such PR
+// stays open per repo; a rollout updates it in place rather than opening a rival.
+const rolloutBranchPrefix = "mercury-axioms/"
 
 // rolloutRepo is one repo's outcome in the rollout report.
 type rolloutRepo struct {
@@ -129,7 +135,22 @@ func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token strin
 	// The constitution reaches a repo the SAME WAY every other change does: on a branch, through a pull
 	// request. Pushing straight onto the default branch was the one path that bypassed review entirely —
 	// and the one thing that made a protected default branch impossible.
-	prBranch := "mercury-axioms/" + rolloutStamp()
+	// One open rollout PR per repo (req 17): if one is already open, reuse ITS branch so SyncFile force-
+	// updates the existing PR in place — same number, same deadline — instead of opening a rival. The older
+	// rollout duplicates are collapsed onto the newest (req 18). A dry-run pushes and opens nothing, so it
+	// spends no GitHub read discovering the branch.
+	prBranch := rolloutBranchPrefix + rolloutStamp()
+	var reuse *github.PullRequest
+	if apply {
+		if open, lerr := github.ListOpenPullRequests(ctx, token, fullName); lerr == nil {
+			if keep, stale := rolloutPRSelection(open); keep != nil {
+				reuse = keep
+				prBranch = keep.Head.Ref
+				s.closeStaleRolloutPRs(ctx, token, fullName, stale, *keep)
+			}
+		}
+	}
+
 	out, err := exec.SyncFile(ctx, wt, token, branch, "CLAUDE.md", "CLAUDE.MD", splice, !apply, prBranch)
 	if err != nil {
 		res.Skipped = err.Error()
@@ -145,6 +166,14 @@ func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token strin
 		return res // dry-run: nothing was pushed, so there is no PR to raise
 	}
 
+	// The existing rollout PR now carries the new constitution on its force-updated branch — keep its
+	// number and deadline, open nothing new (req 16/17).
+	if reuse != nil {
+		res.PRUrl = reuse.HTMLURL
+		s.trackRolloutPR(*reuse, fullName)
+		return res
+	}
+
 	pr, err := github.CreatePullRequest(ctx, token, fullName, prBranch, branch,
 		"Mercury: Axiome & Implementierungsregeln aktualisieren",
 		"Automatisch erzeugt vom Mercury-Rollout. Aktualisiert den generierten Abschnitt der CLAUDE.md; "+
@@ -158,14 +187,60 @@ func (s *Server) rolloutOne(ctx context.Context, user, id, fullName, token strin
 		}
 	}
 	res.PRUrl = pr.HTMLURL
-	// Tracked like a run PR, so the same ordered auto-merge carries it onto the default branch.
-	if s.runPRs != nil {
-		_ = s.runPRs.Add(runs.PendingPR{
-			Repo: fullName, Number: pr.Number, URL: pr.HTMLURL, RunID: "rollout",
-			CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(rolloutMergeAfter()).UTC(),
-		})
-	}
+	s.trackRolloutPR(pr, fullName)
 	return res
+}
+
+// rolloutPRSelection splits a repo's open PRs into the single rollout PR to KEEP — the newest, which is
+// reused and lifted to the new constitution — and the older rollout duplicates to CLOSE. Non-rollout PRs
+// are ignored. "Newest" is the highest PR number (monotonic). This is the whole dedup decision (req 17/18),
+// kept pure so it is testable without a live GitHub.
+func rolloutPRSelection(open []github.PullRequest) (keep *github.PullRequest, stale []github.PullRequest) {
+	var rollout []github.PullRequest
+	for _, pr := range open {
+		if strings.HasPrefix(pr.Head.Ref, rolloutBranchPrefix) {
+			rollout = append(rollout, pr)
+		}
+	}
+	if len(rollout) == 0 {
+		return nil, nil
+	}
+	sort.SliceStable(rollout, func(i, j int) bool { return rollout[i].Number > rollout[j].Number })
+	k := rollout[0]
+	return &k, rollout[1:]
+}
+
+// trackRolloutPR records a rollout PR in the pending-PR pool so the ordered auto-merge carries it onto the
+// default branch. Idempotent (Add dedupes by repo+number): reusing an existing PR keeps its original
+// deadline (req 17).
+func (s *Server) trackRolloutPR(pr github.PullRequest, fullName string) {
+	if s.runPRs == nil {
+		return
+	}
+	_ = s.runPRs.Add(runs.PendingPR{
+		Repo: fullName, Number: pr.Number, URL: pr.HTMLURL, RunID: "rollout",
+		CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(rolloutMergeAfter()).UTC(),
+	})
+}
+
+// closeStaleRolloutPRs collapses a repo's older rollout duplicates onto the newest (req 18): each is
+// commented with a pointer to the one that supersedes it, closed, its branch pruned, and dropped from the
+// service's pending-PR tracking so it no longer lingers in the merge queue. A close that fails leaves the
+// PR tracked (retried next rollout) rather than silently forgotten.
+func (s *Server) closeStaleRolloutPRs(ctx context.Context, token, fullName string, stale []github.PullRequest, keep github.PullRequest) {
+	for _, pr := range stale {
+		note := fmt.Sprintf("Ersetzt durch den aktuelleren Rollout-PR #%d — dieser wird geschlossen (ein offener Rollout-PR pro Repository).", keep.Number)
+		_ = github.AddPullRequestComment(ctx, token, fullName, pr.Number, note)
+		if err := github.ClosePullRequest(ctx, token, fullName, pr.Number); err != nil {
+			log.Printf("devlabd: rollout dedup — could not close stale PR %s#%d: %v", fullName, pr.Number, err)
+			continue // still open → keep tracking it; retry next rollout
+		}
+		_ = github.DeleteBranch(ctx, token, fullName, pr.Head.Ref)
+		if s.runPRs != nil {
+			_ = s.runPRs.Remove(fullName, pr.Number)
+		}
+		log.Printf("devlabd: rollout dedup — closed stale PR %s#%d (superseded by #%d)", fullName, pr.Number, keep.Number)
+	}
 }
 
 // rolloutStamp is the per-rollout branch suffix: one branch per rollout, shared across repos, so a

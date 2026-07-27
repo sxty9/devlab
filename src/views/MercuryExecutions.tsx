@@ -8,7 +8,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { BlockedDeploy, RunActive, RunExecution, RunInFlight, RunResult, RunResultRef, RepoResult, RunStep, RunType, SlotOverview, StartDecision, StartStrategy } from '@/types';
 import {
   deriveJobs,
   isReportExecution,
@@ -37,19 +37,26 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
   const source = useMemo(getDataSource, []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
+  const [decision, setDecision] = useState<StartDecision | null>(null);
   const noun = kind === 'todo' ? 'ToDo' : 'Lauf';
 
-  const trigger = async (fresh: boolean) => {
+  const start = async (opts?: { fresh?: boolean; strategy?: StartStrategy; deferRunId?: string }) => {
     if (busy) return;
     setBusy(true);
     try {
-      const { plan } = await source.mercuryRunNow(id, { fresh });
-      const resumed = plan?.action === 'resume';
-      toast({
-        title: resumed ? `${noun} fortgesetzt` : `${noun} neu gestartet`,
-        description: plan?.reason,
-        variant: 'success',
-      });
+      const r = await source.mercuryRunNow(id, opts);
+      if (r.decision) {
+        setDecision(r.decision); // floor full → let the user einreihen / zurückstellen / überladen
+        return;
+      }
+      setDecision(null);
+      const title = r.queued
+        ? `${noun} eingereiht`
+        : r.plan?.action === 'resume'
+          ? `${noun} fortgesetzt`
+          : `${noun} neu gestartet`;
+      const description = r.queued ? 'Startet, sobald ein Platz frei ist.' : r.plan?.reason;
+      toast({ title, description, variant: 'success' });
       onStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
@@ -61,7 +68,7 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
 
   return (
     <div className="inline-flex items-center gap-0.5">
-      <Button variant="primary" size="sm" disabled={disabled || busy} onClick={() => void trigger(false)}>
+      <Button variant="primary" size="sm" disabled={disabled || busy} onClick={() => void start()}>
         <PlayIcon className="h-3.5 w-3.5" /> {busy ? 'Startet…' : 'Jetzt ausführen'}
       </Button>
       <Dropdown ariaLabel="Weitere Startoptionen" align="end" trigger={<span className="sr-only">Weitere Startoptionen</span>} triggerClassName="h-7 px-1">
@@ -71,11 +78,19 @@ export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind
             hint="unterbrochene Ausführung verwerfen und von vorn"
             onClick={() => {
               close();
-              void trigger(true);
+              void start({ fresh: true });
             }}
           />
         )}
       </Dropdown>
+      {decision && (
+        <StartDecisionDialog
+          decision={decision}
+          busy={busy}
+          onChoose={(strategy, deferRunId) => void start({ strategy, deferRunId })}
+          onClose={() => setDecision(null)}
+        />
+      )}
     </div>
   );
 }
@@ -808,10 +823,11 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; slots: SlotOverview | null; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
+  const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
+  const [slots, setSlots] = useState<SlotOverview | null>(null);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -821,8 +837,9 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
       try {
         const r = await source.mercuryRunActive();
         if (!cancelled) {
-          setActive(r.active);
+          setActive(r.active ?? []);
           setInflight(r.inflight ?? []);
+          setSlots(r.slots ?? null);
         }
       } catch {
         /* transient — keep the last known state */
@@ -839,7 +856,268 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
     };
   }, [source, bump]);
 
-  return { active, inflight, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, inflight, slots, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** The execution floor at a glance (req 8): slots used/free, temporary overloads, and the deferred runs
+ *  with their continuation points. Renders nothing when there is nothing to say. Shared by both surfaces. */
+export function SlotsOverview({ slots, className }: { slots: SlotOverview | null; className?: string }) {
+  if (!slots) return null;
+  if (slots.capacity === 0 && slots.deferred.length === 0 && slots.overload === 0) return null;
+  return (
+    <div className={cn('rounded-md border border-separator bg-surface px-3 py-2 text-caption', className)}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-medium text-text-primary">Plätze</span>
+        <span className="text-text-secondary">
+          {slots.used}/{slots.capacity} belegt
+        </span>
+        <span className="text-text-tertiary">{slots.free} frei</span>
+        {slots.overload > 0 && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">
+            +{slots.overload} Überladung
+          </span>
+        )}
+      </div>
+      {slots.deferred.length > 0 && (
+        <div className="mt-2 border-t border-separator pt-2">
+          <p className="mb-1 text-text-tertiary">Zurückgestellt</p>
+          <ul className="flex flex-col gap-1">
+            {slots.deferred.map((d) => (
+              <li key={d.runId} className="flex flex-wrap items-center gap-2">
+                <span className="font-medium text-text-secondary">{d.runName || 'Lauf'}</span>
+                <span className="text-text-tertiary">{d.resumePoint}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The execution-slot count as an editable setting (req 13): shown in the UI, applied immediately (no
+ *  restart — a raise starts waiting runs at once, a lower drains). Self-hides when the scheduler is not
+ *  armed. This is the service's slot configuration; the backend exposes the full config interface. */
+export function SlotCapacityConfig({ onChanged }: { onChanged?: () => void }) {
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [cfg, setCfg] = useState<{ maxConcurrent: number } | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setCfg(await source.mercuryRunConfig());
+    } catch {
+      setCfg(null); // scheduler not armed / offline → nothing to configure here
+    }
+  }, [source]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (!cfg) return null;
+
+  const save = async () => {
+    const n = Number.parseInt(value, 10);
+    if (Number.isNaN(n) || n < 1) {
+      toast({ title: 'Bitte eine Zahl ≥ 1', variant: 'danger' });
+      return;
+    }
+    setSaving(true);
+    try {
+      await source.mercurySetRunConfig(n);
+      toast({ title: `Ausführungsplätze: ${n}`, description: 'Wirkt sofort — wartende Vorgänge laufen an.', variant: 'success' });
+      setEditing(false);
+      await load();
+      onChanged?.();
+    } catch (e) {
+      toast({ title: 'Konnte die Plätze nicht setzen', description: msg(e), variant: 'danger' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1.5 text-caption text-text-tertiary">
+      <span>Ausführungsplätze</span>
+      {editing ? (
+        <>
+          <input
+            type="number"
+            min={1}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            className="w-14 rounded border border-separator bg-surface px-1.5 py-0.5 text-text-primary outline-none focus:border-accent/50"
+          />
+          <Button variant="primary" size="sm" disabled={saving} onClick={() => void save()}>
+            Speichern
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
+            Abbrechen
+          </Button>
+        </>
+      ) : (
+        <button
+          type="button"
+          className="rounded px-1 font-medium text-text-secondary transition hover:text-text-primary"
+          onClick={() => {
+            setValue(String(cfg.maxConcurrent));
+            setEditing(true);
+          }}
+        >
+          {cfg.maxConcurrent} ✎
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Shown when a start is blocked because every slot is busy (req 5/6): the current floor, the system's
+ *  reasoned defer suggestion (which the user may accept), and the ways forward — einreihen, or überladen
+ *  (only when the block is the cap; a busy repo or an exclusive floor cannot be crossed). A targeted,
+ *  explicit defer of any specific run stays available in the always-visible Aktive-Läufe overview. */
+function StartDecisionDialog({
+  decision,
+  busy,
+  onChoose,
+  onClose,
+}: {
+  decision: StartDecision;
+  busy: boolean;
+  onChoose: (strategy: StartStrategy, deferRunId?: string) => void;
+  onClose: () => void;
+}) {
+  const { blocked, options, suggestion, slots } = decision;
+  const reason =
+    blocked === 'repo-busy'
+      ? 'Ein Ziel-Repository ist gerade belegt.'
+      : blocked === 'exclusive'
+        ? 'Ein Rundumlauf belegt gerade alle Plätze.'
+        : 'Alle Ausführungsplätze sind belegt.';
+  return (
+    <Modal open onClose={onClose} title="Alle Plätze belegt" description={reason} size="md">
+      <div className="flex flex-col gap-3">
+        <SlotsOverview slots={slots} />
+        {suggestion && (
+          <div className="rounded-md border border-accent/30 bg-accent/[0.06] px-3 py-2">
+            <p className="text-caption text-text-secondary">
+              Vorschlag: <span className="font-medium text-text-primary">{suggestion.runName || 'Lauf'}</span> zurückstellen
+            </p>
+            <p className="mt-0.5 text-caption text-text-tertiary">{suggestion.reason}</p>
+            <Button variant="primary" size="sm" disabled={busy} className="mt-2" onClick={() => onChoose('defer', suggestion.runId)}>
+              Vorschlag annehmen
+            </Button>
+          </div>
+        )}
+        <div className="flex flex-wrap gap-2">
+          <Button variant="secondary" size="sm" disabled={busy} onClick={() => onChoose('queue')}>
+            Einreihen und warten
+          </Button>
+          {options.includes('overload') && (
+            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onChoose('overload')}>
+              Überladen — ein Extra-Platz
+            </Button>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** Poll the deliveries blocked on a permanent prod-deploy failure. Keeps the last known state on a
+ *  transient error and re-checks on window focus, mirroring useActiveRun. */
+export function useBlockedDeploys(): { blocked: BlockedDeploy[]; refetch: () => void } {
+  const source = useMemo(() => getDataSource(), []);
+  const [blocked, setBlocked] = useState<BlockedDeploy[]>([]);
+  const [bump, setBump] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const r = await source.mercuryBlockedDeploys();
+        if (!cancelled) setBlocked(r.blocked ?? []);
+      } catch {
+        /* transient — keep the last known state */
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 5000);
+    };
+    void poll();
+    const onFocus = () => setBump((b) => b + 1);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [source, bump]);
+
+  return { blocked, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** The blocked-deliveries banner, shared by both surfaces (Läufe + ToDos) so they stay symmetric. It is
+ *  silent when nothing is blocked; otherwise it names each stuck delivery — service, PR, attempt count,
+ *  since when, and why — with an explicit "Wiederaufnehmen" that clears the block and retries. */
+export function BlockedDeploysPanel() {
+  const { blocked, refetch } = useBlockedDeploys();
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [resuming, setResuming] = useState<string | null>(null);
+
+  if (blocked.length === 0) return null;
+
+  const resume = async (d: BlockedDeploy) => {
+    const key = `${d.repo}#${d.number}`;
+    setResuming(key);
+    try {
+      await source.mercuryResumeDeploy(d.repo, d.number);
+      toast({ title: `Auslieferung von ${d.repo} wird erneut versucht`, variant: 'success' });
+      refetch();
+    } catch (e) {
+      toast({ title: 'Wiederaufnahme fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setResuming(null);
+    }
+  };
+
+  return (
+    <div className="border-b border-danger/40 bg-danger/10 px-4 py-3" role="alert">
+      <div className="mb-2 flex items-center gap-2 text-body font-semibold text-danger">
+        <RocketIcon className="h-4 w-4" />
+        {blocked.length === 1 ? 'Auslieferung blockiert' : `${blocked.length} Auslieferungen blockiert`}
+      </div>
+      <ul className="flex flex-col gap-2">
+        {blocked.map((d) => {
+          const key = `${d.repo}#${d.number}`;
+          return (
+            <li key={key} className="flex items-start justify-between gap-3 rounded-md bg-surface/60 px-3 py-2">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-caption">
+                  <span className="font-medium text-text-primary">{d.repo}</span>
+                  {d.url && d.url !== '#' && (
+                    <a href={d.url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
+                      PR #{d.number}
+                    </a>
+                  )}
+                  <span className="rounded bg-danger/15 px-1.5 py-0.5 font-medium text-danger">
+                    {d.attempts} {d.attempts === 1 ? 'Versuch' : 'Versuche'}
+                  </span>
+                  {d.blockedAt && <span className="text-text-tertiary">seit {fmtDateTime(d.blockedAt)}</span>}
+                </div>
+                <p className="mt-1 text-caption text-text-secondary">{d.reason}</p>
+              </div>
+              <Button variant="secondary" size="sm" disabled={resuming === key} onClick={() => resume(d)} className="shrink-0">
+                {resuming === key ? 'Nimmt auf…' : 'Wiederaufnehmen'}
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
 /** Poll a run's result document, following it live while `live` (every 2s); once it settles it fetches
@@ -1005,7 +1283,19 @@ function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: 
 
 /** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
  *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
-function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+function RunSession({
+  row,
+  onCancel,
+  cancellingId,
+  onDefer,
+  deferringId,
+}: {
+  row: RunInFlight;
+  onCancel: (id: string) => void;
+  cancellingId: string | null;
+  onDefer: (id: string) => void;
+  deferringId: string | null;
+}) {
   const executing = row.state === 'executing';
   return (
     <div className="flex min-h-0 flex-col gap-3">
@@ -1013,9 +1303,14 @@ function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel:
         <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
         <TypeChip type={row.type} />
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-          </Button>
+          <>
+            <Button variant="secondary" size="sm" disabled={deferringId === row.runId} onClick={() => onDefer(row.runId)}>
+              {deferringId === row.runId ? 'Stellt zurück…' : 'Zurückstellen'}
+            </Button>
+            <Button variant="danger" size="sm" disabled={cancellingId === row.runId} onClick={() => onCancel(row.runId)}>
+              {cancellingId === row.runId ? 'Bricht ab…' : 'Abbrechen'}
+            </Button>
+          </>
         )}
       </div>
       {row.resultId ? (
@@ -1056,12 +1351,16 @@ function writeWatch(v: { open: boolean; runId: string | null }) {
 export function ActiveRunsOverview({
   inflight,
   onCancel,
-  cancelling,
+  cancellingId,
+  onDefer,
+  deferringId,
   className,
 }: {
   inflight: RunInFlight[];
-  onCancel: () => void;
-  cancelling: boolean;
+  onCancel: (id: string) => void;
+  cancellingId: string | null;
+  onDefer: (id: string) => void;
+  deferringId: string | null;
   className?: string;
 }) {
   const [restored] = useState(readWatch); // lazy: read session storage once, on mount
@@ -1087,7 +1386,6 @@ export function ActiveRunsOverview({
 
   if (inflight.length === 0) return null;
 
-  const executing = inflight.some((r) => r.state === 'executing');
   const only = inflight.length === 1 ? inflight[0] : null;
   const summary = only ? `${only.state === 'executing' ? 'Läuft' : 'Pausiert'}: ${only.runName || 'Lauf'}` : `${inflight.length} Läufe aktiv`;
   const nExec = inflight.filter((r) => r.state === 'executing').length;
@@ -1105,11 +1403,6 @@ export function ActiveRunsOverview({
           <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-warning" />
           <span className="truncate">{summary}</span>
         </button>
-        {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
-            {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-          </Button>
-        )}
       </div>
 
       <Modal open={open} onClose={() => setOpen(false)} title="Aktive Läufe" description={description} size="xl">
@@ -1121,7 +1414,7 @@ export function ActiveRunsOverview({
           </div>
           <div className="min-w-0 flex-1 border-t border-separator pt-4 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0">
             {selected ? (
-              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancelling={cancelling} />
+              <RunSession key={selected.runId} row={selected} onCancel={onCancel} cancellingId={cancellingId} onDefer={onDefer} deferringId={deferringId} />
             ) : (
               <EmptyPlaceholder text="Wähle links einen Lauf, um ihn live zu verfolgen." />
             )}

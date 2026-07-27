@@ -7,7 +7,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields, budgetLabel } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -89,8 +89,10 @@ export default function RunsView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
+  const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
   // also pulls the auto-assignment feed, so a background assignment surfaces on the next refresh.
@@ -106,11 +108,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When ANY run finishes (an id leaves the active set), refresh the list so lastResult/next-fire/
+  // ToDo-done update. Set-diff, not a single id — several runs execute concurrently now.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -143,19 +146,33 @@ export default function RunsView() {
     return () => window.clearTimeout(t);
   }, [coverage?.pending, dataVersion, reload]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
+  const cancelRun = useCallback(async (id: string) => {
+    if (cancellingId) return;
+    setCancellingId(id);
     try {
-      await source.mercuryCancelRun();
+      await source.mercuryCancelRun(id);
       toast({ title: 'Lauf abgebrochen', variant: 'default' });
       refetchActive();
     } catch (e) {
       toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
-      setCancelling(false);
+      setCancellingId(null);
     }
-  }, [cancelling, source, toast, refetchActive]);
+  }, [cancellingId, source, toast, refetchActive]);
+
+  const deferRun = useCallback(async (id: string) => {
+    if (deferringId) return;
+    setDeferringId(id);
+    try {
+      await source.mercuryDeferRun(id);
+      toast({ title: 'Lauf zurückgestellt', description: 'Setzt am nächsten freien Platz fort.', variant: 'default' });
+      refetchActive();
+    } catch (e) {
+      toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setDeferringId(null);
+    }
+  }, [deferringId, source, toast, refetchActive]);
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -272,7 +289,7 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={activeFor(selectedRun.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -302,8 +319,18 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
+        <div className="ml-auto flex items-center gap-3">
+          <SlotCapacityConfig onChanged={refetchActive} />
+          <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} className="max-w-xs" />
+        </div>
       </header>
+
+      <BlockedDeploysPanel />
+      {slots && (slots.deferred.length > 0 || slots.overload > 0) && (
+        <div className="border-b border-separator px-3 py-2">
+          <SlotsOverview slots={slots} />
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {tab === 'laeufe' && (

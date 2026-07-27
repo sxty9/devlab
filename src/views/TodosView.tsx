@@ -7,7 +7,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, BlockedDeploysPanel, ExecutionList, ExecutionHistory, LiveExecution, SlotCapacityConfig, SlotsOverview, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields, budgetLabel } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
@@ -281,8 +281,10 @@ export default function TodosView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
   // affordance lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  const { active, inflight, slots, refetch: refetchActive } = useActiveRun();
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [deferringId, setDeferringId] = useState<string | null>(null);
+  const activeFor = useCallback((id: string) => active.find((a) => a.runId === id) ?? null, [active]);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
   const reload = useCallback(async () => {
@@ -295,11 +297,11 @@ export default function TodosView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh so the ToDo's done/last-result state updates.
-  const prevActiveRef = useRef<string | null>(null);
+  // When ANY run finishes (an id leaves the active set), refresh so ToDo done/last-result state updates.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -327,19 +329,33 @@ export default function TodosView() {
     };
   }, [source, toast]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
+  const cancelRun = useCallback(async (id: string) => {
+    if (cancellingId) return;
+    setCancellingId(id);
     try {
-      await source.mercuryCancelRun();
+      await source.mercuryCancelRun(id);
       toast({ title: 'Lauf abgebrochen', variant: 'default' });
       refetchActive();
     } catch (e) {
       toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
     } finally {
-      setCancelling(false);
+      setCancellingId(null);
     }
-  }, [cancelling, source, toast, refetchActive]);
+  }, [cancellingId, source, toast, refetchActive]);
+
+  const deferRun = useCallback(async (id: string) => {
+    if (deferringId) return;
+    setDeferringId(id);
+    try {
+      await source.mercuryDeferRun(id);
+      toast({ title: 'Lauf zurückgestellt', description: 'Setzt am nächsten freien Platz fort.', variant: 'default' });
+      refetchActive();
+    } catch (e) {
+      toast({ title: 'Zurückstellen fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setDeferringId(null);
+    }
+  }, [deferringId, source, toast, refetchActive]);
 
   const refresh = useCallback(async () => {
     if (refreshing) return;
@@ -407,7 +423,7 @@ export default function TodosView() {
         key={`${selectedTodo.id}:${selectedTodo.updatedAt}`}
         todo={selectedTodo}
         repos={repos}
-        active={active && active.runId === selectedTodo.id ? active : null}
+        active={activeFor(selectedTodo.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -439,6 +455,8 @@ export default function TodosView() {
         </div>
       </header>
 
+      <BlockedDeploysPanel />
+
       <div className="flex min-h-0 flex-1">
         {tab === 'liste' && (
           <>
@@ -461,8 +479,11 @@ export default function TodosView() {
                   </Button>
                 </div>
                 {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
-                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} />
+                <SlotCapacityConfig onChanged={refetchActive} />
+                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancellingId={cancellingId} onDefer={deferRun} deferringId={deferringId} />
               </div>
+
+              {slots && (slots.deferred.length > 0 || slots.overload > 0) && <SlotsOverview slots={slots} className="mx-1.5" />}
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
                 {todos.length === 0 ? (
