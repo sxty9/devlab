@@ -304,8 +304,8 @@ export const httpSource: DataSource = {
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
-  async mercuryRunNow(id) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {}));
+  async mercuryRunNow(id, opts) {
+    return json(await post(`/api/mercury/runs/${enc(id)}/run${opts?.fresh ? '?fresh=1' : ''}`, {}));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));

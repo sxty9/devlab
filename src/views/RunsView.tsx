@@ -5,9 +5,9 @@ import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
-import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
+import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, RunTrigger, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -451,7 +451,6 @@ function RunDetail({
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
-  const [runningNow, setRunningNow] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [prompt, setPrompt] = useState<string | null>(null);
   const [promptLoading, setPromptLoading] = useState(false);
@@ -515,21 +514,6 @@ function RunDetail({
     }
   };
 
-  const runNow = async () => {
-    if (runningNow) return;
-    setRunningNow(true);
-    try {
-      await source.mercuryRunNow(run.id);
-      toast({ title: 'Lauf gestartet', variant: 'success' });
-      onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
-    } catch (e) {
-      // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
-      toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setRunningNow(false);
-    }
-  };
-
   const next = run.enabled ? fmtDateTime(run.nextFireAt) : '—';
   // A legacy/damaged run can carry no axioms at all (Go marshals the empty slice as null); guard so the
   // detail pane counts and lists them safely instead of throwing on null.
@@ -543,9 +527,7 @@ function RunDetail({
           <p className="mt-1 text-footnote text-text-secondary">{scheduleSummary(run.schedule)}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-          <Button variant="primary" size="sm" disabled={runningNow} onClick={runNow}>
-            <PlayIcon className="h-3.5 w-3.5" /> {runningNow ? 'Startet…' : 'Jetzt ausführen'}
-          </Button>
+          <RunTrigger id={run.id} kind="auto" onStarted={onRunStarted} />
           <Button variant="secondary" size="sm" onClick={onEdit}>
             Bearbeiten
           </Button>

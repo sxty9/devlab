@@ -644,6 +644,20 @@ export interface RunActive {
   startedAt: string;
 }
 
+/** What a trigger decided to do, reported back so the difference between continuing an interrupted
+ *  execution and starting a new one is visible. `action` is the honest answer; `reason` explains why.
+ *  On a resume it names the continued execution (`resultId`) and how far it got (`reposDone`); on an
+ *  explicit fresh start it names the `discarded` execution (and any open PR it left) instead of leaving
+ *  it unnoticed. Omitted by sources without an executor (the mock), so consumers guard for undefined. */
+export interface RunResumePlan {
+  action: 'resume' | 'fresh';
+  resultId?: string;
+  reposDone: number;
+  reason: string;
+  discarded?: string;
+  discardedPrUrl?: string;
+}
+
 /** One run the system is currently working, for the transparent "Aktive Läufe" overview: either
  *  EXECUTING right now or SUSPENDED on the usage limit mid-execution (paused, waiting to resume). Enough
  *  to render a list row — which run, on which repo/step, how far, how much spent — without a per-run

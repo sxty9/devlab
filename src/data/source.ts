@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunResumePlan, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -181,8 +181,11 @@ export interface DataSource {
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
-  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
-  mercuryRunNow(id: string): Promise<{ started: boolean }>;
+  /** Trigger a run immediately (detached). By default this CONTINUES an interrupted execution if one
+   *  exists (skipping its done repos); `fresh` discards it and starts over. The returned `plan` reports
+   *  which happened and why, so the trigger can show "fortgesetzt" vs "neu begonnen". 503 if the executor
+   *  is unconfigured, 409 if one is running. */
+  mercuryRunNow(id: string, opts?: { fresh?: boolean }): Promise<{ started: boolean; plan?: RunResumePlan }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
    *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
    *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */

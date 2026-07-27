@@ -454,7 +454,8 @@ export const mockSource: DataSource = {
     }
     return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
   },
-  async mercuryRunNow(_id: string) {
+  async mercuryRunNow(_id: string, _opts?: { fresh?: boolean }) {
+    // The mock has no executor, so no resume decision is made — the plan is omitted (consumers guard for it).
     return { started: true };
   },
   async mercuryRunActive() {

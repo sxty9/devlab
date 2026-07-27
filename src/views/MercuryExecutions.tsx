@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { Dropdown, DropdownItem } from '@/ui/Dropdown';
 import { Modal } from '@/ui/Modal';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
@@ -25,6 +26,58 @@ import {
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
+
+/** The shared "Jetzt ausführen" control for BOTH surfaces (Läufe + ToDos), so they stay symmetric and
+ *  the run-trigger logic lives in one place. The primary click continues an interrupted execution if one
+ *  exists (else starts fresh); the caret unifies the second variant — "Neu beginnen", which discards the
+ *  interrupted execution and starts over — under the same access point rather than as a rival button. The
+ *  resulting toast names which happened (fortgesetzt / neu begonnen) and why, so the decision is visible. */
+export function RunTrigger({ id, kind, disabled, onStarted }: { id: string; kind: RunType; disabled?: boolean; onStarted: () => void }) {
+  const source = useMemo(getDataSource, []);
+  const { toast } = useToast();
+  const [busy, setBusy] = useState(false);
+  const noun = kind === 'todo' ? 'ToDo' : 'Lauf';
+
+  const trigger = async (fresh: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { plan } = await source.mercuryRunNow(id, { fresh });
+      const resumed = plan?.action === 'resume';
+      toast({
+        title: resumed ? `${noun} fortgesetzt` : `${noun} neu gestartet`,
+        description: plan?.reason,
+        variant: 'success',
+      });
+      onStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
+    } catch (e) {
+      // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
+      toast({ title: 'Start fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="inline-flex items-center gap-0.5">
+      <Button variant="primary" size="sm" disabled={disabled || busy} onClick={() => void trigger(false)}>
+        <PlayIcon className="h-3.5 w-3.5" /> {busy ? 'Startet…' : 'Jetzt ausführen'}
+      </Button>
+      <Dropdown ariaLabel="Weitere Startoptionen" align="end" trigger={<span className="sr-only">Weitere Startoptionen</span>} triggerClassName="h-7 px-1">
+        {(close) => (
+          <DropdownItem
+            title="Neu beginnen"
+            hint="unterbrochene Ausführung verwerfen und von vorn"
+            onClick={() => {
+              close();
+              void trigger(true);
+            }}
+          />
+        )}
+      </Dropdown>
+    </div>
+  );
+}
 
 /** A localized timestamp, or an em dash when absent/unparseable. */
 export function fmtDateTime(iso?: string): string {
