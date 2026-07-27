@@ -3,8 +3,9 @@ package runs
 import (
 	"crypto/rand"
 	"encoding/base32"
-	"regexp"
 	"strings"
+
+	"devlab/backend/internal/slug"
 )
 
 // Mercury names every run branch it pushes by a single, uniform convention:
@@ -30,16 +31,6 @@ const (
 // cut lands on a word boundary (an underscore) when one is in range, never mid-word.
 const branchDescMax = 40
 
-// branchSlugRe matches the characters a slug segment may keep; everything else folds to a single "_".
-var branchSlugRe = regexp.MustCompile(`[^a-z0-9]+`)
-
-// umlauts transliterates the German letters a Holistic run name is most likely to carry, so a name like
-// "Account-Löschung" becomes "account_loeschung" rather than losing the vowel to a bare strip.
-var umlauts = strings.NewReplacer(
-	"ä", "ae", "ö", "oe", "ü", "ue", "ß", "ss",
-	"Ä", "ae", "Ö", "oe", "Ü", "ue",
-)
-
 // BranchKindFor picks the kind for a run branch: a newly planned service is a feature, everything else
 // (a change to an existing repo, an axiom sweep) is a fix.
 func BranchKindFor(newService bool) string {
@@ -54,10 +45,7 @@ func BranchKindFor(newService bool) string {
 // separators, and length-capped on a word boundary. It returns "" when the name carries nothing
 // slugifiable (e.g. only punctuation or non-Latin script) — the caller supplies the fallback.
 func BranchSlug(name string) string {
-	s := umlauts.Replace(name)
-	s = strings.ToLower(s)
-	s = branchSlugRe.ReplaceAllString(s, "_")
-	s = strings.Trim(s, "_")
+	s := slug.Make(name, "_")
 	if len(s) <= branchDescMax {
 		return s
 	}
@@ -81,14 +69,14 @@ func BranchDescGoodEnough(name string) bool {
 // ref stays unique per firing. The result is guaranteed to satisfy git's ref rules — only [a-z0-9._/-],
 // no "..", and no segment that starts with "-".
 func BranchName(kind, desc, uniq string) string {
-	slug := BranchSlug(desc)
-	if slug == "" {
-		slug = "change"
+	seg := BranchSlug(desc)
+	if seg == "" {
+		seg = "change"
 	}
-	if u := strings.Trim(branchSlugRe.ReplaceAllString(strings.ToLower(uniq), "_"), "_"); u != "" {
-		slug += "-" + u
+	if u := slug.Make(uniq, "_"); u != "" {
+		seg += "-" + u
 	}
-	return kind + "/" + slug
+	return kind + "/" + seg
 }
 
 // NewBranchToken mints the short, unguessable per-firing token appended to a run branch's description.
