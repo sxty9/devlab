@@ -396,6 +396,9 @@ export interface Run {
   lastFiredAt?: string;
   lastResult?: RunResultRef;
   stale?: boolean;
+  // The run's still-open pull requests awaiting their merge to main. While non-empty a ToDo is not yet
+  // "erledigt" — it stays in the active list as "wartet auf Merge" until the last PR lands (then Done).
+  pendingPrs?: { repo: string; number: number; url: string }[];
   // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
   suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
 }

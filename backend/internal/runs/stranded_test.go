@@ -76,6 +76,54 @@ func TestFindStranded(t *testing.T) {
 	}
 }
 
+// TestFindStaleHusk pins the reap detector: only an unfinished, unsuspended husk untouched past the
+// cutoff is returned — the crash-orphaned "Leiche" the executor finalizes so it stops lingering and the
+// run becomes restartable. A recently-worked husk (an in-flight resume), a finished result and a live
+// suspension are all left alone.
+func TestFindStaleHusk(t *testing.T) {
+	dir := t.TempDir()
+	resDir := filepath.Join(dir, "res")
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", resDir)
+	res := NewResults()
+	now := time.Now().UTC()
+	zero := time.Time{}
+
+	writeRaw := func(runID, id string, started, updated, finished time.Time, suspended bool) {
+		r := Result{RunID: runID, ResultID: id, StartedAt: started, UpdatedAt: updated,
+			FinishedAt: finished, Suspended: suspended, Repos: []RepoResult{}}
+		b, _ := json.Marshal(r)
+		d := filepath.Join(resDir, runID)
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, id+".json"), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cutoff := now.Add(-15 * time.Minute)
+
+	// A crash husk untouched for an hour → stale, reapable.
+	writeRaw("run_stale", "h", now.Add(-2*time.Hour), now.Add(-time.Hour), zero, false)
+	if got, ok := res.FindStaleHusk("run_stale", cutoff); !ok || got.ResultID != "h" {
+		t.Errorf("FindStaleHusk missed an abandoned husk: got %q ok=%v", got.ResultID, ok)
+	}
+	// A husk worked a minute ago (a live carry-over) → within the grace, NOT reaped.
+	writeRaw("run_fresh", "h", now.Add(-30*time.Minute), now.Add(-time.Minute), zero, false)
+	if _, ok := res.FindStaleHusk("run_fresh", cutoff); ok {
+		t.Error("FindStaleHusk reaped a husk still being worked within the grace")
+	}
+	// A finished result → never a husk.
+	writeRaw("run_done", "h", now.Add(-2*time.Hour), now.Add(-90*time.Minute), now.Add(-90*time.Minute), false)
+	if _, ok := res.FindStaleHusk("run_done", cutoff); ok {
+		t.Error("FindStaleHusk reaped a finished result")
+	}
+	// A suspended husk (usage limit) resumes itself → not reaped here.
+	writeRaw("run_susp", "h", now.Add(-2*time.Hour), now.Add(-time.Hour), zero, true)
+	if _, ok := res.FindStaleHusk("run_susp", cutoff); ok {
+		t.Error("FindStaleHusk reaped a suspended husk")
+	}
+}
+
 // TestFindResumableIncludesOrphanedSuspension pins the freeze-bug fix: an execution suspended on the
 // usage limit whose run lost its Suspended pointer must still be resumable (FindResumable), so it is
 // continued on the next fire instead of freezing forever with its spend stranded — while FindStranded

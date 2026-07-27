@@ -228,6 +228,45 @@ func (r *Results) FindResumable(runID string, notBefore time.Time) (Result, bool
 	return r.newestHusk(runID, notBefore, true)
 }
 
+// FindStaleHusk returns the newest crash/carry-over husk (unfinished, unsuspended) of a run whose last
+// activity is OLDER than olderThan — one that has been abandoned and, for a fire-once ToDo, will never be
+// resumed on a schedule. It is the reap detector: the executor finalizes such a husk so it stops
+// lingering forever as a running "Leiche" and the run becomes cleanly restartable. Recency is the SAME
+// "last worked" measure (UpdatedAt, falling back to StartedAt) FindStranded uses, so a husk still being
+// actively carried over (touched within the grace) is never reaped out from under an in-flight resume.
+func (r *Results) FindStaleHusk(runID string, olderThan time.Time) (Result, bool) {
+	dir := filepath.Join(r.dir, runID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return Result{}, false
+	}
+	var best Result
+	found := false
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		res, err := r.readFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		if !res.FinishedAt.IsZero() || res.Suspended {
+			continue // finished, or a live suspension that resumes itself
+		}
+		touched := res.UpdatedAt
+		if touched.IsZero() {
+			touched = res.StartedAt
+		}
+		if !touched.Before(olderThan) {
+			continue // worked recently — not (yet) abandoned
+		}
+		if !found || res.StartedAt.After(best.StartedAt) {
+			best, found = res, true
+		}
+	}
+	return best, found
+}
+
 // Get returns one result document.
 func (r *Results) Get(runID, resultID string) (Result, bool, error) {
 	res, err := r.readFile(filepath.Join(r.dir, runID, resultID+".json"))

@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,6 +12,135 @@ import (
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/runs"
 )
+
+// seedRunsStore builds a runs store backed by throwaway files, seeded with the given runs.
+func seedRunsStore(t *testing.T, in []runs.Run) *runs.Store {
+	t.Helper()
+	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(t.TempDir(), "runs.json"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(t.TempDir(), "hist"))
+	st := runs.NewStore()
+	if _, err := st.Mutate("seed", "t", func([]runs.Run) ([]runs.Run, error) { return in, nil }); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// writeHusk drops an unfinished result file directly (Save would stamp UpdatedAt to now, defeating the
+// staleness a reap test needs), so the test controls exactly how long ago the husk was last worked.
+func writeHusk(t *testing.T, resDir, runID, id string, updated time.Time) {
+	t.Helper()
+	r := runs.Result{RunID: runID, ResultID: id, StartedAt: updated, UpdatedAt: updated, Repos: []runs.RepoResult{}}
+	b, _ := json.Marshal(r)
+	d := filepath.Join(resDir, runID)
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, id+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMaintainMarksTodoDoneWhenPRMerges pins the "erledigt erst nach dem Merge"-rule end to end: once a
+// ToDo's tracked PR is observed merged and no further PRs of the run remain, Maintain checks the ToDo off.
+func TestMaintainMarksTodoDoneWhenPRMerges(t *testing.T) {
+	runStore := seedRunsStore(t, []runs.Run{{ID: "todo1", Type: runs.TypeTodo, Task: "x"}})
+	prStore := tempPRStore(t)
+	if err := prStore.Add(runs.PendingPR{Repo: "o/r", Number: 7, RunID: "todo1", MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runs: runStore, runPRs: prStore}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+	}
+	x.Maintain(context.Background())
+
+	got, _, _ := runStore.Get("todo1")
+	if !got.Done {
+		t.Error("a ToDo whose PR merged to main must be checked off")
+	}
+	if prs, _ := prStore.List(); len(prs) != 0 {
+		t.Errorf("a merged PR must be untracked, got %d still tracked", len(prs))
+	}
+}
+
+// TestMaintainKeepsTodoOpenWhenPRClosedUnmerged pins the flip side: a PR CLOSED without a merge is a
+// rejection, not a completion — the ToDo stays open (untracked but not done) so it can be restarted.
+func TestMaintainKeepsTodoOpenWhenPRClosedUnmerged(t *testing.T) {
+	runStore := seedRunsStore(t, []runs.Run{{ID: "todo1", Type: runs.TypeTodo, Task: "x"}})
+	prStore := tempPRStore(t)
+	if err := prStore.Add(runs.PendingPR{Repo: "o/r", Number: 7, RunID: "todo1", MergeBy: time.Now().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runs: runStore, runPRs: prStore}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: false, State: "closed"}, nil // rejected
+		},
+	}
+	x.Maintain(context.Background())
+
+	got, _, _ := runStore.Get("todo1")
+	if got.Done {
+		t.Error("a ToDo whose PR was closed WITHOUT merging must stay open (restartable), not be checked off")
+	}
+}
+
+// TestReapOrphanedHusks pins the anti-corpse sweep: a fired-once ToDo's abandoned husk is finalized so it
+// stops lingering forever and the ToDo becomes restartable, while an auto run's stranded husk is left for
+// its scheduled resume and a fresh (in-grace) husk is not disturbed.
+func TestReapOrphanedHusks(t *testing.T) {
+	resDir := filepath.Join(t.TempDir(), "res")
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", resDir)
+	results := runs.NewResults()
+	runStore := seedRunsStore(t, []runs.Run{
+		{ID: "todo_old", Type: runs.TypeTodo, Task: "x"},
+		{ID: "todo_fresh", Type: runs.TypeTodo, Task: "x"},
+		{ID: "auto_old", Type: runs.TypeAuto},
+	})
+	now := time.Now().UTC()
+	writeHusk(t, resDir, "todo_old", "h", now.Add(-time.Hour))    // abandoned ToDo → reap
+	writeHusk(t, resDir, "todo_fresh", "h", now.Add(-time.Minute)) // just worked → keep
+	writeHusk(t, resDir, "auto_old", "h", now.Add(-time.Hour))    // auto resumes on schedule → keep
+
+	x := &runExecutor{s: &Server{runs: runStore, runResults: results}, mode: "pr"}
+	x.reapOrphanedHusks()
+
+	if r, ok, _ := results.Get("todo_old", "h"); !ok || r.FinishedAt.IsZero() {
+		t.Error("an abandoned ToDo husk must be reaped (finished)")
+	}
+	if r, ok, _ := results.Get("todo_fresh", "h"); !ok || !r.FinishedAt.IsZero() {
+		t.Error("a ToDo husk still within the grace must NOT be reaped")
+	}
+	if r, ok, _ := results.Get("auto_old", "h"); !ok || !r.FinishedAt.IsZero() {
+		t.Error("an auto run's husk must be left for its scheduled resume, not reaped")
+	}
+}
+
+// TestRunWedged pins the stuck-run threshold: a run is wedged only once it has blown past the ceiling by
+// more than the grace; a disabled ceiling or a run within budget is never wedged.
+func TestRunWedged(t *testing.T) {
+	now := time.Now()
+	ceiling := 4 * time.Hour
+	if runWedged(now.Add(-2*time.Hour), ceiling, now) {
+		t.Error("a run well within the ceiling must not be wedged")
+	}
+	if runWedged(now.Add(-(ceiling + 10*time.Minute)), ceiling, now) {
+		t.Error("a run just past the ceiling but inside the grace must not be wedged")
+	}
+	if !runWedged(now.Add(-(ceiling + wedgedRunGrace + time.Minute)), ceiling, now) {
+		t.Error("a run past ceiling + grace must be wedged")
+	}
+	if runWedged(now.Add(-10*ceiling), 0, now) {
+		t.Error("a disabled ceiling (0) must never report wedged")
+	}
+	if runWedged(time.Time{}, ceiling, now) {
+		t.Error("a zero start time must never report wedged")
+	}
+}
 
 // tempPRStore builds a PRStore backed by a throwaway file so a test can seed/inspect tracked PRs.
 func tempPRStore(t *testing.T) *runs.PRStore {
