@@ -495,7 +495,7 @@ export interface RunResult {
    *  snapshotted at run time. Absent on executions recorded before it was captured. */
   prompt?: string;
   ok: boolean;
-  repos: RepoResult[];
+  repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
   // The repo in flight while the run executes — kept apart from `repos` (which holds only completed
   // repos) so the live view can show it with its running steps and the agent's streaming output.
   live?: RepoResult;

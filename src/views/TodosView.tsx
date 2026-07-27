@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
+import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
@@ -466,8 +467,11 @@ export default function TodosView() {
               </div>
             </div>
 
-            {/* RIGHT — detail, editor, or placeholder */}
-            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">{rightPane}</div>
+            {/* RIGHT — detail, editor, or placeholder. Boundary-wrapped so a single dead/partial ToDo only
+                fails its own pane (recovering when another is picked, via resetKeys) while the list stays live. */}
+            <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
+              <ErrorBoundary resetKeys={[selectedId, mode]}>{rightPane}</ErrorBoundary>
+            </div>
           </>
         )}
         {tab === 'kalender' && <TodoCalendar dataVersion={dataVersion} />}
