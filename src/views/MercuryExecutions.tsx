@@ -5,7 +5,7 @@ import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { ReportDelivery, RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -486,6 +486,46 @@ function ExecutionRow({ ex, selected, onSelect }: { ex: RunExecution; selected: 
   );
 }
 
+/** Surfaces a failed daily-report send so it is visible, not silent. Renders nothing on the happy path
+ *  (latest report delivered, or none due yet) — a problem appears only when there is one, and the copy
+ *  says it is retried automatically, so no action is implied. Fails quiet: a status-probe error never
+ *  breaks the surrounding history view. */
+export function ReportDeliveryBanner() {
+  const source = useMemo(() => getDataSource(), []);
+  const [failed, setFailed] = useState<ReportDelivery | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    source
+      .mercuryReportStatus()
+      .then((r) => {
+        if (!cancelled) setFailed((r.records ?? []).find((x) => x.status === 'failed') ?? null);
+      })
+      .catch(() => {
+        /* quiet — a delivery-status probe must never break the execution history */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source]);
+
+  if (!failed) return null;
+  return (
+    <div className="flex items-start gap-2 border-b border-warning/30 bg-warning/10 px-3 py-2" role="status">
+      <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-warning" />
+      <div className="min-w-0 text-caption text-text-secondary">
+        <span className="font-medium text-text-primary">The daily report for {failed.day} could not be emailed.</span>{' '}
+        It will be retried automatically{failed.attempts > 1 ? ` (attempt ${failed.attempts})` : ''}.
+        {failed.lastError && (
+          <span className="mt-0.5 block truncate text-text-tertiary" title={failed.lastError}>
+            {failed.lastError}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 /** The execution history for one surface: every completed execution of its `type` (newest first) with
  *  token/cost, and a detail pane that loads the full result document. Reused identically by the Läufe
  *  and ToDos tabs — only `type` differs. */
@@ -532,6 +572,7 @@ export function ExecutionHistory({ type }: { type: RunType }) {
   return (
     <>
       <div className="flex w-96 shrink-0 flex-col border-r border-separator bg-surface">
+        <ReportDeliveryBanner />
         <div className="flex items-center justify-between gap-2 border-b border-separator px-3 py-2">
           <span className="text-footnote font-medium text-text-primary">Ausführungen</span>
           <Button variant="ghost" size="sm" disabled={refreshing} onClick={refresh}>

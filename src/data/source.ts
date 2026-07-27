@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, ReportDelivery, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -171,6 +171,9 @@ export interface DataSource {
   /** Completed executions (execution history; includes deleted runs). `type` narrows to automatic
    *  runs or ToDos so each surface shows its own; omitted = the global log. */
   mercuryRunExecutions(type?: RunType): Promise<{ executions: RunExecution[] }>;
+  /** Recent delivery records of the daily run-report email (newest day first), so a failed send is
+   *  visible in the UI rather than silent. */
+  mercuryReportStatus(): Promise<{ records: ReportDelivery[] }>;
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;

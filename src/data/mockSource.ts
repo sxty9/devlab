@@ -342,6 +342,9 @@ export const mockSource: DataSource = {
   async mercuryRunExecutions(_type?: import('@/types').RunType) {
     return { executions: [] };
   },
+  async mercuryReportStatus() {
+    return { records: [] as import('@/types').ReportDelivery[] };
+  },
   async mercuryChat(_messages: import('@/types').RunChatMessage[]) {
     return { reply: 'Mock-Antwort' };
   },
