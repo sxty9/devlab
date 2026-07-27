@@ -1855,7 +1855,17 @@ func (a *agentStep) finish(report string) {
 
 func (a *agentStep) fail(logtxt string) {
 	s := &a.rr.Steps[a.idx]
-	s.Running, s.Status, s.Log = false, runs.StepFailed, clip(logtxt)
+	s.Running, s.Status = false, runs.StepFailed
+	// Keep what the agent streamed: a failed pass — a budget kill, a deliberate abort, a mid-work error —
+	// still names what it REACHED before it stopped (honest reporting: an aborted run names what was
+	// achieved). The failure REASON rides on the repo result (rr.Error, made honest by budgetAwareError),
+	// so the step log need not overwrite the transcript with the raw kill error. Fall back to the error
+	// text only when nothing streamed — a failure before any output, e.g. the CLI missing.
+	if tail := a.tr.clipped(); strings.TrimSpace(tail) != "" {
+		s.Log = tail
+	} else {
+		s.Log = clip(logtxt)
+	}
 	a.saver.force()
 }
 

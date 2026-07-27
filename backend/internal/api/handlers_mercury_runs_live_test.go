@@ -85,3 +85,23 @@ func TestAgentStepFail(t *testing.T) {
 		t.Fatalf("fail did not finalize the step as failed: %+v", s)
 	}
 }
+
+// A failure AFTER the agent has streamed work (a budget kill, an abort) keeps the transcript — what was
+// reached before it stopped — instead of overwriting it with the raw kill error. The honest failure
+// reason rides on the repo result (rr.Error), so the step log stays useful.
+func TestAgentStepFailKeepsTranscript(t *testing.T) {
+	rr := &runs.RepoResult{Repo: "r"}
+	ag := beginAgentStep(rr, &liveSaver{do: func() {}}, "implement")
+	ag.onProgress([]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"added the handler"}]}}`))
+	ag.fail("Agent run failed: signal: killed")
+	s := rr.Steps[0]
+	if s.Status != runs.StepFailed {
+		t.Fatalf("step should be failed: %+v", s)
+	}
+	if !strings.Contains(s.Log, "added the handler") {
+		t.Fatalf("a killed step must keep the streamed transcript, got %q", s.Log)
+	}
+	if strings.Contains(s.Log, "signal: killed") {
+		t.Fatalf("the raw kill error must not overwrite the transcript, got %q", s.Log)
+	}
+}
