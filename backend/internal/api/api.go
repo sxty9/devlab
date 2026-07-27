@@ -255,6 +255,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
+	// Blocked prod-deploys: the deliveries that failed permanently and wait for an explicit resume. The
+	// literal `deploys` segment is registered before the {id} route so it is never captured as a run id.
+	mux.HandleFunc("GET /api/mercury/runs/deploys", s.guard(s.runDeploysBlocked))
+	mux.HandleFunc("POST /api/mercury/runs/deploys/resume", s.guardCSRF(s.runDeployResume))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))

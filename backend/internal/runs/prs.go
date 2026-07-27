@@ -23,6 +23,16 @@ type PendingPR struct {
 	// reads or writes it (those modes only ever touch OVERDUE PRs), so their behavior is unchanged and
 	// zero-value here. Older stored files simply carry the zero time.
 	LastChecked time.Time `json:"lastChecked,omitempty"`
+
+	// Deploy-blocking (full mode). A merged PR whose prod-deploy fails for a PERMANENT reason is retried a
+	// few times, then BLOCKED: it waits for an explicit resume instead of retrying forever, and while
+	// blocked Maintain skips it entirely so one broken repo can't hold up the others. Only permanent
+	// failures count; a transient one (network) is retried and never increments DeployAttempts. All of
+	// this is policy owned by the caller — the store just persists the fields it sets via Update.
+	DeployAttempts int       `json:"deployAttempts,omitempty"` // consecutive permanent-failure attempts
+	Blocked        bool      `json:"blocked,omitempty"`        // stop auto-retrying until an explicit resume
+	BlockedReason  string    `json:"blockedReason,omitempty"`  // human cause, naming the service and target
+	BlockedAt      time.Time `json:"blockedAt,omitempty"`      // when the block was recorded
 }
 
 // PRStore persists the pending-PR set (a small JSON file, same discipline as the runs store).
@@ -120,6 +130,25 @@ func (s *PRStore) Touch(repo string, number int, at time.Time) error {
 		return nil
 	}
 	return s.save(cur)
+}
+
+// Update applies mutate to the tracked PR matching (repo, number) and saves atomically. found=false (and
+// no save) when the PR is untracked; it never creates one. All decisions about WHAT to change live in the
+// caller's closure — the store stays a passive pool, the mutation is unteilbar under the same lock.
+func (s *PRStore) Update(repo string, number int, mutate func(*PendingPR)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return false, err
+	}
+	for i := range cur {
+		if cur[i].Repo == repo && cur[i].Number == number {
+			mutate(&cur[i])
+			return true, s.save(cur)
+		}
+	}
+	return false, nil
 }
 
 func (s *PRStore) save(prs []PendingPR) error {

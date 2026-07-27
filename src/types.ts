@@ -644,6 +644,18 @@ export interface RunActive {
   startedAt: string;
 }
 
+/** A delivery blocked on a permanent prod-deploy failure — retried a few times, then held for an explicit
+ *  resume so one broken repo can't retry forever or hold up the others. */
+export interface BlockedDeploy {
+  repo: string; // owner/name
+  number: number; // the merged PR number the delivery belongs to
+  url: string;
+  runId: string;
+  reason: string; // human cause, naming the service and the target
+  attempts: number; // permanent-failure attempts before it blocked
+  blockedAt: string;
+}
+
 /** What a trigger decided to do, reported back so the difference between continuing an interrupted
  *  execution and starting a new one is visible. `action` is the honest answer; `reason` explains why.
  *  On a resume it names the continued execution (`resultId`) and how far it got (`reposDone`); on an

@@ -7,6 +7,22 @@ function stub(path: string): FileContent {
   return { path, lang: guessLang(path), code: `// ${path}\n// (mock) file contents arrive with the backend.\n` };
 }
 
+/** One believable blocked delivery so the "Auslieferung blockiert" panel is visible in offline/preview
+ *  mode; resuming it (in-memory) removes it, mirroring the real clear-the-block behaviour. */
+const MOCK_BLOCKED_DEPLOYS = [
+  {
+    repo: 'holistic/scrapr',
+    number: 42,
+    url: '#',
+    runId: 'run_mock',
+    reason:
+      'Dienst »scrapr« ist im Ziel »prod« nicht eingerichtet: Failed to restart scrapr.service: Unit scrapr.service not found.',
+    attempts: 3,
+    blockedAt: new Date().toISOString(),
+  },
+];
+const mockResumedDeploys = new Set<string>();
+
 /** Fabricate a believable "before" for a modified file with no explicit diff content. */
 function synthBefore(after: string): string {
   const lines = after.split('\n');
@@ -465,6 +481,14 @@ export const mockSource: DataSource = {
   },
   async mercuryCancelRun() {
     /* mock: no-op */
+  },
+  async mercuryBlockedDeploys() {
+    const blocked = MOCK_BLOCKED_DEPLOYS.filter((d) => !mockResumedDeploys.has(`${d.repo}#${d.number}`));
+    return { blocked };
+  },
+  async mercuryResumeDeploy(repo: string, number: number) {
+    mockResumedDeploys.add(`${repo}#${number}`);
+    return { resumed: true };
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {
     return [];
