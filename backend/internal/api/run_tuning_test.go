@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -172,7 +173,7 @@ func TestBudgetFor(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := budgetFor(runs.Run{TimeBudget: c.budget}); got != c.want {
+			if got := budgetFor(runs.Run{TimeBudget: c.budget}, nil); got != c.want {
 				t.Fatalf("budgetFor(%q) = %v, want %v", c.budget, got, c.want)
 			}
 		})
@@ -183,18 +184,65 @@ func TestBudgetFor(t *testing.T) {
 // moves every un-chosen run at once), while an explicit choice is pinned and survives a default change.
 func TestBudgetForReferencedNotCopied(t *testing.T) {
 	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "2h")
-	if got := budgetFor(runs.Run{}); got != 2*time.Hour {
+	if got := budgetFor(runs.Run{}, nil); got != 2*time.Hour {
 		t.Fatalf("un-chosen budget = %v, want to follow the 2h default", got)
 	}
-	if got := budgetFor(runs.Run{TimeBudget: "5h"}); got != 5*time.Hour {
+	if got := budgetFor(runs.Run{TimeBudget: "5h"}, nil); got != 5*time.Hour {
 		t.Fatalf("explicit 5h = %v, want pinned 5h", got)
 	}
 	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "4h") // the default moves…
-	if got := budgetFor(runs.Run{}); got != 4*time.Hour {
+	if got := budgetFor(runs.Run{}, nil); got != 4*time.Hour {
 		t.Fatalf("un-chosen budget after default change = %v, want to follow the new 4h default", got)
 	}
-	if got := budgetFor(runs.Run{TimeBudget: "5h"}); got != 5*time.Hour {
+	if got := budgetFor(runs.Run{TimeBudget: "5h"}, nil); got != 5*time.Hour {
 		t.Fatalf("explicit 5h after default change = %v, want still-pinned 5h", got)
+	}
+}
+
+// The central config surface (RunSettings.AgentTimeout) overrides the env/built-in seed for the default,
+// and an un-chosen run follows it LIVE — moving the configured default moves every un-chosen run at once,
+// while an explicit per-run choice stays pinned. A configured no-cap ("off") makes the default itself
+// no-cap. A store that fails to parse (hand-edited) is ignored in favour of the seed.
+func TestBudgetForConfiguredDefault(t *testing.T) {
+	t.Setenv("DEVLAB_RUNS_AGENT_TIMEOUT", "2h") // the env/built-in seed
+	t.Setenv("DEVLAB_MERCURY_RUNS_SETTINGS", filepath.Join(t.TempDir(), "runs-settings.json"))
+	store := runs.NewSettingsStore()
+
+	// Nothing configured yet → follow the seed.
+	if got := budgetFor(runs.Run{}, store); got != 2*time.Hour {
+		t.Fatalf("un-chosen budget with empty store = %v, want the 2h seed", got)
+	}
+	// Configure the default to 6h → an un-chosen run follows it, over the seed.
+	if _, err := store.Set(func(rs *runs.RunSettings) { rs.AgentTimeout = "6h" }); err != nil {
+		t.Fatal(err)
+	}
+	if got := budgetFor(runs.Run{}, store); got != 6*time.Hour {
+		t.Fatalf("un-chosen budget = %v, want to follow the configured 6h default", got)
+	}
+	// An explicit per-run choice is still pinned, unaffected by the configured default.
+	if got := budgetFor(runs.Run{TimeBudget: "30m"}, store); got != 30*time.Minute {
+		t.Fatalf("explicit 30m = %v, want pinned 30m", got)
+	}
+	// Configure the default to no-cap → the default itself becomes 0 (no cap).
+	if _, err := store.Set(func(rs *runs.RunSettings) { rs.AgentTimeout = "off" }); err != nil {
+		t.Fatal(err)
+	}
+	if got := budgetFor(runs.Run{}, store); got != 0 {
+		t.Fatalf("un-chosen budget with configured no-cap = %v, want 0 (no cap)", got)
+	}
+	// Clear the configured default → fall back to the seed again.
+	if _, err := store.Set(func(rs *runs.RunSettings) { rs.AgentTimeout = "" }); err != nil {
+		t.Fatal(err)
+	}
+	if got := budgetFor(runs.Run{}, store); got != 2*time.Hour {
+		t.Fatalf("un-chosen budget after clearing = %v, want the 2h seed", got)
+	}
+	// A garbage stored default (hand-edited) is ignored → seed, never unbounded.
+	if _, err := store.Set(func(rs *runs.RunSettings) { rs.AgentTimeout = "soon" }); err != nil {
+		t.Fatal(err)
+	}
+	if got := budgetFor(runs.Run{}, store); got != 2*time.Hour {
+		t.Fatalf("un-chosen budget with garbage store = %v, want the 2h seed", got)
 	}
 }
 

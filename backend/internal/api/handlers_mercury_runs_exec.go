@@ -61,14 +61,12 @@ const (
 	defaultMaxRunDuration = 4 * time.Hour
 )
 
-// runAgentTimeout is the SERVICE-WIDE DEFAULT time budget for one repo's agent pass — the value a
-// run/todo that made no explicit choice follows. Three hours covers an ordinary change and a from-scratch
-// build both; a too-tight cap kills the pass mid-implement, leaving an empty repo, no PR and no usable
-// output. It is the default an un-chosen run resolves to at RUN TIME (never copied into the run — see
-// budgetFor), so moving it here moves every un-chosen run at once. Configurable via DEVLAB_RUNS_AGENT_TIMEOUT
-// (a Go duration; an explicit "0" removes the cap, leaving only the whole-sweep duration as the bound).
-// The default belongs at the central config surface per the config axiom; until one exists it is a
-// DEVLAB_RUNS_* env knob like its siblings.
+// runAgentTimeout is the ENV/BUILT-IN SEED for the default per-repo time budget — the value the default
+// reverts to when nothing is configured at the central config surface. Three hours covers an ordinary
+// change and a from-scratch build both; a too-tight cap kills the pass mid-implement, leaving an empty
+// repo, no PR and no usable output. Overridable via DEVLAB_RUNS_AGENT_TIMEOUT (a Go duration; an explicit
+// "0" removes the cap, leaving only the whole-sweep duration as the bound) for bootstrapping, exactly the
+// same seed/override discipline as the slot cap (maxConcurrentSeed).
 func runAgentTimeout() time.Duration {
 	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
@@ -78,22 +76,59 @@ func runAgentTimeout() time.Duration {
 	return defaultAgentTimeout
 }
 
+// agentTimeoutDefault resolves the SERVICE-WIDE DEFAULT time budget — the value a run/todo that made no
+// explicit choice follows. Resolution, first hit wins: the central config surface (RunSettings.AgentTimeout,
+// UI-set and live), then the DEVLAB_RUNS_AGENT_TIMEOUT env / built-in 3h seed (runAgentTimeout). It is read
+// live on every call, so moving the default — from the UI or the env — moves every un-chosen run at once
+// (referenced-not-copied). A nil store (tests, an unprovisioned server) falls straight through to the seed;
+// a stored value that fails to parse (a hand-edited settings file) is ignored rather than trusted, so the
+// default can never resolve to garbage.
+func agentTimeoutDefault(settings *runs.SettingsStore) time.Duration {
+	if settings != nil {
+		if rs, err := settings.Get(); err == nil {
+			if d, ok := parseBudgetSetting(rs.AgentTimeout); ok {
+				return d
+			}
+		}
+	}
+	return runAgentTimeout()
+}
+
+// parseBudgetSetting interprets a STORED default time-budget string into a concrete cap: "" = not set
+// (ok=false, caller falls back to the seed), every no-cap spelling → 0 (an explicit "no cap" default,
+// ok=true), a positive Go duration → that value, and anything else = not set (ok=false, defense in depth
+// against a hand-edited settings file). The stored value is canonicalized on write (canonicalizeBudget),
+// so in practice it is only "", "off" or a duration.
+func parseBudgetSetting(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	if isNoBudget(v) {
+		return 0, true
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d, true
+	}
+	return 0, false
+}
+
 // errBudgetExceeded is the cause a per-repo budget context carries when its deadline fires, so a killed
 // agent pass is told apart from the whole-sweep duration cap (context.DeadlineExceeded on the parent) and
 // a deliberate abort (runs.ErrRunAborted) — and reported honestly as an overrun instead of a raw error.
 var errBudgetExceeded = errors.New("time budget exceeded")
 
 // budgetFor is the time-budget SIBLING of tuningFor: it resolves a run's (possibly empty) TimeBudget into
-// the concrete per-repo agent cap. Empty FOLLOWS the live service default (runAgentTimeout), so an
-// un-chosen run tracks the default even after it changes — the referenced-not-copied rule. An explicit
-// no-cap ("off"/"none"/0) removes the cap (0 = only the whole-sweep duration bounds the run — a valid,
-// deliberate choice). A positive duration caps at that value. Anything else (a hand-edited runs.json, a
-// writer that skipped validateTuning) falls back to the default rather than running unbounded — defense in
-// depth at the execution boundary, mirroring agentTuning.resolve.
-func budgetFor(run runs.Run) time.Duration {
+// the concrete per-repo agent cap. Empty FOLLOWS the live service default (agentTimeoutDefault — the central
+// config surface, else the env/built-in seed), so an un-chosen run tracks the default even after it changes
+// — the referenced-not-copied rule. An explicit no-cap ("off"/"none"/0) removes the cap (0 = only the
+// whole-sweep duration bounds the run — a valid, deliberate choice). A positive duration caps at that value.
+// Anything else (a hand-edited runs.json, a writer that skipped validateTuning) falls back to the default
+// rather than running unbounded — defense in depth at the execution boundary, mirroring agentTuning.resolve.
+func budgetFor(run runs.Run, settings *runs.SettingsStore) time.Duration {
 	v := strings.TrimSpace(run.TimeBudget)
 	if v == "" {
-		return runAgentTimeout()
+		return agentTimeoutDefault(settings)
 	}
 	if isNoBudget(v) {
 		return 0
@@ -101,7 +136,17 @@ func budgetFor(run runs.Run) time.Duration {
 	if d, err := time.ParseDuration(v); err == nil && d > 0 {
 		return d
 	}
-	return runAgentTimeout()
+	return agentTimeoutDefault(settings)
+}
+
+// budget is the executor's shortcut to budgetFor, wired to the server's live settings store (nil-safe so a
+// bare executor in tests falls through to the env/built-in seed).
+func (x *runExecutor) budget(run runs.Run) time.Duration {
+	var st *runs.SettingsStore
+	if x.s != nil {
+		st = x.s.runSettings
+	}
+	return budgetFor(run, st)
 }
 
 // isNoBudget recognizes the explicit "no time budget" choice: the word sentinels and any zero duration.
@@ -609,7 +654,7 @@ func (x *runExecutor) freshResult(run runs.Run) runs.Result {
 	model, _, _ := tuningFor(run).resolve()
 	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
 		Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort,
-		TimeBudget: humanizeDuration(budgetFor(run)), StartedAt: start.UTC(),
+		TimeBudget: humanizeDuration(x.budget(run)), StartedAt: start.UTC(),
 		PromptHash: run.PromptHash, Prompt: run.Prompt}
 }
 
@@ -663,7 +708,7 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
 		m, _, _ := tuningFor(run).resolve()
 		candidate.Model, candidate.Effort = m, run.Effort
-		candidate.TimeBudget = humanizeDuration(budgetFor(run))
+		candidate.TimeBudget = humanizeDuration(x.budget(run))
 		return candidate, true
 	}
 	if found {
@@ -935,7 +980,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// only the whole-sweep duration as the bound. The context carries errBudgetExceeded as its cause so an
 	// overrun is reported honestly — as a spent budget with the value that applied — not as a raw kill.
 	actx, cancel := context.WithCancel(ctx)
-	budget := budgetFor(run)
+	budget := x.budget(run)
 	if budget > 0 {
 		cancel()
 		actx, cancel = context.WithTimeoutCause(ctx, budget, errBudgetExceeded)

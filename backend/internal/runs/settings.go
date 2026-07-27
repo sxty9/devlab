@@ -7,12 +7,17 @@ import (
 	"sync"
 )
 
-// RunSettings are the live, UI-adjustable settings of the runs subsystem. Currently just the number of
-// execution slots (the concurrency cap). Persisted so a chosen value survives a restart. A zero value
-// means "not set" — the caller then falls back to the env/default seed, so the environment value stays
-// valid only until something is configured (req 13).
+// RunSettings are the live, UI-adjustable settings of the runs subsystem: the number of execution slots
+// (the concurrency cap) and the default per-repo time budget. Persisted so a chosen value survives a
+// restart. A zero/empty value means "not set" — the caller then falls back to the env/default seed, so
+// the environment value stays valid only until something is configured (req 13).
 type RunSettings struct {
 	MaxConcurrent int `json:"maxConcurrent,omitempty"` // 0 = not set → use the env/default seed
+	// AgentTimeout is the service-wide DEFAULT per-repo time budget — the value a run/todo that made no
+	// explicit choice follows (referenced-not-copied: moving it moves every un-chosen run at once). A
+	// canonical time-budget string: "" = not set → env/default seed, a Go duration ("3h"), or "off" =
+	// no cap. The central-config sibling of the per-run TimeBudget field.
+	AgentTimeout string `json:"agentTimeout,omitempty"`
 }
 
 // SettingsStore persists RunSettings (a small JSON file, same discipline as the other run stores: atomic

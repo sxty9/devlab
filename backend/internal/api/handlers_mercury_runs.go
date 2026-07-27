@@ -269,15 +269,31 @@ func validateTuning(b *runBody) (int, string) {
 	if b.Effort != "" && !runEffortAllowed[b.Effort] {
 		return http.StatusBadRequest, "ungültiger Effort (erlaubt: low, medium, high, xhigh, max, ultracode)"
 	}
-	b.TimeBudget = strings.TrimSpace(b.TimeBudget)
-	if b.TimeBudget != "" {
-		if isNoBudget(b.TimeBudget) {
-			b.TimeBudget = "off" // canonical no-cap
-		} else if d, err := time.ParseDuration(b.TimeBudget); err != nil || d <= 0 {
-			return http.StatusBadRequest, "ungültiges Zeitbudget (z. B. 2h, 90m — oder „off“ für kein Limit)"
-		}
+	if bud, ok := canonicalizeBudget(b.TimeBudget); ok {
+		b.TimeBudget = bud
+	} else {
+		return http.StatusBadRequest, "ungültiges Zeitbudget (z. B. 2h, 90m — oder „off“ für kein Limit)"
 	}
 	return 0, ""
+}
+
+// canonicalizeBudget trims and canonicalizes a time-budget string — a run's per-repo choice OR the service
+// default at the central config surface — so both validate identically (one canonicalizer, no similar
+// siblings). "" stays empty (= follow the default / not set), every no-cap spelling folds to the canonical
+// "off", a positive Go duration passes through verbatim, and anything else is rejected (ok=false) rather
+// than silently defaulted. The canonical form is one the editors round-trip losslessly.
+func canonicalizeBudget(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", true
+	}
+	if isNoBudget(v) {
+		return "off", true
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return v, true
+	}
+	return "", false
 }
 
 // normalizeTargets validates and cleans a ToDo's target list: at least one target, each being exactly
