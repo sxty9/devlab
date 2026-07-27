@@ -12,9 +12,9 @@ import (
 )
 
 // The edit surface lets a user own the tree by hand: change an axiom's text, re-file it into another
-// category, rename it, or delete it — and rename a whole category. Everything rides the graveyard
-// primitives (put/move/delete): scheme carries a record's content with its path on a move, so a
-// re-file or rename never rewrites the axiom, and the front-matter id stays stable across it.
+// category, rename it, or delete it — and rename a whole category. Everything rides the store
+// primitives (put/move/delete): a move carries a record's content with its path, so a re-file or
+// rename never rewrites the axiom, and the front-matter id stays stable across it.
 
 // editAxiom replaces an axiom's title and body, preserving its id and quelle. The leaf slug is
 // re-derived from the new title so the heading always matches the path — a title change renames the
@@ -42,7 +42,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	// Read the existing record so the stable id and quelle survive the edit.
 	data, found, err := s.axioms.Get(r.Context(), body.Path)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	if !found {
@@ -66,12 +66,12 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusConflict, "In dieser Kategorie existiert bereits ein Axiom mit diesem Titel")
 				return
 			}
-			mercuryError(w, http.StatusBadGateway, err)
+			mercuryError(w, err)
 			return
 		}
 	}
 	if err := s.axioms.Put(r.Context(), newPath, string(content), firstLine(body.Body), actor(r), true); err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
@@ -79,7 +79,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 }
 
 // moveAxiom re-files or renames an axiom: from and to are full record paths. A category change
-// re-files it; a slug change renames it. The destination must be free (aigentic returns 409).
+// re-files it; a slug change renames it. The destination must be free (the store returns ErrExists).
 func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		From string `json:"from"`
@@ -104,7 +104,7 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusConflict, "Am Zielpfad liegt bereits ein Axiom")
 			return
 		}
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
@@ -120,7 +120,7 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	cookie := r.Header.Get("Cookie")
 	if err := s.axioms.Delete(r.Context(), path, "Gelöscht: "+path, actor(r)); err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(path))
@@ -128,7 +128,7 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 }
 
 // moveCategory renames or re-homes a whole category: every record under `from/` is moved to the
-// same suffix under `to/`. Because scheme has no empty folders, moving the leaves IS renaming the
+// same suffix under `to/`. Because git tracks no empty folders, moving the leaves IS renaming the
 // category. Best-effort per record; the first hard failure stops and is reported.
 func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -149,11 +149,11 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cookie := r.Header.Get("Cookie")
-	// List by the bare prefix (scheme's list rejects a trailing slash), then keep only records
-	// genuinely UNDER this category — "axiome/ui" must not sweep up a sibling "axiome/ui-native".
+	// List by the bare prefix, then keep only records genuinely UNDER this category — the prefix match
+	// alone would let "axiome/ui" sweep up a sibling "axiome/ui-native", so re-check the "/" boundary.
 	all, err := s.axioms.List(r.Context(), body.From)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	prefix := body.From + "/"

@@ -78,8 +78,7 @@ func migratePath(atom mercury.Atom, used map[string]bool) string {
 	return path
 }
 
-// firstLine is the record's mandatory scheme description: the first line of the body, trimmed to a
-// sane length.
+// firstLine is the record's commit description: the first line of the body, trimmed to a sane length.
 func firstLine(body string) string {
 	line := body
 	if i := indexNewline(body); i >= 0 {

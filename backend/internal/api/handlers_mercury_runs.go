@@ -128,7 +128,7 @@ func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 	}
 	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -148,7 +148,7 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 	}
 	byID, idPath, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -186,7 +186,7 @@ func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 	}
 	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -209,7 +209,7 @@ func (s *Server) runPromptPreview(w http.ResponseWriter, r *http.Request) {
 	}
 	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	axs := axiomsFor(run.AxiomIDs, byID)
@@ -361,7 +361,7 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -408,7 +408,7 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	if code, msg := validateRunBody(&body, byID); code != 0 {
@@ -508,7 +508,7 @@ func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
 	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -539,7 +539,7 @@ func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
 		return mercury.RunPlanFillPrompt(uncovered, names, correction)
 	})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
@@ -554,7 +554,7 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
 	byID, _, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
@@ -573,7 +573,7 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 		return mercury.RunPlanFinetunePrompt(catalog, current, correction)
 	})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
@@ -655,7 +655,7 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 	cookie := r.Header.Get("Cookie")
 	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	// Re-validate the (possibly user-edited) plan against the current axiom set.
@@ -738,7 +738,7 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 	// is structurally unreachable — there is no longer a badge to surface it).
 	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	now := time.Now()
@@ -970,13 +970,13 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
 	ctx, err := s.chatContext(r, cookie)
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	prompt := mercury.MercuryChatPrompt(ctx, body.Messages)
 	result, _, err := aigentic.Run(r.Context(), cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
 	if err != nil {
-		mercuryError(w, http.StatusBadGateway, err)
+		mercuryError(w, err)
 		return
 	}
 	action, cleaned, ok := mercury.ExtractChatAction(result.Output, ctx.ActionContext())

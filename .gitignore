@@ -17,3 +17,7 @@ dist/
 backend/devlabd
 deploy/devlabd
 backend/deploy/
+
+# per-run deploy build output (the Mercury executor builds <workspace>/.mercury-artifact;
+# it must never be committed into the repo it was built from)
+.mercury-artifact/

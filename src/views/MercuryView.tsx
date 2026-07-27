@@ -105,7 +105,8 @@ const NS_EMPTY: Record<SchemeNs, string> = {
 
 /** Mercury — the centre for the Holistic axioms, in three parts: the axioms (aigentic auto-sorts a
  *  new one; the user re-files, renames, edits and deletes by hand), the implementation rules, and
- *  the scheduled runs. It owns no store — the tree is a projection of aigentic's scheme graveyard. */
+ *  the scheduled runs. The tree is a projection of the constitution's own Git repository, served
+ *  through DevLab's single /api/mercury access point. */
 export function MercuryView() {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();

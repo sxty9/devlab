@@ -24,10 +24,9 @@ func newLocalStore(t *testing.T) *Store {
 		"commit", "--quiet", "--allow-empty", "-m", "init")
 	run(t, seed, "git", "push", "--quiet", "origin", "HEAD:main")
 
-	s := New(filepath.Join(root, "work"), remote, func() (string, error) { return "unused", nil })
-	// A local path remote takes no auth header; strip the credential plumbing for the test.
-	s.plain = true
-	return s
+	// A bare-repo filesystem path is recognised as a local remote (localRemote), so the store uses it
+	// verbatim with no credential plumbing — the token below is never consulted.
+	return New(filepath.Join(root, "work"), remote, func() (string, error) { return "unused", nil })
 }
 
 func run(t *testing.T, dir, name string, args ...string) {
