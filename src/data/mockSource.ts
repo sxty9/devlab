@@ -419,15 +419,18 @@ export const mockSource: DataSource = {
     }
     return action ? { reply: 'Mock-Antwort mit Vorschlag.', action } : { reply: 'Mock-Antwort' };
   },
+  async mercuryReportStatus() {
+    return { records: [] as import('@/types').ReportDelivery[] };
+  },
   async mercuryRunNow(_id: string) {
     return { started: true };
   },
   async mercuryRunActive() {
     // The mock has no executor, so nothing is ever genuinely in flight — an empty list is the honest
     // answer (the "Aktive Läufe" overview simply stays quiet in offline/preview mode).
-    return { active: null, inflight: [] };
+    return { active: [], inflight: [], restartPending: false };
   },
-  async mercuryCancelRun() {
+  async mercuryCancelRun(_runId: string) {
     /* mock: no-op */
   },
   async mercuryUploadAttachment(_id: string, _filename: string, _contentB64: string): Promise<import('@/types').RunAttachment[]> {

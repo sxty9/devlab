@@ -9,7 +9,7 @@ import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, TokenStat, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import type {
@@ -91,8 +91,15 @@ export default function RunsView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-run live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The global
   // cancel lives in that overview.
-  const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  // The run executing right now is SERVER truth (via useActiveRun), so the "Lauf aktiv" state — and the
+  // live-follow view — survive a page reload instead of living only in this component. The global cancel
+  // shows whenever a run is live.
+
+  // The runs executing right now are SERVER truth (via useActiveRun), so the active-runs overview — and
+  // the live-follow views — survive a page reload instead of living only in this component. Runs are
+  // concurrent, so this is a list; cancel targets one specific run by id.
+  const { active, inflight, restartPending, refetch: refetchActive } = useActiveRun();
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // Post-mutation refresh: never throws (toasts on failure) so callers can await it after a success. It
   // also pulls the auto-assignment feed, so a background assignment surfaces on the next refresh.
@@ -108,11 +115,12 @@ export default function RunsView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh the list so lastResult/next-fire/ToDo-done update.
-  const prevActiveRef = useRef<string | null>(null);
+  // When any run finishes (its id leaves the active set), refresh the list so lastResult/next-fire/
+  // ToDo-done update. Compares the previous active id set to the current one.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -145,19 +153,22 @@ export default function RunsView() {
     return () => window.clearTimeout(t);
   }, [coverage?.pending, dataVersion, reload]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
+  const cancelRun = useCallback(
+    async (runId: string) => {
+      if (cancellingId) return;
+      setCancellingId(runId);
+      try {
+        await source.mercuryCancelRun(runId);
+        toast({ title: 'Lauf abgebrochen', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setCancellingId(null);
+      }
+    },
+    [cancellingId, source, toast, refetchActive],
+  );
 
   const runFill = useCallback(async () => {
     if (aiBusy) return;
@@ -274,7 +285,8 @@ export default function RunsView() {
         key={`${selectedRun.id}:${selectedRun.promptHash ?? ''}:${selectedRun.updatedAt}`}
         run={selectedRun}
         axioms={list.axioms}
-        active={active && active.runId === selectedRun.id ? active : null}
+        active={active.find((a) => a.runId === selectedRun.id) ?? null}
+        restartPending={restartPending}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -304,7 +316,13 @@ export default function RunsView() {
             </button>
           ))}
         </div>
-        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} className="ml-auto max-w-xs" />
+        <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancellingId !== null} className="ml-auto max-w-xs" />
+        {active.length > 0 && (
+          <span className="ml-auto flex items-center gap-1.5 text-caption text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+            {active.length === 1 ? '1 Lauf aktiv' : `${active.length} Läufe aktiv`}
+          </span>
+        )}
       </header>
 
       <div className="flex min-h-0 flex-1">
@@ -439,6 +457,7 @@ function RunDetail({
   run,
   axioms,
   active,
+  restartPending,
   onEdit,
   onDeleted,
   onRunStarted,
@@ -446,6 +465,7 @@ function RunDetail({
   run: Run;
   axioms: Record<string, string>;
   active: RunActive | null;
+  restartPending: boolean;
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
   onRunStarted: () => void;
@@ -521,8 +541,13 @@ function RunDetail({
     if (runningNow) return;
     setRunningNow(true);
     try {
-      await source.mercuryRunNow(run.id);
-      toast({ title: 'Lauf gestartet', variant: 'success' });
+      const r = await source.mercuryRunNow(run.id);
+      if (r.queued) {
+        // A restart is draining: the run was not started now but will start by itself afterwards.
+        toast({ title: 'Neustart läuft', description: r.message ?? 'Der Lauf wurde eingereiht und startet nach dem Neustart automatisch.', variant: 'default' });
+      } else {
+        toast({ title: 'Lauf gestartet', variant: 'success' });
+      }
       onRunStarted(); // re-check server activity now → the live-follow view opens without waiting for a tick
     } catch (e) {
       // 503 "nicht konfiguriert" / 409 "läuft bereits" surface here.
@@ -574,6 +599,10 @@ function RunDetail({
             {[run.model, run.effort].filter(Boolean).join(' · ')}
           </span>
         )}
+        {restartPending && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">Neustart läuft</span>
+        )}
+        {run.stale && <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">veraltet</span>}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
 
@@ -618,16 +647,16 @@ function RunDetail({
 
       <section className="mt-6 border-t border-separator pt-4">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ausführungen</p>
-        {isLive && active?.resultId && (
-          <div className="mb-3">
-            <LiveExecution runId={run.id} resultId={active.resultId} live />
-          </div>
+        {isLive && (
+          <p className="mb-3 flex items-center gap-1.5 text-footnote text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Läuft gerade – siehe die Übersicht oben.
+          </p>
         )}
         {results === null ? (
           <p className="text-footnote text-text-tertiary">Lädt…</p>
         ) : results.length === 0 ? (
           <p className="text-footnote text-text-tertiary">
-            {isLive ? 'Läuft gerade – siehe oben.' : 'Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.'}
+            {isLive ? 'Läuft gerade – siehe die Übersicht oben.' : 'Noch keine Ausführungen — starte einen Lauf mit „Jetzt ausführen“ oder warte den Zeitplan ab.'}
           </p>
         ) : (
           <ul className="flex flex-col gap-1.5">

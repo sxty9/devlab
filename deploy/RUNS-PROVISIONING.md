@@ -100,12 +100,14 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 
 | Env | Default | Bedeutung |
 |---|---|---|
+| `DEVLAB_RUNS_MAX_CONCURRENCY` | `2` | Obergrenze **gleichzeitig** laufender Läufe. Schützt Abo-Kontingent, Rechenzeit und Speicher: ohne Deckel würde ein Schwung ToDos je einen Claude-CLI zugleich starten. Läufe auf **verschiedene** Repos laufen nebenläufig; zwei auf **dasselbe** Repo nie gleichzeitig; ein **automatischer** Lauf (alle Repos) läuft **exklusiv** (startet erst wenn nichts mehr läuft, blockiert Starts währenddessen). Konservativ starten, bei Headroom erhöhen. |
 | `DEVLAB_RUNS_MAX_DURATION` | `4h` | Obergrenze Wall-Clock **pro Lauf-Versuch**. Reststrecke wird auf den nächsten Termin übertragen (nicht neu begonnen). **`0` = AUS (unbegrenzt)** — nicht „keine Läufe"; Läufe stoppt man mit `MODE=off`. |
-| `DEVLAB_RUNS_MAX_COST_USD` | `0` (aus) | Kosten­deckel **pro Versuch** (nicht kumulativ). Weicher Deckel: der laufende Repo überschreitet ggf. um seine eigenen Kosten. Reststrecke wird übertragen. Nur wirksam, wenn der Claude-CLI `total_cost_usd` liefert (bei Abo-Auth ggf. `0` → dann wirkungslos; einmal prüfen). |
+| `DEVLAB_RUNS_MAX_COST_USD` | `0` (aus) | Kosten­deckel **in Summe über alle gleichzeitig laufenden Läufe** einer Welle (nicht je Lauf, nicht kumulativ über Wellen). Weicher Deckel: der gerade laufende Repo überschreitet ggf. um seine eigenen Kosten. Reststrecke wird übertragen. Nur wirksam, wenn der Claude-CLI `total_cost_usd` liefert (bei Abo-Auth ggf. `0` → dann wirkungslos; einmal prüfen). |
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
 | `DEVLAB_RUNS_DEV_BRANCH` | `mercury-dev` | Name des **persistenten dev-Integrationsbranches** je Repo, den der Runner wachsen lässt und den der dev-Deploy ausliefert. Nie der Standard-Branch (aus dem prod bei Merge beliefert wird). |
+| `DEVLAB_RUNS_DRAIN_GRACE` | `30s` | Beim Neustart (`systemctl restart` → SIGTERM) wartet devlabd so lange auf das Auslaufen des aktiven Laufs, bevor es diesen für den Carry-over abbricht. Neue Läufe werden ab der Neustart-Anforderung **gar nicht mehr** gestartet (sie werden eingereiht), unabhängig von diesem Wert. Sollte innerhalb von `TimeoutStopSec` (siehe `devlabd.service`, `120s`) liegen. |
 
 ### Wachsender dev-Stand statt Zusammensetzen
 
@@ -121,9 +123,15 @@ Standard-Branch), zeigt also nur ihre eigenen Änderungen. Zwei bewusste Handlun
   PR; baut spätere Arbeit darauf auf, wird automatisch ein ToDo erzeugt statt geraten).
 - `POST /api/mercury/runs/reset` `{"repo":"owner/name"}` — **ausdrückliches Zurücksetzen** von
   `mercury-dev` auf den Standard-Branch (verwirft den akkumulierten dev-Stand, force-push).
+| `DEVLAB_MERCURY_RUNS_ACTIVE_MARKER` | `<mercury>/runs-active` | Pfad der Datei, die devlabd schreibt, **solange Läufe aktiv sind** (Inhalt = Anzahl). Ein Deploy des `devlab`-Repos verschiebt seinen Neustart, solange sie existiert. Leer = Marker aus. |
+| `DEVLAB_DEPLOY_RUNS_WAIT` | `1800` | (Deploy-Skript) Sekunden, die ein `devlab`-Deploy auf das Ende laufender Läufe wartet, bevor es trotzdem neustartet. `0` = nicht warten. |
 
-> **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
-> klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.
+> **Nebenläufigkeit + aufgeschobener Neustart.** Mehrere Läufe laufen gleichzeitig (Deckel
+> `DEVLAB_RUNS_MAX_CONCURRENCY`); der Kostendeckel `DEVLAB_RUNS_MAX_COST_USD` gilt **in Summe** über die
+> Welle, nicht je Lauf. Solange **irgendein** Lauf arbeitet, hält der Auto-Merge-Pfad einen Self-Deploy
+> zurück und das `devlab`-Deploy-Skript verschiebt den `systemctl restart devlabd` (der Marker **zählt**
+> die aktiven Läufe und wird erst freigegeben, wenn der letzte endet). Für die erste scharfe Nacht:
+> klein anfangen (wenige Repos / ein ToDo, `MAX_CONCURRENCY=1`), Verbrauch beobachten, dann skalieren.
 
 **Empfehlung:** erst `report` gegen einen echten Lauf testen (erzeugt nur Berichte), dann `pr`
 (Branch + PR, nichts wird gemergt/deployt bis du prüfst), erst dann `full`.

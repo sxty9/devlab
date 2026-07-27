@@ -9,7 +9,7 @@ import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, ExecutionList, fmtDateTime, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
 import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
 import { runStage, RUN_STAGE_LABEL } from '@/types';
@@ -295,8 +295,9 @@ export default function TodosView() {
   // What is running right now is SERVER truth (via useActiveRun): `active` drives the per-ToDo live-follow
   // (survives a reload), `inflight` is the transparent list the Aktive-Läufe overview renders. The cancel
   // affordance lives in that overview.
+  // Runs are concurrent, so this is a list; cancel targets one specific run by id.
   const { active, inflight, refetch: refetchActive } = useActiveRun();
-  const [cancelling, setCancelling] = useState(false);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // Runs without a `type` predate ToDos and are automatic runs — they belong to RunsView.
   const reload = useCallback(async () => {
@@ -309,11 +310,11 @@ export default function TodosView() {
     }
   }, [source, toast]);
 
-  // When a run finishes (active clears), refresh so the ToDo's done/last-result state updates.
-  const prevActiveRef = useRef<string | null>(null);
+  // When any run finishes (its id leaves the active set), refresh so ToDos' done/last-result update.
+  const prevActiveRef = useRef<string[]>([]);
   useEffect(() => {
-    const cur = active?.runId ?? null;
-    if (prevActiveRef.current && !cur) void reload();
+    const cur = active.map((a) => a.runId);
+    if (prevActiveRef.current.some((id) => !cur.includes(id))) void reload();
     prevActiveRef.current = cur;
   }, [active, reload]);
 
@@ -341,19 +342,22 @@ export default function TodosView() {
     };
   }, [source, toast]);
 
-  const cancelRun = useCallback(async () => {
-    if (cancelling) return;
-    setCancelling(true);
-    try {
-      await source.mercuryCancelRun();
-      toast({ title: 'Lauf abgebrochen', variant: 'default' });
-      refetchActive();
-    } catch (e) {
-      toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
-    } finally {
-      setCancelling(false);
-    }
-  }, [cancelling, source, toast, refetchActive]);
+  const cancelRun = useCallback(
+    async (runId: string) => {
+      if (cancellingId) return;
+      setCancellingId(runId);
+      try {
+        await source.mercuryCancelRun(runId);
+        toast({ title: 'Lauf abgebrochen', variant: 'default' });
+        refetchActive();
+      } catch (e) {
+        toast({ title: 'Abbrechen fehlgeschlagen', description: msg(e), variant: 'danger' });
+      } finally {
+        setCancellingId(null);
+      }
+    },
+    [cancellingId, source, toast, refetchActive],
+  );
 
   const refresh = useCallback(async () => {
     if (refreshing) return;
@@ -421,7 +425,7 @@ export default function TodosView() {
         key={`${selectedTodo.id}:${selectedTodo.updatedAt}`}
         todo={selectedTodo}
         repos={repos}
-        active={active && active.runId === selectedTodo.id ? active : null}
+        active={active.find((a) => a.runId === selectedTodo.id) ?? null}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
         onRunStarted={refetchActive}
@@ -451,6 +455,12 @@ export default function TodosView() {
             </button>
           ))}
         </div>
+        {active.length > 0 && (
+          <span className="ml-auto flex items-center gap-1.5 text-caption text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+            {active.length === 1 ? '1 Lauf aktiv' : `${active.length} Läufe aktiv`}
+          </span>
+        )}
       </header>
 
       <div className="flex min-h-0 flex-1">
@@ -475,7 +485,8 @@ export default function TodosView() {
                   </Button>
                 </div>
                 {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
-                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancelling} />
+                <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancellingId !== null} />
+
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
@@ -522,6 +533,11 @@ export default function TodosView() {
 
 /** One row in the left list: name, target, due date, plus a disabled pill. The list holds only
  *  never-run ToDos, so no "done" state appears here — executed ToDos live in the History tab. */
+/** A ToDo is only "erledigt" once its work has reached main. While it has open PRs still awaiting their
+ *  merge it is not done yet — it stays in the active list, shown as "wartet auf Merge". */
+const awaitingMerge = (todo: Run) => !todo.done && (todo.pendingPrs?.length ?? 0) > 0;
+
+/** One row in the left list: name, target, due date, plus done/awaiting-merge/disabled pills. */
 function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]; selected: boolean; onSelect: () => void }) {
   return (
     <button
@@ -537,6 +553,15 @@ function TodoRow({ todo, repos, selected, onSelect }: { todo: Run; repos: Repo[]
           {todo.name}
         </span>
         <StageBadge todo={todo} />
+        {todo.done ? (
+          <span className="flex shrink-0 items-center gap-1 rounded bg-success/15 px-1.5 py-0.5 text-caption font-medium text-success">
+            <CheckIcon className="h-3 w-3" /> Erledigt
+          </span>
+        ) : (
+          awaitingMerge(todo) && (
+            <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">wartet auf Merge</span>
+          )
+        )}
         {!todo.enabled && (
           <span className="shrink-0 rounded bg-fill/15 px-1.5 py-0.5 text-caption font-medium text-text-tertiary">deaktiviert</span>
         )}
@@ -677,10 +702,34 @@ function TodoDetail({
             {[todo.model, todo.effort].filter(Boolean).join(' · ')}
           </span>
         )}
+        {awaitingMerge(todo) && (
+          <span className="rounded bg-warning/15 px-1.5 py-0.5 font-medium text-warning">wartet auf Merge</span>
+        )}
         <span>Termin: {dueLabel(todo)}</span>
       </div>
 
       <Authorship className="mt-3" createdBy={todo.createdBy} updatedBy={todo.updatedBy} />
+      {awaitingMerge(todo) && (
+        <section className="mt-4 rounded-card border border-warning/30 bg-warning/5 p-3">
+          <p className="text-footnote text-text-secondary">
+            Umgesetzt — {todo.pendingPrs!.length === 1 ? 'der Pull Request wartet' : 'die Pull Requests warten'} auf den Merge nach main. Erst
+            danach gilt das ToDo als erledigt.
+          </p>
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+            {todo.pendingPrs!.map((pr) => (
+              <a
+                key={`${pr.repo}#${pr.number}`}
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-caption font-medium text-accent hover:underline"
+              >
+                {pr.repo}#{pr.number} öffnen
+              </a>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section className="mt-6">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Aufgabe</p>
@@ -711,10 +760,10 @@ function TodoDetail({
 
       <section className="mt-6 border-t border-separator pt-4">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Ausführungen</p>
-        {isLive && active?.resultId && (
-          <div className="mb-3">
-            <LiveExecution runId={todo.id} resultId={active.resultId} live />
-          </div>
+        {isLive && (
+          <p className="mb-3 flex items-center gap-1.5 text-footnote text-text-secondary">
+            <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Läuft gerade – siehe die Übersicht oben.
+          </p>
         )}
         <ExecutionList runId={todo.id} results={results} />
       </section>

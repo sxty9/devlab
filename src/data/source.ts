@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, ReportDelivery, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -178,17 +178,21 @@ export interface DataSource {
   /** Completed executions (execution history; includes deleted runs). `type` narrows to automatic
    *  runs or ToDos so each surface shows its own; omitted = the global log. */
   mercuryRunExecutions(type?: RunType): Promise<{ executions: RunExecution[] }>;
+  /** Recent delivery records of the daily run-report email (newest day first), so a failed send is
+   *  visible in the UI rather than silent. */
+  mercuryReportStatus(): Promise<{ records: ReportDelivery[] }>;
   /** The Mercury-WIDE assistant: knows axioms, rules, Laufregeln, runs and ToDos. May return a
    *  reviewable run-plan proposal when asked to create/change runs. */
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
-  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
-  mercuryRunNow(id: string): Promise<{ started: boolean }>;
+  /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if it cannot start
+   *  right now (concurrency cap reached, an exclusive auto run holds the floor, or a target repo busy). */
+  mercuryRunNow(id: string): Promise<{ started: boolean; queued?: boolean; message?: string }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
    *  page reload, and polled to follow it live. `inflight` is the transparent list every run currently
    *  being worked (executing + suspended-on-limit) for the "Aktive Läufe" overview. */
-  mercuryRunActive(): Promise<{ active: RunActive | null; inflight: RunInFlight[] }>;
-  /** Abort the run currently in progress (kill-switch). */
-  mercuryCancelRun(): Promise<void>;
+  mercuryRunActive(): Promise<{ active: RunActive[]; inflight: RunInFlight[]; restartPending?: boolean }>;
+  /** Abort ONE specific run in progress by id (kill-switch); the others keep running. */
+  mercuryCancelRun(runId: string): Promise<void>;
 
   // ── ToDo media (images/documents the agent takes into account) ─────────────
   /** Attach one medium (base64) to a ToDo; returns the ToDo's refreshed attachment list. */

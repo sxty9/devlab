@@ -59,6 +59,12 @@ const (
 	// defaultMaxRunDuration caps an entire sweep's wall-clock. Belt-and-braces beside the per-repo
 	// runAgentTimeout: even 19 repos each just under 60m would otherwise run ~19h. 0 via env = off.
 	defaultMaxRunDuration = 4 * time.Hour
+
+	// defaultDrainGrace bounds how long a restart waits for the in-flight run to finish before forcing
+	// it to carry over. Kept short: a run seconds from done finishes cleanly; a long one carries over
+	// and self-heals on the next start — so a restart is never blocked for long, and a hanging run can
+	// never prevent it. Should stay within systemd's TimeoutStopSec (see deploy/devlabd.service).
+	defaultDrainGrace = 30 * time.Second
 )
 
 // agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
@@ -119,6 +125,17 @@ func resumeEnabled() bool {
 	return !strings.EqualFold(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_LIMIT_RESUME")), "off")
 }
 
+// drainGrace reads the restart drain budget from the environment. DEVLAB_RUNS_DRAIN_GRACE overrides;
+// 0/invalid keeps the default.
+func drainGrace() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DRAIN_GRACE")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultDrainGrace
+}
+
 // StartScheduler arms the run scheduler iff configured. Absent config → it logs and stays dormant
 // (the management layer keeps working). Wired from main() with a cancelable context.
 func (s *Server) StartScheduler(ctx context.Context) {
@@ -164,9 +181,28 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
 	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
-	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
-		mode, user, tokenUser, autoMerge, tick)
+	// Startup self-heal: before the ticker runs, re-queue any execution a prior restart/crash interrupted
+	// so it resumes by itself (skipping the repos already done) — no one has to re-trigger it.
+	s.scheduler.Reconcile(s.runResults, strandedWindow)
+	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s drainGrace=%s",
+		mode, user, tokenUser, autoMerge, tick, drainGrace())
 	go s.scheduler.Run(ctx)
+}
+
+// DrainForRestart is the graceful-restart hook wired from main() on SIGTERM: it gates new runs and waits
+// (bounded by the drain grace) for any in-flight run to finish before the process exits. Together with
+// the scheduler's admission gate this makes "a restart proceeds" and "a run begins" mutually exclusive —
+// a restart never kills a run mid-flight, and no run can start once the restart is imminent. A run that
+// outlasts the grace is carried over (it self-heals on the next start), so a restart is never blocked
+// indefinitely. No-op when the scheduler is not armed.
+func (s *Server) DrainForRestart() {
+	if s.scheduler == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drainGrace())
+	defer cancel()
+	s.scheduler.RequestRestart()
+	s.scheduler.AwaitDrain(ctx)
 }
 
 // runExecutor implements runs.Executor: the per-repo pipeline + auto-merge maintenance.
@@ -190,6 +226,10 @@ type runExecutor struct {
 	// token; never point DEVLAB_RUNS_USER at a human account.
 	tokenUser      string
 	autoMergeAfter time.Duration
+
+	// wave is shared by every concurrent Execute so the spend ceiling and the subscription-limit pause
+	// apply in aggregate across all runs, not per run (task point 5).
+	wave runWave
 
 	// IO seams — nil in production (the real GitHub client and deploy pipeline are used). Kept as
 	// fields so the Maintain orchestration (throttled merge-detection → prod-deploy → untrack) can be
@@ -261,6 +301,12 @@ func (x *runExecutor) markDelivery(repo string, number int, status runs.Delivery
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Trigger, report func(resultID string)) (runs.ResultRef, error) {
+	// Join the concurrency wave so the spend ceiling and the subscription-limit pause are shared across
+	// all runs executing right now (task point 5). enter() resets the aggregate budget/limit gate when
+	// this is the first run of a wave; leave() releases it when the run ends.
+	x.wave.enter()
+	defer x.wave.leave()
+
 	// Resume an execution suspended on the usage limit (same ResultID, skip the repos already done), or
 	// start a fresh one. A resume that can't find its open result silently starts fresh.
 	res, resuming := x.resumeOrNew(run)
@@ -372,10 +418,6 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 		save()
 	}
 
-	// Per-ATTEMPT cost budget. The cost ceiling is a per-night cap, not cumulative: it measures spend
-	// since this attempt began, so a carried-over run resumes with a fresh budget and always makes
-	// progress (a cumulative cap would re-trip forever on the loaded res.CostUSD and deadlock).
-	attemptStartCost := res.CostUSD
 	carriedOver := false // true = stop early but DON'T finalise; the next scheduled fire continues this
 	//                      same result (via the stranded-resume path), skipping the repos already done.
 
@@ -383,15 +425,25 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 		if done[repo.ID] {
 			continue // completed in an earlier attempt of this same execution
 		}
-		// Spend ceiling for THIS attempt: stop before starting another expensive repo. Carry over — the
-		// remaining repos continue on the next scheduled run, not redone-from-scratch (which would
-		// duplicate PRs and raise spend). The check is before a repo, so one repo can overshoot by its
-		// own cost (soft cap).
-		if costCeiling > 0 && res.CostUSD-attemptStartCost >= costCeiling {
-			log.Printf("devlabd: run %s hit the per-run cost ceiling ($%.2f this attempt ≥ $%.2f) after %d repos — carrying the rest to the next run",
-				run.ID, res.CostUSD-attemptStartCost, costCeiling, len(res.Repos))
+		// AGGREGATE spend ceiling (task point 5): stop before starting another expensive repo once the
+		// SUM of what all runs in this wave have cost reaches the ceiling — not each run separately. Carry
+		// over so the remaining repos continue on the next run rather than being redone (which would
+		// duplicate PRs and raise spend). Measured per wave, so a carried-over run resumes with a fresh
+		// aggregate budget and always makes progress. Soft cap: a repo already in flight may overshoot.
+		if x.wave.overBudget(costCeiling) {
+			log.Printf("devlabd: run %s stopping — aggregate spend across active runs reached the ceiling ($%.2f ≥ $%.2f) after %d repos — carrying the rest to the next run",
+				run.ID, x.wave.spendSnapshot(), costCeiling, len(res.Repos))
 			carriedOver = true
 			break
+		}
+		// AGGREGATE subscription-limit pause (task point 5): if ANY concurrent run already hit the usage
+		// limit, pause this one too at the shared reset instant instead of calling Claude and re-hitting
+		// the exhausted account. All paused runs get the same ResumeAt, so they resume together.
+		if resumeEnabled() {
+			if tripped, resumeAt := x.wave.limitTripped(); tripped {
+				log.Printf("devlabd: run %s pausing with the wave on the subscription limit — resuming at %s", run.ID, resumeAt.Format(time.RFC3339))
+				return x.suspend(run, &res, resumeAt, save)
+			}
 		}
 		if ctx.Err() != nil {
 			// Distinguish WHY the context ended. Only a DELIBERATE kill-switch abort (Cancel attaches
@@ -412,8 +464,12 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 		res.Live = nil // this repo has settled (about to be recorded, carried over, or retried on a limit)
 		if lim.limited && resumeEnabled() {
 			// The subscription window is exhausted. Do NOT record this repo (it retries on resume) and
-			// do NOT hammer the rest — suspend the whole execution until the window resets.
-			return x.suspend(run, &res, lim, save)
+			// do NOT hammer the rest — suspend the whole execution until the window resets. Trip the wave
+			// gate first so every OTHER concurrent run pauses at the same reset instant and resumes with
+			// this one, rather than each re-hitting the limit on its own (task point 5).
+			resumeAt := limitResumeAt(lim)
+			x.wave.tripLimit(resumeAt)
+			return x.suspend(run, &res, resumeAt, save)
 		}
 		if lim.infra {
 			// Infrastructure failure (DNS/network) — NOT this repo's fault, and a sign the rest will fail
@@ -449,6 +505,7 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 		res.InputTokens += rr.InputTokens
 		res.OutputTokens += rr.OutputTokens
 		res.CostUSD += rr.CostUSD
+		x.wave.addSpend(rr.CostUSD) // count this repo toward the wave's AGGREGATE spend ceiling
 		res.NumTurns += rr.NumTurns
 		if !rr.OK {
 			overallOK = false
@@ -472,7 +529,22 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Tr
 	res.FinishedAt = time.Now().UTC()
 	res.OK = overallOK
 	save()
-	return res.Ref(), nil
+	ref := res.Ref()
+	// A ToDo that opened PRs is not "done" yet — it awaits its merge to main (Maintain flips Done then).
+	ref.PRsOpen = anyOpenPR(res.Repos)
+	return ref, nil
+}
+
+// anyOpenPR reports whether the finished sweep opened at least one pull request (a repo carrying a PR
+// URL). It is the "did this execution leave work awaiting a merge" signal that keeps a ToDo in the
+// active list until the main-merge is through, rather than checking it off the moment a PR is opened.
+func anyOpenPR(repos []runs.RepoResult) bool {
+	for _, rr := range repos {
+		if rr.PRUrl != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // resumeOrNew continues an interrupted execution, or mints a fresh one. Three interruption kinds resume
@@ -537,17 +609,23 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 	log.Printf("devlabd: reaped husk %s/%s — %s", res.RunID, res.ResultID, reason)
 }
 
-// suspend persists the partial execution as paused and returns a suspended ResultRef — UNLESS the resume
-// budget is exhausted, in which case it finalizes the execution as failed and returns a normal ref (so
-// the scheduler clears the suspension and stops retrying).
-func (x *runExecutor) suspend(run runs.Run, res *runs.Result, lim repoSignal, save func()) (runs.ResultRef, error) {
+// limitResumeAt is when a run paused on the subscription usage limit should resume: a small cushion past
+// the reset instant the CLI reported, or a plain backoff when it gave no reset time. Shared by the run
+// that hit the limit and (via the wave gate) every other run pausing with it, so they resume together.
+func limitResumeAt(lim repoSignal) time.Time {
+	if lim.hasReset && lim.resetAt.After(time.Now()) {
+		return lim.resetAt.Add(1 * time.Minute) // a small cushion past the reported reset
+	}
+	return time.Now().Add(limitBackoff())
+}
+
+// suspend persists the partial execution as paused (resuming at resumeAt) and returns a suspended
+// ResultRef — UNLESS the resume budget is exhausted, in which case it finalizes the execution as failed
+// and returns a normal ref (so the scheduler clears the suspension and stops retrying).
+func (x *runExecutor) suspend(run runs.Run, res *runs.Result, resumeAt time.Time, save func()) (runs.ResultRef, error) {
 	attempts := 0
 	if run.Suspended != nil {
 		attempts = run.Suspended.Attempts
-	}
-	resumeAt := time.Now().Add(limitBackoff())
-	if lim.hasReset && lim.resetAt.After(time.Now()) {
-		resumeAt = lim.resetAt.Add(1 * time.Minute) // a small cushion past the reported reset
 	}
 	if attempts+1 > maxResumes() {
 		res.Suspended, res.ResumeAt = false, nil
@@ -1494,6 +1572,12 @@ func dirExists(p string) bool  { fi, err := os.Stat(p); return err == nil && fi.
 // a failed deploy simply retries next eligible tick (never re-merges) — idempotent via untrack-on-
 // success rather than a fragile persisted flag.
 func (x *runExecutor) Maintain(ctx context.Context) {
+	// Self-healing runs every tick, independent of any tracked PR: a wedged run that has blown past the
+	// hard duration ceiling is cancelled so it stops blocking every future trigger, and crash-orphaned
+	// husks are reaped so nothing lingers forever as a running "Leiche". Both keep the pipeline restartable.
+	x.cancelWedgedRun()
+	x.reapOrphanedHusks()
+
 	prs, err := x.s.runPRs.List()
 	if err != nil || len(prs) == 0 {
 		return
@@ -1548,6 +1632,11 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 				x.markDelivery(p.Repo, p.Number, runs.DeliveryClosed)
 			}
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
+			// A PR that reached main (merged) is what checks a ToDo off; a PR CLOSED without merging is a
+			// rejection — the ToDo stays open so it can be restarted, never silently marked done.
+			if cur.Merged {
+				x.markTodoDoneIfAllMerged(p.RunID)
+			}
 		case prMerge:
 			// One merge per repo per tick, whatever the outcome: a failed merge leaves the older PR open
 			// (its queue must wait), and a successful one has just moved the default branch — GitHub needs
@@ -1562,16 +1651,28 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			x.markDelivered(p, true, false)
 			if x.mode != "full" {
 				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
+				x.markTodoDoneIfAllMerged(p.RunID)      // reached main → the ToDo may now be checked off
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
 			x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged) // the PR is merged; prod-deploy follows
 			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
 			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
-			if name := repoNameOf(p.Repo); !x.deployable(name) {
+			name := repoNameOf(p.Repo)
+			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
+			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
+			if !x.deployable(name) {
 				x.markDelivered(p, true, false) // merged; there is simply nothing to ship
 				_ = x.s.runPRs.Remove(p.Repo, p.Number)
+				x.markTodoDoneIfAllMerged(p.RunID) // merged (deploy is a no-op here) → done once all merged
 				log.Printf("devlabd: %s#%d gemerged — %s → untracked", p.Repo, p.Number, noDeployTargetReason(name))
+				continue
+			}
+			// DEFERRED RESTART (task point 4): deploying the self repo restarts devlabd, which would kill
+			// every run still executing IN THIS process. While any run is active, hold the self-deploy off
+			// and keep the PR tracked — the next eligible tick deploys it once the last run has finished.
+			if isSelfRepo(name) && x.s.scheduler != nil && x.s.scheduler.ActiveCount() > 0 {
+				log.Printf("devlabd: self-deploy of %s#%d deferred — %d run(s) active (a restart would kill them)", p.Repo, p.Number, x.s.scheduler.ActiveCount())
 				continue
 			}
 			depLog, derr := x.runProdDeploy(ctx, token, p)
@@ -1581,6 +1682,7 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 			}
 			x.markDelivered(p, true, true)
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // idempotent untrack-on-success
+			x.markTodoDoneIfAllMerged(p.RunID)      // reached main AND shipped → the ToDo may now be checked off
 			log.Printf("devlabd: prod-deployed %s#%d (run %s)", p.Repo, p.Number, p.RunID)
 		case prNone:
 			// full-mode recheck: still open within its window → nothing to do yet.
@@ -1610,6 +1712,111 @@ func (x *runExecutor) markDelivered(p runs.PendingPR, merged, prod bool) {
 		}
 		return cur, nil
 	})
+}
+
+// markTodoDoneIfAllMerged checks a ToDo off ONCE the main-merge is through: called right after one of a
+// run's PRs merges, it verifies NO pending PR of that run remains, and only then flips the ToDo's Done.
+// This is the "in die History erst, wenn der main-Merge durch ist" rule — a ToDo opened as several PRs
+// stays in the active list until the LAST one lands. A no-op for auto runs (they are recurring, never
+// "done") and when the stores are absent.
+func (x *runExecutor) markTodoDoneIfAllMerged(runID string) {
+	if x.s == nil || x.s.runs == nil || x.s.runPRs == nil || runID == "" {
+		return
+	}
+	pending, err := x.s.runPRs.List()
+	if err != nil {
+		return
+	}
+	for _, p := range pending {
+		if p.RunID == runID {
+			return // more of this run's PRs are still awaiting their merge
+		}
+	}
+	_, _ = x.s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
+		for i := range cur {
+			if cur[i].ID == runID && cur[i].IsTodo() && !cur[i].Done {
+				cur[i].Done = true
+				log.Printf("devlabd: ToDo %s abgeschlossen — alle PRs sind auf main gemergt", runID)
+			}
+		}
+		return cur, nil
+	})
+}
+
+// wedgedRunGrace is how far past the hard duration ceiling a run may linger before it is treated as
+// wedged and cancelled. A healthy run self-terminates at maxRunDuration via its own context deadline;
+// only a genuinely stuck one survives past ceiling + grace, and it would otherwise hold the "one run at
+// a time" lock forever, making EVERY future trigger return "es läuft bereits". The grace absorbs clock
+// skew and shutdown lag so a run that is merely finishing up is never cancelled.
+const wedgedRunGrace = 30 * time.Minute
+
+// orphanHuskGrace is how long an unfinished ToDo husk may sit untouched before it is reaped. A crash or
+// devlabd restart mid-run leaves a husk whose steps read "läuft" forever; unlike an auto run (which
+// resumes on its next scheduled fire) a fired-once ToDo has nothing to pick it up, so it is a "Leiche".
+// The grace lets a fast restart resume it first (a manual re-run within the window still continues it).
+const orphanHuskGrace = 15 * time.Minute
+
+// cancelWedgedRun self-heals a stuck run: if the run in flight has blown past the hard duration ceiling
+// by more than the grace, it is cancelled (the existing kill-switch) so it releases the single-run lock
+// and triggers work again. No-op when no ceiling is configured (can't tell wedged from legitimately long)
+// or nothing is running.
+func (x *runExecutor) cancelWedgedRun() {
+	if x.s == nil || x.s.scheduler == nil {
+		return
+	}
+	ceiling := maxRunDuration()
+	if ceiling <= 0 {
+		return
+	}
+	// With concurrent runs, every active one is checked on its own — a single wedged run must not be
+	// judged by, or take down, the others.
+	for _, a := range x.s.scheduler.Active() {
+		if runWedged(a.StartedAt, ceiling, time.Now()) {
+			log.Printf("devlabd: run %s läuft seit %s (> Grenze %s) — als hängend abgebrochen, damit wieder gestartet werden kann",
+				a.RunID, time.Since(a.StartedAt).Round(time.Minute), ceiling)
+			x.s.scheduler.Cancel(a.RunID)
+		}
+	}
+}
+
+// runWedged reports whether a run started at startedAt has exceeded the hard ceiling by more than the
+// grace and is therefore stuck. Pure so the threshold is unit-tested without a live scheduler; a zero
+// ceiling (cap disabled) or zero start is never wedged.
+func runWedged(startedAt time.Time, ceiling time.Duration, now time.Time) bool {
+	if ceiling <= 0 || startedAt.IsZero() {
+		return false
+	}
+	return now.Sub(startedAt) > ceiling+wedgedRunGrace
+}
+
+// reapOrphanedHusks finalizes crash-orphaned ToDo husks so nothing lingers as a running "Leiche" and the
+// ToDo becomes cleanly restartable. Only fire-once ToDos are swept: an auto run resumes a stranded husk on
+// its next scheduled fire, and a suspended run resumes when its window resets — neither is orphaned. The
+// currently-live run is skipped, and only husks untouched past the grace are reaped, so an in-flight or
+// just-restarted resume is never disturbed.
+func (x *runExecutor) reapOrphanedHusks() {
+	if x.s == nil || x.s.runs == nil || x.s.runResults == nil {
+		return
+	}
+	live := map[string]bool{}
+	if x.s.scheduler != nil {
+		for _, a := range x.s.scheduler.Active() {
+			live[a.RunID] = true
+		}
+	}
+	all, err := x.s.runs.List()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-orphanHuskGrace)
+	for _, run := range all {
+		if !run.IsTodo() || live[run.ID] || run.Suspended != nil {
+			continue
+		}
+		if husk, ok := x.s.runResults.FindStaleHusk(run.ID, cutoff); ok {
+			x.reap(husk, "unterbrochen (Absturz/Neustart) — als fehlgeschlagen abgeschlossen; jetzt neu startbar")
+		}
+	}
 }
 
 // prAction is Maintain's decision for one tracked PR after it has been fetched.
@@ -1794,7 +2001,8 @@ func clip(s string) string {
 }
 
 // runNow triggers a run immediately, detached from this request (it can take a long time). Returns at
-// once; the UI polls the run's results. 503 when unconfigured, 409 when a run is already in progress.
+// once; the UI polls the run's results. 503 when unconfigured, 409 when it cannot start right now (the
+// concurrency cap is reached, an exclusive auto run holds the floor, or a target repo is already busy).
 func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert (DEVLAB_RUNS_MODE/DEVLAB_RUNS_USER)")
@@ -1805,11 +2013,20 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	if !s.scheduler.FireNow(id, actor(r)) {
-		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
-		return
+	switch s.scheduler.FireNow(id, actor(r)) {
+	case runs.StartFired:
+		writeJSON(w, http.StatusOK, map[string]bool{"started": true})
+	case runs.StartDeferred:
+		// A restart is draining: the run is NOT started now (nothing may begin once a restart is
+		// imminent) but was queued and starts by itself after the restart. Report it (202) so the
+		// trigger learns a restart is under way — never a silent drop.
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"started": false, "queued": true,
+			"message": "Ein Neustart läuft — der Lauf wurde eingereiht und startet nach dem Neustart automatisch",
+		})
+	default: // runs.StartBusy
+		writeErr(w, http.StatusConflict, "Kann gerade nicht starten — Auslastung erreicht oder ein Ziel-Repository ist belegt; bitte warten")
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
 }
 
 // runActive reports the run executing in THIS process right now — its id, the live result id (once the
@@ -1823,12 +2040,23 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 // resume). `active` stays the minimal projection existing consumers depend on; `inflight` is the enriched
 // list the "Aktive Läufe" overview renders. One endpoint, two portioned views of the same truth — no
 // parallel data path.
+// runActive reports EVERY run executing in THIS process right now — each with its id, name, live result
+// id (once the executor mints it), and start time — or an empty list when nothing runs. It is the single
+// source of truth the UI reads on mount (so running runs survive a page reload) and polls to follow them
+// live: it mirrors actually-alive goroutines, hence correct across reloads and empty after a restart.
+// Cheap (no scheme scan), so it is safe to poll frequently.
 func (s *Server) runActive(w http.ResponseWriter, r *http.Request) {
-	var active *runs.Activity
+	active := []runs.Activity{}
+	restartPending := false
 	if s.scheduler != nil {
 		active = s.scheduler.Active()
+		restartPending = s.scheduler.RestartPending() // so the UI (and a would-be trigger) sees a restart is under way
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"active": active, "inflight": s.assembleInFlight(active)})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":         active,
+		"inflight":       s.assembleInFlight(active),
+		"restartPending": restartPending, // so the UI (and a would-be trigger) sees a restart is under way
+	})
 }
 
 // inFlightRun is one run the system is currently working: either EXECUTING right now (a live goroutine,
@@ -1862,7 +2090,7 @@ type inFlightRun struct {
 // EXECUTING right now (from the live Activity) followed by every SUSPENDED run (paused on the usage
 // limit). Each entry is enriched from its live result document so the overview shows the current
 // repo/step, progress and spend at a glance. Read-only — it never touches scheduling state.
-func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
+func (s *Server) assembleInFlight(active []runs.Activity) []inFlightRun {
 	out := []inFlightRun{}
 	if s.runs == nil {
 		return out
@@ -1876,24 +2104,26 @@ func (s *Server) assembleInFlight(active *runs.Activity) []inFlightRun {
 		byID[r.ID] = r
 	}
 
-	// 1) The run executing right now (at most one — the scheduler runs runs serially).
-	if active != nil {
-		e := inFlightRun{RunID: active.RunID, State: "executing", ResultID: active.ResultID}
-		st := active.StartedAt
+	// 1) Every run executing right now — runs are concurrent, so this is a set, not a single one.
+	executing := map[string]bool{}
+	for _, a := range active {
+		executing[a.RunID] = true
+		e := inFlightRun{RunID: a.RunID, State: "executing", ResultID: a.ResultID}
+		st := a.StartedAt
 		e.StartedAt = &st
-		if run, ok := byID[active.RunID]; ok {
+		if run, ok := byID[a.RunID]; ok {
 			e.RunName = run.Name
 			e.Type = string(runs.NormalizeType(run.Type))
 			e.ReposTotal = todoRepoTotal(run)
 		}
-		s.enrichInFlight(&e, active.RunID, active.ResultID)
+		s.enrichInFlight(&e, a.RunID, a.ResultID)
 		out = append(out, e)
 	}
 
 	// 2) Every run suspended mid-execution on the usage limit — genuinely in flight, just paused. Never
 	//    double-count the executing one (a run cannot be both).
 	for _, run := range all {
-		if run.Suspended == nil || (active != nil && run.ID == active.RunID) {
+		if run.Suspended == nil || executing[run.ID] {
 			continue
 		}
 		e := inFlightRun{
@@ -1947,14 +2177,14 @@ func (s *Server) enrichInFlight(e *inFlightRun, runID, resultID string) {
 	}
 }
 
-// runCancel aborts the run in progress (kill-switch).
+// runCancel aborts ONE specific run in progress (kill-switch) by id — the others keep running.
 func (s *Server) runCancel(w http.ResponseWriter, r *http.Request) {
 	if s.scheduler == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Ausführung ist nicht konfiguriert")
 		return
 	}
-	if !s.scheduler.Cancel() {
-		writeErr(w, http.StatusConflict, "Kein Lauf aktiv")
+	if !s.scheduler.Cancel(r.PathValue("id")) {
+		writeErr(w, http.StatusConflict, "Dieser Lauf ist nicht aktiv")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

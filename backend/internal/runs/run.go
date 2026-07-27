@@ -105,6 +105,15 @@ type Run struct {
 	// While set it OVERRIDES the schedule (the run does not fire on NextFireAt), and the scheduler
 	// resumes the SAME execution — only the not-yet-done repos — once ResumeAt passes.
 	Suspended *Suspension `json:"suspended,omitempty"`
+
+	// StartPending is a persisted "start this as soon as possible" flag that overrides the schedule
+	// (isDue returns true while it is set). It is the queue that survives a restart, set in two cases:
+	//   1. a manual "Jetzt ausführen" that arrived while a restart was draining — it is not started now
+	//      (no run may begin once a restart is imminent) but recorded so it starts by itself afterwards;
+	//   2. startup self-heal — a run whose execution was interrupted by a restart/crash is re-queued so
+	//      it resumes promptly, including a ToDo whose DueAt was already consumed at its first fire.
+	// The scheduler clears it the moment the run actually starts, so it fires exactly once per request.
+	StartPending bool `json:"startPending,omitempty"`
 }
 
 // Suspension records that a run hit the usage limit and should resume automatically. It points at the
@@ -184,6 +193,13 @@ type ResultRef struct {
 	// Who this execution acted for: autonomous, or the person who asked for it.
 	Trigger     Trigger `json:"trigger,omitempty"`
 	RequestedBy string  `json:"requestedBy,omitempty"`
+
+	// PRsOpen marks a FINISHED execution that opened one or more pull requests still awaiting their merge
+	// to main. It gates a ToDo's completion: a ToDo is not "erledigt" the instant its PR is opened — it
+	// stays in the active list until the main-merge is through, at which point Maintain flips Done. It is
+	// meaningless on a suspended/carried-over ref (those are not finished) and false for a report-mode or
+	// no-change execution (nothing to merge → done at once).
+	PRsOpen bool `json:"prsOpen,omitempty"`
 }
 
 // Stage is the furthest rung of the delivery ladder an execution reached. It is derived, never stored:

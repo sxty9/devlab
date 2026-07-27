@@ -303,6 +303,9 @@ export const httpSource: DataSource = {
   async mercuryRunExecutions(type) {
     return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
   },
+  async mercuryReportStatus() {
+    return json(await request('/api/mercury/runs/report-status'));
+  },
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
@@ -312,8 +315,8 @@ export const httpSource: DataSource = {
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
-  async mercuryCancelRun() {
-    await json<void>(await post('/api/mercury/runs/cancel', {}));
+  async mercuryCancelRun(runId) {
+    await json<void>(await post(`/api/mercury/runs/${enc(runId)}/cancel`, {}));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(

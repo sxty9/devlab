@@ -433,6 +433,11 @@ export interface Run {
   nextFireAt?: string;
   lastFiredAt?: string;
   lastResult?: RunResultRef;
+
+  stale?: boolean;
+  // The run's still-open pull requests awaiting their merge to main. While non-empty a ToDo is not yet
+  // "erledigt" — it stays in the active list as "wartet auf Merge" until the last PR lands (then Done).
+  pendingPrs?: { repo: string; number: number; url: string }[];
   // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
   suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
 }
@@ -655,11 +660,13 @@ export interface RunResult {
   requestedBy?: string;
 }
 
-/** The run executing right now, as the server sees it: its id, the live result id, and when it started
- *  — or null when nothing runs. Read on mount (so a running run survives a page reload) and polled to
- *  follow a live run. Reflects an actually-running process, so it is empty again after a server restart. */
+/** One run executing right now, as the server sees it: its id, name, the live result id, and when it
+ *  started. The server reports EVERY active run (they run concurrently); read on mount so running runs
+ *  survive a page reload, and polled to follow them live. Reflects actually-running processes, so the
+ *  list is empty again after a server restart. */
 export interface RunActive {
   runId: string;
+  runName?: string;
   resultId: string;
   startedAt: string;
 }
@@ -729,6 +736,20 @@ export interface RunExecution {
   /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
   trigger?: RunTrigger;
   requestedBy?: string;
+}
+
+/** Delivery record of one day's run-report email to the owner. `status` is 'sent' once the mail
+ *  service accepted it, or 'failed' while a send has errored — surfaced so a failed send is visible,
+ *  not silent, and understood to be retried automatically. */
+export interface ReportDelivery {
+  recipient: string;
+  day: string; // YYYY-MM-DD
+  status: 'sent' | 'failed';
+  executions: number;
+  attempts: number;
+  sentAt?: string;
+  lastAttempt?: string;
+  lastError?: string;
 }
 
 /** One turn of the free-form run-planning chat. */

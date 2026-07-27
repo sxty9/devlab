@@ -806,10 +806,11 @@ export function ExecutionList({ runId, results }: { runId: string; results: RunR
  *  reload (so a just-started run no longer looks like it never started), and it drives the live-follow
  *  view. refetch() forces an immediate re-check — e.g. right after starting a run — so the UI reacts
  *  without waiting for the next tick. Reflects an actually-running process: empty again after a restart. */
-export function useActiveRun(): { active: RunActive | null; inflight: RunInFlight[]; refetch: () => void } {
+export function useActiveRun(): { active: RunActive[]; inflight: RunInFlight[]; restartPending: boolean; refetch: () => void } {
   const source = useMemo(() => getDataSource(), []);
-  const [active, setActive] = useState<RunActive | null>(null);
+  const [active, setActive] = useState<RunActive[]>([]);
   const [inflight, setInflight] = useState<RunInFlight[]>([]);
+  const [restartPending, setRestartPending] = useState(false);
   const [bump, setBump] = useState(0);
 
   useEffect(() => {
@@ -821,6 +822,7 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
         if (!cancelled) {
           setActive(r.active);
           setInflight(r.inflight ?? []);
+          setRestartPending(!!r.restartPending);
         }
       } catch {
         /* transient — keep the last known state */
@@ -837,7 +839,7 @@ export function useActiveRun(): { active: RunActive | null; inflight: RunInFligh
     };
   }, [source, bump]);
 
-  return { active, inflight, refetch: useCallback(() => setBump((b) => b + 1), []) };
+  return { active, inflight, restartPending, refetch: useCallback(() => setBump((b) => b + 1), []) };
 }
 
 /** Poll a run's result document, following it live while `live` (every 2s); once it settles it fetches
@@ -1003,7 +1005,7 @@ function OverviewRow({ row, selected, onSelect }: { row: RunInFlight; selected: 
 
 /** The right pane of the overview: the focused run as a live session — its title, a kill-switch while it
  *  executes, and the moving pipeline (the agent's live transcript opens in-place). */
-function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: () => void; cancelling: boolean }) {
+function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel: (runId: string) => void; cancelling: boolean }) {
   const executing = row.state === 'executing';
   return (
     <div className="flex min-h-0 flex-col gap-3">
@@ -1011,7 +1013,7 @@ function RunSession({ row, onCancel, cancelling }: { row: RunInFlight; onCancel:
         <h3 className="min-w-0 flex-1 truncate text-body font-semibold text-text-primary">{row.runName || 'Lauf'}</h3>
         <TypeChip type={row.type} />
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+          <Button variant="danger" size="sm" disabled={cancelling} onClick={() => onCancel(row.runId)}>
             {cancelling ? 'Bricht ab…' : 'Abbrechen'}
           </Button>
         )}
@@ -1058,7 +1060,7 @@ export function ActiveRunsOverview({
   className,
 }: {
   inflight: RunInFlight[];
-  onCancel: () => void;
+  onCancel: (runId: string) => void;
   cancelling: boolean;
   className?: string;
 }) {
@@ -1104,7 +1106,12 @@ export function ActiveRunsOverview({
           <span className="truncate">{summary}</span>
         </button>
         {executing && (
-          <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+          <Button
+            variant="danger"
+            size="sm"
+            disabled={cancelling}
+            onClick={() => onCancel(inflight.find((r) => r.state === 'executing')!.runId)}
+          >
             {cancelling ? 'Bricht ab…' : 'Abbrechen'}
           </Button>
         )}
