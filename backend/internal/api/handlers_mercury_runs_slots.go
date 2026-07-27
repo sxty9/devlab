@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"devlab/backend/internal/runs"
@@ -217,64 +218,95 @@ func (s *Server) markRunDueNow(id string) {
 	})
 }
 
-// runConfig reports the runs subsystem's live configuration: the number of execution slots in effect and
-// the env/default seed (so the UI can show what a reset would fall back to). This is the service's config
-// interface (req 13) — the setting belongs to the central configuration, not the env of the host.
+// runConfig reports the runs subsystem's live configuration: the number of execution slots and the default
+// per-repo time budget in effect, each with the env/default seed a reset falls back to and whether a UI
+// value is set. This is the service's config interface (req 13) — both settings belong to the central
+// configuration, not the env of the host.
 func (s *Server) runConfig(w http.ResponseWriter, r *http.Request) {
-	effective := 0
+	s.writeRunConfig(w)
+}
+
+// writeRunConfig emits the current runs configuration — shared by the GET report and the PUT result so the
+// two never diverge. Both knobs report the same triple: the value in effect, the env/default seed a reset
+// falls back to, and whether a UI value is set (vs. running on the seed).
+func (s *Server) writeRunConfig(w http.ResponseWriter) {
+	slots := 0
 	if s.scheduler != nil {
-		effective = s.scheduler.Capacity()
+		slots = s.scheduler.Capacity()
 	}
-	configured := 0
+	slotConfigured, budgetConfigured := 0, ""
 	if s.runSettings != nil {
 		if rs, err := s.runSettings.Get(); err == nil {
-			configured = rs.MaxConcurrent
+			slotConfigured = rs.MaxConcurrent
+			budgetConfigured = strings.TrimSpace(rs.AgentTimeout)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"maxConcurrent":     effective,          // slots currently in effect
-		"maxConcurrentSeed": maxConcurrentSeed(), // the env/default fallback when nothing is configured
-		"configured":        configured != 0,     // whether a UI value is set (vs. running on the seed)
+		"maxConcurrent":        slots,                                                // slots currently in effect
+		"maxConcurrentSeed":    maxConcurrentSeed(),                                  // the env/default fallback
+		"configured":           slotConfigured != 0,                                  // a UI slot value is set
+		"timeBudget":           humanizeDuration(agentTimeoutDefault(s.runSettings)), // the default budget in force
+		"timeBudgetSeed":       humanizeDuration(runAgentTimeout()),                  // env/built-in default fallback
+		"timeBudgetConfigured": budgetConfigured != "",                               // a UI default value is set
 	})
 }
 
-// runSetConfig sets the number of execution slots from the UI (req 13). It persists the value AND applies
-// it to the running scheduler at once — a raise starts waiting runs immediately, a lower drains naturally
-// — without a restart. maxConcurrent<=0 clears the setting, reverting to the env/default seed.
+// runSetConfig sets the runs configuration from the UI (req 13): the number of execution slots and/or the
+// default per-repo time budget. Each field is optional — only the fields present in the body change, so the
+// two knobs are edited independently and one editor never clobbers the other. The slot count is applied to
+// the running scheduler at once — a raise starts waiting runs, a lower drains — without a restart; the
+// budget default needs no push, since budgetFor reads the store live on every run (referenced-not-copied).
+// A slot count <=0 or an empty budget clears that setting, reverting it to the env/default seed.
 func (s *Server) runSetConfig(w http.ResponseWriter, r *http.Request) {
 	if s.runSettings == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Einstellungen sind nicht verfügbar")
 		return
 	}
 	var body struct {
-		MaxConcurrent int `json:"maxConcurrent"`
+		MaxConcurrent *int    `json:"maxConcurrent"`
+		TimeBudget    *string `json:"timeBudget"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if body.MaxConcurrent > runMaxSlots {
+	if body.MaxConcurrent != nil && *body.MaxConcurrent > runMaxSlots {
 		writeErr(w, http.StatusBadRequest, "die Zahl der Plätze ist zu hoch")
 		return
 	}
+	budgetCanon := ""
+	if body.TimeBudget != nil {
+		bc, ok := canonicalizeBudget(*body.TimeBudget)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "ungültiges Zeitbudget (z. B. 2h, 90m — oder „off“ für kein Limit)")
+			return
+		}
+		budgetCanon = bc
+	}
 	if _, err := s.runSettings.Set(func(rs *runs.RunSettings) {
-		if body.MaxConcurrent < 1 {
-			rs.MaxConcurrent = 0 // clear → fall back to the env/default seed
-		} else {
-			rs.MaxConcurrent = body.MaxConcurrent
+		if body.MaxConcurrent != nil {
+			if *body.MaxConcurrent < 1 {
+				rs.MaxConcurrent = 0 // clear → fall back to the env/default seed
+			} else {
+				rs.MaxConcurrent = *body.MaxConcurrent
+			}
+		}
+		if body.TimeBudget != nil {
+			rs.AgentTimeout = budgetCanon // "" clears → fall back to the env/default seed
 		}
 	}); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Einstellung konnte nicht gespeichert werden")
 		return
 	}
-	// Apply live. A cleared value reverts to the seed.
-	effective := body.MaxConcurrent
-	if effective < 1 {
-		effective = maxConcurrentSeed()
-	}
-	if s.scheduler != nil {
+	// Apply the slot count live (a cleared value reverts to the seed). The budget default is read live per
+	// run, so it needs no push here.
+	if body.MaxConcurrent != nil && s.scheduler != nil {
+		effective := *body.MaxConcurrent
+		if effective < 1 {
+			effective = maxConcurrentSeed()
+		}
 		s.scheduler.SetCapacity(effective)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"maxConcurrent": effective})
+	s.writeRunConfig(w)
 }
 
 // runMaxSlots is a sanity ceiling on the configured slot count — high enough to never bind in practice,

@@ -207,6 +207,81 @@ func TestRunConfigSetGetLive(t *testing.T) {
 	}
 }
 
+// TestRunConfigTimeBudgetDefault: the per-repo time-budget DEFAULT is set/read at the same central config
+// surface as the slot cap. Setting it persists (canonicalized) and GET reports it as the default in force;
+// an empty value clears it back to the env/built-in seed; a no-cap "off" is accepted; garbage is rejected;
+// and editing one knob never clobbers the other.
+func TestRunConfigTimeBudgetDefault(t *testing.T) {
+	t.Setenv("DEVLAB_MERCURY_RUNS_SETTINGS", filepath.Join(t.TempDir(), "settings.json"))
+	// env seed unset → the built-in 3h default is the seed.
+	store := seedRunsStore(t, nil)
+	sched := runs.NewScheduler(store, &slotGate{release: make(chan struct{})}, time.Second, 2)
+	s := &Server{runs: store, runSettings: runs.NewSettingsStore(), scheduler: sched}
+
+	put := func(body string) int {
+		rec := httptest.NewRecorder()
+		s.runSetConfig(rec, httptest.NewRequest(http.MethodPut, "/api/mercury/runs/config", strings.NewReader(body)))
+		return rec.Code
+	}
+	get := func() string {
+		rec := httptest.NewRecorder()
+		s.runConfig(rec, httptest.NewRequest(http.MethodGet, "/api/mercury/runs/config", nil))
+		return rec.Body.String()
+	}
+
+	// Nothing configured → the seed (3h) is the default in force, not marked as a UI override.
+	if body := get(); !strings.Contains(body, "\"timeBudget\":\"3h\"") ||
+		!strings.Contains(body, "\"timeBudgetSeed\":\"3h\"") || !strings.Contains(body, "\"timeBudgetConfigured\":false") {
+		t.Errorf("fresh config should show the 3h seed default, got %s", body)
+	}
+
+	// Set a 90m default → persisted canonical ("90m"), reported as the humanized default in force ("1h30m").
+	if code := put(`{"timeBudget":"90m"}`); code != http.StatusOK {
+		t.Fatalf("set time budget = %d, want 200", code)
+	}
+	if rs, _ := s.runSettings.Get(); rs.AgentTimeout != "90m" {
+		t.Errorf("the default must persist canonical, got %q", rs.AgentTimeout)
+	}
+	if body := get(); !strings.Contains(body, "\"timeBudget\":\"1h30m\"") || !strings.Contains(body, "\"timeBudgetConfigured\":true") {
+		t.Errorf("GET should reflect the 1h30m default + configured, got %s", body)
+	}
+
+	// A no-cap default is accepted and read back as "off".
+	if code := put(`{"timeBudget":"off"}`); code != http.StatusOK {
+		t.Fatalf("set no-cap = %d, want 200", code)
+	}
+	if body := get(); !strings.Contains(body, "\"timeBudget\":\"off\"") {
+		t.Errorf("GET should reflect the no-cap default, got %s", body)
+	}
+
+	// Clearing reverts to the seed.
+	if code := put(`{"timeBudget":""}`); code != http.StatusOK {
+		t.Fatalf("clear = %d, want 200", code)
+	}
+	if body := get(); !strings.Contains(body, "\"timeBudget\":\"3h\"") || !strings.Contains(body, "\"timeBudgetConfigured\":false") {
+		t.Errorf("clearing should revert to the seed, got %s", body)
+	}
+
+	// Garbage is rejected, never silently defaulted.
+	if code := put(`{"timeBudget":"soon"}`); code != http.StatusBadRequest {
+		t.Errorf("an unparseable budget must be rejected, got %d", code)
+	}
+
+	// The two knobs are independent: setting the budget must not disturb a configured slot count.
+	if code := put(`{"maxConcurrent":5}`); code != http.StatusOK {
+		t.Fatalf("set slots = %d, want 200", code)
+	}
+	if code := put(`{"timeBudget":"2h"}`); code != http.StatusOK {
+		t.Fatalf("set budget = %d, want 200", code)
+	}
+	if rs, _ := s.runSettings.Get(); rs.MaxConcurrent != 5 || rs.AgentTimeout != "2h" {
+		t.Errorf("editing one knob must not clobber the other, got slots=%d budget=%q", rs.MaxConcurrent, rs.AgentTimeout)
+	}
+	if sched.Capacity() != 5 {
+		t.Errorf("the slot cap must survive a budget-only edit, Capacity=%d", sched.Capacity())
+	}
+}
+
 func contains(xs []string, v string) bool {
 	for _, x := range xs {
 		if x == v {
