@@ -38,12 +38,14 @@ type Server struct {
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
+	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
 	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
 	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
 	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
 	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
 	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
 	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
+	runExec     *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
 	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
@@ -82,6 +84,7 @@ func New(v *auth.Verifier) *Server {
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
 		runNotices:  runs.NewNoticeStore(),
+		deliveries:  runs.NewDeliveryStore(),
 		attachments: runs.NewAttachmentStore(),
 		axiomChecks: runs.NewAxiomChecks(),
 		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
@@ -251,6 +254,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/notices", s.guard(s.runsNoticesList))
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
+	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
 	mux.HandleFunc("GET /api/mercury/runs/{id}", s.guard(s.runGet))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
@@ -265,6 +269,9 @@ func (s *Server) Handler() http.Handler {
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
 	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
+	// Deliveries: roll back a shipped delivery (counter-booking), or reset a repo's dev branch to default.
+	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))
+	mux.HandleFunc("POST /api/mercury/runs/reset", s.guardCSRF(s.runRepoReset))
 
 	// ToDo media — images/documents attached to a concrete ToDo, materialized into the agent's
 	// workspace at run time so the AI considers them. Upload/remove mutate (CSRF); raw serves bytes.

@@ -18,6 +18,73 @@ func tempPRStore(t *testing.T) *runs.PRStore {
 	return runs.NewPRStore()
 }
 
+// tempDeliveryStore builds a DeliveryStore backed by a throwaway file.
+func tempDeliveryStore(t *testing.T) *runs.DeliveryStore {
+	t.Helper()
+	t.Setenv("DEVLAB_MERCURY_RUNS_DELIVERIES", filepath.Join(t.TempDir(), "deliveries.json"))
+	return runs.NewDeliveryStore()
+}
+
+// TestMaintainMarksDeliveryMerged pins the ledger mirror: when Maintain sees a delivery's PR merged, it
+// flips the delivery to merged so LatestOpen (the stacked-PR base) stops pointing at it — the next
+// delivery then stacks on the newest STILL-open predecessor (or the default branch), never a merged one.
+func TestMaintainMarksDeliveryMerged(t *testing.T) {
+	now := time.Now()
+	prs := tempPRStore(t)
+	if err := prs.Add(runs.PendingPR{Repo: "o/x", Number: 7, MergeBy: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deliv := tempDeliveryStore(t)
+	if err := deliv.Add(runs.Delivery{ID: "d1", Repo: "o/x", Branch: "mercury-run/d1", PRNumber: 7, Status: runs.DeliveryOpen, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runPRs: prs, deliveries: deliv}, mode: "full", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: true, State: "closed"}, nil
+		},
+		prodDeployFn:   func(context.Context, string, runs.PendingPR) (string, error) { return "ok", nil },
+		deployTargetFn: func(string) bool { return true },
+	}
+
+	x.Maintain(context.Background())
+
+	if d, _, _ := deliv.Get("d1"); d.Status != runs.DeliveryMerged {
+		t.Errorf("delivery status = %q, want merged after its PR merged", d.Status)
+	}
+	if _, ok, _ := deliv.LatestOpen("o/x"); ok {
+		t.Errorf("a merged delivery must not remain the stacked-PR base")
+	}
+}
+
+// TestMaintainMarksDeliveryClosed pins the withdrawn path: a PR closed WITHOUT merging closes its
+// delivery (it is no longer an eligible stacked base).
+func TestMaintainMarksDeliveryClosed(t *testing.T) {
+	now := time.Now()
+	prs := tempPRStore(t)
+	if err := prs.Add(runs.PendingPR{Repo: "o/x", Number: 8, MergeBy: now.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	deliv := tempDeliveryStore(t)
+	if err := deliv.Add(runs.Delivery{ID: "d2", Repo: "o/x", Branch: "mercury-run/d2", PRNumber: 8, Status: runs.DeliveryOpen, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	x := &runExecutor{
+		s: &Server{runPRs: prs, deliveries: deliv}, mode: "pr", tokenUser: "owner",
+		tokenFn: func(string) (string, error) { return "tok", nil },
+		getPRFn: func(context.Context, string, string, int) (github.PullRequest, error) {
+			return github.PullRequest{Merged: false, State: "closed"}, nil // closed without merge
+		},
+	}
+
+	x.Maintain(context.Background())
+
+	if d, _, _ := deliv.Get("d2"); d.Status != runs.DeliveryClosed {
+		t.Errorf("delivery status = %q, want closed after its PR was closed unmerged", d.Status)
+	}
+}
+
 // ─── Pure decision helpers ─────────────────────────────────────────────────
 
 // TestShouldCheckPR pins Finding A's read-budget discipline: report/pr never touch an in-window PR

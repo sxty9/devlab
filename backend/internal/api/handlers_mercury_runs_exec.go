@@ -136,7 +136,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 		log.Printf("devlabd: runs scheduler OFF under dev-bypass")
 		return
 	}
-	if s.runs == nil || s.runResults == nil || s.runPRs == nil || s.links == nil {
+	if s.runs == nil || s.runResults == nil || s.runPRs == nil || s.deliveries == nil || s.links == nil {
 		log.Printf("devlabd: runs scheduler OFF — stores unavailable")
 		return
 	}
@@ -162,6 +162,7 @@ func (s *Server) StartScheduler(ctx context.Context) {
 	// the background rollout so both agree on which account pushes.
 	tokenUser := runnerTokenUser()
 	x := &runExecutor{s: s, mode: mode, user: user, tokenUser: tokenUser, autoMergeAfter: autoMerge}
+	s.runExec = x // also drives rollback/reset (POST /deliveries/{id}/rollback, /repos/reset)
 	s.scheduler = runs.NewScheduler(s.runs, x, tick)
 	log.Printf("devlabd: runs scheduler ENABLED — mode=%s user=%s tokenUser=%s automerge=%s tick=%s",
 		mode, user, tokenUser, autoMerge, tick)
@@ -181,7 +182,7 @@ type runExecutor struct {
 	// token belongs to a real linked account (the owner). DEVLAB_RUNS_TOKEN_USER sets it; it
 	// defaults to user.
 	//
-	// WARNING: user is the WORKSPACE owner, and executeRepo calls ResetToRemote (git reset --hard +
+	// WARNING: user is the WORKSPACE owner, and executeRepo runs CleanWorktree (git reset --hard HEAD +
 	// clean -fdx) on /var/lib/devlab/workspaces/<user>/<repo> before every run. The DevLab IDE keys
 	// its OWN workspace by the logged-in username under the same path. So DEVLAB_RUNS_USER must be a
 	// DEDICATED account (devlab-runs) that no human ever uses interactively — otherwise a nightly run
@@ -200,6 +201,15 @@ type runExecutor struct {
 	// deployTargetFn stubs the deploy allowlist lookup, whose real answer depends on root-owned files in
 	// /etc that a test can neither create nor rely on.
 	deployTargetFn func(repoName string) bool
+
+	// Rollback/reset seams — the git counter-booking runs against a real per-user workspace (sudo), and
+	// the PR ops hit GitHub; both are stubbed in tests so the rollback DECISION logic (conflict → ToDo,
+	// merged → reversing PR, open → close PR) is exercised deterministically.
+	counterBookFn func(ctx context.Context, token string, d runs.Delivery, reversalBranch string) (counterBookResult, error)
+	createPRFn    func(ctx context.Context, token, fullName, head, base, title, body string) (github.PullRequest, error)
+	closePRFn     func(ctx context.Context, token, fullName string, number int) error
+	commentPRFn   func(ctx context.Context, token, fullName string, number int, body string) error
+	resetRepoFn   func(ctx context.Context, token string, repo model.Repo) (string, error)
 }
 
 // token / fetchPR / mergePR / runProdDeploy dispatch to the injected seam when present, else the real
@@ -238,6 +248,16 @@ func (x *runExecutor) deployable(repoName string) bool {
 		return x.deployTargetFn(repoName)
 	}
 	return hasDeployTarget(repoName)
+}
+
+// markDelivery mirrors a PR outcome onto the delivery ledger (merged/closed), so LatestOpen — the
+// stacked-PR base — never points at an already-merged predecessor. A no-op when the ledger is absent
+// (older setups / tests) or the PR predates it.
+func (x *runExecutor) markDelivery(repo string, number int, status runs.DeliveryStatus) {
+	if x.s == nil || x.s.deliveries == nil {
+		return
+	}
+	_, _, _ = x.s.deliveries.SetStatusByPR(repo, number, status)
 }
 
 func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(resultID string)) (runs.ResultRef, error) {
@@ -570,10 +590,10 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		saver.force()
 	}
 
-	// NOTE: a repo with an open Mercury PR is NEVER skipped. The run proceeds normally; it just bases its
-	// work on main + the still-open pending PRs (see the run-branch setup below), so the agent sees not-yet-
-	// merged work as present and does not redo it, while still implementing whatever a (possibly different-
-	// axiom) run still needs.
+	// NOTE: a repo with an open Mercury PR is NEVER skipped, and its not-yet-merged work is never redone.
+	// The run builds on the persistent dev branch (mercury-dev), which already CARRIES every prior
+	// delivery — so the agent sees not-yet-merged work as present without any PR-folding step (see the dev
+	// branch setup below).
 
 	// Clone (first run only; Ensure is a no-op once cloned). Retry a few times on a connectivity blip
 	// before giving up, and tell a network failure apart from a broken repo: a network failure carries
@@ -613,18 +633,52 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 	ex := workspace.Executor{User: x.user, PerUser: true}
 
-	// Ensure() returns an ALREADY-CLONED workspace untouched — it never fetches. Without this the
-	// runner analyses the snapshot taken at first clone (and in pr/full mode branches off a stale
-	// origin/<branch>), so nightly runs silently work against outdated code and never see anything
-	// pushed since. Refresh to the real remote state before the agent looks at it. Network-classified so
-	// a fetch failure carries over rather than failing the repo.
+	devBranch := devBranchName()
+	rr.DevBranch = devBranch // the delivered state is always nameable (req 2), even when this run adds nothing
+
+	// GROW, don't reconstruct. Sit on the persistent per-repo dev branch (mercury-dev) — the accumulated
+	// state of every previous run — instead of hard-resetting to the default branch. This is the SINGLE
+	// way a state comes to be: prior not-yet-merged work is already present because the dev branch carries
+	// it, so the old "fold the open PRs in before building" special case is gone (removed with
+	// openMercuryPRHeads). EnsureDevBranch fetches too, so a connectivity failure carries the sweep over.
+	var devCreated bool
 	if err := retryInfra(ctx, 3, 10*time.Second, func() error {
-		return ex.ResetToRemote(ctx, wt, token, branch)
+		c, e := ex.EnsureDevBranch(ctx, wt, token, branch, devBranch)
+		devCreated = c
+		return e
 	}); err != nil {
 		if isInfraError(err) {
-			return rr, repoSignal{infra: true, infraErr: "workspace aktualisieren " + repo.ID + ": " + err.Error()}
+			return rr, repoSignal{infra: true, infraErr: "dev-Branch vorbereiten " + repo.ID + ": " + err.Error()}
 		}
-		rr.Error = "workspace aktualisieren: " + err.Error()
+		rr.Error = "dev-Branch vorbereiten: " + err.Error()
+		return rr, repoSignal{}
+	}
+	// Hygiene without loss of history: clear an aborted run's half-changes (uncommitted edits + untracked
+	// files); the branch pointer — and the accumulated history — is untouched (req 4).
+	if err := ex.CleanWorktree(ctx, wt); err != nil {
+		rr.Error = "Arbeitsbaum säubern: " + err.Error()
+		return rr, repoSignal{}
+	}
+	startTip, err := ex.RevParse(ctx, wt, "HEAD")
+	if err != nil {
+		rr.Error = "dev-Tip ermitteln: " + err.Error()
+		return rr, repoSignal{}
+	}
+	// Fold the default branch INTO the dev state (never reset the state onto it — req 1). A conflict is
+	// non-fatal: the state simply keeps going without the very newest default until a run resolves it.
+	if err := ex.FoldInBranch(ctx, wt, branch); err != nil {
+		if errors.Is(err, workspace.ErrMergeConflict) {
+			step("fold", "Standard-Branch "+branch+" nicht konfliktfrei einfaltbar — dev-Stand ohne die neuesten "+branch+"-Änderungen fortgeführt", false)
+		} else {
+			rr.Error = "Standard-Branch einfalten: " + err.Error()
+			return rr, repoSignal{}
+		}
+	}
+	// The delivery base is the dev tip AFTER the fold, so a delivery's range is exactly the agent's own
+	// linear commits (no fold merge) — the range a counter-booking later reverses.
+	deliveryBase, err := ex.RevParse(ctx, wt, "HEAD")
+	if err != nil {
+		rr.Error = "Lieferungs-Basis ermitteln: " + err.Error()
 		return rr, repoSignal{}
 	}
 
@@ -641,7 +695,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 	defer cancel()
 
-	// REPORT: read-only plan; no branch, no writes, no push, no deploy.
+	// REPORT: read-only plan against the dev state; no push, no deploy, no delivery.
 	if x.mode == "report" {
 		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
 		if lim.limited {
@@ -652,63 +706,14 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			return rr, repoSignal{}
 		}
 		applyUsage(&rr, final) // the agent's report already streamed into the analyze step
+		if tip, e := ex.RevParse(ctx, wt, "HEAD"); e == nil {
+			rr.DevCommit = tip
+		}
 		rr.OK = true
 		return rr, repoSignal{}
 	}
 
-	// PR / FULL: implement on a fresh run branch. The name follows Mercury's uniform convention
-	// <kind>/<description> (e.g. feature/dark_mode-k3f9a2): kind is fix, or feature for a newly planned
-	// service; description is the run's own name (its AI-optimized form when the raw name was too thin),
-	// slugified. A short token keeps each firing's branch unique — the workspace is reused and the push is
-	// non-forced, so a stable name would collide on switch -c and on a non-fast-forward push.
-	branchDesc := run.Name
-	if run.BranchDesc != "" {
-		branchDesc = run.BranchDesc
-	}
-	runBranch := runs.BranchName(runs.BranchKindFor(isNewRepo), branchDesc, runs.NewBranchToken())
-	if err := ex.CreateBranch(ctx, wt, runBranch, "origin/"+branch); err != nil {
-		rr.Error = "branch: " + err.Error()
-		return rr, repoSignal{}
-	}
-	if err := ex.Checkout(ctx, wt, runBranch); err != nil {
-		rr.Error = "checkout: " + err.Error()
-		return rr, repoSignal{}
-	}
-
-	// Base the run on main + the still-open pending Mercury PRs (NOT a skip). Fold each open Mercury run
-	// branch into this run branch so the agent sees not-yet-merged work as already present and does not
-	// redo it — while still implementing whatever else this (possibly different-axiom) run needs. A PR
-	// branch that no longer merges cleanly is skipped with a logged note; the run still proceeds. ToDos
-	// keep a plain main base (they are explicit, targeted tasks). report mode never reaches here.
-	if !run.IsTodo() {
-		if heads := x.openMercuryPRHeads(ctx, token, repo.FullName); len(heads) > 0 {
-			_ = ex.Fetch(ctx, wt, token) // refresh the pending PR branches before merging
-			merged := 0
-			for _, h := range heads {
-				if h == runBranch {
-					continue
-				}
-				if err := ex.MergeRef(ctx, wt, "origin/"+h); err != nil {
-					step("pending-pr", "offener PR-Branch "+h+" nicht konfliktfrei mergebar — ohne ihn fortgefahren: "+err.Error(), false)
-					continue
-				}
-				merged++
-			}
-			if merged > 0 {
-				step("pending-prs", fmt.Sprintf("Base = main + %d offene(r) Mercury-PR(s) berücksichtigt — keine Doppelarbeit", merged), true)
-			}
-		}
-	}
-
-	// The run's base AFTER folding in the pending PRs. New work is measured against THIS tip (not plain
-	// origin/main), so a run that only re-surfaces already-pending changes contributes nothing new and
-	// opens no redundant PR; only genuine additions from this run get pushed.
-	baseTip, err := ex.RevParse(ctx, wt, "HEAD")
-	if err != nil {
-		rr.Error = "Base-Tip ermitteln: " + err.Error()
-		return rr, repoSignal{}
-	}
-
+	// PR / FULL: implement ON the dev branch (it already carries the accumulated work).
 	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
@@ -736,36 +741,39 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		}
 	}
 
-	// Measure what THIS run added on top of the base (main + pending PRs), not on top of plain main — so
-	// a run that only reproduced already-pending work contributes nothing new and opens no redundant PR.
-	ahead, err := ex.CommitsAhead(ctx, wt, baseTip)
+	finalTip, err := ex.RevParse(ctx, wt, "HEAD")
+	if err != nil {
+		rr.Error = "dev-Tip ermitteln: " + err.Error()
+		return rr, repoSignal{}
+	}
+	rr.DevCommit = finalTip
+
+	// A DELIVERY is the runner's own work: the commits the agent added on top of the delivery base (the
+	// fold). devAdvanced is broader — the dev branch moved AT ALL (agent work and/or a folded-in default
+	// branch), i.e. there is a new state to serve on dev. A brand-new dev branch always counts.
+	deliveryCommits, err := ex.CommitsAhead(ctx, wt, deliveryBase)
 	if err != nil {
 		rr.Error = "Commits zählen: " + err.Error()
 		return rr, repoSignal{}
 	}
-	if ahead == 0 {
-		step("implement", "keine neuen Änderungen über main + pending PRs hinaus — nichts zu pushen", true)
+	hasDelivery := deliveryCommits > 0
+	devAdvanced := devCreated || finalTip != startTip
+
+	if !devAdvanced {
+		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", true)
 		rr.OK = true
 		return rr, repoSignal{}
 	}
 
-	// DEV-DEPLOY (full mode only) — BEFORE the push, deliberately. dev is the very box we built on, so
-	// this workspace and its run branch already ARE the source record for the code going live here;
-	// there is no "live code with no source" risk that the old push-first ordering guarded against.
-	// That invariant still holds for PROD, which is no longer touched here at all — a prod-deploy is
-	// driven only by a MERGED PR in Maintain, where the pushed branch + merge are the durable record
-	// before anything ships to the VPS.
+	// DEV-DEPLOY (full mode only) — delivers EXACTLY the dev branch: nothing folded together, filtered or
+	// skipped (req 2). BEFORE the push, deliberately: dev is the very box we built on, so this workspace
+	// already IS the source record. PROD is untouched here — it ships only from a MERGED default branch
+	// (Maintain, req 6).
 	//
-	// Finding C: the build runs UNPRIVILEGED here (buildArtifact, as the runner itself); the root
-	// wrapper only installs+restarts a prebuilt artifact, never builds. Finding B: the self repo is
-	// NEVER dev-deployed — restarting THIS devlabd would kill the running sweep; its PR still lands and
-	// its deploy happens out-of-band (its prod-deploy, which restarts the VPS not the runner, is fine
-	// via Maintain). A dev-deploy failure is NON-fatal: we log the step and still push + open the PR.
-	//
-	// EVERY full-mode repo records a dev-deploy step, including one that is skipped: an omitted step reads
-	// as "never attempted" in the pipeline view, which is how a whole disabled half of the pipeline stayed
-	// invisible. A skip that is expected (self repo, switched off, no deploy target) is a SUCCESSFUL step
-	// carrying its reason; only a real build/install failure is red.
+	// Finding C: the build runs UNPRIVILEGED here; the root wrapper only installs+restarts. Finding B: the
+	// self repo is NEVER dev-deployed (restarting THIS devlabd would kill the running sweep). A dev-deploy
+	// failure is NON-fatal. A skip that is expected (self repo, switched off, no deploy target) is a
+	// SUCCESSFUL step carrying its reason; only a real build/install failure is red.
 	switch {
 	case x.mode != "full":
 		// report/pr never deploy at all — no step, as before.
@@ -774,35 +782,59 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	case !x.deployable(repo.Name):
 		step("dev-deploy", noDeployTargetReason(repo.Name), true)
 	default:
-		// What goes live on dev is the SUM of the pending work, not this run alone: build from a
-		// throwaway branch that folds in the other open Mercury PRs. Without it each dev-deploy would
-		// install "main + just my ToDo" and silently undo every earlier ToDo that is still waiting for
-		// its auto-merge — dev would flip between features instead of accumulating them. The run branch
-		// itself stays untouched, so the PR keeps carrying only this run's work.
-		restore := x.foldPendingForDeploy(ctx, ex, wt, token, repo, run, runBranch, step)
+		// No folding of open PRs any more: the dev branch IS the accumulated state, so what is built here
+		// is by construction the sum of everything delivered so far. Assembling a state per deploy — the
+		// old approach — is what let features disappear whenever one PR did not merge cleanly.
 		if artifactDir, berr := x.buildArtifact(ctx, wt, repo); berr != nil {
 			step("dev-deploy", "Build fehlgeschlagen (nicht fatal): "+berr.Error(), false)
 		} else if depLog, derr := x.deploy(ctx, repo, artifactDir, "dev"); derr != nil {
 			step("dev-deploy", depLog+"\n"+derr.Error(), false)
 		} else {
-			step("dev-deploy", depLog, true)
+			step("dev-deploy", depLog+"\nAusgelieferter Stand: "+devBranch+"@"+short(finalTip), true)
 			rr.Deployed = true
 		}
-		restore()
 	}
 
-	// Push + PR. The remote branch and PR are the durable record of what was built — established before
-	// prod ever runs (prod-deploy happens only in Maintain, on merge). A push failure is terminal for
-	// this repo; the local run branch is discarded by the next run's ResetToRemote.
-	if _, err := ex.Push(ctx, wt, token); err != nil {
+	// Publish the grown dev state. Push mercury-dev so the durable, nameable record advances; when this run
+	// produced a delivery, ALSO snapshot the dev tip as an immutable per-delivery branch for its stacked
+	// PR. A push failure is terminal for this repo.
+	var deliveryID, deliveryBranch string
+	if hasDelivery {
+		deliveryID = runs.NewDeliveryID()
+		deliveryBranch = "mercury-run/" + run.ID + "/" + deliveryID
+		if err := ex.BranchAt(ctx, wt, deliveryBranch, "HEAD"); err != nil {
+			rr.Error = "Lieferungs-Branch: " + err.Error()
+			return rr, repoSignal{}
+		}
+	}
+	pushRefs := []string{devBranch}
+	if deliveryBranch != "" {
+		pushRefs = append(pushRefs, deliveryBranch)
+	}
+	if _, err := ex.PushRefs(ctx, wt, token, false, pushRefs...); err != nil {
 		rr.Error = "push: " + err.Error()
 		return rr, repoSignal{}
 	}
-	step("push", runBranch, true)
+	step("push", strings.Join(pushRefs, ", "), true)
 
-	pr, err := github.CreatePullRequest(ctx, token, repo.FullName, runBranch, branch, "Mercury-Lauf: "+run.Name, runPRBody(run))
+	if !hasDelivery {
+		// The dev branch advanced only by folding in the default branch — dev now serves it, but there is
+		// no PR-worthy unit of the runner's OWN work, so no delivery and no PR.
+		step("implement", "nur Standard-Branch eingefaltet — dev-Stand aktualisiert ("+devBranch+"@"+short(finalTip)+"), kein eigener Beitrag", true)
+		rr.OK = true
+		return rr, repoSignal{}
+	}
+
+	// Stacked PR base (req 9): the previous still-open delivery's branch, else the default branch. So the
+	// PR shows ONLY this delivery's changes even though its branch sits on the prior work (req 3). GitHub
+	// re-targets the base to the default branch automatically once the predecessor merges.
+	prBase := branch
+	if prev, ok, _ := x.s.deliveries.LatestOpen(repo.FullName); ok && prev.Branch != "" {
+		prBase = prev.Branch
+	}
+	pr, err := github.CreatePullRequest(ctx, token, repo.FullName, deliveryBranch, prBase, "Mercury-Lauf: "+run.Name, runPRBody(run))
 	if err != nil {
-		if found, ok := github.FindOpenPullRequest(ctx, token, repo.FullName, runBranch); ok {
+		if found, ok := github.FindOpenPullRequest(ctx, token, repo.FullName, deliveryBranch); ok {
 			pr = found
 		} else {
 			step("pr", err.Error(), false)
@@ -811,16 +843,24 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		}
 	}
 	rr.PRUrl = pr.HTMLURL
-	step("pr", pr.HTMLURL, true)
+	rr.PRBase = prBase
+	rr.DeliveryID = deliveryID
+	step("pr", pr.HTMLURL+" (Basis: "+prBase+")", true)
+	now := time.Now().UTC()
 	_ = x.s.runPRs.Add(runs.PendingPR{
 		Repo: repo.FullName, Number: pr.Number, URL: pr.HTMLURL, RunID: run.ID,
-		CreatedAt: time.Now().UTC(), MergeBy: time.Now().Add(x.autoMergeAfter).UTC(),
+		CreatedAt: now, MergeBy: now.Add(x.autoMergeAfter),
+	})
+	// Record the delivery: the addressable unit (req 8) — its commit range, snapshot branch, stacked PR.
+	_ = x.s.deliveries.Add(runs.Delivery{
+		ID: deliveryID, RunID: run.ID, ResultID: res.ResultID, RunName: run.Name, Repo: repo.FullName,
+		Branch: deliveryBranch, DevBranch: devBranch, BaseBranch: prBase,
+		FromCommit: deliveryBase, ToCommit: finalTip, PRNumber: pr.Number, PRUrl: pr.HTMLURL,
+		CreatedAt: now, Status: runs.DeliveryOpen,
 	})
 
-	// PROD-DEPLOY is intentionally NOT done here. In the two-environment model the dev-deploy above
-	// already put this build live on the dev box; prod is reached only after the PR is MERGED (by a
-	// human or by the auto-merge window), detected and shipped by Maintain in full mode. That keeps the
-	// merge as the gate for prod and avoids deploying unreviewed code straight to the VPS.
+	// PROD-DEPLOY is intentionally NOT done here — prod ships only from a MERGED default branch (Maintain,
+	// req 6). dev already serves the grown state above.
 	rr.OK = true
 	return rr, repoSignal{}
 }
@@ -913,6 +953,24 @@ func repoNameOf(fullName string) string {
 		return fullName[i+1:]
 	}
 	return fullName
+}
+
+// devBranchName is the persistent per-repo integration branch the runner GROWS and that dev serves —
+// the single, nameable source of the dev state (req 2). Overridable via DEVLAB_RUNS_DEV_BRANCH; default
+// "mercury-dev". It is never the default branch (prod ships from that).
+func devBranchName() string {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_DEV_BRANCH")); v != "" {
+		return v
+	}
+	return "mercury-dev"
+}
+
+// short trims a commit SHA for display in a step/result (the delivered state is named as <branch>@<sha>).
+func short(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // devDeployEnabled reports whether the in-run dev-deploy step is active. DEVLAB_RUNS_DEV_DEPLOY=off (or
@@ -1230,7 +1288,7 @@ func attachmentDescriptors(atts []loadedAttachment) []mercury.TodoAttachment {
 // writeWorkspaceAttachments materializes a ToDo's media into the agent's workspace (under
 // mercury.TodoAttachmentDir) so the agent can open them, and returns a cleanup that removes them again
 // BEFORE anything is committed — the media is CONTEXT, never part of the change set. A workspace is
-// disposable (the next run's ResetToRemote clears any leftover), so cleanup is best-effort.
+// disposable (the next run's CleanWorktree clears any leftover), so cleanup is best-effort.
 func writeWorkspaceAttachments(ex workspace.Executor, wt string, atts []loadedAttachment) (func(), error) {
 	written := make([]string, 0, len(atts))
 	cleanup := func() {
@@ -1475,8 +1533,13 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 		}
 		switch action {
 		case prUntrack:
+			// Mirror the outcome onto the delivery ledger so LatestOpen (the stacked-PR base) stays honest:
+			// a merged PR closes its delivery as merged, a closed-without-merge one as closed.
 			if cur.Merged {
-				x.markDelivered(p, true, false) // report/pr: the ladder ends at "merged"
+				x.markDelivered(p, true, false)
+				x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged)
+			} else {
+				x.markDelivery(p.Repo, p.Number, runs.DeliveryClosed)
 			}
 			_ = x.s.runPRs.Remove(p.Repo, p.Number) // merged (report/pr) or closed → stop tracking
 		case prMerge:
@@ -1489,12 +1552,14 @@ func (x *runExecutor) Maintain(ctx context.Context) {
 				continue
 			}
 			log.Printf("devlabd: auto-merged %s#%d (run %s)", p.Repo, p.Number, p.RunID)
+			x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged)
 			x.markDelivered(p, true, false)
 			if x.mode != "full" {
 				_ = x.s.runPRs.Remove(p.Repo, p.Number) // report/pr: merged and done
 			}
 			// full: keep tracked — the next eligible tick sees it merged and prod-deploys it.
 		case prDeploy:
+			x.markDelivery(p.Repo, p.Number, runs.DeliveryMerged) // the PR is merged; prod-deploy follows
 			// A merged PR for a repo with NO deploy target has nothing to ship: retrying it every recheck
 			// interval only reset its workspace and rebuilt nothing, forever. Untrack it like report/pr does.
 			if name := repoNameOf(p.Repo); !x.deployable(name) {

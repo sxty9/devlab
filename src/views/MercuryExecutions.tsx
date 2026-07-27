@@ -158,6 +158,26 @@ export function RepoBlock({ repo }: { repo: RepoResult }) {
         )}
       </div>
 
+      {/* Name the delivered state (the dev branch this run grew and the exact commit dev serves) so the
+          execution view always says, unambiguously, what dev is running — even when the run added nothing.
+          The stacked PR base is shown too, so a reviewer sees the delivery sits on the prior work. */}
+      {!running && repo.devBranch && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-caption text-text-tertiary">
+          <span>
+            Ausgelieferter Stand:{' '}
+            <span className="text-text-secondary">
+              {repo.devBranch}
+              {repo.devCommit ? `@${repo.devCommit.slice(0, 8)}` : ''}
+            </span>
+          </span>
+          {repo.prBase && (
+            <span>
+              PR-Basis: <span className="text-text-secondary">{repo.prBase}</span>
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="mt-1.5">
         <TokenStat input={repo.inputTokens} output={repo.outputTokens} cost={repo.costUsd} />
       </div>

@@ -564,12 +564,41 @@ export interface RepoResult {
   ok: boolean;
   deployed: boolean;
   prUrl?: string;
+  /** The delivered dev state: the persistent integration branch this run grew (mercury-dev) and the
+   *  exact commit dev serves. Always set once a run reaches the dev branch — even when it added nothing. */
+  devBranch?: string;
+  devCommit?: string;
+  /** This delivery's stacked-PR base: the previous still-open delivery's branch, else the default branch. */
+  prBase?: string;
+  /** The recorded delivery id (rollback target), when this run produced a delivery for the repo. */
+  deliveryId?: string;
   steps: RunStep[] | null; // null when the repo failed before any step ran (Go marshals the empty slice as null)
   error?: string;
   inputTokens?: number;
   outputTokens?: number;
   costUsd?: number;
   numTurns?: number;
+}
+
+/** One recorded delivery — a run's addressable unit of work at a repo (commit range + stacked PR). */
+export interface Delivery {
+  id: string;
+  runId: string;
+  resultId: string;
+  runName?: string;
+  repo: string;
+  branch: string;
+  devBranch: string;
+  baseBranch: string;
+  fromCommit: string;
+  toCommit: string;
+  prNumber?: number;
+  prUrl?: string;
+  createdAt: string;
+  status: 'open' | 'merged' | 'closed' | 'reverted';
+  revertedAt?: string;
+  revertedBy?: string;
+  revertOf?: string;
 }
 
 export interface RunResult {
