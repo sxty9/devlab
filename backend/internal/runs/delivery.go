@@ -167,6 +167,26 @@ func (s *DeliveryStore) LatestOpen(repo string) (Delivery, bool, error) {
 	return Delivery{}, false, nil
 }
 
+// OpenForExecution returns the OPEN delivery a SPECIFIC execution (runId + resultId) already made for a
+// repo, if any. It is how the executor recognises that a prior attempt of THIS SAME execution already
+// opened a pull request for the repo but crashed before its repo-result was recorded — so a resume must
+// ADOPT that pull request rather than implement the work again and stack a duplicate beside it (req 5).
+// Matching on the exact resultId keeps it precise: a legitimate later delivery from a different execution
+// (an automatic run stacking the next night's work) has a different resultId and is never mistaken for one.
+// Passive: it only answers the query; the adopt decision is the caller's.
+func (s *DeliveryStore) OpenForExecution(runID, resultID, repo string) (Delivery, bool, error) {
+	list, err := s.ListForRepo(repo)
+	if err != nil {
+		return Delivery{}, false, err
+	}
+	for i := len(list) - 1; i >= 0; i-- {
+		if d := list[i]; d.RunID == runID && d.ResultID == resultID && d.Status == DeliveryOpen {
+			return d, true, nil
+		}
+	}
+	return Delivery{}, false, nil
+}
+
 // LaterOpenDeliveries returns the OPEN deliveries for a repo created after the given delivery — the work
 // that is stacked ON it. A rollback consults this to name what a counter-booking would sit under.
 func (s *DeliveryStore) LaterOpenDeliveries(repo, afterID string) ([]Delivery, error) {

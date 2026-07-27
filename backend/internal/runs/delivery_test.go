@@ -134,6 +134,44 @@ func TestDeliverySetStatusByPR(t *testing.T) {
 	}
 }
 
+// TestDeliveryOpenForExecution pins the duplicate-work guard (req 5): the OPEN delivery a specific
+// execution already made for a repo is found by its exact (runId, resultId), while a delivery from a
+// different execution or a merged/closed one is never mistaken for it.
+func TestDeliveryOpenForExecution(t *testing.T) {
+	s := tempDeliveryStore(t)
+	mk := func(id, run, result, repo string, n int, status DeliveryStatus) Delivery {
+		d := mkDelivery(id, repo, n, status)
+		d.RunID, d.ResultID, d.PRUrl = run, result, "https://gh/"+id
+		return d
+	}
+	for _, d := range []Delivery{
+		mk("d1", "run_a", "res_1", "o/x", 1, DeliveryOpen),   // the one to adopt
+		mk("d2", "run_a", "res_2", "o/x", 2, DeliveryOpen),   // same run, DIFFERENT execution — not it
+		mk("d3", "run_b", "res_1", "o/x", 3, DeliveryOpen),   // same result id, DIFFERENT run — not it
+		mk("d4", "run_a", "res_1", "o/y", 4, DeliveryOpen),   // right ids, DIFFERENT repo — not it
+		mk("d5", "run_a", "res_9", "o/x", 5, DeliveryMerged), // merged — never adopted
+	} {
+		if err := s.Add(d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, ok, err := s.OpenForExecution("run_a", "res_1", "o/x")
+	if err != nil || !ok {
+		t.Fatalf("OpenForExecution ok=%v err=%v — expected to find d1", ok, err)
+	}
+	if got.ID != "d1" {
+		t.Errorf("OpenForExecution = %s, want d1", got.ID)
+	}
+	// A merged delivery of the same execution is not an open PR to adopt.
+	if _, ok, _ := s.OpenForExecution("run_a", "res_9", "o/x"); ok {
+		t.Error("OpenForExecution must ignore a merged delivery")
+	}
+	// An execution that delivered nothing to this repo → nothing to adopt.
+	if _, ok, _ := s.OpenForExecution("run_a", "res_absent", "o/x"); ok {
+		t.Error("OpenForExecution must be false when the execution made no open delivery here")
+	}
+}
+
 func ids(ds []Delivery) []string {
 	out := make([]string, len(ds))
 	for i, d := range ds {
