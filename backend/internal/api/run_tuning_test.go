@@ -245,6 +245,49 @@ func TestBudgetAwareError(t *testing.T) {
 	})
 }
 
+// A time-budget overrun must KEEP the streamed transcript on the step — "what was reached until then"
+// (req 4) — headed as partial progress, instead of clobbering it with the raw kill error. The honest
+// "Zeitbudget überschritten" naming lives on the repo-level Error, so it is deliberately not repeated here.
+func TestAgentStepFailBudgetKeepsTranscript(t *testing.T) {
+	rr := &runs.RepoResult{Steps: []runs.Step{{Name: "implement", Running: true}}}
+	ag := &agentStep{rr: rr, saver: &liveSaver{do: func() {}}, idx: 0}
+	// stream what the live agent would have emitted before the cap fired
+	ag.tr.push([]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"scaffolded the service"}]}}`))
+	ag.tr.push([]byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"main.go"}}]}}`))
+
+	ag.failBudget()
+
+	s := rr.Steps[0]
+	if s.Running || s.Status != runs.StepFailed {
+		t.Fatalf("failBudget: running=%v status=%v, want stopped + failed", s.Running, s.Status)
+	}
+	if !strings.Contains(s.Log, "scaffolded the service") || !strings.Contains(s.Log, "main.go") {
+		t.Fatalf("failBudget dropped the partial transcript: %q", s.Log)
+	}
+	if !strings.Contains(s.Log, "Bis dahin erreicht") {
+		t.Fatalf("failBudget must head the transcript as partial progress: %q", s.Log)
+	}
+	// It must NOT leak the raw kill error — that technical text is exactly what req 4 forbids surfacing.
+	if strings.Contains(strings.ToLower(s.Log), "signal: killed") || strings.Contains(strings.ToLower(s.Log), "agent run failed") {
+		t.Fatalf("failBudget leaked a raw kill error: %q", s.Log)
+	}
+}
+
+// With nothing streamed before the cap fired, failBudget leaves the step log empty — the repo-level overrun
+// banner alone then states it, and the step shows no misleading content (never a raw deadline error).
+func TestAgentStepFailBudgetEmptyTranscript(t *testing.T) {
+	rr := &runs.RepoResult{Steps: []runs.Step{{Name: "implement", Running: true}}}
+	ag := &agentStep{rr: rr, saver: &liveSaver{do: func() {}}, idx: 0}
+	ag.failBudget()
+	s := rr.Steps[0]
+	if s.Running || s.Status != runs.StepFailed {
+		t.Fatalf("failBudget(empty): running=%v status=%v, want stopped + failed", s.Running, s.Status)
+	}
+	if s.Log != "" {
+		t.Fatalf("failBudget(empty) log = %q, want empty", s.Log)
+	}
+}
+
 // assertFlag checks that args contains flag immediately followed by want.
 func assertFlag(t *testing.T, args []string, flag, want string) {
 	t.Helper()

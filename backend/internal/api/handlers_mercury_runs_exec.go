@@ -139,9 +139,10 @@ func humanizeDuration(d time.Duration) string {
 // budgetAwareError renders the honest reason an agent pass ended. When actx was cancelled because THIS
 // repo's time budget elapsed (cause errBudgetExceeded — told apart from the whole-sweep duration cap and a
 // deliberate abort, whose causes differ), it names the overrun with the budget that applied — "Zeitbudget
-// überschritten (3h)" — rather than the raw kill error; otherwise the underlying error stands. The partial
-// transcript is untouched: it already streamed into the step's Log (ag.fail keeps it on failure), so the
-// step still names what was reached before the budget ran out.
+// überschritten (3h)" — rather than the raw kill error; otherwise the underlying error stands. This is the
+// REPO-level reason (rr.Error); the partial transcript — "what was reached until then" — is preserved
+// separately on the step itself (runAgentLive routes a budget overrun to agentStep.failBudget), so the two
+// are shown side by side: the honest banner and the partial work.
 func budgetAwareError(actx context.Context, budget time.Duration, err error) string {
 	if errors.Is(context.Cause(actx), errBudgetExceeded) {
 		return "Zeitbudget überschritten (" + humanizeDuration(budget) + ")"
@@ -1899,10 +1900,27 @@ func (a *agentStep) fail(logtxt string) {
 	a.saver.force()
 }
 
+// failBudget fails the step on a time-budget overrun WITHOUT discarding the streamed transcript. That
+// partial transcript is exactly "what was reached until then" (req 4), so it stays as the step's Bericht
+// under a heading instead of being clobbered by the raw kill error ("signal: killed") — which is the very
+// technical text req 4 forbids surfacing. The honest "Zeitbudget überschritten (<value>)" naming is carried
+// by the repo-level Error shown right beside this step (budgetAwareError), so it is deliberately not
+// repeated here. An empty transcript (nothing streamed before the cap fired) leaves the log empty — that
+// banner alone then states the overrun.
+func (a *agentStep) failBudget() {
+	s := &a.rr.Steps[a.idx]
+	s.Running, s.Status = false, runs.StepFailed
+	if tr := a.tr.clipped(); tr != "" {
+		s.Log = clip("Bis dahin erreicht:\n\n" + tr)
+	}
+	a.saver.force()
+}
+
 // runAgentLive runs the agent as a live step `name` on rr, streaming its transcript AND its climbing
 // token counters into rr as it works, then settling the token/cost totals to the authoritative final
 // result event. On a usage-limit stop it leaves the step running and the repo unrecorded (it retries on
-// resume); on error it fails the step; on success it finalizes the step to the report.
+// resume); on error it fails the step — keeping the partial transcript when the failure is this repo's own
+// time-budget overrun (req 4); on success it finalizes the step to the report.
 func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
 	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
@@ -1916,7 +1934,14 @@ func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, 
 	// the mid-stream estimate. On error the tokens actually spent on the failed invocation are recorded.
 	ag.settle(final)
 	if aerr != nil {
-		ag.fail(agentError(aerr))
+		// A time-budget overrun — THIS repo's own cap fired (cause errBudgetExceeded, told apart from the
+		// whole-sweep cap and a deliberate abort, which cancel with different causes) — keeps the partial
+		// transcript as its report; every other error fails plainly with its message.
+		if errors.Is(context.Cause(actx), errBudgetExceeded) {
+			ag.failBudget()
+		} else {
+			ag.fail(agentError(aerr))
+		}
 		return repoSignal{}, aerr
 	}
 	ag.finish(parseClaudeResult(final).Output)
