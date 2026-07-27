@@ -260,10 +260,16 @@ func (x *runExecutor) markDelivery(repo string, number int, status runs.Delivery
 	_, _, _ = x.s.deliveries.SetStatusByPR(repo, number, status)
 }
 
-func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(resultID string)) (runs.ResultRef, error) {
+func (x *runExecutor) Execute(ctx context.Context, run runs.Run, trigger runs.Trigger, report func(resultID string)) (runs.ResultRef, error) {
 	// Resume an execution suspended on the usage limit (same ResultID, skip the repos already done), or
 	// start a fresh one. A resume that can't find its open result silently starts fresh.
 	res, resuming := x.resumeOrNew(run)
+	if !resuming {
+		// Stamp origin only on a fresh execution: how it was triggered (autonomous vs a person) and the
+		// run's author it acts for. A resume keeps the original stamp so provenance never rewrites.
+		res.Trigger = trigger
+		res.RequestedBy = run.CreatedBy
+	}
 	res.Suspended, res.ResumeAt = false, nil // recomputed below if we hit the limit again
 	res.Live = nil                           // drop any stale in-flight repo left by a crashed prior attempt
 	saver := &liveSaver{do: func() { _ = x.s.runResults.Save(res) }}

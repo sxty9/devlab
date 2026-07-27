@@ -228,6 +228,7 @@ export const mockSource: DataSource = {
       titel: path.split('/').pop()?.replace('.md', '') ?? 'Axiom',
       quelle: 'axioms/CLAUDE.MD.md#holistic_architecture_maxims/Single Source of Truth',
       body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
+      author: { createdBy: MOCK_ACTOR, createdAt: new Date().toISOString(), updatedBy: MOCK_ACTOR, updatedAt: new Date().toISOString() },
     };
   },
   async mercuryAddAxiom(titel: string, _body: string, section?: string, _force?: boolean) {
@@ -307,6 +308,9 @@ export const mockSource: DataSource = {
       id,
       createdAt: idx >= 0 ? runStore[idx].createdAt : new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      // Preserve the original creator across an edit; only the last editor changes.
+      createdBy: idx >= 0 ? runStore[idx].createdBy : MOCK_ACTOR,
+      updatedBy: MOCK_ACTOR,
     };
     if (idx >= 0) runStore[idx] = run;
     else runStore.push(run);
@@ -326,7 +330,14 @@ export const mockSource: DataSource = {
     /* mock: no-op */
   },
   async mercuryRunHistory() {
-    return { snapshots: [] };
+    // A believable sample so the offline surface shows the authorship history: a recent change by the
+    // signed-in user, and an older one with no recorded actor ("?") — surfaced as unknown, not guessed.
+    return {
+      snapshots: [
+        { ts: new Date().toISOString(), action: 'update', actor: MOCK_ACTOR, runCount: 2 },
+        { ts: new Date(Date.now() - 864e5).toISOString(), action: 'create', actor: '?', runCount: 1 },
+      ],
+    };
   },
   async mercuryRestoreRunHistory(_ts: string) {
     /* mock: no-op */
@@ -371,6 +382,9 @@ export const mockSource: DataSource = {
       outputTokens: 0,
       costUsd: 0,
       numTurns: 0,
+      // An autonomous run that still names the person it acted for (the "name both" case).
+      trigger: { auto: true },
+      requestedBy: MOCK_ACTOR,
     };
   },
   async mercuryRunCalendar(days?: number, type?: import('@/types').RunType) {
@@ -439,8 +453,13 @@ function mockRun(body: import('@/types').RunInput) {
     prompt: '',
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
+    createdBy: MOCK_ACTOR,
+    updatedBy: MOCK_ACTOR,
   };
 }
+
+/** The mock's signed-in user (mirrors getUser) — the author stamped on runs/ToDos created offline. */
+const MOCK_ACTOR = 'dev';
 
 const visionStore: Record<string, VisionFile[]> = {};
 const commentStore: Record<string, Comment[]> = {};

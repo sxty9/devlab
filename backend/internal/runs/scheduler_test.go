@@ -14,7 +14,7 @@ type fakeExec struct {
 	maintain int
 }
 
-func (f *fakeExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
+func (f *fakeExec) Execute(_ context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
 	f.mu.Lock()
 	f.executed = append(f.executed, run.ID)
 	f.mu.Unlock()
@@ -39,7 +39,7 @@ type blockingExec struct {
 	release  chan struct{}
 }
 
-func (b *blockingExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
+func (b *blockingExec) Execute(_ context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
 	report("res_live")
 	b.reported <- run.ID
 	<-b.release
@@ -136,7 +136,7 @@ type scriptedExec struct {
 	resps []ResultRef
 }
 
-func (f *scriptedExec) Execute(_ context.Context, run Run, report func(string)) (ResultRef, error) {
+func (f *scriptedExec) Execute(_ context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i := len(f.calls)
@@ -228,5 +228,46 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	m, _, _ := store.Get("m")
 	if m.NextFireAt == nil || !m.NextFireAt.Equal(future) {
 		t.Errorf("run-now must NOT advance the schedule; got %v want %v", m.NextFireAt, future)
+	}
+}
+
+// capturingExec records the Trigger it was handed, so a test can assert the scheduler's provenance
+// decision (autonomous for a scheduled firing, the caller for a manual run-now).
+type capturingExec struct{ got chan Trigger }
+
+func (c *capturingExec) Execute(_ context.Context, _ Run, tr Trigger, report func(string)) (ResultRef, error) {
+	report("res_cap")
+	c.got <- tr
+	return ResultRef{ResultID: "res_cap", At: time.Now(), OK: true}, nil
+}
+func (c *capturingExec) Maintain(context.Context) {}
+
+// A scheduled firing is autonomous and names NO person; a manual run-now is attributed to its caller.
+// This is exactly what lets the execution history show an autonomous run without ascribing it to a
+// person, while a manual run keeps its initiator.
+func TestSchedulerTriggerProvenance(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	future := time.Now().Add(time.Hour)
+	sc := Schedule{Kind: Daily, TimeOfDay: "03:00"}
+	store := seedStore(t, []Run{
+		{ID: "auto", Enabled: true, Schedule: sc, NextFireAt: &past, AxiomIDs: []string{"x"}},
+		{ID: "manual", Enabled: true, Schedule: sc, NextFireAt: &future, AxiomIDs: []string{"x"}}, // not due → only FireNow fires it
+	})
+	ce := &capturingExec{got: make(chan Trigger, 1)}
+	s := NewScheduler(store, ce, time.Second)
+	s.logf = func(string, ...any) {}
+
+	// Scheduled: autonomous, no person.
+	s.fireDue(context.Background())
+	if tr := <-ce.got; !tr.Auto || tr.By != "" {
+		t.Fatalf("scheduled firing must be autonomous with no person: %+v", tr)
+	}
+
+	// Manual: the caller, not autonomous.
+	if !s.FireNow("manual", "alice") {
+		t.Fatal("FireNow returned false")
+	}
+	if tr := <-ce.got; tr.Auto || tr.By != "alice" {
+		t.Fatalf("manual run must be attributed to the caller and not autonomous: %+v", tr)
 	}
 }

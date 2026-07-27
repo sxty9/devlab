@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/axiomauthors"
 	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/chats"
 	"devlab/backend/internal/comments"
@@ -28,25 +29,26 @@ const version = "0.1.0"
 // Server wires the verifier + repo base + per-user GitHub link store + workspace manager into
 // HTTP handlers.
 type Server struct {
-	v           *auth.Verifier
-	reposBase   string
-	links       *links.Store // nil when no encryption key is configured (dev/preview sandbox)
-	workspaces  *workspace.Manager
-	comments    *comments.Store       // nil if the comments dir can't be created
-	chats       *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
-	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
-	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
-	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
-	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
-	deliveries  *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
-	attachments *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
-	axiomChecks *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
-	scheduler   *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
-	autoRollout *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
-	axioms      *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
-	assigner    *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
-	runExec     *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
-	staticDir   string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
+	v            *auth.Verifier
+	reposBase    string
+	links        *links.Store // nil when no encryption key is configured (dev/preview sandbox)
+	workspaces   *workspace.Manager
+	comments     *comments.Store       // nil if the comments dir can't be created
+	chats        *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
+	runs         *runs.Store           // Mercury's Automatische Läufe — run instances + config history
+	axiomAuthors *axiomauthors.Store   // passive, DevLab-local pool: who created/last-changed each axiom
+	runResults   *runs.Results         // per-execution results/logs (written by the executor, read here)
+	runPRs       *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
+	runNotices   *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
+	deliveries   *runs.DeliveryStore   // ledger of per-repo deliveries (commit range + stacked PR) — the growing dev state
+	attachments  *runs.AttachmentStore // passive media pool for ToDo attachments (bytes; metadata is on the Run)
+	axiomChecks  *runs.AxiomChecks     // per repo+axiom: the commit it was last examined against (incremental runs)
+	scheduler    *runs.Scheduler       // nil until StartScheduler arms it (needs DEVLAB_RUNS_MODE + _USER)
+	autoRollout  *autoRollout          // debounced background CLAUDE.md rollout on axiom/rule writes
+	axioms       *axiomrepo.Store      // the constitution itself: a dedicated Git repository, versioned and unprotected
+	assigner     *autoAssigner         // background: assigns any uncovered axiom to a run (reuses the AI-fill machinery)
+	runExec      *runExecutor          // the armed executor — also drives rollback/reset; nil when the scheduler is off
+	staticDir    string                // built SPA to serve for non-/api routes ("" ⇒ 404, e.g. dev where vite serves)
 }
 
 // New builds a server. DEVLAB_REPOS_PATH is the base dir holding local working copies (sandbox).
@@ -74,20 +76,21 @@ func New(v *auth.Verifier) *Server {
 		chatStore = nil
 	}
 	s := &Server{
-		v:           v,
-		reposBase:   base,
-		links:       store,
-		workspaces:  workspace.NewManager(),
-		comments:    cstore,
-		chats:       chatStore,
-		runs:        runs.NewStore(),
-		runResults:  runs.NewResults(),
-		runPRs:      runs.NewPRStore(),
-		runNotices:  runs.NewNoticeStore(),
-		deliveries:  runs.NewDeliveryStore(),
-		attachments: runs.NewAttachmentStore(),
-		axiomChecks: runs.NewAxiomChecks(),
-		staticDir:   os.Getenv("DEVLAB_STATIC_DIR"),
+		v:            v,
+		reposBase:    base,
+		links:        store,
+		workspaces:   workspace.NewManager(),
+		comments:     cstore,
+		chats:        chatStore,
+		runs:         runs.NewStore(),
+		runResults:   runs.NewResults(),
+		runPRs:       runs.NewPRStore(),
+		runNotices:   runs.NewNoticeStore(),
+		deliveries:   runs.NewDeliveryStore(),
+		attachments:  runs.NewAttachmentStore(),
+		axiomChecks:  runs.NewAxiomChecks(),
+		axiomAuthors: axiomauthors.NewStore(),
+		staticDir:    os.Getenv("DEVLAB_STATIC_DIR"),
 	}
 	// The constitution lives in its own repository. Pushing uses the runner's linked account — the same
 	// identity the autonomous pipeline commits with — so an edit works whether or not the person making

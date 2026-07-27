@@ -83,7 +83,12 @@ func (s *Server) mercuryItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ax := mercury.ParseAxiom(string(data))
-	writeJSON(w, http.StatusOK, map[string]any{"path": path, "axiom": ax})
+	resp := map[string]any{"path": path, "axiom": ax}
+	// Join the local authorship pool by the stable id. Absent ⇒ the client shows the author as unknown.
+	if a, ok := s.axiomAuthors.Get(ax.ID); ok {
+		resp["author"] = a
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // mercuryError maps a Mercury backend failure onto an HTTP response that is honest about WHY it could

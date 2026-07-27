@@ -6,16 +6,9 @@ import { ThemeToggle } from './ThemeToggle';
 import { Button, IconButton } from '@/ui/Button';
 import { HelpIcon, RocketIcon, SettingsIcon } from '@/ui/icons';
 import { Tooltip } from '@/ui/Tooltip';
+import { Person } from '@/ui/Person';
 import { PREVIEW_URL } from '@/lib/constants';
 import { CAPABILITIES } from '@/views/capabilities';
-
-/** Two-letter initials from a display name (or username). */
-function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return '?';
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-}
 
 /** The window chrome: brand · (repository · branch, in the IDE) ……  actions. */
 export function TopBar() {
@@ -73,9 +66,9 @@ export function TopBar() {
           <button
             type="button"
             aria-label="Account"
-            className="ml-1 flex h-6 w-6 items-center justify-center rounded-full bg-gpu/20 text-caption font-semibold text-gpu transition hover:ring-2 hover:ring-gpu/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+            className="ml-1 rounded-full transition hover:ring-2 hover:ring-gpu/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
           >
-            {initials(name)}
+            <Person avatarOnly username={user.username} displayName={user.displayName} />
           </button>
         </Tooltip>
       </div>

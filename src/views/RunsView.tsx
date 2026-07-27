@@ -4,6 +4,8 @@ import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Modal } from '@/ui/Modal';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
+import { Authorship } from '@/ui/Authorship';
+import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
@@ -574,6 +576,8 @@ function RunDetail({
         )}
         <span>{run.suspended ? `Fortsetzung: ${fmtDateTime(run.suspended.resumeAt)}` : `nächster Lauf: ${next}`}</span>
       </div>
+
+      <Authorship className="mt-3" createdBy={run.createdBy} updatedBy={run.updatedBy} />
 
       <section className="mt-6">
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Axiome ({axiomIds.length})</p>
@@ -1157,9 +1161,14 @@ function HistoryModal({ onClose, onRestored }: { onClose: () => void; onRestored
             <li key={s.ts} className="flex items-center gap-3 rounded-card border border-separator bg-surface p-3">
               <div className="min-w-0 flex-1">
                 <p className="truncate text-footnote font-medium text-text-primary">{s.action}</p>
-                <p className="mt-0.5 text-caption text-text-tertiary">
-                  {fmtDateTime(s.ts)} · {s.actor} · {s.runCount} {s.runCount === 1 ? 'Lauf' : 'Läufe'}
-                </p>
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-caption text-text-tertiary">
+                  <span>{fmtDateTime(s.ts)}</span>
+                  <span aria-hidden>·</span>
+                  {/* Reuse the actor the history already carries; "?" is its unknown-actor sentinel. */}
+                  <Person username={s.actor === '?' ? undefined : s.actor} size="sm" />
+                  <span aria-hidden>·</span>
+                  <span>{s.runCount} {s.runCount === 1 ? 'Lauf' : 'Läufe'}</span>
+                </div>
               </div>
               <Button variant="secondary" size="sm" disabled={restoring !== null} onClick={() => restore(s.ts)}>
                 {restoring === s.ts ? 'Stellt her…' : 'Wiederherstellen'}

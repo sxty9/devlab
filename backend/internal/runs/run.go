@@ -83,13 +83,20 @@ type Run struct {
 
 	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
 	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
-	Repo        string     `json:"repo,omitempty"`
-	NewRepo     string     `json:"newRepo,omitempty"`
-	Prompt      string     `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
-	PromptAt    time.Time  `json:"promptAt,omitempty"`   // when the snapshot was composed
-	PromptHash  string     `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
+	Repo       string    `json:"repo,omitempty"`
+	NewRepo    string    `json:"newRepo,omitempty"`
+	Prompt     string    `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
+	PromptAt   time.Time `json:"promptAt,omitempty"`   // when the snapshot was composed
+	PromptHash string    `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	// CreatedBy and UpdatedBy are the Holistic usernames of who first created this run/ToDo and who last
+	// changed it — kept SEPARATE so the creator stays visible even after someone else edits it. They are
+	// stamped from the same actor already flowing into Store.Mutate, so no second author signal is
+	// introduced. Empty on records written before authorship was tracked: surfaced as "unknown", never
+	// back-filled to a person (no invented history).
+	CreatedBy   string     `json:"createdBy,omitempty"`
+	UpdatedBy   string     `json:"updatedBy,omitempty"`
 	NextFireAt  *time.Time `json:"nextFireAt,omitempty"`  // nil = not scheduled (disabled); persisted → survives a restart
 	LastFiredAt *time.Time `json:"lastFiredAt,omitempty"` // nil = never fired
 	LastResult  *ResultRef `json:"lastResult,omitempty"`
@@ -173,6 +180,10 @@ type ResultRef struct {
 	PRUrl        string `json:"prUrl,omitempty"`        // the PR this execution opened (first, if several)
 	Merged       bool   `json:"merged,omitempty"`       // that PR reached the default branch
 	ProdDeployed bool   `json:"prodDeployed,omitempty"` // and prod was shipped from the merge
+
+	// Who this execution acted for: autonomous, or the person who asked for it.
+	Trigger     Trigger `json:"trigger,omitempty"`
+	RequestedBy string  `json:"requestedBy,omitempty"`
 }
 
 // Stage is the furthest rung of the delivery ladder an execution reached. It is derived, never stored:

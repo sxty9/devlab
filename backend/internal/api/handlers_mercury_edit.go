@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"devlab/backend/internal/axiomauthors"
 	"devlab/backend/internal/mercury"
 )
 
@@ -75,6 +77,14 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
+	// Record the editor in DevLab's local pool. An axiom that predates authorship tracking keeps an
+	// empty (unknown) creator — only the editor is stamped, never a back-filled creator.
+	now := time.Now().UTC()
+	who := actor(r)
+	s.axiomAuthors.Mutate(ax.ID, func(a axiomauthors.Author) axiomauthors.Author {
+		a.UpdatedBy, a.UpdatedAt = who, now
+		return a
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"path": newPath, "axiom": ax})
 }
 
