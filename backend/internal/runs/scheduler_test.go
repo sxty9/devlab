@@ -61,7 +61,7 @@ func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
 	if a := s.Active(); a != nil {
 		t.Fatalf("expected no activity before firing, got %+v", a)
 	}
-	if !s.FireNow("r", "t") {
+	if _, ok := s.FireNow("r", "t", false); !ok {
 		t.Fatal("FireNow returned false")
 	}
 	<-be.reported // the run has reported its result id and is now blocked mid-execution
@@ -223,7 +223,7 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	s := NewScheduler(store, fe, time.Second)
 	s.logf = func(string, ...any) {}
 
-	if !s.FireNow("m", "tester") {
+	if _, ok := s.FireNow("m", "tester", false); !ok {
 		t.Fatal("FireNow returned busy on an idle scheduler")
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -238,5 +238,39 @@ func TestSchedulerFireNowRunsOnceWithoutAdvancing(t *testing.T) {
 	m, _, _ := store.Get("m")
 	if m.NextFireAt == nil || !m.NextFireAt.Equal(future) {
 		t.Errorf("run-now must NOT advance the schedule; got %v want %v", m.NextFireAt, future)
+	}
+}
+
+// TestFireNowReturnsResumePlan is req 2 at the scheduler seam: a manual trigger reports SYNCHRONOUSLY —
+// before the detached run begins — whether it will continue an interrupted execution or start fresh, so
+// the caller can tell the user which happened. The decision comes from the executor (here the scripted
+// fake), the same source the execution path uses.
+func TestFireNowReturnsResumePlan(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{
+		{ID: "sus", Enabled: true, Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, NextFireAt: &past,
+			Suspended: &Suspension{ResumeAt: past, ResultID: "res_1"}, AxiomIDs: []string{"x"}},
+		{ID: "plain", Enabled: true, Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, NextFireAt: &past, AxiomIDs: []string{"x"}},
+	})
+	s := NewScheduler(store, &scriptedExec{}, time.Second)
+	s.logf = func(string, ...any) {}
+
+	fire := func(id string, fresh bool) ResumePlan {
+		deadline := time.Now().Add(2 * time.Second)
+		for s.Current() != "" && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond) // wait for the previous detached run to release the lock
+		}
+		plan, ok := s.FireNow(id, "t", fresh)
+		if !ok {
+			t.Fatalf("FireNow(%s) unexpectedly busy", id)
+		}
+		return plan
+	}
+
+	if p := fire("sus", false); p.Action != ResumeContinue || p.ResultID != "res_1" {
+		t.Errorf("a suspended run must report a continuation of its execution: %+v", p)
+	}
+	if p := fire("plain", false); p.Action != ResumeFresh {
+		t.Errorf("a run with nothing interrupted must report a fresh start: %+v", p)
 	}
 }

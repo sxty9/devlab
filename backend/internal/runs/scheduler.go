@@ -137,12 +137,21 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 	}
 }
 
-// FireNow triggers a run immediately (manual "Jetzt ausführen"), detached from the caller's request
-// so the HTTP handler returns at once. Returns false if a run is already in progress. A manual run
-// does NOT advance the schedule (it is out of band).
-func (s *Scheduler) FireNow(id, actor string) bool {
+// FireNow triggers a run immediately (manual "Jetzt ausführen"), detached from the caller's request so
+// the HTTP handler returns at once. It first consults the executor for what the imminent execution will
+// do — continue an interrupted execution or start fresh — and returns that ResumePlan so the trigger can
+// report the difference to whoever pressed the button. fresh=true forces a fresh start, discarding any
+// resumable execution (the executor reaps it). ok=false when a run is already in progress (nothing was
+// decided or started). A manual run does NOT advance the schedule (it is out of band).
+func (s *Scheduler) FireNow(id, actor string, fresh bool) (plan ResumePlan, ok bool) {
 	if !s.runMu.TryLock() {
-		return false
+		return ResumePlan{}, false
+	}
+	// Decide (and, for an explicit fresh start, discard the husk) synchronously WHILE holding the run lock,
+	// so the plan we return is exactly what the detached execution will enact — no other run can slip in and
+	// change the picture in between. The execution path re-derives the same decision from the same state.
+	if run, got, err := s.store.Get(id); err == nil && got {
+		plan = s.exec.PlanResume(run, fresh)
 	}
 	// Register the run BEFORE returning: otherwise a Cancel arriving between this return and the
 	// goroutine being scheduled would find curStop nil and silently do nothing.
@@ -154,7 +163,7 @@ func (s *Scheduler) FireNow(id, actor string) bool {
 		defer s.clearCurrent()
 		s.runOnce(ctx, id, actor, false)
 	}()
-	return true
+	return plan, true
 }
 
 // runOnce advances the schedule (if scheduled), executes the run, and attaches the result. No locking

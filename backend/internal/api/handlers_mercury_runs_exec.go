@@ -1899,11 +1899,17 @@ func (s *Server) runNow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
 		return
 	}
-	if !s.scheduler.FireNow(id, actor(r)) {
+	// ?fresh=1 explicitly discards any interrupted execution and starts over (req 4); the default (no flag)
+	// continues an interrupted execution if one exists (req 1). Either way the returned plan says which
+	// happened and why, so the difference is visible to whoever triggered the run (req 2).
+	q := r.URL.Query().Get("fresh")
+	fresh := q == "1" || strings.EqualFold(q, "true")
+	plan, started := s.scheduler.FireNow(id, actor(r), fresh)
+	if !started {
 		writeErr(w, http.StatusConflict, "Es läuft bereits ein Lauf — bitte warten")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"started": true})
+	writeJSON(w, http.StatusOK, map[string]any{"started": true, "plan": plan})
 }
 
 // runActive reports the run executing in THIS process right now — its id, the live result id (once the
