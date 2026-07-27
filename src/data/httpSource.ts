@@ -208,7 +208,7 @@ export const httpSource: DataSource = {
     return json(await request('/api/mercury/tree'));
   },
   async mercuryItem(path) {
-    const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
+    const r = await request(`/api/mercury/item?path=${enc(path)}`);
     return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
   },
   async mercuryAddAxiom(titel, body, section, force) {
@@ -290,7 +290,7 @@ export const httpSource: DataSource = {
     return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
   },
   async mercuryRunExecutions(type) {
-    return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
+    return json(await request(`/api/mercury/runs/executions${type ? `?type=${enc(type)}` : ''}`));
   },
   async mercuryReportStatus() {
     return json(await request('/api/mercury/runs/report-status'));

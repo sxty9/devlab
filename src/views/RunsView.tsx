@@ -7,7 +7,9 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, useActiveRun, ActiveRunBanner } from './MercuryExecutions';
+import { fmtDateTime } from '@/lib/format';
+import { Segmented } from '@/ui/Segmented';
 import type {
   Run,
   RunActive,
@@ -233,31 +235,8 @@ export default function RunsView() {
     // width and leaves the rest of the pane empty (most visibly on the Kalender tab).
     <div className="flex h-full min-h-0 w-full flex-col">
       <header className="flex items-center gap-3 border-b border-separator bg-surface px-3 py-2">
-        <div className="inline-flex items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={cn(
-                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                tab === t.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        {running && (
-          <div className="ml-auto flex items-center gap-2">
-            <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-            </span>
-            <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-              {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-            </Button>
-          </div>
-        )}
+        <Segmented value={tab} options={TABS.map((t) => ({ value: t.id, label: t.label }))} onChange={setTab} />
+        {running && <ActiveRunBanner className="ml-auto" cancelling={cancelling} onCancel={cancelRun} />}
       </header>
 
       <div className="flex min-h-0 flex-1">

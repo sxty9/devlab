@@ -7,6 +7,7 @@ import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import type { ReportDelivery, RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import { fmtDateTime, fmtNum, fmtCost, fmtTime } from '@/lib/format';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -16,16 +17,30 @@ import type { ReportDelivery, RunActive, RunExecution, RunResult, RunResultRef, 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
 
-/** A localized timestamp, or an em dash when absent/unparseable. */
-export function fmtDateTime(iso?: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString('de-DE');
+/** The "Lauf aktiv" indicator + kill-switch, shared by the Läufe and ToDos surfaces so both stay
+ *  symmetric. `className` positions it (e.g. `ml-auto`, or the ToDo list's boxed style). */
+export function ActiveRunBanner({ cancelling, onCancel, className }: { cancelling: boolean; onCancel: () => void; className?: string }) {
+  return (
+    <div className={cn('flex items-center gap-2', className)}>
+      <span className="flex items-center gap-1.5 text-caption text-text-secondary">
+        <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
+      </span>
+      <Button variant="danger" size="sm" disabled={cancelling} onClick={onCancel}>
+        {cancelling ? 'Bricht ab…' : 'Abbrechen'}
+      </Button>
+    </div>
+  );
 }
 
-export const fmtNum = (n: number) => n.toLocaleString('de-DE');
-export const fmtCost = (n: number) => `$${n.toFixed(4)}`;
+/** The "Aktualisieren" refresh button (its icon spins while refreshing), shared by the Mercury surfaces. */
+export function RefreshButton({ refreshing, onClick }: { refreshing: boolean; onClick: () => void }) {
+  return (
+    <Button variant="ghost" size="sm" disabled={refreshing} onClick={onClick}>
+      <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
+    </Button>
+  );
+}
+
 
 /** Compact input/output token + cost readout, shown wherever an execution/result appears. */
 export function TokenStat({ input, output, cost }: { input?: number; output?: number; cost?: number }) {
@@ -417,7 +432,7 @@ function ExecutionDetailBody({ res, hideHeader }: { res: RunResult; hideHeader?:
             <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{res.runName ?? 'Ausführung'}</h1>
             <p className="mt-1 text-footnote text-text-secondary">
               {fmtDateTime(res.startedAt)}
-              {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
+              {res.finishedAt ? ` – ${fmtTime(res.finishedAt)}` : ''}
             </p>
           </div>
           <OkPill ok={res.ok} />
@@ -583,9 +598,7 @@ export function ExecutionHistory({ type }: { type: RunType }) {
         <ReportDeliveryBanner />
         <div className="flex items-center justify-between gap-2 border-b border-separator px-3 py-2">
           <span className="text-footnote font-medium text-text-primary">Ausführungen</span>
-          <Button variant="ghost" size="sm" disabled={refreshing} onClick={refresh}>
-            <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
-          </Button>
+          <RefreshButton refreshing={refreshing} onClick={refresh} />
         </div>
         <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
           {executions === null ? (
@@ -650,7 +663,7 @@ function InlineExecutionDetail({ runId, resultId }: { runId: string; resultId: s
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
         <span className="text-caption text-text-tertiary">
           {fmtDateTime(res.startedAt)}
-          {res.finishedAt ? ` – ${new Date(res.finishedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}` : ''}
+          {res.finishedAt ? ` – ${fmtTime(res.finishedAt)}` : ''}
         </span>
         <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
         <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />

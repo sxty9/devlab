@@ -9,6 +9,8 @@ import TodosView from './TodosView';
 import GlobalCalendarView from './GlobalCalendarView';
 import MercuryChat from './MercuryChat';
 import { cn } from '@/lib/cn';
+import { basename, dirname } from '@/lib/lang';
+import { Segmented } from '@/ui/Segmented';
 import { ChevronRightIcon, MercuryIcon, SitemapIcon, RocketIcon, DotIcon, PlusIcon, CheckIcon } from '@/ui/icons';
 import type { Axiom, Conformance, MercuryNode, MercuryTree, MetaViolation } from '@/types';
 
@@ -38,10 +40,6 @@ function readDragItem(e: React.DragEvent): DragItem | null {
 }
 
 type DropPos = 'inside' | 'before' | 'after';
-
-function parentOf(path: string): string {
-  return path.slice(0, path.lastIndexOf('/'));
-}
 
 /** Find a node by path within a forest. */
 function findNode(nodes: MercuryNode[], path: string): MercuryNode | null {
@@ -149,7 +147,7 @@ export function MercuryView() {
   const reNest = useCallback(
     async (item: DragItem, targetCat: string) => {
       if (item.kind === 'axiom') {
-        const leaf = item.path.slice(item.path.lastIndexOf('/') + 1);
+        const leaf = basename(item.path);
         const to = `${targetCat}/${leaf}`;
         if (to === item.path) return;
         const res = await source.mercuryMoveAxiom(item.path, to);
@@ -177,16 +175,15 @@ export function MercuryView() {
             await reNest(item, targetPath);
             return;
           }
-          const targetParent = parentOf(targetPath);
-          const itemParent = parentOf(item.path);
+          const targetParent = dirname(targetPath);
+          const itemParent = dirname(item.path);
           if (targetParent === itemParent) {
             // pure reorder within the shared parent — send the full new child-name order. A child's
             // key is its path's last segment (an axiom's segment carries ".md"), matching the backend.
-            const lastSeg = (p: string) => p.slice(p.lastIndexOf('/') + 1);
-            const dragKey = lastSeg(item.path);
-            const targetKey = lastSeg(targetPath);
+            const dragKey = basename(item.path);
+            const targetKey = basename(targetPath);
             const keys = childrenOf(roots, targetParent, section)
-              .map((n) => lastSeg(n.path))
+              .map((n) => basename(n.path))
               .filter((k) => k !== dragKey);
             const at = keys.indexOf(targetKey);
             if (at < 0) return;
@@ -258,47 +255,35 @@ export function MercuryView() {
         </nav>
 
         {section === 'laeufe' && (
-          <div className="flex gap-1 border-b border-separator p-2">
-            {(['laufregeln', 'laeufe'] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => {
-                  setLaeufeTab(t);
-                  setSelectedPath(null);
-                  setAdding(false);
-                }}
-                className={cn(
-                  'flex-1 rounded-md px-2 py-1 text-center text-caption transition duration-fast',
-                  laeufeTab === t ? 'bg-fill/[0.07] font-medium text-text-primary' : 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
-                )}
-              >
-                {t === 'laeufe' ? 'Läufe' : 'Laufregeln'}
-              </button>
-            ))}
-          </div>
+          <Segmented<'laeufe' | 'laufregeln'>
+            variant="tabs"
+            value={laeufeTab}
+            options={[
+              { value: 'laufregeln', label: 'Laufregeln' },
+              { value: 'laeufe', label: 'Läufe' },
+            ]}
+            onChange={(t) => {
+              setLaeufeTab(t);
+              setSelectedPath(null);
+              setAdding(false);
+            }}
+          />
         )}
 
         {section === 'axiome' && (
-          <div className="flex gap-1 border-b border-separator p-2">
-            {(['axiome', 'meta'] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => {
-                  setAxiomeTab(t);
-                  setSelectedPath(null);
-                  setAdding(false);
-                }}
-                className={cn(
-                  'flex-1 rounded-md px-2 py-1 text-center text-caption transition duration-fast',
-                  axiomeTab === t ? 'bg-fill/[0.07] font-medium text-text-primary' : 'text-text-secondary hover:bg-fill/10 hover:text-text-primary',
-                )}
-              >
-                {t === 'axiome' ? 'Axiome' : 'Meta-Axiome'}
-              </button>
-            ))}
-          </div>
+          <Segmented<'axiome' | 'meta'>
+            variant="tabs"
+            value={axiomeTab}
+            options={[
+              { value: 'axiome', label: 'Axiome' },
+              { value: 'meta', label: 'Meta-Axiome' },
+            ]}
+            onChange={(t) => {
+              setAxiomeTab(t);
+              setSelectedPath(null);
+              setAdding(false);
+            }}
+          />
         )}
 
         {treeMode && (
@@ -740,7 +725,7 @@ function NamespaceDropZone({ namespace, children }: { namespace: SchemeNs; child
         setOver(false);
         const dropped = readDragItem(e) ?? drag;
         setDrag(null);
-        if (dropped && parentOf(dropped.path) !== namespace) onMove(dropped, namespace, false, 'inside');
+        if (dropped && dirname(dropped.path) !== namespace) onMove(dropped, namespace, false, 'inside');
       }}
     >
       {children}
@@ -761,7 +746,7 @@ function RenameCategoryRow({
   onRename: (from: string, to: string) => Promise<number>;
 }) {
   const { toast } = useToast();
-  const parent = node.path.slice(0, node.path.lastIndexOf('/'));
+  const parent = dirname(node.path);
   const [name, setName] = useState(node.name);
   const [busy, setBusy] = useState(false);
 
@@ -933,7 +918,7 @@ function AxiomPane({
   return (
     <article className="mx-auto max-w-3xl px-8 py-7">
       <div className="flex items-start justify-between gap-4">
-        <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{axiom.titel || path.split('/').pop()}</h1>
+        <h1 className="text-title3 font-semibold tracking-tight text-text-primary">{axiom.titel || basename(path)}</h1>
         <div className="flex shrink-0 items-center gap-1.5">
           <Button variant="secondary" size="sm" onClick={() => setMode('edit')}>
             Bearbeiten
@@ -1114,8 +1099,8 @@ function MoveAxiomForm({
   onMove: (to: string) => Promise<void>;
 }) {
   const { toast } = useToast();
-  const currentCat = path.slice(0, path.lastIndexOf('/'));
-  const currentSlug = path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/, '');
+  const currentCat = dirname(path);
+  const currentSlug = basename(path).replace(/\.md$/, '');
   const [target, setTarget] = useState(currentCat); // selected category path
   const [name, setName] = useState(currentSlug);
   const [busy, setBusy] = useState(false);

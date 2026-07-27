@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // A Snapshot is the full run configuration at one instant, written on every Store mutation so any
@@ -56,21 +58,8 @@ func (h *History) snapshot(action, actor string, runs []Run) {
 	}
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	snap := Snapshot{TS: ts, Action: action, Actor: actor, Runs: runs}
-	b, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return
-	}
-	if os.MkdirAll(h.dir, 0o700) != nil {
-		return
-	}
 	final := filepath.Join(h.dir, stem(ts)+".json")
-	tmp := final + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) != nil {
-		return
-	}
-	if os.Rename(tmp, final) != nil {
-		_ = os.Remove(tmp)
-	}
+	_ = fsatomic.WriteJSON(final, snap) // best-effort: a history write must never fail a mutation
 }
 
 // List returns snapshot metadata, newest first.

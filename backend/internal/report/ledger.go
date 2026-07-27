@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // Status is the delivery state of one day's report to one recipient.
@@ -134,16 +136,5 @@ func (l *Ledger) Put(rec Record) error {
 }
 
 func (l *Ledger) save(recs []Record) error {
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(file{Records: recs}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, l.path)
+	return fsatomic.WriteJSON(l.path, file{Records: recs})
 }

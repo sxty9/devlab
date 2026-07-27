@@ -5,9 +5,11 @@ import { Button } from '@/ui/Button';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
-import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
+import { PlusIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, useActiveRun, ActiveRunBanner, RefreshButton } from './MercuryExecutions';
+import { fmtDateTime } from '@/lib/format';
+import { Segmented } from '@/ui/Segmented';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -393,21 +395,7 @@ export default function TodosView() {
     // w-full: MercuryView's <main> is a flex ROW — without it this view shrinks to its content width.
     <div className="flex h-full min-h-0 w-full flex-col">
       <header className="flex items-center gap-3 border-b border-separator bg-surface px-3 py-2">
-        <div className="inline-flex items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              onClick={() => setTab(t.id)}
-              className={cn(
-                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                tab === t.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
+        <Segmented value={tab} options={TABS.map((t) => ({ value: t.id, label: t.label }))} onChange={setTab} />
       </header>
 
       <div className="flex min-h-0 flex-1">
@@ -427,19 +415,14 @@ export default function TodosView() {
                   <PlusIcon className="h-4 w-4" /> Neues ToDo
                 </Button>
                 <div className="flex items-center gap-1.5">
-                  <Button variant="ghost" size="sm" disabled={refreshing} onClick={refresh}>
-                    <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
-                  </Button>
+                  <RefreshButton refreshing={refreshing} onClick={refresh} />
                 </div>
                 {running && (
-                  <div className="flex items-center justify-between gap-2 rounded-md bg-warning/10 px-2 py-1.5">
-                    <span className="flex items-center gap-1.5 text-caption text-text-secondary">
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-warning" /> Lauf aktiv
-                    </span>
-                    <Button variant="danger" size="sm" disabled={cancelling} onClick={cancelRun}>
-                      {cancelling ? 'Bricht ab…' : 'Abbrechen'}
-                    </Button>
-                  </div>
+                  <ActiveRunBanner
+                    className="justify-between rounded-md bg-warning/10 px-2 py-1.5"
+                    cancelling={cancelling}
+                    onCancel={cancelRun}
+                  />
                 )}
               </div>
 
@@ -952,26 +935,15 @@ function TodoEditor({
           {rows.map((row, i) => (
             <div key={i} className="flex flex-col gap-2 rounded-card border border-separator bg-surface p-3">
               <div className="flex items-center gap-2">
-                <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-                  {(
-                    [
-                      { id: 'existing', label: 'Vorhandenes Repo' },
-                      { id: 'new', label: 'Neues Repo anlegen' },
-                    ] as const
-                  ).map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setRow(i, { kind: opt.id })}
-                      className={cn(
-                        'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                        row.kind === opt.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-                      )}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
+                <Segmented<'existing' | 'new'>
+                  className="w-fit"
+                  value={row.kind}
+                  options={[
+                    { value: 'existing', label: 'Vorhandenes Repo' },
+                    { value: 'new', label: 'Neues Repo anlegen' },
+                  ]}
+                  onChange={(kind) => setRow(i, { kind })}
+                />
                 <div className="flex-1" />
                 {rows.length > 1 && (
                   <Button variant="ghost" size="sm" onClick={() => removeRow(i)}>
@@ -1026,21 +998,7 @@ function TodoEditor({
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Execution</p>
-        <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-          {RUN_MODES.map((m) => (
-            <button
-              key={m.id}
-              type="button"
-              onClick={() => setMode(m.id)}
-              className={cn(
-                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                mode === m.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-              )}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
+        <Segmented className="w-fit" value={mode} options={RUN_MODES.map((m) => ({ value: m.id, label: m.label }))} onChange={setMode} />
         {mode === 'scheduled' && (
           <div className="mt-2">
             <input

@@ -241,7 +241,7 @@ func TestSchedulerFireNowRestartsDoneTodo(t *testing.T) {
 	s := NewScheduler(store, fe, time.Second)
 	s.logf = func(string, ...any) {}
 
-	if !s.FireNow("t", "tester") {
+	if s.FireNow("t", "tester") != StartFired {
 		t.Fatal("FireNow returned busy on an idle scheduler")
 	}
 	deadline := time.Now().Add(2 * time.Second)

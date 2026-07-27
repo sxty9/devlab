@@ -92,14 +92,21 @@ func (s *Server) canPush(ctx context.Context, u *auth.User, id, full string) boo
 	return perm == "push" || perm == "admin"
 }
 
-// decodeJSON reads a size-capped JSON body into v, writing a 400 on failure.
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+// decodeJSONLimit reads a JSON body capped at limit bytes into v, writing a 400 with badMsg on
+// failure. decodeJSON and the larger attachment-upload path share this one decoder; only the cap
+// (and the message) differ, so the size-capped decode lives in exactly one place.
+func decodeJSONLimit(w http.ResponseWriter, r *http.Request, v any, limit int64, badMsg string) bool {
 	defer r.Body.Close()
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(v); err != nil {
-		writeErr(w, http.StatusBadRequest, "Invalid request body")
+	if err := json.NewDecoder(io.LimitReader(r.Body, limit)).Decode(v); err != nil {
+		writeErr(w, http.StatusBadRequest, badMsg)
 		return false
 	}
 	return true
+}
+
+// decodeJSON reads a size-capped JSON body into v, writing a 400 on failure.
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	return decodeJSONLimit(w, r, v, maxBodyBytes, "Invalid request body")
 }
 
 // gitEnsure clones the repo into the caller's workspace if needed (idempotent).

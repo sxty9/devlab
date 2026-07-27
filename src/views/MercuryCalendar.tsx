@@ -3,7 +3,8 @@ import { cn } from '@/lib/cn';
 import { Button, IconButton } from '@/ui/Button';
 import { ChevronRightIcon } from '@/ui/icons';
 import { Modal } from '@/ui/Modal';
-import { ExecutionDetail, OkPill, fmtDateTime } from './MercuryExecutions';
+import { ExecutionDetail, OkPill } from './MercuryExecutions';
+import { fmtDateTime, fmtTime } from '@/lib/format';
 import type { RunOccurrence, RunType } from '@/types';
 
 /** The two kinds an occurrence can carry, spelled out so Tailwind sees whole class names. `auto`
@@ -48,7 +49,6 @@ const addMonths = (d: Date, n: number) => {
 const startOfWeek = (d: Date) => addDays(d, -((d.getDay() + 6) % 7)); // back to Monday
 const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 const dayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
-const fmtTime = (iso: string) => new Date(iso).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
 
 /** MercuryCalendar — the one shared calendar behind every Mercury surface (Laufkalender, ToDo-Kalender
  *  and „Kalender — alles"). It renders the union the parent fetches: past executions AND upcoming

@@ -113,24 +113,42 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// aigenticRetry runs the shared aigentic claude-cli parse loop: it builds a prompt (folding the
+// previous attempt's parse error in as a correction line), runs it, and re-parses — up to
+// classifyAttempts times. It returns the first successful parse; the transport error verbatim if
+// aigentic is unreachable (no retry); or the last parse error once every attempt has failed. classify,
+// conform and planRuns are all this one loop with a different prompt builder and parser.
+func aigenticRetry[T any](ctx context.Context, cookie, csrf string, build func(correction string) string, parse func(output string) (T, error)) (T, error) {
+	var zero T
+	correction := ""
+	var lastErr error
+	for i := 0; i < classifyAttempts; i++ {
+		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: build(correction), OutputFormat: "text"})
+		if err != nil {
+			return zero, err
+		}
+		v, perr := parse(result.Output)
+		if perr == nil {
+			return v, nil
+		}
+		correction, lastErr = perr.Error(), perr
+	}
+	return zero, lastErr
+}
+
 // classify runs the classification loop for namespace ns: prompt aigentic (claude-cli), validate,
 // and retry with a correction line on any contract violation, up to classifyAttempts. ok is false
 // when every attempt failed (the caller parks the record).
 func (s *Server) classify(ctx context.Context, cookie, csrf string, categories []string, members map[string][]string, titel, body, hint, ns string) (mercury.Placement, bool) {
-	correction := ""
-	for i := 0; i < classifyAttempts; i++ {
-		prompt := mercury.ClassifyPrompt(categories, members, titel, body, hint, correction, ns)
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
-		if err != nil {
-			return mercury.Placement{}, false // aigentic unreachable / no subscription: park it
-		}
-		p, perr := mercury.ParsePlacement(result.Output, categories, ns)
-		if perr == nil {
-			return p, true
-		}
-		correction = perr.Error()
+	p, err := aigenticRetry(ctx, cookie, csrf,
+		func(correction string) string {
+			return mercury.ClassifyPrompt(categories, members, titel, body, hint, correction, ns)
+		},
+		func(out string) (mercury.Placement, error) { return mercury.ParsePlacement(out, categories, ns) })
+	if err != nil {
+		return mercury.Placement{}, false // aigentic unreachable or unparseable after retries: park it
 	}
-	return mercury.Placement{}, false
+	return p, true
 }
 
 // optimizeRecord polishes a record's title+body via aigentic (orthography, generalization, brevity)
@@ -237,20 +255,13 @@ func (s *Server) metaAxioms(ctx context.Context, cookie string, paths []string) 
 // classifyAttempts. ok is false when every attempt failed (model unreachable / unparseable) — the
 // caller then fails open (never block adding an axiom because the checker is down).
 func (s *Server) conform(ctx context.Context, cookie, csrf, titel, body string, metas []mercury.RunAxiom) (mercury.Conformance, bool) {
-	correction := ""
-	for i := 0; i < classifyAttempts; i++ {
-		prompt := mercury.ConformancePrompt(titel, body, metas, correction)
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
-		if err != nil {
-			return mercury.Conformance{}, false
-		}
-		c, perr := mercury.ParseConformance(result.Output)
-		if perr == nil {
-			return c, true
-		}
-		correction = perr.Error()
+	c, err := aigenticRetry(ctx, cookie, csrf,
+		func(correction string) string { return mercury.ConformancePrompt(titel, body, metas, correction) },
+		mercury.ParseConformance)
+	if err != nil {
+		return mercury.Conformance{}, false
 	}
-	return mercury.Conformance{}, false
+	return c, true
 }
 
 func orEmptyViolations(v []mercury.Violation) []mercury.Violation {
