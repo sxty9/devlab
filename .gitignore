@@ -17,3 +17,6 @@ dist/
 backend/devlabd
 deploy/devlabd
 backend/deploy/
+
+# mercury dev-deploy staging output (built binary + SPA), never source
+.mercury-artifact/
