@@ -63,6 +63,15 @@ type Run struct {
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
 
+	// TimeBudget caps ONE repo's agent pass for THIS run/todo — the third tunable beside Model + Effort,
+	// shared by auto and todo. Empty means NO explicit choice: the run REFERENCES the service default
+	// (DEVLAB_RUNS_AGENT_TIMEOUT, 3h) and follows it even when that default later changes — the default is
+	// never copied in here, so one setting moves every un-chosen run at once. A non-empty value overrides:
+	// a Go duration ("90m", "3h", "6h"), or "off" (also "none"/"0") for an explicit NO cap, leaving only the
+	// whole-sweep duration as the bound. An explicit value is the only deviation from the default, and it is
+	// stored exactly so the surface can show it as one.
+	TimeBudget string `json:"timeBudget,omitempty"`
+
 	// auto only
 	Schedule Schedule `json:"schedule"`
 	AxiomIDs []string `json:"axiomIds"`

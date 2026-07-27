@@ -40,8 +40,13 @@ const (
 	deployWrapper = "/usr/local/sbin/devlab-deploy"
 	// deployScriptDir mirrors the wrapper's vetted per-repo allowlist. A repo WITHOUT a script there has
 	// no deploy target at all — see hasDeployTarget.
-	deployScriptDir     = "/etc/devlab/deploy.d"
-	defaultAgentTimeout = 60 * time.Minute // a full implement pass can be long
+	deployScriptDir = "/etc/devlab/deploy.d"
+	// defaultAgentTimeout is the SERVICE default per-repo agent budget — what a run/todo that made no own
+	// choice follows. Three hours: an ordinary change finishes well inside it, and a service built from
+	// scratch — the case a tight 60-minute cap used to kill mid-implement, leaving an empty repo and no PR
+	// — now fits. It is the referenced default (never copied into a run), overridable centrally via
+	// DEVLAB_RUNS_AGENT_TIMEOUT and per run/todo via Run.TimeBudget.
+	defaultAgentTimeout = 3 * time.Hour
 	runnerPreamble      = "You are the autonomous Holistic runner, executing unattended on the server. Work " +
 		"strictly against the axioms and Laufregeln in this prompt. There is no human to ask — for " +
 		"unresolved operational gaps follow the Laufregeln (log a non-blocking skip, do not stop). Make " +
@@ -61,10 +66,12 @@ const (
 	defaultMaxRunDuration = 4 * time.Hour
 )
 
-// agentTimeout caps ONE repo's agent pass. Sixty minutes covers an ordinary change, but not building a
-// service from nothing — that hit the ceiling and was killed mid-implement, leaving an empty repo, no
-// PR and no usable output. So the cap is configurable (DEVLAB_RUNS_AGENT_TIMEOUT); an explicit "0"
-// removes it entirely, leaving the whole-sweep duration cap as the only bound.
+// runAgentTimeout is the SERVICE-LEVEL default per-repo agent budget: what a run/todo that made no own
+// choice follows. It is service configuration (belongs at the central config, not the service tab), set
+// via DEVLAB_RUNS_AGENT_TIMEOUT and otherwise the 3h defaultAgentTimeout; an explicit "0" removes the cap
+// entirely, leaving the whole-sweep duration as the only bound. A run's own Run.TimeBudget overrides this
+// (see budgetFor) — this stays the single referenced default that every un-chosen run resolves to at run
+// time, so changing it moves them all at once without touching any stored run.
 func runAgentTimeout() time.Duration {
 	if v := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_AGENT_TIMEOUT")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
@@ -72,6 +79,65 @@ func runAgentTimeout() time.Duration {
 		}
 	}
 	return defaultAgentTimeout
+}
+
+// errBudgetExceeded is the cause attached to a repo's agent context when THIS repo's own time budget runs
+// out (see executeRepo). It lets the failure be told apart from the whole-sweep duration cap and from a
+// deliberate kill-switch abort, so a budget overrun is reported honestly — as an exceeded time budget with
+// the value that applied — rather than as a raw "context deadline exceeded".
+var errBudgetExceeded = errors.New("agent time budget exceeded")
+
+// budgetFor resolves the per-repo agent time budget for a run: the run's OWN TimeBudget when it made a
+// choice, otherwise the service default (runAgentTimeout). A zero duration means an explicit "no cap".
+// explicit reports whether the run overrode the default — the surface uses it to show an override as the
+// deviation it is. An empty choice returns the current service default WITHOUT copying it into the run, so
+// the run keeps following that default when it later changes; an unparseable stored value (a hand-edited
+// runs.json) falls back to the default rather than erroring.
+func budgetFor(run runs.Run) (d time.Duration, explicit bool) {
+	v := strings.TrimSpace(run.TimeBudget)
+	if v == "" {
+		return runAgentTimeout(), false
+	}
+	if isNoCap(v) {
+		return 0, true
+	}
+	if pd, err := time.ParseDuration(v); err == nil && pd > 0 {
+		return pd, true
+	}
+	return runAgentTimeout(), false
+}
+
+// isNoCap reports whether a stored/chosen budget expresses an explicit "no time cap": the "off"/"none"
+// tokens the UI sends, or any zero duration ("0", "0s") — mirroring the DEVLAB_RUNS_AGENT_TIMEOUT "0"
+// convention. A no-cap run is bounded only by the whole-sweep duration.
+func isNoCap(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "off", "none":
+		return true
+	}
+	if pd, err := time.ParseDuration(v); err == nil && pd == 0 {
+		return true
+	}
+	return false
+}
+
+// budgetLabel renders a resolved budget for display + stamping: a compact human duration ("3h", "90m") or
+// "off" for no cap. It is the canonical token the Result carries and the UI formats.
+func budgetLabel(d time.Duration) string {
+	if d <= 0 {
+		return "off"
+	}
+	d = d.Round(time.Minute)
+	h := d / time.Hour
+	m := (d % time.Hour) / time.Minute
+	switch {
+	case h > 0 && m > 0:
+		return fmt.Sprintf("%dh%dm", h, m)
+	case h > 0:
+		return fmt.Sprintf("%dh", h)
+	default:
+		return fmt.Sprintf("%dm", m)
+	}
 }
 
 // maxCostUSD is the cumulative-spend ceiling for one execution; once crossed, the sweep stops cleanly
@@ -474,8 +540,10 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 func (x *runExecutor) freshResult(run runs.Run) runs.Result {
 	start := time.Now()
 	model, _, _ := tuningFor(run).resolve()
+	budget, _ := budgetFor(run)
 	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
-		Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
+		Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort,
+		TimeBudget: budgetLabel(budget), StartedAt: start.UTC(),
 		PromptHash: run.PromptHash, Prompt: run.Prompt}
 }
 
@@ -529,6 +597,8 @@ func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
 		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
 		m, _, _ := tuningFor(run).resolve()
 		candidate.Model, candidate.Effort = m, run.Effort
+		budget, _ := budgetFor(run)
+		candidate.TimeBudget = budgetLabel(budget)
 		return candidate, true
 	}
 	if found {
@@ -774,21 +844,31 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		rr.Base = head
 	}
 
+	// Per-repo agent time budget: this run's own choice (Run.TimeBudget) if it made one, else the service
+	// default (runAgentTimeout). A zero budget is an explicit "no cap" — only the whole-sweep duration then
+	// bounds the agent (req 3). The budget's own timeout carries errBudgetExceeded as its cause, so a run
+	// killed by it is reported honestly as an exceeded budget with the value that applied (req 4), told
+	// apart from the whole-sweep cap and a deliberate abort.
+	budget, _ := budgetFor(run)
 	actx, cancel := context.WithCancel(ctx)
-	if d := runAgentTimeout(); d > 0 {
+	if budget > 0 {
 		cancel()
-		actx, cancel = context.WithTimeout(ctx, d)
+		actx, cancel = context.WithTimeoutCause(ctx, budget, errBudgetExceeded)
 	}
 	defer cancel()
 
 	// REPORT: read-only plan against the dev state; no push, no deploy, no delivery.
 	if x.mode == "report" {
-		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), atts, &rr, saver)
+		final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "plan", "analyze", tuningFor(run), budget, atts, &rr, saver)
 		if lim.limited {
 			return rr, lim
 		}
 		if err != nil {
-			rr.Error = "analyze: " + err.Error()
+			if msg := budgetOverrun(actx, budget); msg != "" {
+				rr.Error = msg // an exceeded time budget, named as such (req 4), not a raw deadline error
+			} else {
+				rr.Error = "analyze: " + err.Error()
+			}
 			return rr, repoSignal{}
 		}
 		applyUsage(&rr, final) // the agent's report already streamed into the analyze step
@@ -800,12 +880,16 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	}
 
 	// PR / FULL: implement ON the dev branch (it already carries the accumulated work).
-	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
+	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), budget, atts, &rr, saver)
 	if lim.limited {
 		return rr, lim
 	}
 	if err != nil {
-		rr.Error = "implement: " + err.Error()
+		if msg := budgetOverrun(actx, budget); msg != "" {
+			rr.Error = msg // an exceeded time budget, named as such (req 4), not a raw deadline error
+		} else {
+			rr.Error = "implement: " + err.Error()
+		}
 		recordNotExecuted(&rr, x.mode, "implement", saver)
 		return rr, repoSignal{}
 	}
@@ -1519,10 +1603,35 @@ func (a *agentStep) fail(logtxt string) {
 	a.saver.force()
 }
 
+// failBudget fails the step as a time-budget overrun. Unlike fail(), it KEEPS the streamed transcript —
+// that is exactly "what was reached until then" (req 4) — and names the exceeded budget above it, so a run
+// cut short at its deadline shows its partial work, not a bare "context deadline exceeded".
+func (a *agentStep) failBudget(note string) {
+	s := &a.rr.Steps[a.idx]
+	s.Running, s.Status = false, runs.StepFailed
+	if tr := a.tr.clipped(); tr != "" {
+		s.Log = clip(note + "\n\nBis dahin erreicht:\n" + tr)
+	} else {
+		s.Log = clip(note)
+	}
+	a.saver.force()
+}
+
+// budgetOverrun returns the honest "Zeitbudget überschritten (<value>)" line when actx was cancelled by
+// THIS repo's own agent budget (cause errBudgetExceeded), naming the value that applied — else "". It tells
+// a budget overrun apart from the whole-sweep duration cap and a deliberate kill-switch abort, which cancel
+// with different causes, so only a real budget timeout is reported as one (req 4).
+func budgetOverrun(actx context.Context, budget time.Duration) string {
+	if errors.Is(context.Cause(actx), errBudgetExceeded) {
+		return "Zeitbudget überschritten (" + budgetLabel(budget) + ")"
+	}
+	return ""
+}
+
 // runAgentLive runs the agent as a live step `name` on rr and returns the extracted final result event
 // (for usage/limit parsing). On a usage-limit stop it leaves the step running and the repo unrecorded
 // (it retries on resume); on error it fails the step; on success it finalizes the step to the report.
-func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
+func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, wt, prompt, permMode, name string, t agentTuning, budget time.Duration, atts []loadedAttachment, rr *runs.RepoResult, saver *liveSaver) (final []byte, lim repoSignal, err error) {
 	ag := beginAgentStep(rr, saver, name)
 	out, aerr := x.runAgent(actx, ex, wt, prompt, permMode, t, atts, ag.onProgress)
 	final = resultEvent(out)
@@ -1530,7 +1639,13 @@ func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, 
 		return final, l, aerr // leave the step running; the repo is not recorded
 	}
 	if aerr != nil {
-		ag.fail(agentError(aerr))
+		// A time-budget overrun is named as such — with the value that applied — and keeps the partial
+		// transcript (req 4); every other error fails plainly with its message.
+		if msg := budgetOverrun(actx, budget); msg != "" {
+			ag.failBudget(msg)
+		} else {
+			ag.fail(agentError(aerr))
+		}
 		return final, repoSignal{}, aerr
 	}
 	ag.finish(parseClaudeResult(final).Output)

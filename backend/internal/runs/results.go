@@ -45,7 +45,13 @@ type Result struct {
 	// shows how each run was tuned. Empty on older results.
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
-	OK     bool   `json:"ok"`
+	// TimeBudget records the per-repo agent time budget that ACTUALLY governed this execution — the
+	// RESOLVED value, not the run's raw choice: a human duration ("3h", "90m") or "off" for no cap. So the
+	// execution view can name which budget applied (a run with no own choice shows the service default it
+	// referenced, an override shows its value) rather than leaving it implicit. Stamped at mint and
+	// re-stamped on resume, like Model/Effort. Empty only on results predating this field.
+	TimeBudget string `json:"timeBudget,omitempty"`
+	OK         bool   `json:"ok"`
 	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
 	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
 	Suspended bool         `json:"suspended,omitempty"`
