@@ -351,6 +351,11 @@ export const mockSource: DataSource = {
   async mercuryRunActive() {
     return { active: null };
   },
+  mercuryEvents(_onTopic) {
+    // The mock has no server to push from; returning null tells the provider to fall back to a gentle
+    // poll so offline/dev still reflects changes (there is no backend to burden).
+    return null;
+  },
   async mercuryCancelRun() {
     /* mock: no-op */
   },

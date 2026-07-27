@@ -18,5 +18,7 @@
     "baseUrl": ".",
     "paths": { "@/*": ["src/*"] }
   },
-  "include": ["src", "vite.config.ts", "tailwind.config.ts"]
+  "include": ["src", "vite.config.ts", "tailwind.config.ts"],
+  "comment": "*.test.ts are run by `npm test` (node --test with type-stripping), not bundled or app-typechecked.",
+  "exclude": ["src/**/*.test.ts"]
 }

@@ -88,6 +88,7 @@ export const dataSource: DataSource = {
   mercuryChat: (messages) => impl.mercuryChat(messages),
   mercuryRunNow: (id) => impl.mercuryRunNow(id),
   mercuryRunActive: () => impl.mercuryRunActive(),
+  mercuryEvents: (onTopic) => impl.mercuryEvents(onTopic),
   mercuryCancelRun: () => impl.mercuryCancelRun(),
   mercuryUploadAttachment: (id, filename, contentB64) => impl.mercuryUploadAttachment(id, filename, contentB64),
   mercuryDeleteAttachment: (id, attachmentId) => impl.mercuryDeleteAttachment(id, attachmentId),

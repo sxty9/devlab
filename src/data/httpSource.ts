@@ -9,6 +9,7 @@ import {
   type WriteResult,
 } from './source';
 import type { AgentReply, AiMessage, AiModelCatalog, AssistantReply, Comment, PullRequestResult, User, VisionFile } from '@/types';
+import { openLiveStream, type LiveEventSource } from '@/lib/live';
 
 const opts: RequestInit = { credentials: 'include', cache: 'no-store' };
 
@@ -300,6 +301,21 @@ export const httpSource: DataSource = {
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
+  },
+  mercuryEvents(onTopic) {
+    // EventSource is same-origin and cookie-authenticated (a GET → no CSRF). openLiveStream owns the
+    // reconnect loop so an expired access token is refreshed before retrying — a raw EventSource
+    // cannot do that itself. Absent EventSource (non-browser) → null so the caller polls instead.
+    if (typeof EventSource === 'undefined') return null;
+    const stream = openLiveStream(
+      '/api/mercury/events',
+      { onTopic },
+      {
+        create: (url) => new EventSource(url, { withCredentials: true }) as unknown as LiveEventSource,
+        refresh: refreshSession,
+      },
+    );
+    return () => stream.close();
   },
   async mercuryCancelRun() {
     await json<void>(await post('/api/mercury/runs/cancel', {}));

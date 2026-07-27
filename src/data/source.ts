@@ -1,4 +1,5 @@
 import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInput, RunList, RunPlan, RunProposal, RunResult, RunResultRef, RunSnapshotMeta, RunType, User, VisionFile } from '@/types';
+import type { MercuryTopic } from '@/lib/live';
 
 export interface DiffPayload {
   before: string;
@@ -177,8 +178,14 @@ export interface DataSource {
   /** Trigger a run immediately (detached). 503 if the executor is unconfigured, 409 if one is running. */
   mercuryRunNow(id: string): Promise<{ started: boolean }>;
   /** The run executing right now (server truth), or null — read on mount so a running run survives a
-   *  page reload, and polled to follow it live. */
+   *  page reload. Kept current by the live-event stream (mercuryEvents) rather than a resting poll. */
   mercuryRunActive(): Promise<{ active: RunActive | null }>;
+  /** Subscribe to Mercury's SINGLE live-update stream. `onTopic(topic)` fires whenever the server
+   *  signals a change of that kind — axioms/runs/active/progress — regardless of who made it (this
+   *  session, another window, an automatic run, a second instance). Returns an unsubscribe, or null
+   *  when this source has no live stream (mock/offline) so the caller can fall back to a gentle poll.
+   *  This is the one connection the whole Mercury surface shares; nothing else opens its own. */
+  mercuryEvents(onTopic: (topic: MercuryTopic) => void): (() => void) | null;
   /** Abort the run currently in progress (kill-switch). */
   mercuryCancelRun(): Promise<void>;
 
