@@ -623,25 +623,11 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
 }
 
-// planRuns runs the aigentic classification loop for a run plan (mirrors s.classify).
+// planRuns runs the aigentic classification loop for a run plan — the shared aigenticRetry loop with
+// the run-plan prompt builder and parser.
 func (s *Server) planRuns(ctx context.Context, cookie, csrf string, knownIDs []string, build func(correction string) string) (mercury.RunPlan, error) {
-	correction := ""
-	var lastErr error
-	for i := 0; i < classifyAttempts; i++ {
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: build(correction), OutputFormat: "text"})
-		if err != nil {
-			return mercury.RunPlan{}, err
-		}
-		plan, perr := mercury.ParseRunPlan(result.Output, knownIDs)
-		if perr == nil {
-			return plan, nil
-		}
-		correction, lastErr = perr.Error(), perr
-	}
-	if lastErr == nil {
-		lastErr = mercury.ErrNoJSON
-	}
-	return mercury.RunPlan{}, lastErr
+	return aigenticRetry(ctx, cookie, csrf, build,
+		func(out string) (mercury.RunPlan, error) { return mercury.ParseRunPlan(out, knownIDs) })
 }
 
 // aiBranchDesc supplies the "otherwise optimise with ai" half of the run-branch naming convention: when a

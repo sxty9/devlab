@@ -11,14 +11,13 @@ import {
 import type { Branch, EditorSettings, FileContent, FileNode, Overlay, PanelId, PullRequestResult, Repo, RepoData, Tab, User } from '@/types';
 import { getDataSource, type CommitResult, type DiffPayload, type PushResult } from '@/data';
 import { basename, guessLang } from '@/lib/lang';
+import { defaultBranchName } from '@/lib/repo';
 import { useSession } from '@/state/session';
 import { useToast } from '@/ui/Toast';
 import { Splash } from '@/shell/Splash';
 
 const FALLBACK_BRANCH: Branch = { name: 'main', isDefault: true, ahead: 0, behind: 0, updated: '' };
 const FALLBACK_REPO: Repo = { id: '', name: '…', fullName: '', kind: 'repo', description: '', language: '', icon: 'service', tint: 'accent', permission: 'pull' };
-
-const defaultBranchName = (d: RepoData) => d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? FALLBACK_BRANCH.name;
 
 const initialTabId = (d: RepoData) =>
   d.defaultTabs.some((t) => t.id === d.activeTabId) ? d.activeTabId : (d.defaultTabs[0]?.id ?? null);

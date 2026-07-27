@@ -301,7 +301,7 @@ export const httpSource: DataSource = {
     return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
   },
   async mercuryRunExecutions(type) {
-    return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
+    return json(await request(`/api/mercury/runs/executions${type ? `?type=${enc(type)}` : ''}`));
   },
   async mercuryReportStatus() {
     return json(await request('/api/mercury/runs/report-status'));

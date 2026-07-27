@@ -4,9 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"io"
 	"mime"
 	"net/http"
 	"path"
@@ -37,14 +35,10 @@ const (
 	maxAttachmentBodyBytes = 40 << 20
 )
 
-// decodeAttachmentBody decodes the upload JSON with the attachment-sized body cap (see above).
+// decodeAttachmentBody decodes the upload JSON with the attachment-sized body cap (see above),
+// reusing the shared size-capped decoder.
 func decodeAttachmentBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	defer r.Body.Close()
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxAttachmentBodyBytes)).Decode(v); err != nil {
-		writeErr(w, http.StatusBadRequest, "Ungültiger Anfrage-Body")
-		return false
-	}
-	return true
+	return decodeJSONLimit(w, r, v, maxAttachmentBodyBytes, "Ungültiger Anfrage-Body")
 }
 
 // Sentinel validation failures a Patch closure raises so the handler can map them to a precise status.

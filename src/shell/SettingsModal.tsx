@@ -2,37 +2,9 @@ import { useState } from 'react';
 import { useSession } from '@/state/session';
 import { Modal } from '@/ui/Modal';
 import { Button } from '@/ui/Button';
-import { cn } from '@/lib/cn';
+import { Segmented } from '@/ui/Segmented';
 
 type Theme = 'dark' | 'light';
-
-function Segmented<T extends string | number>({
-  value,
-  options,
-  onChange,
-}: {
-  value: T;
-  options: { label: string; value: T }[];
-  onChange: (v: T) => void;
-}) {
-  return (
-    <div className="inline-flex rounded-md bg-fill/10 p-0.5">
-      {options.map((o) => (
-        <button
-          key={String(o.value)}
-          type="button"
-          onClick={() => onChange(o.value)}
-          className={cn(
-            'rounded-sm px-3 py-1 text-caption font-medium transition',
-            value === o.value ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (

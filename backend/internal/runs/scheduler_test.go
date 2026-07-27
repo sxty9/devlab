@@ -191,7 +191,8 @@ func TestSchedulerFiresOnlyDueEnabledRunsAndAdvances(t *testing.T) {
 type scriptedExec struct {
 	mu    sync.Mutex
 	calls []Run
-	resps []ResultRef
+	resps []ResultRef          // positional (serial expectations)
+	byRun map[string]ResultRef // by run id — the reliable form once runs are concurrent
 }
 
 func (f *scriptedExec) Execute(_ context.Context, run Run, _ Trigger, report func(string)) (ResultRef, error) {
@@ -200,6 +201,9 @@ func (f *scriptedExec) Execute(_ context.Context, run Run, _ Trigger, report fun
 	i := len(f.calls)
 	f.calls = append(f.calls, run)
 	report("res")
+	if r, ok := f.byRun[run.ID]; ok {
+		return r, nil
+	}
 	if i < len(f.resps) {
 		return f.resps[i], nil
 	}
@@ -261,6 +265,68 @@ func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 	}
 	if r2.NextFireAt == nil || !r2.NextFireAt.After(time.Now()) {
 		t.Error("NextFireAt must be re-anchored forward after a resume")
+	}
+}
+
+// TestSchedulerTodoDoneOnlyWhenNoPRsOpen pins the "in die History erst nach dem Merge"-rule: a ToDo whose
+// execution opened PRs is NOT checked off — it stays in the active list awaiting its merge — while a ToDo
+// with nothing to merge (report mode / no changes → PRsOpen false) is done at once.
+func TestSchedulerTodoDoneOnlyWhenNoPRsOpen(t *testing.T) {
+	past := time.Now().Add(-time.Minute)
+	store := seedStore(t, []Run{
+		{ID: "a", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
+		{ID: "b", Type: TypeTodo, Enabled: true, DueAt: &past, Task: "x"},
+	})
+	fe := &scriptedExec{byRun: map[string]ResultRef{
+		"a": {ResultID: "r", OK: true, PRsOpen: true},  // opened PRs, awaits merge
+		"b": {ResultID: "r", OK: true, PRsOpen: false}, // nothing to merge
+	}}
+	s := NewScheduler(store, fe, time.Second)
+	s.logf = func(string, ...any) {}
+
+	s.fireDue(context.Background())
+	eventually(t, "both ToDos finished", func() bool {
+		a, _, _ := store.Get("a")
+		b, _, _ := store.Get("b")
+		return a.LastResult != nil && b.LastResult != nil
+	})
+
+	a, _, _ := store.Get("a")
+	if a.Done {
+		t.Error("a ToDo with open PRs must stay in the list (not done) until the main-merge is through")
+	}
+	b, _, _ := store.Get("b")
+	if !b.Done {
+		t.Error("a ToDo with nothing to merge must be checked off at once")
+	}
+}
+
+// TestSchedulerFireNowRestartsDoneTodo pins the restart: manually re-running an already-erledigt ToDo
+// reopens it (Done cleared) and — because the fresh run opens PRs — it awaits merge again rather than
+// snapping straight back to done. This is the "wieder anstartbar" path for a completed/stuck ToDo.
+func TestSchedulerFireNowRestartsDoneTodo(t *testing.T) {
+	store := seedStore(t, []Run{{ID: "t", Type: TypeTodo, Enabled: true, Done: true, Task: "x"}})
+	fe := &scriptedExec{resps: []ResultRef{{ResultID: "r", OK: true, PRsOpen: true}}}
+	s := NewScheduler(store, fe, time.Second)
+	s.logf = func(string, ...any) {}
+
+	if s.FireNow("t", "tester") != StartFired {
+		t.Fatal("FireNow returned busy on an idle scheduler")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fe.mu.Lock()
+		done := len(fe.calls) >= 1
+		fe.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // let the detached result-attach patch land
+	got, _, _ := store.Get("t")
+	if got.Done {
+		t.Error("re-running a done ToDo must reopen it (Done cleared), not leave it checked off")
 	}
 }
 

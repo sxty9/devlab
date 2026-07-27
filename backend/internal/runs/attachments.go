@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // AttachmentStore is the passive media pool for ToDo attachments: a plain on-disk blob store holding
@@ -53,14 +55,7 @@ func (a *AttachmentStore) Put(runID, attID string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, p)
+	return fsatomic.WriteFile(p, data)
 }
 
 // Get returns an attachment's bytes (os.ErrNotExist when absent).

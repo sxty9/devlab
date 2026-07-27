@@ -1,6 +1,7 @@
 import type { AgentReply, AiMessage, AssistantReply, Change, Comment, FileContent, MercuryNode, MercuryTree, RepoData, Run, RunInput, RunNotice, VisionFile } from '@/types';
 import { REPOS, REPO_DATA, DEFAULT_REPO_ID } from '@/mock/workspace';
 import { basename, guessLang, visionKind } from '@/lib/lang';
+import { defaultBranchName } from '@/lib/repo';
 import type { BranchResult, CommitResult, DataSource, DiffPayload, PushResult, WriteResult } from './source';
 
 function stub(path: string): FileContent {
@@ -76,21 +77,21 @@ export const mockSource: DataSource = {
     const d = data(id);
     d.changes = d.changes.filter((c) => !c.staged);
     void message;
-    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    const branch = defaultBranchName(d);
     const b = d.branches.find((x) => x.name === branch);
     if (b) b.ahead += 1;
     return { hash: mockHash(), branch, changes: d.changes };
   },
   async push(id): Promise<PushResult> {
     const d = data(id);
-    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    const branch = defaultBranchName(d);
     const b = d.branches.find((x) => x.name === branch);
     if (b) b.ahead = 0;
     return { branch, ahead: 0, behind: 0, message: 'Everything up-to-date (mock)', branches: d.branches };
   },
   async pull(id): Promise<PushResult> {
     const d = data(id);
-    const branch = d.branches.find((b) => b.isDefault)?.name ?? d.branches[0]?.name ?? 'main';
+    const branch = defaultBranchName(d);
     return { branch, ahead: 0, behind: 0, message: 'Already up to date (mock)', branches: d.branches };
   },
   async createBranch(id, name, from): Promise<BranchResult> {
@@ -225,7 +226,7 @@ export const mockSource: DataSource = {
   async mercuryItem(path: string) {
     return {
       id: 'ax_mock01',
-      titel: path.split('/').pop()?.replace('.md', '') ?? 'Axiom',
+      titel: basename(path).replace('.md', '') || 'Axiom',
       quelle: 'axioms/CLAUDE.MD.md#holistic_architecture_maxims/Single Source of Truth',
       body: 'Existiert für die Entität bereits ein Zugangspunkt? Zwingend wiederverwenden. Baue niemals parallele Datenpfade.',
       author: { createdBy: MOCK_ACTOR, createdAt: new Date().toISOString(), updatedBy: MOCK_ACTOR, updatedAt: new Date().toISOString() },

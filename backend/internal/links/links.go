@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // userRe bounds a username to safe filename characters (Linux account names). Defends the
@@ -188,20 +190,7 @@ func (s *Store) Save(user, ghLogin string, ghID int64, token, scopes string, now
 		Link:     Link{GHLogin: ghLogin, GHID: ghID, Scopes: scopes, LinkedAt: now.UTC().Format(time.RFC3339)},
 		TokenEnc: enc,
 	}
-	b, err := json.Marshal(st)
-	if err != nil {
-		return err
-	}
-	// Atomic replace, 0600. tmp in the same dir so os.Rename stays on one filesystem.
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return fsatomic.WriteJSON(p, st)
 }
 
 // Get returns the token-free link metadata, or (nil, nil) when the user has none linked.

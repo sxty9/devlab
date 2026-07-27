@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // Trigger records how an execution was set going. A scheduled (autonomous) firing sets Auto and
@@ -230,20 +232,8 @@ func (r *Results) Save(res Result) error {
 	if res.Repos == nil {
 		res.Repos = []RepoResult{}
 	}
-	dir := filepath.Join(r.dir, res.RunID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(res, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := filepath.Join(dir, res.ResultID+".json.tmp")
-	final := filepath.Join(dir, res.ResultID+".json")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, final)
+	final := filepath.Join(r.dir, res.RunID, res.ResultID+".json")
+	return fsatomic.WriteJSON(final, res)
 }
 
 // ListForRun returns result summaries for a run, newest first.

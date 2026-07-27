@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sync"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
 )
 
@@ -100,20 +101,5 @@ func (s *Store) Put(user, repo string, msgs []model.AiMessage) error {
 	if len(msgs) > maxMessages {
 		msgs = msgs[len(msgs)-maxMessages:]
 	}
-	b, err := json.Marshal(file{Messages: msgs})
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return fsatomic.WriteJSON(p, file{Messages: msgs})
 }
