@@ -181,6 +181,7 @@ export const mockSource: DataSource = {
   async assistantModels() {
     return {
       claude: [
+        { id: 'claude-fable-5', label: 'Fable' },
         { id: 'claude-opus-4-8', label: 'Opus' },
         { id: 'claude-fable-5', label: 'Fable' },
         { id: 'claude-sonnet-4-6', label: 'Sonnet' },

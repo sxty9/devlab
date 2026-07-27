@@ -25,6 +25,19 @@ const AGENT_MODES = [
   { id: 'full', label: 'Full (autonom)' },
 ];
 
+/** Leak the model + version into one option label: the catalog's friendly name plus the version
+ *  encoded in the model id (claude-opus-4-8 → "4.8", claude-fable-5 → "5"), so the picker shows
+ *  WHICH version it selects instead of a bare family name. Targets the current family-first id
+ *  scheme; leaves the label untouched when it already carries the version or the id has none
+ *  (e.g. an Ollama tag). */
+function modelLabel(m: { id: string; label: string }): string {
+  const parts = m.id.replace(/^claude-/, '').split('-');
+  const ver: string[] = [];
+  for (let i = 1; i < parts.length && /^\d{1,2}$/.test(parts[i]); i++) ver.push(parts[i]);
+  const v = ver.join('.');
+  return v && !m.label.includes(v) ? `${m.label} ${v}` : m.label;
+}
+
 /** Resolve the Holistic dashboard origin so we can deep-link to the aigentic settings. */
 function aigenticUrl(): string {
   if (typeof window === 'undefined') return '#';
@@ -344,7 +357,7 @@ export function ClaudePanel() {
             >
               <option value="">Modell: Auto</option>
               {models.map((m) => (
-                <option key={m.id} value={m.id}>{m.label}</option>
+                <option key={m.id} value={m.id}>{modelLabel(m)}</option>
               ))}
             </select>
           )}
