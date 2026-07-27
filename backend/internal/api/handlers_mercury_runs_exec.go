@@ -627,6 +627,32 @@ type repoSignal struct {
 	infraErr string
 }
 
+// adoptPriorDelivery detects duplicate work before it is redone (req 5): if a PRIOR attempt of THIS SAME
+// execution already opened a pull request for this repo — recorded in the delivery ledger — but crashed
+// before its repo-result was saved (so the resume's done-set missed it and would implement it again), the
+// existing pull request is ADOPTED instead of a second being stacked beside it. Keying on the exact
+// (runId, resultId) keeps it precise: a legitimate delivery from a different execution (an automatic run's
+// next night) has a different resultId and is never mistaken for a duplicate. ok=false is the normal path
+// (nothing to adopt). Pure w.r.t. the workspace — it reads only the ledger, so it needs no clone.
+func (x *runExecutor) adoptPriorDelivery(run runs.Run, res *runs.Result, repoID, repoFull string) (runs.RepoResult, bool) {
+	if x.s == nil || x.s.deliveries == nil {
+		return runs.RepoResult{}, false
+	}
+	prior, ok, _ := x.s.deliveries.OpenForExecution(run.ID, res.ResultID, repoFull)
+	if !ok {
+		return runs.RepoResult{}, false
+	}
+	rr := runs.RepoResult{
+		Repo:      repoID,
+		DevBranch: prior.DevBranch, DevCommit: prior.ToCommit,
+		PRUrl: prior.PRUrl, PRBase: prior.BaseBranch, DeliveryID: prior.ID,
+		Steps: []runs.Step{{Name: "pr", Status: runs.StepOK, At: time.Now().UTC(),
+			Log: clip("an open pull request from this same execution already delivers this repository — adopted instead of opening a second: " + prior.PRUrl)}},
+	}
+	rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
+	return rr, true
+}
+
 func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.Repo, isNewRepo bool, prompt, token, ghLogin string, ghID int64, atts []loadedAttachment, res *runs.Result, saver *liveSaver) (runs.RepoResult, repoSignal) {
 	rr := runs.RepoResult{Repo: repo.ID, Running: true}
 	res.Live = &rr // publish this repo as the in-flight one; the caller clears Live once it settles
@@ -636,6 +662,18 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	step := func(name, logtxt string, status runs.StepStatus) {
 		rr.Steps = append(rr.Steps, runs.Step{Name: name, Status: status, Log: clip(logtxt), At: time.Now().UTC()})
 		saver.force()
+	}
+
+	// Duplicate-work guard (req 5), BEFORE the expensive clone/implement: a prior attempt of THIS SAME
+	// execution may have already opened a pull request for this repo and then crashed before its repo-result
+	// was recorded — so the resume's done-set missed it and arrived here to redo the work. Adopt that pull
+	// request from the ledger instead of implementing again and stacking a second one beside it.
+	if adopted, ok := x.adoptPriorDelivery(run, res, repo.ID, repo.FullName); ok {
+		rr = adopted
+		res.Live = &rr
+		saver.force()
+		log.Printf("devlabd: run %s repo %s — adopted the open PR %s from this same execution (duplicate avoided)", run.ID, repo.ID, adopted.PRUrl)
+		return rr, repoSignal{}
 	}
 
 	// NOTE: a repo with an open Mercury PR is NEVER skipped, and its not-yet-merged work is never redone.

@@ -135,3 +135,42 @@ func TestPlanResumeExplicitFreshDiscards(t *testing.T) {
 		t.Error("a discarded execution must not be resumed afterwards")
 	}
 }
+
+// TestAdoptPriorDeliveryReusesOpenPR is req 5: when a prior attempt of the SAME execution already opened a
+// pull request for a repo (recorded in the ledger) but its repo-result was lost to a crash, the resume
+// adopts that pull request instead of implementing again and opening a duplicate. A different execution
+// has nothing to adopt — it would legitimately open its own.
+func TestAdoptPriorDeliveryReusesOpenPR(t *testing.T) {
+	t.Setenv("DEVLAB_MERCURY_RUNS_DELIVERIES", filepath.Join(t.TempDir(), "d.json"))
+	x := &runExecutor{s: &Server{deliveries: runs.NewDeliveryStore()}, mode: "pr"}
+	if err := x.s.deliveries.Add(runs.Delivery{
+		ID: "dlv_1", RunID: "run_a", ResultID: "res_1", Repo: "o/x",
+		DevBranch: "mercury-dev", ToCommit: "abc123", PRUrl: "https://gh/pr/7", BaseBranch: "main",
+		Status: runs.DeliveryOpen,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run := runs.Run{ID: "run_a"}
+
+	rr, ok := x.adoptPriorDelivery(run, &runs.Result{RunID: "run_a", ResultID: "res_1"}, "o/x", "o/x")
+	if !ok {
+		t.Fatal("the same execution's already-open PR must be adopted (req 5)")
+	}
+	if rr.PRUrl != "https://gh/pr/7" || rr.DeliveryID != "dlv_1" || rr.PRBase != "main" || rr.DevCommit != "abc123" {
+		t.Fatalf("adopted repo-result must carry the existing PR/delivery: %+v", rr)
+	}
+	if !rr.OK || len(rr.Steps) != 1 || rr.Steps[0].Status != runs.StepOK {
+		t.Fatalf("adopted repo must be a clean, succeeded chain: %+v", rr)
+	}
+
+	// A different execution of the same run has nothing to adopt — the guard must not fire (it would
+	// otherwise wrongly suppress a legitimate, separate delivery).
+	if _, ok := x.adoptPriorDelivery(run, &runs.Result{RunID: "run_a", ResultID: "res_2"}, "o/x", "o/x"); ok {
+		t.Error("must NOT adopt a delivery across a different execution")
+	}
+	// No ledger at all → no-op (tests / report mode).
+	bare := &runExecutor{s: &Server{}, mode: "pr"}
+	if _, ok := bare.adoptPriorDelivery(run, &runs.Result{RunID: "run_a", ResultID: "res_1"}, "o/x", "o/x"); ok {
+		t.Error("no delivery ledger must be a safe no-op")
+	}
+}
