@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // ErrNotFound is returned by a Mutate closure that matched no run, so Mutate aborts before writing —
@@ -354,16 +356,5 @@ func (s *Store) apply(fn func([]Run) ([]Run, error)) ([]Run, error) {
 func (s *Store) History() *History { return s.hist }
 
 func (s *Store) save(runs []Run) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(file{Runs: runs}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return fsatomic.WriteJSON(s.path, file{Runs: runs})
 }

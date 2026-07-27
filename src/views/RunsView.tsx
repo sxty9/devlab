@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
@@ -7,11 +7,13 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { Authorship } from '@/ui/Authorship';
 import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
-import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon, XIcon } from '@/ui/icons';
+import { ChevronRightIcon, LightbulbIcon, PlayIcon, PlusIcon, RefreshIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, TokenStat, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, TokenStat, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
-import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
+import { NO_RUN_FILTER, RunFilterBar, applyRunFilter, type RunFilter } from './MercuryRunFilters';
+import { fmtDateTime } from '@/lib/format';
+import { Segmented } from '@/ui/Segmented';
 import type {
   Run,
   RunActive,
@@ -323,6 +325,7 @@ export default function RunsView() {
             {active.length === 1 ? '1 Lauf aktiv' : `${active.length} Läufe aktiv`}
           </span>
         )}
+        <Segmented value={tab} options={TABS.map((t) => ({ value: t.id, label: t.label }))} onChange={setTab} />
       </header>
 
       <div className="flex min-h-0 flex-1">

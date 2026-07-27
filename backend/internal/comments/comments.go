@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
 )
 
@@ -88,19 +89,7 @@ func (s *Store) writeFile(repo string, f *file) error {
 	if err != nil {
 		return err
 	}
-	b, err := json.Marshal(f)
-	if err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return fsatomic.WriteJSON(p, f)
 }
 
 // List returns a repo's comments (optionally only those attached to path), oldest first.

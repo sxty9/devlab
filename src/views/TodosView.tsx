@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
@@ -7,13 +7,15 @@ import { Authorship } from '@/ui/Authorship';
 import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
 import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
-import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
+import { CheckIcon, ChevronRightIcon, FileIcon, PlayIcon, PlusIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, ExecutionList, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ActiveRunsOverview, EmptyPlaceholder, ExecutionHistory, ExecutionList, RefreshButton, useActiveRun } from './MercuryExecutions';
 import { RunTuningFields } from './RunTuning';
-import { RunFilterBar, applyRunFilter, NO_RUN_FILTER, type RunFilter } from './MercuryRunFilters';
-import { runStage, RUN_STAGE_LABEL } from '@/types';
-import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
+import { NO_RUN_FILTER, RunFilterBar, applyRunFilter, type RunFilter } from './MercuryRunFilters';
+import { RUN_STAGE_LABEL, runStage } from '@/types';
+import { fmtDateTime } from '@/lib/format';
+import { Segmented } from '@/ui/Segmented';
+import type { Repo, Run, RunActive, RunAttachment, RunCalendar, RunInput, RunResultRef, RunTarget } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -461,6 +463,7 @@ export default function TodosView() {
             {active.length === 1 ? '1 Lauf aktiv' : `${active.length} Läufe aktiv`}
           </span>
         )}
+        <Segmented value={tab} options={TABS.map((t) => ({ value: t.id, label: t.label }))} onChange={setTab} />
       </header>
 
       <div className="flex min-h-0 flex-1">
@@ -480,13 +483,10 @@ export default function TodosView() {
                   <PlusIcon className="h-4 w-4" /> Neues ToDo
                 </Button>
                 <div className="flex items-center gap-1.5">
-                  <Button variant="ghost" size="sm" disabled={refreshing} onClick={refresh}>
-                    <RefreshIcon className={cn('h-4 w-4', refreshing && 'animate-spin')} /> Aktualisieren
-                  </Button>
+                  <RefreshButton refreshing={refreshing} onClick={refresh} />
                 </div>
                 {openTodos.length > 0 && <RunFilterBar filter={filter} onChange={setFilter} showIdle={false} />}
                 <ActiveRunsOverview inflight={inflight} onCancel={cancelRun} cancelling={cancellingId !== null} />
-
               </div>
 
               <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
@@ -1001,26 +1001,15 @@ function TodoEditor({
           {rows.map((row, i) => (
             <div key={i} className="flex flex-col gap-2 rounded-card border border-separator bg-surface p-3">
               <div className="flex items-center gap-2">
-                <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-                  {(
-                    [
-                      { id: 'existing', label: 'Vorhandenes Repo' },
-                      { id: 'new', label: 'Neues Repo anlegen' },
-                    ] as const
-                  ).map((opt) => (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => setRow(i, { kind: opt.id })}
-                      className={cn(
-                        'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                        row.kind === opt.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-                      )}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
-                </div>
+                <Segmented<'existing' | 'new'>
+                  className="w-fit"
+                  value={row.kind}
+                  options={[
+                    { value: 'existing', label: 'Vorhandenes Repo' },
+                    { value: 'new', label: 'Neues Repo anlegen' },
+                  ]}
+                  onChange={(kind) => setRow(i, { kind })}
+                />
                 <div className="flex-1" />
                 {rows.length > 1 && (
                   <Button variant="ghost" size="sm" onClick={() => removeRow(i)}>
@@ -1075,21 +1064,7 @@ function TodoEditor({
 
       <div>
         <p className="mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Execution</p>
-        <div className="inline-flex w-fit items-center gap-0.5 rounded-md bg-fill/10 p-0.5">
-          {RUN_MODES.map((m) => (
-            <button
-              key={m.id}
-              type="button"
-              onClick={() => setMode(m.id)}
-              className={cn(
-                'rounded px-3 py-1 text-caption font-medium transition duration-fast',
-                mode === m.id ? 'bg-surface-raised text-text-primary shadow-elev-1' : 'text-text-secondary hover:text-text-primary',
-              )}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
+        <Segmented className="w-fit" value={mode} options={RUN_MODES.map((m) => ({ value: m.id, label: m.label }))} onChange={setMode} />
         {mode === 'scheduled' && (
           <div className="mt-2">
             <input

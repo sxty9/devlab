@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"regexp"
 	"strings"
+
+	"devlab/backend/internal/slug"
 )
 
 // The one-time migration decomposes the original constitution (the 5+2 maxims and the prose
@@ -230,22 +232,5 @@ func closeTagName(t string) string {
 // Slug reduces a title to a lowercase kebab path segment (ascii-only, matching the classifier's
 // path rule): umlauts transliterated, everything else collapsed to single dashes.
 func Slug(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	repl := strings.NewReplacer("ä", "ae", "ö", "oe", "ü", "ue", "ß", "ss")
-	s = repl.Replace(s)
-	var b strings.Builder
-	prevDash := false
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-			b.WriteRune(r)
-			prevDash = false
-		default:
-			if !prevDash {
-				b.WriteByte('-')
-				prevDash = true
-			}
-		}
-	}
-	return strings.Trim(b.String(), "-")
+	return slug.Make(s, "-")
 }

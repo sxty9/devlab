@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // A run in pr/full mode opens a PR per repo. A human may merge it anytime; if none does within the
@@ -123,16 +125,5 @@ func (s *PRStore) Touch(repo string, number int, at time.Time) error {
 }
 
 func (s *PRStore) save(prs []PendingPR) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(prFile{PRs: prs}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return fsatomic.WriteJSON(s.path, prFile{PRs: prs})
 }

@@ -251,7 +251,7 @@ func stageWord(step string) string {
 func lastOKStep(rr runs.RepoResult) string {
 	name := ""
 	for _, s := range rr.Steps {
-		if s.OK {
+		if s.Status == runs.StepOK {
 			name = s.Name
 		}
 	}

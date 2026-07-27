@@ -15,10 +15,10 @@ func TestDeliveryStageHonestlyReflectsOutcome(t *testing.T) {
 	}{
 		{"deployed", runs.RepoResult{OK: true, Deployed: true}, "deployed"},
 		{"pr", runs.RepoResult{OK: true, PRUrl: "https://x/pr/1"}, "PR opened"},
-		{"analyzed-only", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", OK: true}}}, "analyzed"},
-		{"implemented", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", OK: true}, {Name: "implement", OK: true}}}, "implemented"},
+		{"analyzed-only", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", Status: runs.StepOK}}}, "analyzed"},
+		{"implemented", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", Status: runs.StepOK}, {Name: "implement", Status: runs.StepOK}}}, "implemented"},
 		{"ok-no-steps", runs.RepoResult{OK: true}, "analyzed"},
-		{"failed-at-push", runs.RepoResult{OK: false, Steps: []runs.Step{{Name: "implement", OK: true}, {Name: "push", OK: false}}}, "failed at pushed"},
+		{"failed-at-push", runs.RepoResult{OK: false, Steps: []runs.Step{{Name: "implement", Status: runs.StepOK}, {Name: "push", Status: runs.StepFailed}}}, "failed at pushed"},
 		{"failed-no-steps", runs.RepoResult{OK: false}, "failed"},
 	}
 	for _, c := range cases {

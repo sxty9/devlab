@@ -204,6 +204,19 @@ func (s *Scheduler) FireNow(id, actor string) StartOutcome {
 		s.queueStart(id)
 		return StartDeferred
 	}
+	// Re-running an already-checked-off ToDo reopens it: it is being worked again, so leaving it marked
+	// done would state something untrue for as long as it runs.
+	if run.IsTodo() && run.Done {
+		_, _ = s.store.Patch(func(cur []Run) ([]Run, error) {
+			for i := range cur {
+				if cur[i].ID == id {
+					cur[i].Done = false
+				}
+			}
+			return cur, nil
+		})
+		run.Done = false
+	}
 	// Detached from any request context so the run outlives the HTTP handler.
 	if s.tryStart(context.Background(), run, actor, false) {
 		return StartFired
@@ -458,8 +471,10 @@ func (s *Scheduler) runOnce(ctx context.Context, id, actor string, advance bool)
 				r := ref
 				cur[i].LastResult = &r
 			}
-			if cur[i].IsTodo() && ref.OK {
-				cur[i].Done = true // a completed ToDo is checked off; a failed one stays open
+			// A ToDo is checked off only when its work has actually LANDED: an execution that left pull
+			// requests open is not finished — the merge to main is (the PR maintenance flips Done then).
+			if cur[i].IsTodo() && ref.OK && !ref.PRsOpen {
+				cur[i].Done = true // nothing left to merge → done at once; a failed one stays open
 			}
 			// A resume that finished after a long suspension may have left NextFireAt in the past;
 			// re-anchor it forward so it doesn't immediately catch-up fire.
