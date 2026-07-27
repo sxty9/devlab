@@ -24,6 +24,12 @@ type Executor interface {
 	// uncalled if the run fails before a result exists.
 	Execute(ctx context.Context, run Run, report func(resultID string)) (ResultRef, error)
 	Maintain(ctx context.Context)
+	// PlanResume decides — synchronously, before the run executes — whether the imminent execution will
+	// continue an interrupted one or start fresh, and why (a ResumePlan). With fresh=true it additionally
+	// DISCARDS any resumable execution (marking it as such) so the run deliberately starts over. The
+	// scheduler consults it in FireNow so a manual trigger can report the decision to its caller; the
+	// execution path re-derives the same decision, so the two never diverge.
+	PlanResume(run Run, fresh bool) ResumePlan
 }
 
 // Activity is a snapshot of the run currently executing: its id, the live result id (once the executor

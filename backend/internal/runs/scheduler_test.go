@@ -26,6 +26,7 @@ func (f *fakeExec) Maintain(context.Context) {
 	f.maintain++
 	f.mu.Unlock()
 }
+func (f *fakeExec) PlanResume(Run, bool) ResumePlan { return ResumePlan{Action: ResumeFresh} }
 func (f *fakeExec) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -45,7 +46,8 @@ func (b *blockingExec) Execute(_ context.Context, run Run, report func(string)) 
 	<-b.release
 	return ResultRef{ResultID: "res_live", OK: true}, nil
 }
-func (b *blockingExec) Maintain(context.Context) {}
+func (b *blockingExec) Maintain(context.Context)        {}
+func (b *blockingExec) PlanResume(Run, bool) ResumePlan { return ResumePlan{Action: ResumeFresh} }
 
 func TestSchedulerActiveReflectsRunningRun(t *testing.T) {
 	past := time.Now().Add(-time.Minute)
@@ -148,6 +150,14 @@ func (f *scriptedExec) Execute(_ context.Context, run Run, report func(string)) 
 	return ResultRef{ResultID: "res", OK: true}, nil
 }
 func (f *scriptedExec) Maintain(context.Context) {}
+func (f *scriptedExec) PlanResume(run Run, fresh bool) ResumePlan {
+	// Mirror the real executor's shape closely enough for scheduler tests: a run suspended on the usage
+	// limit resumes its named result; anything else starts fresh.
+	if run.Suspended != nil && run.Suspended.ResultID != "" && !fresh {
+		return ResumePlan{Action: ResumeContinue, ResultID: run.Suspended.ResultID}
+	}
+	return ResumePlan{Action: ResumeFresh}
+}
 
 func TestSchedulerSuspendsThenResumesOnUsageLimit(t *testing.T) {
 	past := time.Now().Add(-time.Minute)

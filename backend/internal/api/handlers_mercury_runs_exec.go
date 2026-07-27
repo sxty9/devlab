@@ -469,53 +469,101 @@ func (x *runExecutor) Execute(ctx context.Context, run runs.Run, report func(res
 	return res.Ref(), nil
 }
 
-// resumeOrNew continues an interrupted execution, or mints a fresh one. Three interruption kinds resume
-// the SAME result (so repos already done are skipped, never re-implemented into duplicate PRs):
-//  1. a usage-limit suspension (run.Suspended points at the open result);
-//  2. a crash/restart mid-run — no suspension, but a stranded result (unfinished, unsuspended) is on
-//     disk. Without (2), a devlabd restart during a sweep makes the next fire redo every repo; and
-//  3. an ORPHANED suspension — an execution that paused on the limit but whose run lost its Suspended
-//     pointer (a restart between the two writes). FindResumable recovers it, so it no longer freezes
-//     forever with its spend stranded (the freeze bug).
+// freshResult mints a brand-new execution stamped with the run's current identity, mode and tuning —
+// snapshotted so the History stays legible even after the run (or its axioms) later change.
+func (x *runExecutor) freshResult(run runs.Run) runs.Result {
+	start := time.Now()
+	model, _, _ := tuningFor(run).resolve()
+	return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
+		Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
+		PromptHash: run.PromptHash, Prompt: run.Prompt}
+}
+
+// classifyResume is the SINGLE, read-only decision of whether the next fire of `run` continues an
+// interrupted execution or starts fresh — and why. It performs NO side effects (it neither reaps nor
+// mints), so the exact same logic can PREVIEW the decision for whoever triggers the run (PlanResume) and
+// ENACT it in the execution path (resumeOrNew) without a second, divergable code path — one source of
+// truth for "fortgesetzt oder neu begonnen?". Three interruption kinds are continued (skipping the repos
+// already done, so nothing is re-implemented into a duplicate PR): a usage-limit suspension (run.Suspended
+// points at the open result), a crash/restart mid-run (a stranded, unsuspended husk on disk), and an
+// ORPHANED suspension whose run lost its pointer (FindResumable recovers it — the freeze-bug fix).
 //
-// A husk started under a DIFFERENT safety-ladder mode is NOT continued (a report husk marks repos
-// "done" after mere analysis; resuming it in pr mode would skip implementing them). Such a husk is
-// reaped — finalised as failed so it stops lingering — and a fresh execution starts.
-func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
-	fresh := func() runs.Result {
-		start := time.Now()
-		model, _, _ := tuningFor(run).resolve() // the engine this execution is minted with (re-stamped on resume, see consider)
-		return runs.Result{RunID: run.ID, ResultID: runs.NewResultID(start), RunName: run.Name,
-			Type: runs.NormalizeType(run.Type), Mode: x.mode, Model: model, Effort: run.Effort, StartedAt: start.UTC(),
-			PromptHash: run.PromptHash, Prompt: run.Prompt}
-	}
-	consider := func(existing runs.Result) (runs.Result, bool, bool) {
+// The standing conditions are applied reliably, not weakened: a husk from a DIFFERENT safety-ladder mode
+// is NOT continued (a report husk marks repos "done" after mere analysis; resuming it in pr mode would
+// skip implementing them), and a husk not worked within the stranded window has aged out and is not found
+// at all. candidate is the husk the plan refers to — the one to resume, or the mode-mismatched one the
+// caller must reap before starting fresh; found reports whether any husk was considered.
+func (x *runExecutor) classifyResume(run runs.Run) (plan runs.ResumePlan, candidate runs.Result, found bool) {
+	decide := func(existing runs.Result) (runs.ResumePlan, runs.Result, bool) {
 		if existing.Mode != "" && existing.Mode != x.mode {
-			x.reap(existing, fmt.Sprintf("Modus gewechselt (%s → %s) — Husk nicht fortgesetzt", existing.Mode, x.mode))
-			return runs.Result{}, false, true // reaped: don't resume, fall through to fresh
+			return runs.ResumePlan{Action: runs.ResumeFresh,
+				Reason: fmt.Sprintf("the interrupted execution ran in %s mode; starting fresh in %s mode", existing.Mode, x.mode),
+			}, existing, true
 		}
+		return runs.ResumePlan{Action: runs.ResumeContinue, ResultID: existing.ResultID, ReposDone: len(existing.Repos),
+			Reason: fmt.Sprintf("continuing the interrupted execution — %s already done", reposPhrase(len(existing.Repos))),
+		}, existing, true
+	}
+	// A live usage-limit suspension names its open result directly; prefer it, but only while it is still
+	// unfinished (a finished result is never resumed — a defensive guard so the pointer can't resurrect one).
+	if run.Suspended != nil && run.Suspended.ResultID != "" {
+		if existing, ok, _ := x.s.runResults.Get(run.ID, run.Suspended.ResultID); ok && existing.FinishedAt.IsZero() {
+			return decide(existing)
+		}
+	}
+	// Otherwise a crash/carry-over husk (or an orphaned suspension) on disk, bounded by the stranded window.
+	if existing, ok := x.s.runResults.FindResumable(run.ID, time.Now().Add(-strandedWindow)); ok {
+		return decide(existing)
+	}
+	return runs.ResumePlan{Action: runs.ResumeFresh, Reason: "no interrupted execution to continue — starting a new one"}, runs.Result{}, false
+}
+
+// resumeOrNew enacts classifyResume's decision: continue the interrupted execution (same id, done repos
+// skipped) or mint a fresh one. A husk from a different mode is reaped — finalised as failed so it stops
+// lingering as unfinished — before the fresh start.
+func (x *runExecutor) resumeOrNew(run runs.Run) (runs.Result, bool) {
+	plan, candidate, found := x.classifyResume(run)
+	if plan.Action == runs.ResumeContinue {
 		// A resumed attempt is driven by the run's CURRENT tuning (executeRepo reads tuningFor(run) each
 		// fire), so re-stamp the engine label to match — else a legacy husk shows no model, and one whose
 		// tuning was edited while suspended keeps a stale label. Label-only; it steers no resume decision.
 		m, _, _ := tuningFor(run).resolve()
-		existing.Model, existing.Effort = m, run.Effort
-		return existing, true, false
+		candidate.Model, candidate.Effort = m, run.Effort
+		return candidate, true
 	}
-	if run.Suspended != nil && run.Suspended.ResultID != "" {
-		if existing, ok, _ := x.s.runResults.Get(run.ID, run.Suspended.ResultID); ok {
-			if res, resume, reaped := consider(existing); resume {
-				return res, true
-			} else if reaped {
-				return fresh(), false
-			}
-		}
+	if found {
+		x.reap(candidate, plan.Reason) // mode-mismatched husk — close it out so it stops showing as unfinished
 	}
-	if existing, ok := x.s.runResults.FindResumable(run.ID, time.Now().Add(-strandedWindow)); ok {
-		if res, resume, _ := consider(existing); resume {
-			return res, true
-		}
+	return x.freshResult(run), false
+}
+
+// PlanResume answers "fortgesetzt oder neu begonnen?" synchronously for whoever triggers a run, and
+// enacts an EXPLICIT fresh start. With fresh=false it is the read-only classifier — the executor
+// re-derives the same decision, deterministically, when it actually runs. With fresh=true it DISCARDS any
+// resumable execution: the husk is reaped (visibly marked as discarded, not left lingering), so the run
+// starts new instead of continuing it, and the returned plan names the discarded execution and any open
+// pull request it left — surfacing it rather than silently placing a second one beside it.
+func (x *runExecutor) PlanResume(run runs.Run, fresh bool) runs.ResumePlan {
+	plan, candidate, _ := x.classifyResume(run)
+	if !fresh || plan.Action != runs.ResumeContinue {
+		return plan // nothing to discard: report the classifier's decision as-is
 	}
-	return fresh(), false
+	x.reap(candidate, "discarded on an explicit fresh start")
+	out := runs.ResumePlan{Action: runs.ResumeFresh, Discarded: candidate.ResultID,
+		Reason: fmt.Sprintf("discarded the interrupted execution (%s done) and started fresh, as requested", reposPhrase(len(candidate.Repos)))}
+	if pr := candidate.Ref().PRUrl; pr != "" {
+		out.DiscardedPRUrl = pr
+		out.Reason += "; it left an open pull request: " + pr
+	}
+	return out
+}
+
+// reposPhrase renders a repo count with correct singular/plural, for the human-readable resume reason.
+func reposPhrase(n int) string {
+	if n == 1 {
+		return "1 repository"
+	}
+	return fmt.Sprintf("%d repositories", n)
 }
 
 // reap finalises an unresumable husk (mode-mismatched, or otherwise not to be continued) as a failed,
@@ -526,7 +574,7 @@ func (x *runExecutor) reap(res runs.Result, reason string) {
 	res.ResumeAt = nil
 	res.FinishedAt = time.Now().UTC()
 	res.OK = false
-	res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false, Error: "abgeschlossen (nicht fortgesetzt): " + reason})
+	res.Repos = append(res.Repos, runs.RepoResult{Repo: "-", OK: false, Error: "closed (not continued): " + reason})
 	_ = x.s.runResults.Save(res)
 	log.Printf("devlabd: reaped husk %s/%s — %s", res.RunID, res.ResultID, reason)
 }
