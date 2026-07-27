@@ -6,7 +6,7 @@ import { Modal } from '@/ui/Modal';
 import { cn } from '@/lib/cn';
 import { PlusIcon, LightbulbIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionHistory, LiveExecution, TokenStat, EmptyPlaceholder, fmtDateTime, useActiveRun, BlockedDeploysPanel } from './MercuryExecutions';
 import type {
   Run,
   RunActive,
@@ -252,6 +252,8 @@ export default function RunsView() {
           </div>
         )}
       </header>
+
+      <BlockedDeploysPanel />
 
       <div className="flex min-h-0 flex-1">
         {tab === 'laeufe' && (

@@ -6,7 +6,7 @@ import { cn } from '@/lib/cn';
 import { humanSize, toBase64 } from '@/lib/file';
 import { PlusIcon, RefreshIcon, ChevronRightIcon, PlayIcon, CheckIcon, FileIcon, XIcon } from '@/ui/icons';
 import { MercuryCalendar } from './MercuryCalendar';
-import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun } from './MercuryExecutions';
+import { ExecutionList, ExecutionHistory, LiveExecution, EmptyPlaceholder, fmtDateTime, useActiveRun, BlockedDeploysPanel } from './MercuryExecutions';
 import type { Run, RunActive, RunInput, RunTarget, RunAttachment, RunResultRef, Repo, RunCalendar } from '@/types';
 
 /** A single-file cap that matches the backend (25 MiB). */
@@ -398,6 +398,8 @@ export default function TodosView() {
           ))}
         </div>
       </header>
+
+      <BlockedDeploysPanel />
 
       <div className="flex min-h-0 flex-1">
         {tab === 'liste' && (

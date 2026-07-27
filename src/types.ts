@@ -511,6 +511,19 @@ export interface RunActive {
   startedAt: string;
 }
 
+/** A prod-delivery the scheduler has BLOCKED after repeated permanent failures (typically: the service
+ *  is not set up on the target). Surfaced in the UI so a stuck delivery is seen without reading the
+ *  system log, and can be explicitly resumed. */
+export interface BlockedDeploy {
+  repo: string; // owner/name
+  number: number; // the merged PR number the delivery belongs to
+  url: string;
+  runId: string;
+  reason: string; // human cause, naming the service and the target
+  attempts: number; // permanent-failure attempts before it blocked
+  blockedAt: string;
+}
+
 /** One upcoming firing in the Laufkalender. `type` separates automatic runs from ToDos (colour). */
 export interface RunOccurrence {
   runId: string;

@@ -5,7 +5,7 @@ import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { renderMarkdown } from '@/lib/markdown';
 import { RocketIcon, RefreshIcon, ChevronRightIcon, PlayIcon } from '@/ui/icons';
-import type { RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
+import type { BlockedDeploy, RunActive, RunExecution, RunResult, RunResultRef, RepoResult, RunStep, RunType } from '@/types';
 
 /** Shared execution-history kit for Mercury's parallel surfaces — Automatische Läufe and Konkrete
  *  ToDos. Both run on the SAME machinery (store, executor, results), so their history is rendered by
@@ -681,6 +681,110 @@ export function useActiveRun(): { active: RunActive | null; refetch: () => void 
   }, [source, bump]);
 
   return { active, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** Poll the blocked deliveries — the deployments the scheduler stopped retrying after repeated
+ *  permanent failures. Same rhythm as useActiveRun; keeps the last known list across a transient poll
+ *  error so the alert doesn't flicker. */
+export function useBlockedDeploys(): { blocked: BlockedDeploy[]; refetch: () => void } {
+  const source = useMemo(() => getDataSource(), []);
+  const [blocked, setBlocked] = useState<BlockedDeploy[]>([]);
+  const [bump, setBump] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const r = await source.mercuryBlockedDeploys();
+        if (!cancelled) setBlocked(r.blocked ?? []);
+      } catch {
+        /* transient — keep the last known state */
+      }
+      if (!cancelled) timer = window.setTimeout(poll, 5000);
+    };
+    void poll();
+    const onFocus = () => setBump((b) => b + 1);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [source, bump]);
+
+  return { blocked, refetch: useCallback(() => setBump((b) => b + 1), []) };
+}
+
+/** A prominent alert listing deliveries the scheduler has BLOCKED — one broken repo that stopped being
+ *  retried after repeated permanent failures (typically: the service is not set up on the target). Shows
+ *  the repository, the human reason, and how many attempts it took, with an explicit "Wiederaufnehmen"
+ *  that clears the block so the next maintain tick retries. Renders nothing when nothing is blocked, so
+ *  it never clutters the surface — it appears exactly when it matters. Shared by the Läufe and ToDos
+ *  surfaces (both deliver via the same machinery). */
+export function BlockedDeploysPanel() {
+  const { blocked, refetch } = useBlockedDeploys();
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [resuming, setResuming] = useState<string | null>(null);
+
+  if (blocked.length === 0) return null;
+
+  const resume = async (d: BlockedDeploy) => {
+    const key = `${d.repo}#${d.number}`;
+    setResuming(key);
+    try {
+      await source.mercuryResumeDeploy(d.repo, d.number);
+      toast({ title: `Auslieferung von ${d.repo} wird erneut versucht`, variant: 'success' });
+      refetch();
+    } catch (e) {
+      toast({ title: 'Wiederaufnahme fehlgeschlagen', description: msg(e), variant: 'danger' });
+    } finally {
+      setResuming(null);
+    }
+  };
+
+  return (
+    <div className="border-b border-danger/40 bg-danger/10 px-4 py-3" role="alert">
+      <div className="mb-2 flex items-center gap-2 text-body font-semibold text-danger">
+        <RocketIcon className="h-4 w-4" />
+        {blocked.length === 1 ? 'Auslieferung blockiert' : `${blocked.length} Auslieferungen blockiert`}
+      </div>
+      <ul className="flex flex-col gap-2">
+        {blocked.map((d) => {
+          const key = `${d.repo}#${d.number}`;
+          return (
+            <li key={key} className="flex items-start justify-between gap-3 rounded-md bg-surface/60 px-3 py-2">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-caption">
+                  <span className="font-medium text-text-primary">{d.repo}</span>
+                  {d.url && d.url !== '#' && (
+                    <a href={d.url} target="_blank" rel="noreferrer" className="text-accent hover:underline">
+                      PR #{d.number}
+                    </a>
+                  )}
+                  <span className="rounded bg-danger/15 px-1.5 py-0.5 font-medium text-danger">
+                    {d.attempts} {d.attempts === 1 ? 'Versuch' : 'Versuche'}
+                  </span>
+                  {d.blockedAt && <span className="text-text-tertiary">seit {fmtDateTime(d.blockedAt)}</span>}
+                </div>
+                <p className="mt-1 text-caption text-text-secondary">{d.reason}</p>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={resuming === key}
+                onClick={() => resume(d)}
+                className="shrink-0"
+              >
+                {resuming === key ? 'Nimmt auf…' : 'Wiederaufnehmen'}
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
 /** Follow a run LIVE: poll its in-flight result document and render it — the totals, the repos already
