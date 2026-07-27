@@ -35,6 +35,7 @@ type Server struct {
 	comments    *comments.Store       // nil if the comments dir can't be created
 	chats       *chats.Store          // nil if the chats dir can't be created — AI transcript persistence
 	runs        *runs.Store           // Mercury's Automatische Läufe — run instances + config history
+	config      *runs.ConfigStore     // service-level run config (the default time budget) — a passive pool
 	runResults  *runs.Results         // per-execution results/logs (written by the executor, read here)
 	runPRs      *runs.PRStore         // run-created PRs awaiting merge (auto-merge after the window)
 	runNotices  *runs.NoticeStore     // passive feed of automatic axiom→run assignments (and their failures)
@@ -79,6 +80,7 @@ func New(v *auth.Verifier) *Server {
 		comments:    cstore,
 		chats:       chatStore,
 		runs:        runs.NewStore(),
+		config:      runs.NewConfigStore(),
 		runResults:  runs.NewResults(),
 		runPRs:      runs.NewPRStore(),
 		runNotices:  runs.NewNoticeStore(),
@@ -245,6 +247,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))
 	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
+	// Service-level run configuration (the default time budget) — the central place a service default is
+	// set, apart from the per-run/todo choice. Read under guard; write under CSRF (a store mutation).
+	mux.HandleFunc("GET /api/mercury/config", s.guard(s.mercuryConfigGet))
+	mux.HandleFunc("PUT /api/mercury/config", s.guardCSRF(s.mercuryConfigSet))
 	// Execution controls (Phase 2). Inert until the scheduler is armed (DEVLAB_RUNS_MODE + _USER).
 	mux.HandleFunc("POST /api/mercury/runs/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
