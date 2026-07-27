@@ -105,6 +105,7 @@ journalctl -u devlabd -n5   # "runs scheduler ENABLED — mode=report ..."
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | `15m` | Wartezeit nach Abo-Limit, wenn die CLI keinen Reset-Zeitpunkt nennt. Empfehlung `5h` (einmal aufs Fenster warten statt blind pollen). |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | `24` | Nach so vielen Abo-Limit-Fortsetzungen aufgeben. Empfehlung `2`. |
 | `DEVLAB_RUNS_SELF_REPO` | `devlab` | Repo, das im `full`-Modus **nicht** aus seinem eigenen Lauf deployt wird (Neustart würde den Executor killen). Groß/klein egal. |
+| `DEVLAB_RUNS_DRAIN_GRACE` | `30s` | Beim Neustart (`systemctl restart` → SIGTERM) wartet devlabd so lange auf das Auslaufen des aktiven Laufs, bevor es diesen für den Carry-over abbricht. Neue Läufe werden ab der Neustart-Anforderung **gar nicht mehr** gestartet (sie werden eingereiht), unabhängig von diesem Wert. Sollte innerhalb von `TimeoutStopSec` (siehe `devlabd.service`, `120s`) liegen. |
 
 > **Kein harter Gesamt-Kostendeckel.** Die Deckel oben sind pro Versuch. Für die erste scharfe Nacht:
 > klein anfangen (wenige Repos / ein ToDo), Verbrauch beobachten, dann skalieren.
