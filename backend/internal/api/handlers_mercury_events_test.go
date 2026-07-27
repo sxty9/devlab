@@ -10,86 +10,122 @@ import (
 	"time"
 
 	"devlab/backend/internal/live"
+	"devlab/backend/internal/runs"
 )
 
-// The SSE stream proves the three behaviours the task requires of the mechanism: an externally
-// triggered change appears on an open connection without a reload; closing (interrupting) the
-// connection releases the subscription server-side; and a fresh connection re-subscribes and receives
-// events again (the server side of "an interrupted connection finds its way back").
+// sseClient is a minimal EventSource for tests: it connects to an SSE handler and exposes the "data:"
+// topic lines it receives on a channel. close() disconnects (which the server observes as ctx.Done).
+type sseClient struct {
+	lines chan string
+	stop  func()
+}
+
+func dialSSE(t *testing.T, url string) *sseClient {
+	t.Helper()
+	resp, err := http.Get(url) //nolint:bodyclose // closed via stop()
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+	lines := make(chan string, 16)
+	done := make(chan struct{})
+	go func() {
+		br := bufio.NewReader(resp.Body)
+		for {
+			line, err := br.ReadString('\n')
+			if data, ok := strings.CutPrefix(strings.TrimRight(line, "\n"), "data: "); ok {
+				select {
+				case lines <- data:
+				case <-done:
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return &sseClient{lines: lines, stop: func() { close(done); _ = resp.Body.Close() }}
+}
+
+func (c *sseClient) next(t *testing.T) string {
+	t.Helper()
+	select {
+	case l := <-c.lines:
+		return l
+	case <-time.After(2 * time.Second):
+		t.Fatal("no data line received")
+		return ""
+	}
+}
+
+func waitSubscribers(t *testing.T, b *live.Broker, want int) {
+	t.Helper()
+	for i := 0; i < 400; i++ {
+		if b.Subscribers() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("subscriber count = %d, want %d", b.Subscribers(), want)
+}
+
+// The SSE stream proves three behaviours the task requires: an externally triggered change appears on
+// an open connection without a reload; closing (interrupting) the connection releases the subscription
+// server-side; and a fresh connection re-subscribes and receives events again (the server side of "an
+// interrupted connection finds its way back").
 func TestMercuryEventsStreamDisconnectReconnect(t *testing.T) {
 	s := &Server{live: live.NewBroker()}
 	srv := httptest.NewServer(http.HandlerFunc(s.mercuryEvents))
 	defer srv.Close()
 
-	open := func() (<-chan string, func()) {
-		resp, err := http.Get(srv.URL)
-		if err != nil {
-			t.Fatalf("connect: %v", err)
-		}
-		if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
-			t.Fatalf("Content-Type = %q, want text/event-stream", ct)
-		}
-		lines := make(chan string, 16)
-		done := make(chan struct{})
-		go func() {
-			br := bufio.NewReader(resp.Body)
-			for {
-				line, err := br.ReadString('\n')
-				if data, ok := strings.CutPrefix(strings.TrimRight(line, "\n"), "data: "); ok {
-					select {
-					case lines <- data:
-					case <-done:
-						return
-					}
-				}
-				if err != nil {
-					return
-				}
-			}
-		}()
-		return lines, func() { close(done); _ = resp.Body.Close() }
-	}
-
-	waitSubs := func(want int) {
-		t.Helper()
-		for i := 0; i < 400; i++ {
-			if s.live.Subscribers() == want {
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-		t.Fatalf("subscriber count = %d, want %d", s.live.Subscribers(), want)
-	}
-	recv := func(ch <-chan string) string {
-		t.Helper()
-		select {
-		case l := <-ch:
-			return l
-		case <-time.After(2 * time.Second):
-			t.Fatal("no data line received")
-			return ""
-		}
-	}
-
 	// 1) Connect and receive an externally published change without reconnecting.
-	lines1, close1 := open()
-	waitSubs(1)
+	c1 := dialSSE(t, srv.URL)
+	waitSubscribers(t, s.live, 1)
 	s.publish(live.TopicRuns)
-	if got := recv(lines1); got != live.TopicRuns {
+	if got := c1.next(t); got != live.TopicRuns {
 		t.Fatalf("first event = %q, want %q", got, live.TopicRuns)
 	}
 
 	// 2) Interrupt the connection → the server drops the subscription (no leak).
-	close1()
-	waitSubs(0)
+	c1.stop()
+	waitSubscribers(t, s.live, 0)
 
 	// 3) Reconnect → a brand-new connection re-subscribes and receives events again.
-	lines2, close2 := open()
-	defer close2()
-	waitSubs(1)
+	c2 := dialSSE(t, srv.URL)
+	defer c2.stop()
+	waitSubscribers(t, s.live, 1)
 	s.publish(live.TopicActive)
-	if got := recv(lines2); got != live.TopicActive {
+	if got := c2.next(t); got != live.TopicActive {
 		t.Fatalf("post-reconnect event = %q, want %q", got, live.TopicActive)
+	}
+}
+
+// End to end: a run created through the store (an "external" change, exactly as another session or the
+// scheduler would make it) reaches an already-open stream as a "runs" notification — no reload.
+func TestRunChangeReachesOpenStream(t *testing.T) {
+	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(t.TempDir(), "runs.json"))
+	broker := live.NewBroker()
+	store := runs.NewStore()
+	store.SetPublisher(broker)
+	s := &Server{live: broker, runs: store}
+
+	srv := httptest.NewServer(http.HandlerFunc(s.mercuryEvents))
+	defer srv.Close()
+
+	c := dialSSE(t, srv.URL)
+	defer c.stop()
+	waitSubscribers(t, s.live, 1)
+
+	if _, err := store.Mutate("create", "someone-else", func(cur []runs.Run) ([]runs.Run, error) {
+		return append(cur, runs.Run{ID: "run_x", Name: "From another session"}), nil
+	}); err != nil {
+		t.Fatalf("Mutate: %v", err)
+	}
+	if got := c.next(t); got != live.TopicRuns {
+		t.Fatalf("event = %q, want %q", got, live.TopicRuns)
 	}
 }
 
