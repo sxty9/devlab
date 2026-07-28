@@ -34,11 +34,13 @@ func TestAssembleInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Live result for the executing run: one repo done, one in flight on a running implement step.
+	// Live result for the executing run: one repo done, one in flight on a running implement step. The
+	// in-flight repo carries its OWN live token spend (climbing as it works) — separate from the settled
+	// totals — so the overview must add the two, not show only the completed repos.
 	if err := results.Save(runs.Result{
 		RunID: "run_exec", ResultID: "rid_exec", StartedAt: now,
 		Repos: []runs.RepoResult{{Repo: "a", OK: true}},
-		Live: &runs.RepoResult{Repo: "b", Running: true, Steps: []runs.Step{
+		Live: &runs.RepoResult{Repo: "b", Running: true, InputTokens: 40, OutputTokens: 20, CostUSD: 0.05, NumTurns: 2, Steps: []runs.Step{
 			{Name: "analyze", Status: runs.StepOK},
 			{Name: "implement", Running: true, Log: "…working"},
 		}},
@@ -70,8 +72,9 @@ func TestAssembleInFlight(t *testing.T) {
 	if ex.ReposDone != 1 || ex.ReposTotal != 2 {
 		t.Fatalf("executing progress wrong: done=%d total=%d", ex.ReposDone, ex.ReposTotal)
 	}
-	if ex.OutputTokens != 50 || ex.NumTurns != 7 {
-		t.Fatalf("executing spend not carried: %+v", ex)
+	// Settled totals PLUS the in-flight repo's live spend: 100+40 in, 50+20 out, 7+2 turns.
+	if ex.InputTokens != 140 || ex.OutputTokens != 70 || ex.NumTurns != 9 {
+		t.Fatalf("executing spend must include the in-flight repo: %+v", ex)
 	}
 
 	sp := list[1]

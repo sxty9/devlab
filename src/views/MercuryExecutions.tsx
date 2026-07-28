@@ -118,6 +118,19 @@ export function TokenStat({ input, output, cost }: { input?: number; output?: nu
   );
 }
 
+/** Run-level token/cost/turn totals INCLUDING the repo currently in flight. A RunResult's own totals
+ *  count only settled repos, so during a run the in-flight repo's live spend (res.live) must be added
+ *  for the header to climb continuously instead of jumping only when each repo finishes and rolls up. */
+function liveTotals(res: RunResult): { input: number; output: number; cost: number; turns: number } {
+  const live = res.live;
+  return {
+    input: res.inputTokens + (live?.inputTokens ?? 0),
+    output: res.outputTokens + (live?.outputTokens ?? 0),
+    cost: res.costUsd + (live?.costUsd ?? 0),
+    turns: res.numTurns + (live?.numTurns ?? 0),
+  };
+}
+
 /** The Claude engine that drove an execution — the model (a Holistic requirement: every AI answer is
  *  labelled with its model), the effort tier when it differs from the default, and the per-repo time
  *  budget that applied ("3h", or "no limit" for an explicit no-cap) so a run names honestly what bounded
@@ -1182,6 +1195,9 @@ export function LiveExecution({
   const label = suspended ? 'Pausiert' : live ? 'Läuft gerade' : 'Gerade beendet';
   const dotLive = suspended || live;
   const hasRows = (res.repos?.length ?? 0) > 0 || !!res.live;
+  // Fold the in-flight repo into the header totals so Turns and Tokenverbrauch climb continuously as the
+  // current repo works, not only when it settles into the execution roll-up.
+  const totals = liveTotals(res);
   return (
     <div className={cn('flex flex-col gap-3 rounded-card border p-3', dotLive ? 'border-warning/30 bg-warning/5' : 'border-separator')}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -1190,8 +1206,8 @@ export function LiveExecution({
         </span>
         <span className="text-caption text-text-tertiary">seit {fmtDateTime(res.startedAt)}</span>
         {res.model && <ModelStat model={res.model} effort={res.effort} timeBudget={res.timeBudget} />}
-        <span className="text-caption text-text-tertiary">{res.numTurns} Turns</span>
-        <TokenStat input={res.inputTokens} output={res.outputTokens} cost={res.costUsd} />
+        <span className="text-caption text-text-tertiary">{totals.turns} Turns</span>
+        <TokenStat input={totals.input} output={totals.output} cost={totals.cost} />
       </div>
       <PromptDisclosure prompt={res.prompt} />
       {hasRows ? <ExecutionPipeline result={res} /> : <p className="text-caption text-text-tertiary">Der Lauf startet…</p>}

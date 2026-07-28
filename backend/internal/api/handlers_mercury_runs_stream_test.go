@@ -1,10 +1,12 @@
 package api
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"devlab/backend/internal/mercury"
+	"devlab/backend/internal/runs"
 )
 
 // A representative stream-json (NDJSON) transcript from the claude CLI: init, assistant text, a tool
@@ -92,6 +94,56 @@ func TestTranscriptRendersTextAndTools(t *testing.T) {
 	// system, tool_result and the final result event contribute nothing to the transcript.
 	if changed != 3 {
 		t.Errorf("expected 3 visible events (2 tool_use + 1 text), got %d", changed)
+	}
+}
+
+// assistantUsageLine renders one stream-json assistant event carrying token usage — the shape the runner
+// folds live. input adds up as input_tokens + cache_creation + cache_read (mirrors parseClaudeUsage).
+func assistantUsageLine(id string, in, cacheCreate, cacheRead, out int) []byte {
+	return []byte(fmt.Sprintf(
+		`{"type":"assistant","message":{"id":%q,"usage":{"input_tokens":%d,"cache_creation_input_tokens":%d,"cache_read_input_tokens":%d,"output_tokens":%d}}}`,
+		id, in, cacheCreate, cacheRead, out))
+}
+
+// Live token tracking must (1) climb the repo counters as assistant events stream in, (2) dedupe by
+// message id — the claude CLI repeats one turn's usage once per content block — and (3) settle to the
+// authoritative final result event without double-counting the live estimate. This pins all three.
+func TestAgentStepFoldsLiveUsageDedupedThenSettles(t *testing.T) {
+	rr := &runs.RepoResult{Repo: "r"}
+	ag := beginAgentStep(rr, &liveSaver{do: func() {}}, "implement")
+
+	// Turn 1, two content blocks → same message id, identical usage. Fold ONCE (in = 10+100+200 = 310).
+	if !ag.foldUsage(assistantUsageLine("m1", 10, 100, 200, 4)) {
+		t.Fatal("first assistant event should move the live totals")
+	}
+	if ag.foldUsage(assistantUsageLine("m1", 10, 100, 200, 4)) {
+		t.Fatal("a repeated message id must NOT move the totals again (dedupe by id)")
+	}
+	if rr.InputTokens != 310 || rr.OutputTokens != 4 || rr.NumTurns != 1 {
+		t.Fatalf("turn 1 folded wrong: in=%d out=%d turns=%d", rr.InputTokens, rr.OutputTokens, rr.NumTurns)
+	}
+
+	// Turn 2, a new message id → summed on top (in = 20+0+300 = 320).
+	if !ag.foldUsage(assistantUsageLine("m2", 20, 0, 300, 7)) {
+		t.Fatal("a new message id should move the live totals")
+	}
+	if rr.InputTokens != 630 || rr.OutputTokens != 11 || rr.NumTurns != 2 {
+		t.Fatalf("turn 2 folded wrong: in=%d out=%d turns=%d", rr.InputTokens, rr.OutputTokens, rr.NumTurns)
+	}
+
+	// Non-usage lines (a tool result, the init event) are ignored.
+	if ag.foldUsage([]byte(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}`)) {
+		t.Fatal("a non-assistant line must not move the totals")
+	}
+
+	// Settle to the authoritative result event: it REPLACES the running estimate (no double count) and
+	// brings in cost, which the per-turn stream never carries. Fixture: in=115, out=50, cost=0.1234, turns=7.
+	ag.settle(resultEvent([]byte(streamNDJSON)))
+	if rr.InputTokens != 115 || rr.OutputTokens != 50 || rr.NumTurns != 7 {
+		t.Fatalf("settle must replace the live estimate, not add to it: in=%d out=%d turns=%d", rr.InputTokens, rr.OutputTokens, rr.NumTurns)
+	}
+	if rr.CostUSD != 0.1234 {
+		t.Fatalf("settle must bring in the final cost: %v", rr.CostUSD)
 	}
 }
 

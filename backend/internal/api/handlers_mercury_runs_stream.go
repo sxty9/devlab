@@ -73,6 +73,45 @@ func resultEvent(out []byte) []byte {
 	return out
 }
 
+// streamUsage pulls one assistant event's message id and running token usage out of a stream-json line,
+// so the runner can climb the token counters LIVE as the agent works (instead of only at the final result
+// event). The claude CLI emits one assistant event PER CONTENT BLOCK, and every block of the same turn
+// repeats the SAME message.id AND the SAME message.usage — so a live accumulator must dedupe by id (fold
+// each id's usage once), never sum the raw events, or one turn is counted several times. The per-turn
+// usage carries no cost (only the final result event does), so cost is reconciled separately at the end.
+//
+// ok is false for any line that is not an assistant event carrying usage (init, tool results, the final
+// result summary, and the simplified fixtures that omit usage) — the caller then skips it.
+func streamUsage(line []byte) (id string, u usage, ok bool) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 || line[0] != '{' {
+		return "", usage{}, false
+	}
+	var ev struct {
+		Type    string `json:"type"`
+		Message struct {
+			ID    string `json:"id"`
+			Usage struct {
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &ev) != nil || ev.Type != "assistant" || ev.Message.ID == "" {
+		return "", usage{}, false
+	}
+	u = usage{
+		in:  ev.Message.Usage.InputTokens + ev.Message.Usage.CacheCreationInputTokens + ev.Message.Usage.CacheReadInputTokens,
+		out: ev.Message.Usage.OutputTokens,
+	}
+	if u.in == 0 && u.out == 0 {
+		return "", usage{}, false // an assistant event without usage carries nothing to fold
+	}
+	return ev.Message.ID, u, true
+}
+
 // transcript accumulates a compact, human-readable narrative of a streaming agent run — the assistant's
 // text and the tools it invokes — for display in the live step log. Tool results and bookkeeping events
 // are omitted to keep it readable and portioned; the whole thing is clipped to a recent window.
