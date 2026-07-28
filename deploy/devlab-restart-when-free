@@ -3,15 +3,68 @@
 # devlab-install --handover as a transient systemd unit OUTSIDE the devlabd cgroup — the
 # restart survives the daemon's own death; devlabd never restarts itself inline.
 #
-# Contract (B5 implements; this skeleton pins the seams):
-#   * free probe: `curl --unix-socket $DEVLAB_STATE_DIR/restart-ready.sock http://x/ready`
-#       204 ⇒ free (no execution document is "running") · 423 ⇒ busy · connection error ⇒ the
-#       daemon is dead ⇒ free (a dead daemon blocks nothing)
-#   * poll interval DEVLAB_RESTART_POLL (default 10s); hard cap DEVLAB_RESTART_MAXWAIT
-#     (default 21600s = 6h) ⇒ restart anyway, logged (REQ-018.5)
-#   * restart: `systemctl restart ${DEVLAB_UNIT:-devlabd}` — the ONE restart path (W2)
-#   * --check: dry-run — probe once, print free/busy/dead, exit without restarting
+# Free probe (the S7 state machine's signal, never a PID marker):
+#     curl --unix-socket $DEVLAB_STATE_DIR/restart-ready.sock http://localhost/ready
+#   204 ⇒ free (no execution document is "running") · 423 ⇒ busy · connection error ⇒ the
+#   daemon is dead ⇒ free (a dead daemon blocks nothing) · anything else ⇒ busy (a live
+#   daemon said something unexpected — do not restart under it; the cap still bounds the wait).
+#
+# Poll interval DEVLAB_RESTART_POLL (default 10s); hard cap DEVLAB_RESTART_MAXWAIT (default
+# 21600s = 6h) ⇒ restart anyway, logged (REQ-018.5). Restart: `systemctl restart $DEVLAB_UNIT`
+# (default devlabd) — the ONE restart path (W2). The new process finds mercury/restart.json and
+# completes the handover on boot.
+#
+# --check: dry-run — probe once, print free|busy|dead, exit 0 without restarting (the testable
+# seam; probe logic is verified without root).
 set -euo pipefail
 
-echo "devlab-restart-when-free: not implemented yet (deploy & ports, Welle 1 — B5)" >&2
-exit 1
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+SOCK="$STATE_DIR/restart-ready.sock"
+UNIT="${DEVLAB_UNIT:-devlabd}"
+POLL="${DEVLAB_RESTART_POLL:-10}"
+MAX_WAIT="${DEVLAB_RESTART_MAXWAIT:-21600}"
+
+log() { logger -t devlab-restart-when-free -- "$*" 2>/dev/null || true; echo "devlab-restart-when-free: $*"; }
+die() { printf 'devlab-restart-when-free: error: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+[[ "$POLL" =~ ^[0-9]+$ ]] && [ "$POLL" -ge 1 ] || die "invalid DEVLAB_RESTART_POLL '$POLL'" 2
+[[ "$MAX_WAIT" =~ ^[0-9]+$ ]] || die "invalid DEVLAB_RESTART_MAXWAIT '$MAX_WAIT'" 2
+
+# probe → free | busy | dead (dead counts as free: nothing is running that a restart could kill).
+probe() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --unix-socket "$SOCK" http://localhost/ready 2>/dev/null)" || code=000
+  case "$code" in
+    204) echo free ;;
+    000) echo dead ;;
+    423) echo busy ;;
+    *)   echo busy ;;
+  esac
+}
+
+if [ "${1:-}" = "--check" ]; then
+  echo "$(probe)"
+  exit 0
+fi
+[ $# -eq 0 ] || die "usage: devlab-restart-when-free [--check]" 2
+
+waited=0
+while true; do
+  state="$(probe)"
+  if [ "$state" != busy ]; then
+    log "ready signal: $state after ${waited}s — restarting $UNIT"
+    break
+  fi
+  if [ "$waited" -ge "$MAX_WAIT" ]; then
+    log "waited ${waited}s (cap ${MAX_WAIT}s) — restarting $UNIT anyway (REQ-018.5)"
+    break
+  fi
+  if [ "$waited" = 0 ]; then
+    log "executions in flight — deferring restart of $UNIT (poll ${POLL}s, cap ${MAX_WAIT}s)"
+  fi
+  sleep "$POLL"
+  waited=$(( waited + POLL ))
+done
+
+systemctl restart "$UNIT"
+log "restart of $UNIT done"

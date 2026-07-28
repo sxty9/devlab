@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"devlab/backend/internal/axiomrepo"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 
 	"context"
@@ -66,9 +67,10 @@ func (s *Server) mercuryReorder(w http.ResponseWriter, r *http.Request) {
 	o := mercury.LoadOrder(path)
 	o[body.Category] = body.Order
 	if err := mercury.SaveOrder(path, o); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Reihenfolge konnte nicht gespeichert werden")
+		writeErr(w, http.StatusInternalServerError, "Could not save the order")
 		return
 	}
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

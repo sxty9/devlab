@@ -44,7 +44,7 @@ function dueTime(run: Run, nextDue?: Record<string, string>): number | null {
 }
 
 /** Narrow a run/todo list by the "not run since" and "due within" windows. Pure: `now` is injected so
- *  the same inputs always yield the same output. Reused by the Läufe and ToDos lists (Symmetry). */
+ *  the same inputs always yield the same output. Reused by the runs and todos lists (symmetry). */
 export function applyRunFilter(
   runs: Run[],
   f: RunFilter,

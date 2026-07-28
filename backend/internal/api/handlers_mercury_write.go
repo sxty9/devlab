@@ -13,6 +13,7 @@ import (
 
 	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/axiomauthors"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -30,7 +31,7 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		Titel   string `json:"titel"`
 		Body    string `json:"body"`
 		Section string `json:"section"`
-		Force   bool   `json:"force"` // create even though a similar record exists (user chose "trotzdem neu")
+		Force   bool   `json:"force"` // create even though a similar record exists (user chose "create anyway")
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -111,8 +112,10 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	// Recompose the affected run snapshots and, for a CLAUDE.md-carried namespace, trigger the rollout.
+	// Recompose the affected run snapshots in the same request (REQ-003). There is no rollout:
+	// the constitution reaches every repository through the prompt alone.
 	s.reconcileAfterWrite(r.Context(), cookie)
+	s.publish(live.TopicAxioms)
 	// A brand-new axiom belongs to no run yet. Assign it to one automatically in the background (the
 	// write does not wait) so it is enforced without a manual step. Only axioms drive run coverage —
 	// a new Laufregel or meta-axiom leaves the covered set unchanged, so it need not kick.
@@ -173,7 +176,7 @@ func (s *Server) classify(ctx context.Context, cookie, csrf string, categories [
 }
 
 // optimizeRecord polishes a record's title+body via aigentic (orthography, generalization, brevity)
-// WITHOUT persisting — the "Mit KI optimieren" button and the auto-optimize on add both use it. On
+// WITHOUT persisting — the "Polish with AI" button and the auto-optimize on add both use it. On
 // repeated model failure it returns the input unchanged (never worse than the original).
 func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -216,7 +219,7 @@ func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, mercury.Optimized{Titel: body.Titel, Body: body.Body})
 }
 
-// conformRecord checks an axiom strictly against every meta-axiom for the "Konformität"-panel. No
+// conformRecord checks an axiom strictly against every meta-axiom for the conformance panel. No
 // meta-axioms (or a model outage) ⇒ conforms:true (fail open) so the surface never blocks on infra.
 func (s *Server) conformRecord(w http.ResponseWriter, r *http.Request) {
 	var body struct {

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 
+	"devlab/backend/internal/discover"
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/model"
 )
@@ -35,7 +36,27 @@ func (g liveGitHub) FindOpenPRByHead(ctx context.Context, repo, head string) (*m
 	return &model.PRRef{Number: pr.Number, URL: pr.HTMLURL, HeadBranch: head}, nil
 }
 
-// MergePullRequest merges with method "merge" ONLY — the sole admissible method (REQ-024/F14).
+func (g liveGitHub) GetPullRequest(ctx context.Context, repo string, number int) (PRState, error) {
+	st, err := github.GetPullState(ctx, g.token, repo, number)
+	if err != nil {
+		return PRState{}, err
+	}
+	return PRState(st), nil
+}
+
+func (g liveGitHub) ListOpenPullRequests(ctx context.Context, repo string) ([]PRState, error) {
+	heads, err := github.ListOpenPullHeads(ctx, g.token, repo)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PRState, 0, len(heads))
+	for _, h := range heads {
+		out = append(out, PRState(h))
+	}
+	return out, nil
+}
+
+// MergePullRequest merges with method "merge" ONLY — the sole admissible method (REQ-033.5).
 func (g liveGitHub) MergePullRequest(ctx context.Context, repo string, number int, method string) error {
 	if method != "merge" {
 		return errors.New(`merge method must be "merge"`)
@@ -54,8 +75,14 @@ func (g liveGitHub) DeleteBranch(ctx context.Context, repo, branch string) error
 	return github.DeleteBranch(ctx, g.token, repo, branch)
 }
 
-func (g liveGitHub) CreateRepo(ctx context.Context, name string, private bool) error {
-	panic("TODO(B4)") // github.CreateRepo signature alignment happens with the protection pass
+// CreateRepo creates the repository in the instance's holistic namespace (owner + topic from
+// the runtime configuration — never a literal) and reports the resulting full name. An
+// already-existing repo is returned as-is (Satisfied, REQ-033.6). The `private` flag is
+// accepted for the interface's sake; the client creates repositories private.
+func (g liveGitHub) CreateRepo(ctx context.Context, name string, private bool) (string, error) {
+	_ = private
+	return github.CreateRepo(ctx, g.token, discover.Owner(), name,
+		"Holistic service repository, created by the delivery chain", discover.Topic())
 }
 
 func (g liveGitHub) ProtectDefaultBranch(ctx context.Context, repo, requiredStatus string) error {

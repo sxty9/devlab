@@ -71,8 +71,9 @@ case "$real/" in "$rootreal"/*) : ;; *) die "staged path escapes staging root" 2
 
 log "install-only prod deploy of '$REPO' from $real"
 
-# Per-repo prod install: map the prebuilt artifact to concrete prod paths + unit. NO build. Add a
-# case per deployable repo (mirrors the dev-side per-repo install).
+# Install the prebuilt artifact into concrete prod paths + unit. NO build, and no per-repo
+# scripts (B-44): every uniform service takes the ONE generic branch below; only the self repo
+# has a different artifact shape (daemon + web SPA) and therefore its own layout.
 case "$REPO" in
   devlab)
     BIN="$real/devlabd"; WEB="$real/web"

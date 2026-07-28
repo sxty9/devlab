@@ -6,6 +6,23 @@
 # (REQ-027.1); DEVLAB_RUNS_MAX_CONCURRENCY, when set, is only the FIRST-start seed of the
 # runtime settings pool (REQ-013.2).
 #
+# Environment-contract migration (B-45 — one note per changed variable):
+#   DEVLAB_RUNS_MODE          REMOVED. Operating modes do not exist; the one chain always runs
+#                             preflight → implement → deliver-dev → publish → pull-request.
+#   DEVLAB_RUNS_MAX_COST*     REMOVED. There is no cost cap (REQ-017): consumption is counted
+#                             live and reported, never capped. The time budget is a per-run
+#                             tunable in the runtime settings, not an env variable.
+#   run-active/runs-active    REMOVED (REQ-039.3). Activity is a projection over the execution
+#                             documents; the only marker file is mercury/restart.json.
+#   DEVLAB_LINKS, DEVLAB_WORKSPACES, DEVLAB_STATIC_DIR, DEVLAB_REPOS_PATH
+#                             now DERIVE from DEVLAB_STATE_DIR (internal/statepath). The
+#                             historical per-variable overrides keep working as overrides for
+#                             genuinely split roots; stop setting them otherwise.
+#   DEVLAB_RESTART_POLL / DEVLAB_RESTART_MAXWAIT
+#                             unchanged, but now consumed by devlab-restart-when-free polling
+#                             the ready SOCKET (restart-ready.sock) — the PID busy-marker of
+#                             devlab-restart-idle is gone.
+#
 # Install (once, as root — the `service` CLI performs these steps interactively):
 #   sudo install -m0755 devlabd /usr/local/bin/devlabd
 #   sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service

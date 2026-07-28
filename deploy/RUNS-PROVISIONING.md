@@ -38,11 +38,20 @@ on behalf of.
 
 ```sh
 sudo install -o root -g root -m 0755 deploy/devlab-exec /usr/local/sbin/devlab-exec
+sudo install -o root -g root -m 0755 deploy/devlab-mkworkspace /usr/local/sbin/devlab-mkworkspace
 sudo install -o root -g root -m 0755 deploy/devlab-install /usr/local/sbin/devlab-install
 sudo install -o root -g root -m 0755 deploy/devlab-restart-when-free /usr/local/sbin/devlab-restart-when-free
 sudo install -o root -g root -m 0440 deploy/devlab.sudoers /etc/sudoers.d/devlab
 sudo install -o root -g root -m 0440 deploy/devlab-runs.sudoers /etc/sudoers.d/devlab-runs
 sudo visudo -c
+```
+
+Both deploy wrappers carry a `--check` dry-run branch: the full validation cascade runs and
+prints its decision without touching the host, so the security logic is verifiable in place:
+
+```sh
+/usr/local/sbin/devlab-install <repo> <artifact-dir> dev --check   # prints PLAN lines, or dies
+/usr/local/sbin/devlab-restart-when-free --check                   # prints free|busy|dead
 ```
 
 ## 5. Environment contract (drop-in; instance values live ONLY here)
@@ -69,3 +78,28 @@ cap (REQ-017 — consumption is reported live, never capped), and every activity
 
 Stop admissions by setting the slot capacity to 0 in the service configuration
 (`PUT /api/service/config`); running executions drain honestly. There is no mode switch.
+
+## 7. Delivery mechanics (S11 — one generic path)
+
+- **Build as the user, install as root:** the runner builds via `devlab-exec artifact-build`
+  into `<worktree>/.mercury-artifact`; root only ever installs that prebuilt result through
+  `devlab-install` (name grammar, `realpath -e` confinement under the workspace root, env
+  strictly `dev|prod`). Root never builds and never executes repo code.
+- **First-time setup:** a template-conforming service with no unit yet is provisioned by the
+  wrapper from its own root-owned inline templates (unit + route + rights manifest copy) with
+  a validated port from the atlas proposal (`--port`). No per-repo scripts exist (B-44).
+- **Honest gate (F10):** "installed and started" is reported only after the unit is ACTIVE and
+  the port is HELD (`deploy.VerifyRunning`); otherwise the delivery FAILED, with the port
+  conflict named and a free port proposed where that is the cause.
+- **Ports (F9, REQ-044):** the ledger is derived on read from the route drop-ins and
+  `/proc/net/tcp{,6}` — never stored, no maintainable list. `GET /api/atlas/ports` serves it;
+  `DEVLAB_PORT_BAND` bounds proposals.
+- **Self repo (K-2):** install lands immediately; the restart is handed to a transient unit
+  outside the devlabd cgroup (`devlab-install … --handover` →
+  `systemd-run --collect devlab-restart-when-free`), which polls the ready socket
+  (`$DEVLAB_STATE_DIR/restart-ready.sock`: 204 free · 423 busy · dead ⇒ free) and restarts
+  when free — or after `DEVLAB_RESTART_MAXWAIT`, logged. A failed handover fails the stage;
+  nothing ever restarts inline.
+- **prod (not armed):** the prod send (rsync into the rrsync-confined staging behind the
+  forced-command receiver `devlab-deploy-recv`, target server-side only) is implemented and
+  fixture-tested, but not armed in this phase.

@@ -194,6 +194,27 @@ func TestStorePutDeleteAndHistory(t *testing.T) {
 	}
 }
 
+// An autonomous mutation is recorded AS autonomous in the config history (REQ-041.3): the
+// snapshot's actor names the system, never a person it could be misattributed to.
+func TestAutonomousActorRecordedAsSuch(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
+	s := NewStore(nil)
+	r := Run{ID: "run_a", Kind: model.KindAuto, Title: "A",
+		Authorship: model.Authorship{Created: model.Actor{Autonomous: true}, Updated: model.Actor{Autonomous: true}}}
+	if err := s.Put(r); err != nil {
+		t.Fatal(err)
+	}
+	snaps, err := s.History().List()
+	if err != nil || len(snaps) != 1 {
+		t.Fatalf("history: %v len=%d", err, len(snaps))
+	}
+	if snaps[0].Actor != "autonomous" {
+		t.Fatalf("autonomous mutation recorded as %q, want %q", snaps[0].Actor, "autonomous")
+	}
+}
+
 // Patch is the runtime-state write path: it saves but never snapshots the history.
 func TestPatchDoesNotSnapshotHistory(t *testing.T) {
 	dir := t.TempDir()

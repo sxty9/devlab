@@ -7,12 +7,15 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
 
 	"devlab/backend/internal/statepath"
 )
 
-// A run in pr/full mode opens a PR per repo. A human may merge it anytime; if none does within the
-// auto-merge window the scheduler merges it. PendingPR tracks the ones still awaiting that outcome.
+// The chain opens a PR per delivery. A human may merge it anytime; if none does within the
+// auto-merge window, deliver.Maintain merges it. PendingPR tracks the ones still awaiting that
+// outcome. The store is a passive pool: every decision (merge, back off, block) is the
+// caller's; the pool persists what the caller sets.
 type PendingPR struct {
 	Repo      string    `json:"repo"` // owner/name
 	Number    int       `json:"number"`
@@ -20,12 +23,24 @@ type PendingPR struct {
 	RunID     string    `json:"runId"`
 	CreatedAt time.Time `json:"createdAt"`
 	MergeBy   time.Time `json:"mergeBy"` // auto-merge on/after this time
-	// LastChecked is when Maintain last spent a GitHub read on this PR. It exists ONLY for full mode's
-	// merge-detection throttle: an in-window PR is re-fetched at most once per recheck interval, so the
-	// sweep never GETs every tracked PR every tick and exhausts the rate budget. report/pr mode never
-	// reads or writes it (those modes only ever touch OVERDUE PRs), so their behavior is unchanged and
-	// zero-value here. Older stored files simply carry the zero time.
+	// DeliveryID ties the tracked PR to its ledger entry, so the maintenance can mirror
+	// merge/close outcomes onto the delivery without guessing by repo+number alone. Legacy
+	// records carry "" (tolerated: the ledger is then matched by repo+number).
+	DeliveryID string `json:"deliveryId,omitempty"`
+	// LastChecked is when Maintain last spent a GitHub read on this PR — the merge-detection
+	// throttle: an in-window PR is re-fetched at most once per recheck interval, so the sweep
+	// never GETs every tracked PR every tick and exhausts the rate budget. Older stored files
+	// simply carry the zero time.
 	LastChecked time.Time `json:"lastChecked,omitempty"`
+
+	// Retry/blockade state (C F4, K-5) — persisted AT the affected record, owned by the
+	// caller's policy. Backoff carries the growing-interval retry state of a transient fault;
+	// Blocked is the honest terminal state after the attempts are exhausted (or a permanent
+	// fault was named): no further automatic attempt until an explicit resume clears it.
+	Backoff       *model.Backoff `json:"backoff,omitempty"`
+	Blocked       bool           `json:"blocked,omitempty"`
+	BlockedReason string         `json:"blockedReason,omitempty"`
+	BlockedAt     time.Time      `json:"blockedAt,omitempty"`
 }
 
 // PRStore persists the pending-PR set (a small JSON file, same discipline as the runs store).
@@ -126,6 +141,26 @@ func (s *PRStore) Touch(repo string, number int, at time.Time) error {
 		return nil
 	}
 	return s.save(cur)
+}
+
+// Update applies mutate to the tracked PR matching (repo, number) and saves atomically.
+// found=false (and no save) when the PR is untracked; it never creates one. All decisions
+// about WHAT to change live in the caller's closure — the store stays a passive pool, and the
+// read-modify-write is indivisible under the store lock (C F4).
+func (s *PRStore) Update(repo string, number int, mutate func(*PendingPR)) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return false, err
+	}
+	for i := range cur {
+		if cur[i].Repo == repo && cur[i].Number == number {
+			mutate(&cur[i])
+			return true, s.save(cur)
+		}
+	}
+	return false, nil
 }
 
 func (s *PRStore) save(prs []PendingPR) error {

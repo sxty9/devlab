@@ -357,7 +357,7 @@ func (s *Store) write(ctx context.Context, message, actor string, apply func() e
 		}
 		full := message
 		if actor != "" {
-			full += "\n\nGeändert von: " + actor
+			full += "\n\nChanged by: " + actor
 		}
 		if _, err := s.git(ctx, "commit", "-m", full); err != nil {
 			return err
@@ -383,7 +383,7 @@ func (s *Store) write(ctx context.Context, message, actor string, apply func() e
 // safePath rejects anything that could escape the repository or hit its git directory.
 func safePath(p string) error {
 	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, "..") || strings.HasPrefix(p, ".git") {
-		return fmt.Errorf("ungültiger Pfad %q", p)
+		return fmt.Errorf("invalid path %q", p)
 	}
 	return nil
 }

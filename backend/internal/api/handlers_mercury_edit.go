@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/axiomauthors"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -63,9 +64,9 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	// record (same category) before writing. A body-only edit leaves the slug unchanged and never moves.
 	newPath := reslugLeaf(body.Path, body.Titel)
 	if newPath != body.Path {
-		if err := s.axioms.Move(r.Context(), body.Path, newPath, "Axiom umbenannt: "+body.Titel, actor(r)); err != nil {
+		if err := s.axioms.Move(r.Context(), body.Path, newPath, "Rename axiom: "+body.Titel, actor(r)); err != nil {
 			if errors.Is(err, axiomrepo.ErrExists) {
-				writeErr(w, http.StatusConflict, "In dieser Kategorie existiert bereits ein Axiom mit diesem Titel")
+				writeErr(w, http.StatusConflict, "An axiom with this title already exists in this category")
 				return
 			}
 			mercuryError(w, err)
@@ -77,6 +78,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie)
+	s.publish(live.TopicAxioms)
 	// Record the editor in DevLab's local pool. An axiom that predates authorship tracking keeps an
 	// empty (unknown) creator — only the editor is stamped, never a back-filled creator.
 	now := time.Now().UTC()
@@ -100,7 +102,7 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	body.From, body.To = strings.TrimSpace(body.From), strings.TrimSpace(body.To)
 	if !mercury.ValidRecordPath(body.To) {
-		writeErr(w, http.StatusBadRequest, "Ungültiger Zielpfad — erwartet z. B. axiome/kategorie/name.md (Kleinbuchstaben, Bindestriche)")
+		writeErr(w, http.StatusBadRequest, "Invalid target path — expected e.g. axiome/category/name.md (lowercase, hyphens)")
 		return
 	}
 	if body.From == body.To {
@@ -108,16 +110,17 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	err := s.axioms.Move(r.Context(), body.From, body.To, "Verschoben: "+body.From+" → "+body.To, actor(r))
+	err := s.axioms.Move(r.Context(), body.From, body.To, "Move: "+body.From+" → "+body.To, actor(r))
 	if err != nil {
 		if errors.Is(err, axiomrepo.ErrExists) {
-			writeErr(w, http.StatusConflict, "Am Zielpfad liegt bereits ein Axiom")
+			writeErr(w, http.StatusConflict, "An axiom already exists at the target path")
 			return
 		}
 		mercuryError(w, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie)
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
@@ -125,15 +128,16 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if !mercury.ValidRecordPath(path) {
-		writeErr(w, http.StatusBadRequest, "Ungültiger Pfad")
+		writeErr(w, http.StatusBadRequest, "Invalid path")
 		return
 	}
 	cookie := r.Header.Get("Cookie")
-	if err := s.axioms.Delete(r.Context(), path, "Gelöscht: "+path, actor(r)); err != nil {
+	if err := s.axioms.Delete(r.Context(), path, "Delete: "+path, actor(r)); err != nil {
 		mercuryError(w, err)
 		return
 	}
 	s.reconcileAfterWrite(r.Context(), cookie)
+	s.publish(live.TopicAxioms)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -150,7 +154,7 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	}
 	body.From, body.To = strings.TrimSpace(body.From), strings.TrimSpace(body.To)
 	if !mercury.ValidCategory(body.From) || !mercury.ValidCategory(body.To) {
-		writeErr(w, http.StatusBadRequest, "Ungültige Kategorie — erwartet z. B. axiome/architektur/uniformitaet")
+		writeErr(w, http.StatusBadRequest, "Invalid category — expected e.g. axiome/architecture/uniformity")
 		return
 	}
 	if body.From == body.To {
@@ -173,14 +177,15 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		dest := body.To + strings.TrimPrefix(leaf, body.From)
-		if err := s.axioms.Move(r.Context(), leaf, dest, "Kategorie verschoben: "+leaf+" → "+dest, actor(r)); err != nil {
-			writeErr(w, http.StatusConflict, "Konnte "+leaf+" nicht verschieben (Ziel belegt?); "+strconv.Itoa(moved)+" bereits verschoben")
+		if err := s.axioms.Move(r.Context(), leaf, dest, "Move category: "+leaf+" → "+dest, actor(r)); err != nil {
+			writeErr(w, http.StatusConflict, "Could not move "+leaf+" (target occupied?); "+strconv.Itoa(moved)+" already moved")
 			return
 		}
 		moved++
 	}
 	if moved > 0 {
 		s.reconcileAfterWrite(r.Context(), cookie)
+		s.publish(live.TopicAxioms)
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

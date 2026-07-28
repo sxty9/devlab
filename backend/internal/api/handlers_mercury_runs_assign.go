@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
@@ -21,7 +22,7 @@ import (
 // of that guarantee: the write handler only *kicks* the assigner and returns at once; the assigner
 // coalesces bursts of kicks, then runs ONE assignment pass on the caller's behalf.
 //
-// It adds no second planning path: it reuses the very machinery behind the "Mit KI auffüllen" button —
+// It adds no second planning path: it reuses the very machinery behind the interactive AI-fill button —
 // s.runCatalog (the axiom set), s.planRuns + mercury.RunPlanFillPrompt (the plan, validated against the
 // known axiom ids), composeInto (the snapshot) and upsertPlannedRun (extend-or-create) — the difference
 // being only that it runs detached and debounced instead of returning a reviewable proposal. The plan
@@ -30,7 +31,7 @@ import (
 // The pass is idempotent: it acts only on the CURRENTLY uncovered axioms (re-checked under the store
 // lock), so an already-covered axiom is never reassigned and overlapping passes never double-assign.
 // Every outcome — success or failure — is recorded as a portioned notice so the user is informed and can
-// adjust the assignment afterwards. A failure (e.g. the KI-Planung is unreachable) leaves the axiom
+// adjust the assignment afterwards. A failure (e.g. the AI planning is unreachable) leaves the axiom
 // uncovered and visible; it blocks neither the axiom write nor the running scheduler.
 type autoAssigner struct {
 	s     *Server
@@ -280,6 +281,9 @@ func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, cat runs.Ca
 		a.recordFailure(tried, "Assignment could not be saved")
 		return
 	}
+	if a.s != nil {
+		a.s.publish(live.TopicRuns) // the background write is a caller too — it announces itself
+	}
 	for _, o := range outcomes {
 		a.record(runs.Notice{
 			Kind: runs.NoticeAssigned, RunID: o.runID, RunName: o.runName, NewRun: o.newRun,
@@ -305,13 +309,15 @@ func (a *autoAssigner) record(n runs.Notice) {
 	}
 	if err := a.s.runNotices.Add(n); err != nil {
 		log.Printf("devlabd: auto-assign notice write failed: %v", err)
+		return
 	}
+	a.s.publish(live.TopicNotices)
 }
 
 // --- server-side glue ---------------------------------------------------------
 
 // kickAutoAssign hands the assigner the caller's session (cookie + CSRF) and identity, then returns at
-// once. The pass runs on the user's behalf, exactly as the interactive "Mit KI auffüllen" does.
+// once. The pass runs on the user's behalf, exactly as the interactive AI-fill does.
 func (s *Server) kickAutoAssign(r *http.Request) {
 	if s.assigner == nil {
 		return
@@ -330,7 +336,7 @@ func (s *Server) runsNoticesList(w http.ResponseWriter, _ *http.Request) {
 	}
 	list, err := s.runNotices.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweise konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the notices")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"notices": list})
@@ -349,13 +355,14 @@ func (s *Server) runsNoticeDismiss(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(body.ID) == "" {
-		writeErr(w, http.StatusBadRequest, "id ist erforderlich")
+		writeErr(w, http.StatusBadRequest, "id is required")
 		return
 	}
 	if err := s.runNotices.Dismiss(body.ID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweis konnte nicht entfernt werden")
+		writeErr(w, http.StatusInternalServerError, "Could not dismiss the notice")
 		return
 	}
+	s.publish(live.TopicNotices)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -366,8 +373,9 @@ func (s *Server) runsNoticesClear(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	if err := s.runNotices.Clear(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweise konnten nicht entfernt werden")
+		writeErr(w, http.StatusInternalServerError, "Could not clear the notices")
 		return
 	}
+	s.publish(live.TopicNotices)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

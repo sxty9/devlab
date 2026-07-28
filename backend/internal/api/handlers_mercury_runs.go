@@ -164,7 +164,9 @@ var runEffortAllowed = func() map[string]bool {
 var runModelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // validateTuning trims and guards the tuning a run/todo carries (all optional; empty REFERS to
-// the service default, REQ-010.2).
+// the service default, REQ-010.2). The time budget is the third tunable at the same access
+// point: absent = the default reference, 0 = explicitly "no budget" (REQ-010.3), negative is
+// refused rather than silently corrected.
 func validateTuning(t *runs.Tuning) (int, string) {
 	t.Model = strings.TrimSpace(t.Model)
 	if t.Model != "" && !runModelRe.MatchString(t.Model) {
@@ -177,6 +179,9 @@ func validateTuning(t *runs.Tuning) (int, string) {
 	t.Effort = strings.TrimSpace(t.Effort)
 	if t.Effort != "" && !runEffortAllowed[t.Effort] {
 		return http.StatusBadRequest, "Invalid effort (allowed: low, medium, high, xhigh, max, ultracode)"
+	}
+	if t.TimeBudget != nil && *t.TimeBudget < 0 {
+		return http.StatusBadRequest, "Invalid time budget (0 means no budget; omit it to use the default)"
 	}
 	return 0, ""
 }

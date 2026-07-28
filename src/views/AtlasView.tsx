@@ -5,6 +5,7 @@ import { IconCard } from '@/ui/IconCard';
 import { Splash } from '@/shell/Splash';
 import { SitemapIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
+import { AtlasPorts } from '@/views/AtlasPorts';
 import type { AtlasGraph, AtlasNode, Repo } from '@/types';
 
 /** A node's tint carries its state: fully declared, or missing a manifest or a route. */
@@ -14,7 +15,7 @@ function tintOf(n: AtlasNode): Repo['tint'] {
 }
 
 function subtitleOf(n: AtlasNode): string {
-  return n.port ? `:${n.port}` : 'nicht geroutet';
+  return n.port ? `:${n.port}` : 'not routed';
 }
 
 /** Atlas — the model of how Holistic services interact.
@@ -46,7 +47,7 @@ export function AtlasView() {
   if (failed) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-bg-base">
-        <p className="text-footnote text-text-secondary">Die Landschaft konnte nicht gelesen werden.</p>
+        <p className="text-footnote text-text-secondary">The landscape could not be read.</p>
       </div>
     );
   }
@@ -96,6 +97,13 @@ export function AtlasView() {
             </ul>
           </section>
         )}
+
+        <section>
+          <h2 className="mb-2.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
+            Ports
+          </h2>
+          <AtlasPorts />
+        </section>
       </div>
     </div>
   );

@@ -1,24 +1,61 @@
 # 00 — Cutover (Orchestrator, root; B-9 order: stop → migrate → start)
 
-_Owner: B5. This skeleton pins the section; B5 fills the exact command sequence from
-BAUPLAN §5 (backup, wrappers + sudoers, unit + drop-in, marker removal, build as
-unprivileged user, install-only, migrate BEFORE first start, start + honest probes)._
+_Owner: B5. The command sequence below is the binding cutover (BAUPLAN §5): backup, wrappers +
+sudoers, unit + drop-in, marker removal, build as an unprivileged user, install-only, migrate
+BEFORE the first start, start + honest probes. Instance values appear ONLY here and in the
+drop-in — never in the repository's code._
 
-## Order (binding)
+```sh
+# 0) Sicherung (Alt-Datenpfad + Binary + Unit)
+sudo systemctl stop devlabd
+sudo tar -C /var/lib/devlab -czf /root/devlab-state-$(date +%Y%m%d-%H%M%S).tar.gz mercury links chats comments
+sudo cp -a /usr/local/bin/devlabd /root/devlabd.bak
+sudo cp -a /etc/systemd/system/devlabd.service /root/devlabd.service.bak
+sudo cp -a /etc/systemd/system/devlabd.service.d/runs.conf /root/runs.conf.bak
 
-1. Backup: old state path + binary + unit (+ runs drop-in).
-2. Wrappers + sudoers (pinned, narrow; the runner keeps NO sudo): devlab-exec (no preview
-   verbs), devlab-install, devlab-restart-when-free, devlab.sudoers, devlab-runs.sudoers
-   (grant: devlab → devlab-install). Remove the retired wrappers (devlab-restart-idle,
-   devlab-deploy, devlab-preview); move /etc/devlab/deploy.d out of service (B-44).
-3. Unit + drop-in: instance values ONLY in the drop-in. REMOVE Environment=DEVLAB_RUNS_MODE
-   (does not exist in the rebuild, REQ-027.1); SET DEVLAB_STATE_DIR, DEVLAB_RUNS_DRAIN_GRACE,
-   DEVLAB_RUNS_RESUME_WINDOW. DEVLAB_RUNS_MAX_CONCURRENCY stays as FIRST-start seed only.
-4. Remove the legacy markers mercury/run-active and mercury/runs-active (REQ-039.3).
-5. Build as an UNPRIVILEGED user (root never builds), then install-only.
-6. Data migration BEFORE the first start (devlab-migrate refuses while the daemon lives).
-7. Start + honest checks: unit active, port held, /api/health, ready socket answers 204.
+# 1) Wrapper + sudoers (gepinnt, eng; Runner behält GAR KEIN sudo)
+sudo install -o root -g root -m0755 deploy/devlab-exec /usr/local/sbin/devlab-exec          # ohne preview-Verben
+sudo install -o root -g root -m0755 deploy/devlab-install /usr/local/sbin/devlab-install
+sudo install -o root -g root -m0755 deploy/devlab-restart-when-free /usr/local/sbin/devlab-restart-when-free
+sudo install -o root -g root -m0440 deploy/devlab.sudoers /etc/sudoers.d/devlab
+sudo install -o root -g root -m0440 deploy/devlab-runs.sudoers /etc/sudoers.d/devlab-runs   # Grant: devlab → devlab-install
+sudo visudo -c
+sudo rm -f /usr/local/sbin/devlab-restart-idle /usr/local/sbin/devlab-deploy /usr/local/sbin/devlab-preview
+sudo mv /etc/devlab/deploy.d /root/deploy.d.bak    # per-Repo-Skriptmechanik außer Betrieb (B-44)
+
+# 2) Unit + Drop-in (Instanz-Werte bleiben NUR hier)
+sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
+sudo $EDITOR /etc/systemd/system/devlabd.service.d/runs.conf
+#   ENTFERNEN: Environment=DEVLAB_RUNS_MODE=full          (existiert im Neubau nicht, REQ-027.1)
+#   SETZEN:    Environment=DEVLAB_STATE_DIR=/var/lib/devlab
+#              Environment=DEVLAB_RUNS_DRAIN_GRACE=60s
+#              Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
+#   (DEVLAB_RUNS_MAX_CONCURRENCY bleibt als STARTWERT; Laufzeit gewinnt, REQ-013.2)
+sudo systemctl daemon-reload
+
+# 3) Alt-Marker entfernen (REQ-039.3) — die Doppel-Falle existiert nicht mehr
+sudo rm -f /var/lib/devlab/mercury/run-active /var/lib/devlab/mercury/runs-active
+
+# 4) Bauen als UNPRIVILEGIERTER User (root baut nie), dann install-only
+(cd backend && go build -o /tmp/neubau/devlabd ./cmd/devlabd && go build -o /tmp/neubau/devlab-migrate ./cmd/devlab-migrate)
+npm ci && npm run build
+sudo install -o root -g root -m0755 /tmp/neubau/devlabd /usr/local/bin/devlabd
+sudo rsync -a --delete dist/ /var/lib/devlab/www/
+
+# 5) Datenmigration VOR dem ersten Start (B-9; migrate verweigert bei laufendem Dienst)
+sudo -u devlab env DEVLAB_STATE_DIR=/var/lib/devlab /tmp/neubau/devlab-migrate \
+    --input /home/nanu/devlab-neubau/mercury-runs-roh.json
+
+# 6) Start + ehrliche Prüfung
+sudo systemctl start devlabd && systemctl status devlabd --no-pager
+ss -tlnp | grep 8781 && curl -fsS http://127.0.0.1:8781/api/health
+curl -fsS --unix-socket /var/lib/devlab/restart-ready.sock http://x/ready -o /dev/null -w '%{http_code}\n'   # 204 erwartet
+```
 
 ## Rollback
 
-Reverse order with the step-1 backup artifacts.
+Reverse order with the step-0 backup artifacts: stop devlabd, restore
+`/root/devlabd.bak → /usr/local/bin/devlabd`, `/root/devlabd.service.bak` and
+`/root/runs.conf.bak` into systemd, `daemon-reload`, restore the state tarball into
+`/var/lib/devlab`, move `/root/deploy.d.bak` back to `/etc/devlab/deploy.d`, reinstall the
+retired wrappers from the previous checkout, then start devlabd.

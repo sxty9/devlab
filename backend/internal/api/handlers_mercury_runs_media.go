@@ -142,6 +142,7 @@ func (s *Server) runAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	var updated runs.Run
+	deduped := false
 	// Patch, not Mutate: an attachment is task data, not part of the axiom-config lineage the restore
 	// history is for — recording it there would both bloat the history and let a restore resurrect a
 	// blob that was since deleted.
@@ -153,15 +154,21 @@ func (s *Server) runAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 		if cur[idx].Kind != "todo" {
 			return nil, errNotTodo
 		}
-		if len(cur[idx].Attachments) >= maxAttachmentsPerTodo {
-			return nil, errTooManyAttachments
-		}
 		var total int64
 		for _, a := range cur[idx].Attachments {
+			// SHA dedup (REQ-007): the same bytes attached twice — a double paste, or dialog
+			// then paste — coalesce to the one existing attachment instead of a duplicate row.
+			if a.SHA256 != "" && a.SHA256 == att.SHA256 {
+				deduped, updated = true, cur[idx]
+				return cur, nil
+			}
 			if strings.EqualFold(a.Filename, name) {
 				return nil, errDupAttachment
 			}
 			total += a.Size
+		}
+		if len(cur[idx].Attachments) >= maxAttachmentsPerTodo {
+			return nil, errTooManyAttachments
 		}
 		if total+att.Size > maxAttachmentsTotalBytes {
 			return nil, errAttachmentsTooLarge
@@ -175,6 +182,9 @@ func (s *Server) runAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 		_ = s.attachments.Delete(id, att.ID) // roll back the orphaned blob
 		s.writeAttachmentErr(w, perr)
 		return
+	}
+	if deduped {
+		_ = s.attachments.Delete(id, att.ID) // the freshly written blob is redundant — same bytes exist
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"attachments": updated.Attachments})
 }
@@ -205,7 +215,7 @@ func (s *Server) runAttachmentRaw(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if meta == nil {
-		writeErr(w, http.StatusNotFound, "Kein Anhang mit dieser id")
+		writeErr(w, http.StatusNotFound, errAttachmentNotFound.Error())
 		return
 	}
 	data, err := s.attachments.Get(id, aid)

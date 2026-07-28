@@ -4,9 +4,13 @@
 package runs
 
 import (
+	"encoding/json"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/statepath"
 )
@@ -18,10 +22,22 @@ type Settings struct {
 	AutomergeWindow   time.Duration `json:"automergeWindow"`
 }
 
+// settingsFile is the on-disk form. Durations are stored as model.Duration strings ("3h") so the
+// pool stays human-readable; the tolerant unmarshal also accepts legacy nanosecond integers. Who
+// changed the settings last is recorded as a label (REQ-041), never evaluated here.
+type settingsFile struct {
+	MaxConcurrency    int            `json:"maxConcurrency"`
+	DefaultTimeBudget model.Duration `json:"defaultTimeBudget"`
+	AutomergeWindow   model.Duration `json:"automergeWindow"`
+	Updated           model.Actor    `json:"updated"`
+	UpdatedAt         time.Time      `json:"updatedAt"`
+}
+
 // SettingsStore is the passive settings pool (mercury/settings.json).
 type SettingsStore struct {
 	path string
 	seed Settings
+	mu   sync.Mutex
 }
 
 // NewSettingsStore builds the store below the state root. seed provides the first-start values
@@ -34,14 +50,41 @@ func NewSettingsStore(p *statepath.Paths, seed Settings) *SettingsStore {
 	return &SettingsStore{path: path, seed: seed}
 }
 
-// Get returns the current settings (the seed while no file exists).
+// Get returns the current settings (the seed while no file exists). A present-but-unreadable
+// file is an error, never silently the seed — a runtime choice must not be shadowed.
 func (s *SettingsStore) Get() (Settings, error) {
-	panic("TODO(B8)")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := os.ReadFile(s.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return s.seed, nil
+		}
+		return Settings{}, err
+	}
+	var f settingsFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return Settings{}, err
+	}
+	return Settings{
+		MaxConcurrency:    f.MaxConcurrency,
+		DefaultTimeBudget: time.Duration(f.DefaultTimeBudget),
+		AutomergeWindow:   time.Duration(f.AutomergeWindow),
+	}, nil
 }
 
-// Put replaces the settings atomically, recording who changed them.
+// Put replaces the settings atomically, recording who changed them. From the first Put on, the
+// stored values win over the env seed (REQ-013.2).
 func (s *SettingsStore) Put(set Settings, by model.Actor) error {
-	panic("TODO(B8)")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return fsatomic.WriteJSON(s.path, settingsFile{
+		MaxConcurrency:    set.MaxConcurrency,
+		DefaultTimeBudget: model.Duration(set.DefaultTimeBudget),
+		AutomergeWindow:   model.Duration(set.AutomergeWindow),
+		Updated:           by,
+		UpdatedAt:         time.Now().UTC(),
+	})
 }
 
 // ResolvedTuning is a run's fully resolved engine choice — reference semantics applied.
@@ -54,8 +97,24 @@ type ResolvedTuning struct {
 }
 
 // EffectiveTuning resolves a run's tuning against the service defaults — the ONE place the
-// reference semantics live (REQ-010): empty fields refer to the default (so a later default
-// change reaches every referring run), a present zero budget means "no budget".
+// reference semantics live (REQ-010): a nil budget REFERS to the default (so a later default
+// change reaches every referring run), a present zero budget means "no budget". A negative
+// stored value (corrupt data; the API refuses it) resolves to "no budget" rather than an
+// unusable negative timeout.
 func EffectiveTuning(r Run, set Settings) ResolvedTuning {
-	panic("TODO(B8)")
+	rt := ResolvedTuning{
+		Model:        strings.TrimSpace(r.Tuning.Model),
+		ModelVersion: strings.TrimSpace(r.Tuning.ModelVersion),
+		Effort:       strings.TrimSpace(r.Tuning.Effort),
+	}
+	if r.Tuning.TimeBudget == nil {
+		rt.Budget = set.DefaultTimeBudget
+		rt.BudgetIsDefault = true
+		return rt
+	}
+	rt.Budget = time.Duration(*r.Tuning.TimeBudget)
+	if rt.Budget < 0 {
+		rt.Budget = 0
+	}
+	return rt
 }

@@ -9,6 +9,10 @@ import (
 	"devlab/backend/internal/model"
 )
 
+// prOps builds the GitHubOps of the IDE route over the CALLER's token (a human PR is the
+// user's PR, not the runner's). A seam so the handler is testable without GitHub.
+var prOps = deliver.NewGitHub
+
 // openPR pushes the caller's current branch and opens a GitHub pull request into the default branch
 // (the "Delivery" pipeline action). It needs push permission (guarded by mutateCtx). If a PR for the
 // branch is already open it focuses that one instead of erroring — the action is idempotent. Under
@@ -65,7 +69,7 @@ func (s *Server) openPR(w http.ResponseWriter, r *http.Request) {
 	if title == "" {
 		title = head
 	}
-	ref, adopted, err := deliver.OpenOrAdoptPR(r.Context(), deliver.NewGitHub(wc.token), s.deliveries, deliver.PRIn{
+	ref, adopted, err := deliver.OpenOrAdoptPR(r.Context(), prOps(wc.token), s.deliveries, deliver.PRIn{
 		Repo: full, Head: head, Base: base, Title: title, Body: body.Body,
 	})
 	if err != nil {

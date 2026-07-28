@@ -26,8 +26,15 @@ func repoIDs(repos []model.Repo) []string {
 	return ids
 }
 
-// atlasPorts reports the observed port allocations (F9): routes + /proc/net/tcp, derived
-// fresh on every call — no stored port state. B5 fills the body over atlas.Allocations.
+// atlasPorts reports the observed port allocations (F9): the ledger is derived fresh from the
+// host's routes and bound sockets on EVERY call — no stored port state, so it cannot drift from
+// what is deployed (REQ-044.4). Conflicts arrive named on the entries themselves. An unreadable
+// route source is an honest error, never an empty green ledger.
 func (s *Server) atlasPorts(w http.ResponseWriter, _ *http.Request) {
-	writeErr(w, http.StatusNotImplemented, "GET /api/atlas/ports is not wired yet (deploy & ports, Welle 1)")
+	allocs, err := atlas.AllocationsNow()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "port ledger unavailable: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, allocs)
 }

@@ -6,10 +6,15 @@
 package deploy
 
 import (
-	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"devlab/backend/internal/model"
-	"devlab/backend/internal/workspace"
 )
 
 // Kind classifies a repo for delivery.
@@ -23,11 +28,25 @@ const (
 	KindTemplate      Kind = "template"
 )
 
+// DeclarationFileName is the optional per-repo declaration (REQ-028.2): named values instead of
+// code, in the repo root. It is the ONLY way a repo states delivery deviations — there are no
+// per-repo scripts (B-44).
+const DeclarationFileName = "holistic-service.json"
+
+// templatePlaceholderID is the pristine template's placeholder service id: a repo still carrying
+// permissions/<placeholder>.json IS the template and never counts as a delivery gap (REQ-029.4).
+const templatePlaceholderID = "myservice"
+
 // Detection is a classification WITH its evidence: the conforming ./service CLI (template
 // convention) or backend/cmd/<id>d for a service; the declaration file for excluded.
 type Detection struct {
 	Kind     Kind
 	Evidence string
+	// ID is the detected service id (unit and route stem): the permissions-manifest stem, the
+	// cmd/<id>d stem, or the repo directory name. Empty for non-services.
+	ID string
+	// Decl is the parsed declaration file, when present.
+	Decl *DeclarationFile
 }
 
 // DeclarationFile is the optional per-repo declaration (REQ-028.2 — named values instead of
@@ -42,47 +61,120 @@ type DeclarationFile struct {
 	} `json:"artifact,omitempty"`
 }
 
-// Detect classifies one repo directory with evidence.
+// Detect classifies one repo directory with evidence. Order of judgement: the pristine template,
+// an explicit exclusion, a conforming service (the ./service CLI or a cmd/<id>d daemon), a repo
+// that CLAIMS delivery without conforming, and — only then — a library.
 func Detect(repoDir string) (Detection, error) {
-	panic("TODO(B5)")
+	if fi, err := os.Stat(repoDir); err != nil || !fi.IsDir() {
+		return Detection{}, fmt.Errorf("deploy: not a repo directory: %s", repoDir)
+	}
+
+	decl, declErr := readDeclaration(repoDir)
+
+	// 1) The pristine template: still carries the placeholder id — never a service, never a gap.
+	if _, err := os.Stat(filepath.Join(repoDir, "permissions", templatePlaceholderID+".json")); err == nil {
+		return Detection{Kind: KindTemplate, Decl: decl,
+			Evidence: "pristine service template (placeholder permissions/" + templatePlaceholderID + ".json)"}, nil
+	}
+
+	// 2) A malformed declaration is a violation, not a guess.
+	if declErr != nil {
+		return Detection{Kind: KindNonconforming,
+			Evidence: DeclarationFileName + " is unreadable: " + declErr.Error()}, nil
+	}
+
+	// 3) Explicitly declared not-to-deliver: abbildbar, and it suppresses every attempt.
+	if decl != nil && decl.Deliver != nil && !*decl.Deliver {
+		return Detection{Kind: KindExcluded, Decl: decl,
+			Evidence: DeclarationFileName + " declares deliver:false"}, nil
+	}
+
+	// 4) A conforming service: the uniform ./service CLI, or the template daemon layout.
+	id := manifestID(repoDir)
+	if fi, err := os.Stat(filepath.Join(repoDir, "service")); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+		if id == "" {
+			id = filepath.Base(repoDir)
+		}
+		return Detection{Kind: KindService, ID: id, Decl: decl,
+			Evidence: "./service CLI (template convention)"}, nil
+	}
+	if cmdID, dir := daemonCmdID(repoDir); cmdID != "" {
+		return Detection{Kind: KindService, ID: cmdID, Decl: decl,
+			Evidence: dir + "/" + cmdID + "d (template daemon layout)"}, nil
+	}
+
+	// 5) Claims delivery (declaration present) or looks daemon-shaped, but conforms to nothing:
+	// a "Code-Struktur" violation to report — never a special path (REQ-028.4).
+	if decl != nil {
+		return Detection{Kind: KindNonconforming, Decl: decl,
+			Evidence: DeclarationFileName + " present, but neither a ./service CLI nor a cmd/<id>d daemon conforms to the shared structure"}, nil
+	}
+	if hasNonconformingCmd(repoDir) {
+		return Detection{Kind: KindNonconforming,
+			Evidence: "has a cmd/ tree, but neither a ./service CLI nor a cmd/<id>d daemon conforms to the shared structure"}, nil
+	}
+
+	// 6) Everything else holds code without a deliverable daemon: a library.
+	return Detection{Kind: KindLibrary, Evidence: "no ./service CLI and no cmd/<id>d daemon — nothing to deliver"}, nil
 }
 
-// Build builds the repo's artifact AS THE USER via devlab-exec artifact-build (root never
-// builds) and returns the artifact directory.
-func Build(ctx context.Context, ex *workspace.Executor, repo string) (string, error) {
-	panic("TODO(B5)")
+func readDeclaration(repoDir string) (*DeclarationFile, error) {
+	raw, err := os.ReadFile(filepath.Join(repoDir, DeclarationFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var d DeclarationFile
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
-// RootInstaller is the thin seam over `sudo devlab-install` (the pinned wrapper).
-type RootInstaller interface {
-	Install(ctx context.Context, repo, artifactDir, env string, port int, handover bool) error
+// manifestID returns the service id from permissions/<id>.json, the template's source of truth.
+func manifestID(repoDir string) string {
+	entries, err := os.ReadDir(filepath.Join(repoDir, "permissions"))
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if name, ok := strings.CutSuffix(e.Name(), ".json"); ok && !e.IsDir() {
+			return name
+		}
+	}
+	return ""
 }
 
-// PortSource proposes a validated free port for first-time setup.
-type PortSource interface {
-	Propose(ctx context.Context) (int, error)
+// daemonCmdID finds the template daemon layout cmd/<id>d (repo root or backend/), returning the
+// id and which cmd tree carried it.
+func daemonCmdID(repoDir string) (id, dir string) {
+	for _, base := range []string{"backend/cmd", "cmd"} {
+		entries, err := os.ReadDir(filepath.Join(repoDir, base))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() && strings.HasSuffix(e.Name(), "d") && len(e.Name()) > 1 {
+				return strings.TrimSuffix(e.Name(), "d"), base
+			}
+		}
+	}
+	return "", ""
 }
 
-// Outcome is the honest install result.
-type Outcome struct {
-	Installed bool
-	Running   bool
-	Port      int
-	Detail    string
-}
-
-// DeliverDev delivers a repo to dev: foreign repo ⇒ install + unit restart inside the wrapper;
-// self repo ⇒ install + --handover (B-2). First-time setup of template-conforming services is
-// done by the WRAPPER from root-owned inline templates with validated values (port from
-// atlas.Propose) — no per-repo script, no repo code as root (REQ-028).
-func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, d Detection, repo, artifactDir string) (Outcome, error) {
-	panic("TODO(B5)")
-}
-
-// VerifyRunning is the honest gate (F10): unit active AND port held, otherwise failed
-// (REQ-044.3). Never green by default.
-func VerifyRunning(ctx context.Context, d Detection, port int) error {
-	panic("TODO(B5)")
+func hasNonconformingCmd(repoDir string) bool {
+	for _, base := range []string{"backend/cmd", "cmd"} {
+		entries, err := os.ReadDir(filepath.Join(repoDir, base))
+		if err != nil {
+			continue
+		}
+		if len(entries) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Gap names a repo whose delivery is possible but not yet set up — "delivery not yet set up"
@@ -94,19 +186,42 @@ type Gap struct {
 	Detail string
 }
 
-// FindGaps derives the delivery gaps from detections and observed ports.
+// FindGaps derives the delivery gaps from detections and observed ports: a detected service
+// with no routed port has no delivery path yet (REQ-029.1); a nonconforming repo is reported as
+// the "Code-Struktur" violation it is (REQ-028.4). Libraries, the template and excluded repos
+// produce no gap.
 func FindGaps(dets map[string]Detection, allocs []model.PortAllocation) []Gap {
-	panic("TODO(B5)")
+	repos := make([]string, 0, len(dets))
+	for r := range dets {
+		repos = append(repos, r)
+	}
+	sort.Strings(repos)
+
+	var gaps []Gap
+	for _, repo := range repos {
+		d := dets[repo]
+		switch d.Kind {
+		case KindService:
+			if _, routed := routedPortOf(allocs, d.ID); !routed {
+				gaps = append(gaps, Gap{Repo: repo, Kind: KindService,
+					Detail: "delivery not yet set up: service detected (" + d.Evidence + ") but no route/port is provisioned"})
+			}
+		case KindNonconforming:
+			gaps = append(gaps, Gap{Repo: repo, Kind: KindNonconforming,
+				Detail: "violates the Code-Struktur axiom: " + d.Evidence})
+		}
+	}
+	return gaps
 }
 
-// ProdConfig configures the prod send: rsync to an rrsync staging path behind a
-// forced-command receiver; the TARGET is server-side, never in the request.
-type ProdConfig struct {
-	RsyncTarget string
-}
-
-// SendProd ships an artifact to prod staging. In this phase it is exercised ONLY against a
-// fixture target — never armed.
-func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) error {
-	panic("TODO(B5)")
+func routedPortOf(allocs []model.PortAllocation, service string) (int, bool) {
+	if service == "" {
+		return 0, false
+	}
+	for _, a := range allocs {
+		if a.Routed && a.Service == service {
+			return a.Port, true
+		}
+	}
+	return 0, false
 }
