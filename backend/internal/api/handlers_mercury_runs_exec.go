@@ -884,10 +884,10 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// way a state comes to be: prior not-yet-merged work is already present because the dev branch carries
 	// it, so the old "fold the open PRs in before building" special case is gone (removed with
 	// openMercuryPRHeads). EnsureDevBranch fetches too, so a connectivity failure carries the sweep over.
-	var devCreated bool
+	var devPrep workspace.DevBranchPrep
 	if err := retryInfra(ctx, 3, 10*time.Second, func() error {
-		c, e := ex.EnsureDevBranch(ctx, wt, token, branch, devBranch)
-		devCreated = c
+		p, e := ex.EnsureDevBranch(ctx, wt, token, branch, devBranch)
+		devPrep = p
 		return e
 	}); err != nil {
 		if isInfraError(err) {
@@ -895,6 +895,17 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		}
 		rr.Error = "dev-Branch vorbereiten: " + err.Error()
 		return rr, repoSignal{}
+	}
+	// Recovered work (req 5): an interrupted prior run left committed-but-unpublished commits in this
+	// workspace. They are NOT silently absorbed — the step names them, and marking devPrep.Recovered on the
+	// dev-advance decision below guarantees the dev push publishes them even if this run adds nothing else.
+	if devPrep.Recovered > 0 {
+		step("dev-branch", fmt.Sprintf("%d festgeschriebene(r) Commit(s) eines unterbrochenen Laufs im Arbeitsstand gefunden, übernommen und mit ausgeliefert", devPrep.Recovered), runs.StepOK)
+	}
+	// A pushed dev state that will not fold cleanly is non-fatal (req 2): the local state is kept as-is and
+	// the run continues on it, simply without the very newest pushed commits until a later run resolves it.
+	if devPrep.RemoteConflict {
+		step("dev-branch", "veröffentlichter dev-Stand ("+devBranch+") nicht konfliktfrei einfaltbar — auf dem lokalen Stand fortgeführt", runs.StepNotApplicable)
 	}
 	// Hygiene without loss of history: clear an aborted run's half-changes (uncommitted edits + untracked
 	// files); the branch pointer — and the accumulated history — is untouched (req 4).
@@ -1005,7 +1016,10 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 	hasDelivery := deliveryCommits > 0
-	devAdvanced := devCreated || finalTip != startTip
+	// The dev state is worth publishing when this run added work (tip moved), when the branch was just
+	// created, OR when it recovered an interrupted run's unpublished commits — the last case pushes them to
+	// the durable remote even if this run itself changed nothing (req 3/5).
+	devAdvanced := devPrep.Created || devPrep.Recovered > 0 || finalTip != startTip
 
 	if !devAdvanced {
 		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", runs.StepOK)

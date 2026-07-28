@@ -61,12 +61,12 @@ func TestDevBranchGrows(t *testing.T) {
 	const dev = "mercury-dev"
 
 	// Run 1: establish mercury-dev from main (first time → created), do work, publish mercury-dev.
-	created, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	prep, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
 	if err != nil {
 		t.Fatalf("EnsureDevBranch run1: %v", err)
 	}
-	if !created {
-		t.Errorf("first EnsureDevBranch must report created=true")
+	if !prep.Created {
+		t.Errorf("first EnsureDevBranch must report Created=true")
 	}
 	if err := e.CleanWorktree(ctx, wt); err != nil {
 		t.Fatalf("CleanWorktree: %v", err)
@@ -81,12 +81,12 @@ func TestDevBranchGrows(t *testing.T) {
 	// A brand-new workspace clone (simulating a wiped/recreated workspace) must recover the grown state.
 	wt2 := filepath.Join(t.TempDir(), "work2")
 	gitT(t, "", "clone", origin, wt2)
-	created, err = e.EnsureDevBranch(ctx, wt2, "", "main", dev)
+	prep, err = e.EnsureDevBranch(ctx, wt2, "", "main", dev)
 	if err != nil {
 		t.Fatalf("EnsureDevBranch run2: %v", err)
 	}
-	if created {
-		t.Errorf("second EnsureDevBranch must report created=false (mercury-dev already exists)")
+	if prep.Created {
+		t.Errorf("second EnsureDevBranch must report Created=false (mercury-dev already exists)")
 	}
 	if !exists(wt2, "run1.txt") {
 		t.Errorf("run1's work missing after preparing the next run — the state was reset, not grown")
@@ -415,6 +415,145 @@ func TestStackedDeliveryDiff(t *testing.T) {
 	both, _ := runGit(e.gitIn(ctx, wt, "", "ls-tree", "--name-only", "mercury-run/r2"))
 	if !contains(both, "a.txt") || !contains(both, "b.txt") {
 		t.Errorf("delivery 2 branch must carry both a.txt and b.txt, got tree: %q", both)
+	}
+}
+
+// TestDevBranchKeepsUnpushedLocalCommits is the core of the loss fix (req 1/7): a run commits to the
+// persistent dev branch but is interrupted BEFORE publishing, so the commit lives only locally. The next
+// run, in the SAME workspace, must KEEP that commit — never reset the branch onto the (stale) remote — and
+// fold the remote in. It also reports the recovered commit (req 5).
+func TestDevBranchKeepsUnpushedLocalCommits(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+	_ = origin
+
+	// Run 1 establishes AND publishes mercury-dev, so origin/mercury-dev exists.
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "published.txt"), "published\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "run1 published")
+	if _, err := e.PushRefs(ctx, wt, "", false, dev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 2 (same workspace) prepares the branch, commits MORE work, but is interrupted before PushRefs —
+	// the commit exists only on the local branch.
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "unpushed.txt"), "interrupted before publish\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "run2 unpublished work")
+	unpushedTip, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	// Run 3, same workspace, prepares the branch AGAIN. The unpushed commit MUST survive — the pre-fix
+	// `checkout -f -B mercury-dev origin/mercury-dev` would have reset it away.
+	prep, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	if err != nil {
+		t.Fatalf("EnsureDevBranch run3: %v", err)
+	}
+	if !exists(wt, "unpushed.txt") {
+		t.Errorf("unpushed local commit was LOST — the branch was reset onto the remote")
+	}
+	if !exists(wt, "published.txt") {
+		t.Errorf("published work missing after preparing the next run")
+	}
+	if prep.Recovered != 1 {
+		t.Errorf("Recovered = %d, want 1 (the one unpublished commit)", prep.Recovered)
+	}
+	if !commitReachable(t, e, ctx, wt, unpushedTip) {
+		t.Errorf("unpushed commit %s no longer reachable from HEAD — it was discarded", unpushedTip)
+	}
+}
+
+// TestDevBranchFirstRunUnpushedKept covers the FIRST-ever run interrupted before it could publish: the
+// local mercury-dev exists with commits, but origin/mercury-dev does NOT. The next run must KEEP the local
+// branch (grow on it), never recreate it from the default branch and discard the first run's work — the
+// pre-fix code did exactly that whenever the remote dev branch was absent.
+func TestDevBranchFirstRunUnpushedKept(t *testing.T) {
+	_, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+
+	prep, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prep.Created {
+		t.Fatalf("first run should report Created=true")
+	}
+	writeF(t, filepath.Join(wt, "first.txt"), "first run work\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "first run work")
+	// No push — origin/mercury-dev is never created (the run was interrupted).
+
+	prep, err = e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prep.Created {
+		t.Errorf("second run must NOT recreate the branch — a local dev branch already exists")
+	}
+	if !exists(wt, "first.txt") {
+		t.Errorf("first run's unpublished work was discarded by a reset to the default branch")
+	}
+	if prep.Recovered != 1 {
+		t.Errorf("Recovered = %d, want 1", prep.Recovered)
+	}
+}
+
+// TestDevBranchRemoteFoldConflictKeepsLocal is req 2/7: when the pushed dev state has DIVERGED from the
+// kept local dev branch (both changed the same line), folding it in conflicts — and that must reset
+// NOTHING. The local commits stay exactly as they were, the tree is clean, and RemoteConflict is reported
+// so the run can decide per the Laufregeln whether to proceed.
+func TestDevBranchRemoteFoldConflictKeepsLocal(t *testing.T) {
+	origin, wt, e := devTestRepo(t)
+	ctx := context.Background()
+	const dev = "mercury-dev"
+
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "shared.txt"), "base\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "base")
+	if _, err := e.PushRefs(ctx, wt, "", false, dev); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another worker advances origin/mercury-dev with a conflicting edit to the same line.
+	other := filepath.Join(t.TempDir(), "other")
+	gitT(t, "", "clone", "-b", dev, origin, other)
+	writeF(t, filepath.Join(other, "shared.txt"), "remote version\n")
+	gitT(t, other, "add", "-A")
+	gitCommit(t, other, "remote edits shared")
+	gitT(t, other, "push", "origin", dev)
+
+	// This workspace's interrupted run edited the SAME line differently and committed, but never pushed.
+	writeF(t, filepath.Join(wt, "shared.txt"), "local version\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "local edits shared")
+	localTip, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+
+	prep, err := e.EnsureDevBranch(ctx, wt, "", "main", dev)
+	if err != nil {
+		t.Fatalf("a fold conflict must be non-fatal, got err: %v", err)
+	}
+	if !prep.RemoteConflict {
+		t.Errorf("RemoteConflict not reported for a diverged pushed dev state")
+	}
+	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", "HEAD"))
+	if after != localTip {
+		t.Errorf("HEAD moved (%s → %s) — a conflicting fold must keep the local state exactly", localTip, after)
+	}
+	if got := readF(t, filepath.Join(wt, "shared.txt")); got != "local version\n" {
+		t.Errorf("local work clobbered by a conflicting fold: %q", got)
+	}
+	if out, _ := runGit(e.gitIn(ctx, wt, "", "status", "--porcelain")); out != "" {
+		t.Errorf("aborted fold left the tree dirty: %q", out)
 	}
 }
 

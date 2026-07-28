@@ -80,6 +80,50 @@ func TestResetToRemote(t *testing.T) {
 	}
 }
 
+// TestResetToRemotePreservesDevBranch is req 4: materializing the merged default branch for a prod build
+// must NOT clobber the persistent dev branch. An interrupted run's committed-but-unpublished dev commits
+// live only on the local mercury-dev ref; ResetToRemote("main") must leave that ref exactly where it was.
+func TestResetToRemotePreservesDevBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	gitT(t, "", "init", "--bare", "-b", "main", origin)
+	seed := filepath.Join(root, "seed")
+	gitT(t, "", "clone", origin, seed)
+	writeF(t, filepath.Join(seed, "README.md"), "v1\n")
+	gitT(t, seed, "add", "-A")
+	gitCommit(t, seed, "seed")
+	gitT(t, seed, "push", "origin", "main")
+
+	wt := filepath.Join(root, "work")
+	gitT(t, "", "clone", origin, wt)
+	e := Executor{PerUser: false}
+	const dev = "mercury-dev"
+
+	// A prior run established mercury-dev and committed work, but was interrupted before publishing it.
+	if _, err := e.EnsureDevBranch(ctx, wt, "", "main", dev); err != nil {
+		t.Fatal(err)
+	}
+	writeF(t, filepath.Join(wt, "dev-work.txt"), "unpublished dev work\n")
+	gitT(t, wt, "add", "-A")
+	gitCommit(t, wt, "unpublished dev work")
+	devTip, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", dev))
+
+	// A merged PR triggers a prod build, which materializes origin/main in the SAME per-repo workspace.
+	if err := e.ResetToRemote(ctx, wt, "", "main"); err != nil {
+		t.Fatalf("ResetToRemote: %v", err)
+	}
+
+	// The dev branch ref — and thus the unpublished dev commit — is untouched.
+	after, _ := runGit(e.gitIn(ctx, wt, "", "rev-parse", dev))
+	if after != devTip {
+		t.Errorf("mercury-dev moved (%s → %s) — the prod-build reset clobbered unpublished dev work", devTip, after)
+	}
+}
+
 // TestCommitsAhead pins the measure the runner uses to decide whether there is anything to push.
 // The case that matters is the one that silently broke a real run: the agent committed its own work,
 // so the working tree is CLEAN while a finished implementation sits in a commit. A working-tree-only
