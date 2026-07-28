@@ -7,15 +7,14 @@ import (
 	"strings"
 	"time"
 
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
 
-// Executions is the read side of the run-results store the Reporter needs: the day's execution
-// summaries, and the full result for one execution (to derive per-repo delivery stages). *runs.Results
-// satisfies it.
+// Executions is the read side of the result store the Reporter needs: every stored result
+// document (each already carrying its per-repo stage array). *runs.ResultStore satisfies it.
 type Executions interface {
-	All() ([]runs.ExecutionSummary, error)
-	Get(runID, resultID string) (runs.Result, bool, error)
+	List() ([]runs.Result, error)
 }
 
 // Sender delivers a composed report to a recipient. The production implementation wraps the mailer
@@ -129,13 +128,13 @@ func (rp *Reporter) tick(ctx context.Context) {
 	now := rp.now().In(rp.loc)
 	today := dayKey(now)
 
-	summaries, err := rp.execs.All()
+	summaries, err := rp.execs.List()
 	if err != nil {
 		rp.logf("devlabd: daily-report list executions: %v", err)
 		return
 	}
 
-	byDay := map[string][]runs.ExecutionSummary{}
+	byDay := map[string][]runs.Result{}
 	for _, s := range summaries {
 		byDay[rp.reportDay(s)] = append(byDay[rp.reportDay(s)], s)
 	}
@@ -170,7 +169,7 @@ func (rp *Reporter) tick(ctx context.Context) {
 
 // deliverDay sends (or seals, or records a failure for) exactly one report for day d. It is idempotent
 // per day: a day already sent is skipped, so a second pass or a restart cannot double-send.
-func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs.ExecutionSummary, now time.Time) {
+func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs.Result, now time.Time) {
 	rec, _, err := rp.ledger.Get(rp.recipient, day)
 	if err != nil {
 		rp.logf("devlabd: daily-report ledger read %s: %v", day, err)
@@ -203,45 +202,54 @@ func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs
 	})
 }
 
-// buildItems turns a day's execution summaries (oldest first) into report items, loading each full
-// result for its per-repo delivery stages.
-func (rp *Reporter) buildItems(summaries []runs.ExecutionSummary) []Item {
-	ordered := append([]runs.ExecutionSummary(nil), summaries...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].At.Before(ordered[j].At) })
+// buildItems turns a day's results (oldest first) into report items — each result already
+// carries its per-repo stage array (the one source of stage truth).
+func (rp *Reporter) buildItems(summaries []runs.Result) []Item {
+	ordered := append([]runs.Result(nil), summaries...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].StartedAt.Before(ordered[j].StartedAt) })
 
 	items := make([]Item, 0, len(ordered))
 	for _, s := range ordered {
 		it := Item{
 			RunName:   runName(s),
-			TypeLabel: typeLabel(s.Type),
-			StartedAt: s.At,
-			Finished:  !s.FinishedAt.IsZero(),
-			OK:        s.OK,
-			Suspended: s.Suspended,
-			InTokens:  s.InputTokens,
-			OutTokens: s.OutputTokens,
-			CostUSD:   s.CostUSD,
+			TypeLabel: typeLabel(s.Kind),
+			StartedAt: s.StartedAt,
+			Finished:  s.EndedAt != nil,
+			OK:        resultOK(s),
+			InTokens:  int(s.Usage.InputTokens),
+			OutTokens: int(s.Usage.OutputTokens),
+			CostUSD:   s.Usage.CostUSD,
 		}
-		if full, ok, err := rp.execs.Get(s.RunID, s.ResultID); err == nil && ok {
-			if it.RunName == "" {
-				it.RunName = runName(runs.ExecutionSummary{RunName: full.RunName, RunID: full.RunID})
-			}
-			for _, rr := range full.Repos {
-				it.Repos = append(it.Repos, RepoLine{Repo: rr.Repo, Stage: deliveryStage(rr)})
-			}
+		for _, rr := range s.Repos {
+			it.Repos = append(it.Repos, RepoLine{Repo: rr.Repo, Stage: deliveryStage(rr)})
 		}
 		items = append(items, it)
 	}
 	return items
 }
 
+// resultOK reads success off the stage arrays: every repo done and succeeded (the honest
+// success formula, REQ-030.4). An empty result is no success.
+func resultOK(res runs.Result) bool {
+	if len(res.Repos) == 0 {
+		return false
+	}
+	for _, rp := range res.Repos {
+		done, ok := model.PipelineSucceeded(rp.Stages)
+		if !done || !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // reportDay is the calendar day an execution belongs to: the day it FINISHED (so a run that finishes
 // after its start day is reported on the day it actually completed), falling back to its start day
 // while it is still unfinished.
-func (rp *Reporter) reportDay(s runs.ExecutionSummary) string {
-	t := s.At
-	if !s.FinishedAt.IsZero() {
-		t = s.FinishedAt
+func (rp *Reporter) reportDay(s runs.Result) string {
+	t := s.StartedAt
+	if s.EndedAt != nil {
+		t = *s.EndedAt
 	}
 	return dayKey(t.In(rp.loc))
 }
@@ -256,8 +264,8 @@ func (rp *Reporter) dayLink() string {
 // dayKey renders a time as its "YYYY-MM-DD" report day (in whatever location the time already carries).
 func dayKey(t time.Time) string { return t.Format("2006-01-02") }
 
-func runName(s runs.ExecutionSummary) string {
-	if n := strings.TrimSpace(s.RunName); n != "" {
+func runName(s runs.Result) string {
+	if n := strings.TrimSpace(s.RunTitle); n != "" {
 		return n
 	}
 	if s.RunID != "" {

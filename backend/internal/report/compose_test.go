@@ -4,22 +4,26 @@ import (
 	"strings"
 	"testing"
 
-	"devlab/backend/internal/runs"
+	"devlab/backend/internal/model"
 )
 
 func TestDeliveryStageHonestlyReflectsOutcome(t *testing.T) {
+	sv := func(stage string, state model.StepState) model.StageView {
+		return model.StageView{Stage: model.Stage(stage), State: state}
+	}
 	cases := []struct {
 		name string
-		rr   runs.RepoResult
+		rr   model.RepoPipeline
 		want string
 	}{
-		{"deployed", runs.RepoResult{OK: true, Deployed: true}, "deployed"},
-		{"pr", runs.RepoResult{OK: true, PRUrl: "https://x/pr/1"}, "PR opened"},
-		{"analyzed-only", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", Status: runs.StepOK}}}, "analyzed"},
-		{"implemented", runs.RepoResult{OK: true, Steps: []runs.Step{{Name: "analyze", Status: runs.StepOK}, {Name: "implement", Status: runs.StepOK}}}, "implemented"},
-		{"ok-no-steps", runs.RepoResult{OK: true}, "analyzed"},
-		{"failed-at-push", runs.RepoResult{OK: false, Steps: []runs.Step{{Name: "implement", Status: runs.StepOK}, {Name: "push", Status: runs.StepFailed}}}, "failed at pushed"},
-		{"failed-no-steps", runs.RepoResult{OK: false}, "failed"},
+		{"deployed", model.RepoPipeline{Stages: []model.StageView{sv("preflight", model.StepExecuted), sv("implement", model.StepExecuted), sv("deliver-dev", model.StepExecuted)}}, "deployed"},
+		{"pr", model.RepoPipeline{Stages: []model.StageView{sv("implement", model.StepExecuted), sv("pull-request", model.StepExecuted)}}, "PR opened"},
+		{"analyzed-only", model.RepoPipeline{Stages: []model.StageView{sv("preflight", model.StepExecuted)}}, "analyzed"},
+		{"implemented", model.RepoPipeline{Stages: []model.StageView{sv("preflight", model.StepExecuted), sv("implement", model.StepExecuted)}}, "implemented"},
+		{"no-stages", model.RepoPipeline{}, "not started"},
+		{"failed-at-publish", model.RepoPipeline{Stages: []model.StageView{sv("implement", model.StepExecuted), sv("publish", model.StepFailed), sv("pull-request", model.StepNotExecuted)}}, "failed at published"},
+		{"running", model.RepoPipeline{Stages: []model.StageView{sv("implement", model.StepRunning)}}, "working on implemented"},
+		{"legacy-step-names", model.RepoPipeline{Stages: []model.StageView{sv("analyze", model.StepExecuted), sv("push", model.StepFailed)}}, "failed at published"},
 	}
 	for _, c := range cases {
 		if got := deliveryStage(c.rr); got != c.want {
@@ -29,14 +33,14 @@ func TestDeliveryStageHonestlyReflectsOutcome(t *testing.T) {
 }
 
 func TestTypeLabel(t *testing.T) {
-	if typeLabel(runs.TypeTodo) != "ToDo" {
+	if typeLabel(model.KindTodo) != "ToDo" {
 		t.Error("todo label")
 	}
-	if typeLabel(runs.TypeAuto) != "Automatic run" {
+	if typeLabel(model.KindAuto) != "Automatic run" {
 		t.Error("auto label")
 	}
-	if typeLabel(runs.Type("")) != "Automatic run" {
-		t.Error("empty type should read as auto")
+	if typeLabel(model.RunKind("")) != "Automatic run" {
+		t.Error("empty kind should read as auto")
 	}
 }
 

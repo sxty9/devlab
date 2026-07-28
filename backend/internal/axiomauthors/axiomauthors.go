@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/statepath"
 )
 
 // Author is who created and who last changed one axiom, kept separate so the creator stays visible
@@ -36,13 +38,16 @@ type Store struct {
 }
 
 // NewStore builds the pool from the environment.
-func NewStore() *Store { return &Store{path: authorsPath()} }
+func NewStore(p *statepath.Paths) *Store { return &Store{path: authorsPath(p)} }
 
-func authorsPath() string {
+func authorsPath(p *statepath.Paths) string {
 	if p := os.Getenv("DEVLAB_MERCURY_AXIOM_AUTHORS"); p != "" {
 		return p
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "axiom-authors.json")
+	if p != nil {
+		return p.AxiomAuthors()
+	}
+	return ""
 }
 
 type file struct {

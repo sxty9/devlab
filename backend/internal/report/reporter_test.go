@@ -8,21 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
 
 // --- fakes -----------------------------------------------------------------
 
 type fakeExecs struct {
-	summaries []runs.ExecutionSummary
-	full      map[string]runs.Result
+	summaries []runs.Result
 }
 
-func (f *fakeExecs) All() ([]runs.ExecutionSummary, error) { return f.summaries, nil }
-func (f *fakeExecs) Get(runID, resultID string) (runs.Result, bool, error) {
-	r, ok := f.full[runID+"/"+resultID]
-	return r, ok, nil
-}
+func (f *fakeExecs) List() ([]runs.Result, error) { return f.summaries, nil }
 
 type sentMail struct {
 	recipient string
@@ -50,12 +46,17 @@ func at(day int, hour int) time.Time {
 	return time.Date(2026, 7, day, hour, 0, 0, 0, time.UTC)
 }
 
-// summary builds a finished execution summary.
-func summary(runID, name string, finished time.Time) runs.ExecutionSummary {
-	return runs.ExecutionSummary{
-		RunID: runID, RunName: name, ResultID: "r-" + runID,
-		At: finished.Add(-30 * time.Minute), FinishedAt: finished, OK: true,
-		RepoCount: 1, InputTokens: 1000, OutputTokens: 200, CostUSD: 0.05,
+// summary builds a finished, successful execution result.
+func summary(runID, name string, finished time.Time) runs.Result {
+	end := finished
+	return runs.Result{
+		RunID: runID, RunTitle: name, ID: "r-" + runID,
+		StartedAt: finished.Add(-30 * time.Minute), EndedAt: &end,
+		Repos: []model.RepoPipeline{{
+			Repo:   "svc",
+			Stages: []model.StageView{{Stage: model.StageImplement, State: model.StepExecuted}},
+		}},
+		Usage: model.UsageView{InputTokens: 1000, OutputTokens: 200, CostUSD: 0.05},
 	}
 }
 
@@ -81,7 +82,7 @@ func TestNoExecutionsNoEmail(t *testing.T) {
 	rp.tick(context.Background())
 
 	// (b) executions exist, but only for today (not a closed day).
-	execs := &fakeExecs{summaries: []runs.ExecutionSummary{summary("a", "Today run", at(27, 9))}}
+	execs := &fakeExecs{summaries: []runs.Result{summary("a", "Today run", at(27, 9))}}
 	rp2 := newReporter(t, execs, sender, ledger, at(27, 23))
 	rp2.tick(context.Background())
 
@@ -94,7 +95,7 @@ func TestNoExecutionsNoEmail(t *testing.T) {
 func TestMultipleExecutionsOneEmail(t *testing.T) {
 	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
 	sender := &fakeSender{}
-	execs := &fakeExecs{summaries: []runs.ExecutionSummary{
+	execs := &fakeExecs{summaries: []runs.Result{
 		summary("a", "Nightly axioms", at(26, 20)),
 		summary("b", "Fix login", at(26, 22)),
 	}}
@@ -119,7 +120,7 @@ func TestMultipleExecutionsOneEmail(t *testing.T) {
 func TestRestartSameDayNoSecondEmail(t *testing.T) {
 	dir := t.TempDir()
 	ledgerPath := filepath.Join(dir, "l.json")
-	execs := &fakeExecs{summaries: []runs.ExecutionSummary{summary("a", "Nightly", at(26, 20))}}
+	execs := &fakeExecs{summaries: []runs.Result{summary("a", "Nightly", at(26, 20))}}
 
 	sender1 := &fakeSender{}
 	rp1 := newReporter(t, execs, sender1, NewLedgerAt(ledgerPath), at(27, 0))
@@ -142,7 +143,7 @@ func TestRestartSameDayNoSecondEmail(t *testing.T) {
 func TestFailedSendIsVisibleAndRetriedWithoutDuplicate(t *testing.T) {
 	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
 	sender := &fakeSender{failFirst: 1} // first attempt fails, then the mail service recovers
-	execs := &fakeExecs{summaries: []runs.ExecutionSummary{summary("a", "Nightly", at(26, 20))}}
+	execs := &fakeExecs{summaries: []runs.Result{summary("a", "Nightly", at(26, 20))}}
 	rp := newReporter(t, execs, sender, ledger, at(27, 0))
 
 	// Pass 1: the send fails. It is visible in the ledger as a failure with the reason, not silent.
@@ -179,9 +180,10 @@ func TestRunFinishingNextDayGoesToNextDayReport(t *testing.T) {
 	sender := &fakeSender{}
 
 	a := summary("a", "Same-day run", at(26, 20)) // started & finished the 26th
-	b := runs.ExecutionSummary{RunID: "b", RunName: "Carry-over migration", ResultID: "r-b",
-		At: at(26, 23), FinishedAt: at(27, 2), OK: true, RepoCount: 1} // started 26th, finished 27th
-	execs := &fakeExecs{summaries: []runs.ExecutionSummary{a, b}}
+	bEnd := at(27, 2)
+	b := runs.Result{RunID: "b", RunTitle: "Carry-over migration", ID: "r-b",
+		StartedAt: at(26, 23), EndedAt: &bEnd} // started 26th, finished 27th
+	execs := &fakeExecs{summaries: []runs.Result{a, b}}
 
 	// End of the 26th (now in the 27th): only the same-day run is reported for the 26th.
 	rp := newReporter(t, execs, sender, ledger, at(27, 5))
@@ -208,20 +210,21 @@ func TestRunFinishingNextDayGoesToNextDayReport(t *testing.T) {
 	}
 }
 
-// buildItems fills per-repo delivery stages from the full result.
+// buildItems fills per-repo delivery stages straight off the result's stage arrays.
 func TestBuildItemsFillsRepoStages(t *testing.T) {
 	s := summary("a", "Run A", at(26, 20))
-	execs := &fakeExecs{
-		summaries: []runs.ExecutionSummary{s},
-		full: map[string]runs.Result{
-			"a/r-a": {RunID: "a", Repos: []runs.RepoResult{
-				{Repo: "devlab", OK: true, Deployed: true},
-				{Repo: "aigentic", OK: true, PRUrl: "https://x/pr/2"},
-			}},
-		},
+	s.Repos = []model.RepoPipeline{
+		{Repo: "devlab", Stages: []model.StageView{
+			{Stage: model.StageImplement, State: model.StepExecuted},
+			{Stage: model.StageDeliverDev, State: model.StepExecuted},
+		}},
+		{Repo: "aigentic", Stages: []model.StageView{
+			{Stage: model.StageImplement, State: model.StepExecuted},
+			{Stage: model.StagePullRequest, State: model.StepExecuted},
+		}},
 	}
-	rp := newReporter(t, execs, &fakeSender{}, NewLedgerAt(filepath.Join(t.TempDir(), "l.json")), at(27, 0))
-	items := rp.buildItems([]runs.ExecutionSummary{s})
+	rp := newReporter(t, &fakeExecs{summaries: []runs.Result{s}}, &fakeSender{}, NewLedgerAt(filepath.Join(t.TempDir(), "l.json")), at(27, 0))
+	items := rp.buildItems([]runs.Result{s})
 	if len(items) != 1 || len(items[0].Repos) != 2 {
 		t.Fatalf("items=%+v", items)
 	}

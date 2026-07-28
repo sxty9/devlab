@@ -76,7 +76,7 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.Path, newPath))
+	s.reconcileAfterWrite(r.Context(), cookie)
 	// Record the editor in DevLab's local pool. An axiom that predates authorship tracking keeps an
 	// empty (unknown) creator — only the editor is stamped, never a back-filled creator.
 	now := time.Now().UTC()
@@ -117,7 +117,7 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
+	s.reconcileAfterWrite(r.Context(), cookie)
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
@@ -133,7 +133,7 @@ func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(path))
+	s.reconcileAfterWrite(r.Context(), cookie)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -180,7 +180,7 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 		moved++
 	}
 	if moved > 0 {
-		s.reconcileAfterWrite(r.Context(), cookie, touchesClaudeMd(body.From, body.To))
+		s.reconcileAfterWrite(r.Context(), cookie)
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

@@ -14,23 +14,22 @@ import (
 	"devlab/backend/internal/report"
 )
 
-// StartReporter arms the daily run-report emailer, gated the same way as the run scheduler: it runs
-// only when the scheduler is configured (DEVLAB_RUNS_MODE + DEVLAB_RUNS_USER), never under dev-bypass.
-// The recipient is the run OWNER — the linked account the runner acts on behalf of
-// (DEVLAB_RUNS_TOKEN_USER, else DEVLAB_RUNS_USER) — whose mailbox the mail service resolves from their
-// landscape identity, so no address is configured here. Wired from main() with a cancelable context.
+// StartReporter arms the daily run-report emailer. There are NO operating modes (REQ-027.1):
+// it runs whenever a run user is provisioned, never under dev-bypass. The recipient is the run
+// OWNER — the linked account the runner acts on behalf of (DEVLAB_RUNS_TOKEN_USER, else
+// DEVLAB_RUNS_USER) — whose mailbox the mail service resolves from their landscape identity,
+// so no address is configured here. Wired from main() with a cancelable context.
 func (s *Server) StartReporter(ctx context.Context) {
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_MODE")))
 	user := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_USER"))
-	if mode == "" || mode == "off" || user == "" {
-		log.Printf("devlabd: daily-report reporter OFF (runs scheduler not configured)")
+	if user == "" {
+		log.Printf("devlabd: daily-report reporter OFF (no run user provisioned)")
 		return
 	}
 	if s.v.DevBypass() {
 		log.Printf("devlabd: daily-report reporter OFF under dev-bypass")
 		return
 	}
-	if s.runResults == nil || s.reportLedger == nil {
+	if s.results == nil || s.reportLedger == nil {
 		log.Printf("devlabd: daily-report reporter OFF — stores unavailable")
 		return
 	}
@@ -55,7 +54,7 @@ func (s *Server) StartReporter(ctx context.Context) {
 
 	rp := report.NewReporter(report.Config{
 		Recipient: recipient,
-		Execs:     s.runResults,
+		Execs:     s.results,
 		Ledger:    s.reportLedger,
 		Sender:    mailSender{},
 		Lookback:  lookback,

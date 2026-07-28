@@ -4,11 +4,14 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 
 	"devlab/backend/internal/axiomrepo"
 	"devlab/backend/internal/mercury"
+
+	"context"
+	"devlab/backend/internal/statepath"
 )
 
 // Mercury is the axiom-management surface. It reads and writes the constitution through a single
@@ -21,11 +24,14 @@ import (
 var orderMu sync.Mutex
 
 // mercuryOrderPath resolves the manual-order file, matching the other DevLab store conventions.
-func mercuryOrderPath() string {
+func mercuryOrderPath(p *statepath.Paths) string {
 	if p := os.Getenv("DEVLAB_MERCURY_ORDER"); p != "" {
 		return p
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "order.json")
+	if p != nil {
+		return p.MercuryOrder()
+	}
+	return ""
 }
 
 // mercuryTree returns the whole axiom model — the three namespaces (axiome, regeln, laeufe) as
@@ -36,7 +42,7 @@ func (s *Server) mercuryTree(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, mercury.Build(paths, mercury.LoadOrder(mercuryOrderPath())))
+	writeJSON(w, http.StatusOK, mercury.Build(paths, mercury.LoadOrder(mercuryOrderPath(s.paths))))
 }
 
 // mercuryReorder sets the manual order of one category's immediate children. The body is the
@@ -56,7 +62,7 @@ func (s *Server) mercuryReorder(w http.ResponseWriter, r *http.Request) {
 	}
 	orderMu.Lock()
 	defer orderMu.Unlock()
-	path := mercuryOrderPath()
+	path := mercuryOrderPath(s.paths)
 	o := mercury.LoadOrder(path)
 	o[body.Category] = body.Order
 	if err := mercury.SaveOrder(path, o); err != nil {
@@ -109,4 +115,40 @@ func mercuryError(w http.ResponseWriter, err error) {
 	default:
 		writeErr(w, http.StatusBadGateway, "Mercury backend error: "+err.Error())
 	}
+}
+
+// fetchRecord reads one record from the constitution store — the shared read primitive of
+// every Mercury handler (catalog scans, reconcile, chat context).
+func (s *Server) fetchRecord(ctx context.Context, cookie string, path string) (mercury.Record, bool) {
+	_ = cookie // the store reads from the local working copy; the session already authorized the request
+	data, found, err := s.axioms.Get(ctx, path)
+	if err != nil || !found {
+		return mercury.Record{}, false
+	}
+	return mercury.Record{Path: path, Axiom: mercury.ParseAxiom(string(data))}, true
+}
+
+// actor names the request's user for the axiom-authorship pool ("?" only ever appears for a
+// request that somehow passed the guards without a user).
+func actor(r *http.Request) string {
+	if u := userFrom(r); u != nil {
+		return u.Username
+	}
+	return "?"
+}
+
+// firstLine is a record's commit description: the first line of the body, trimmed to a sane
+// length.
+func firstLine(body string) string {
+	line := body
+	if i := strings.IndexAny(body, "\r\n"); i >= 0 {
+		line = body[:i]
+	}
+	if len(line) > 160 {
+		line = line[:160]
+	}
+	if line == "" {
+		return "Axiom"
+	}
+	return line
 }

@@ -19,6 +19,8 @@ import (
 
 	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
+
+	"devlab/backend/internal/statepath"
 )
 
 // repoRe bounds the repo id to safe filename characters (defends the per-repo file path).
@@ -31,11 +33,14 @@ type Store struct {
 	locks map[string]*sync.Mutex
 }
 
-// NewStore builds the store from DEVLAB_COMMENTS (default /var/lib/devlab/comments), dir 0700.
-func NewStore() (*Store, error) {
+// NewStore builds the store below the state root (DEVLAB_COMMENTS overrides), dir 0700.
+func NewStore(p *statepath.Paths) (*Store, error) {
 	dir := os.Getenv("DEVLAB_COMMENTS")
+	if dir == "" && p != nil {
+		dir = p.Comments()
+	}
 	if dir == "" {
-		dir = "/var/lib/devlab/comments"
+		return nil, fmt.Errorf("comments: no directory configured (state root missing)")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("comments: mkdir %s: %w", dir, err)

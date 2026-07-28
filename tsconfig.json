@@ -19,5 +19,6 @@
     "paths": { "@/*": ["src/*"] }
   },
   "include": ["src", "vite.config.ts", "tailwind.config.ts"],
-  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"],
+  "files": ["src/types.contract.test.ts"]
 }

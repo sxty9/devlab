@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# devlab-restart-when-free — waits until devlabd is FREE, then restarts it (K-2). Launched by
+# devlab-install --handover as a transient systemd unit OUTSIDE the devlabd cgroup — the
+# restart survives the daemon's own death; devlabd never restarts itself inline.
+#
+# Contract (B5 implements; this skeleton pins the seams):
+#   * free probe: `curl --unix-socket $DEVLAB_STATE_DIR/restart-ready.sock http://x/ready`
+#       204 ⇒ free (no execution document is "running") · 423 ⇒ busy · connection error ⇒ the
+#       daemon is dead ⇒ free (a dead daemon blocks nothing)
+#   * poll interval DEVLAB_RESTART_POLL (default 10s); hard cap DEVLAB_RESTART_MAXWAIT
+#     (default 21600s = 6h) ⇒ restart anyway, logged (REQ-018.5)
+#   * restart: `systemctl restart ${DEVLAB_UNIT:-devlabd}` — the ONE restart path (W2)
+#   * --check: dry-run — probe once, print free/busy/dead, exit without restarting
+set -euo pipefail
+
+echo "devlab-restart-when-free: not implemented yet (deploy & ports, Welle 1 — B5)" >&2
+exit 1

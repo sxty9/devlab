@@ -1,14 +1,28 @@
-// Command devlabd is the DevLab backend daemon. It serves the JSON API (and, in later phases,
-// terminal/Claude WebSockets) under /api, gated by package auth. It runs unprivileged behind
-// the sxgate Caddy proxy (static_proxy mode serves dist/ and proxies /api/* here), or directly
-// in local dev (vite proxies /api). One process, one port, one auth gate.
+// devlabd — the DevLab daemon: one loopback port serves SPA and API from one process.
+//
+// Boot order (ARCHITEKTUR §6.2; steps 1–5 BEFORE ListenAndServe, 6–8 after, asynchronously):
+//
+//  1. read the env contract; statepath.CheckWritable (+ *.tmp hygiene); SSO fail-closed
+//  2. open the stores (read/validate only; legacy results stay readable, REQ-027.3)
+//  3. exorcise ghosts: execstate.MarkInterruptedAtBoot — every "running" document becomes
+//     "interrupted"; running stages are terminalized honestly (B2/B3)
+//  4. restart completion: restart.json present ⇒ THIS boot is the restart — notice, delete,
+//     release the queued starts through normal admission (B2)
+//  5. HTTP + SSE + ready socket up — the first answers are ghost-free
+//  6. startup reconciliation: preflight.SyncStartupTodos (synthetic results, B-5/B3)
+//  7. enqueue resumes: every interrupted execution, newest first, via normal admission (B2)
+//  8. ticks: due ticker, PR maintenance (deliver.Maintain), protection verify, reporter,
+//     self-check
+//
+// SIGTERM ⇒ sched.DrainAndPersist (≤ DEVLAB_RUNS_DRAIN_GRACE) ⇒ shutdown (K-2). A running
+// execution is persisted as interrupted with its continuation — a long run never blocks the
+// stop.
 package main
 
 import (
 	"context"
-	"flag"
+	"errors"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -17,65 +31,76 @@ import (
 
 	"devlab/backend/internal/api"
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/statepath"
 )
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8780", "address to listen on")
-	flag.Parse()
-
-	v := auth.New()
-	if v.DevBypass() {
-		log.Print("devlabd: dev-bypass mode (full access, no auth)")
-	} else if !v.HasSecret() {
-		// Refuse to serve without a real secret: an empty HMAC key would validate forged
-		// tokens (fail-open). Set HOLISTIC_SECRET_FILE or run with DEVLAB_DEV_BYPASS_AUTH=1.
-		log.Fatal("devlabd: no JWT secret (set HOLISTIC_SECRET_FILE) — refusing to start in SSO mode")
-	} else {
-		log.Print("devlabd: holistic SSO mode (hp_devlab_access required)")
-	}
-
-	server := api.New(v)
-	srv := &http.Server{
-		Handler:           server.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-
-	// Mercury's run scheduler runs in the background for the process lifetime; it stays dormant
-	// unless DEVLAB_RUNS_MODE + DEVLAB_RUNS_USER are configured. Cancelled on shutdown so an
-	// in-flight run drains before the process exits. The auto-rollout worker shares that lifetime:
-	// axiom/rule edits debounce into one CLAUDE.md rollout, pushed with the same runner token.
-	schedCtx, schedCancel := context.WithCancel(context.Background())
-	server.StartScheduler(schedCtx)
-	server.StartRolloutWorker(schedCtx)
-	// The daily run-report emailer shares the scheduler's lifetime and gating: at the close of a day
-	// on which runs executed, it mails the owner a summary of what they did.
-	server.StartReporter(schedCtx)
-
-	ln, err := net.Listen("tcp", *listen)
+	// ── 1. Env contract + state root + SSO (fail-closed) ─────────────────────────────
+	paths, err := statepath.FromEnv()
 	if err != nil {
-		schedCancel()
-		log.Fatalf("devlabd: listen %s: %v", *listen, err)
+		log.Fatalf("devlabd: %v", err)
 	}
+	if err := paths.CheckWritable(); err != nil {
+		log.Fatalf("devlabd: %v", err)
+	}
+	verifier := auth.New()
+	if !verifier.HasSecret() && !verifier.DevBypass() {
+		// SSO is fail-closed: without a readable secret the daemon must not serve as if
+		// authenticated (B-05).
+		log.Fatalf("devlabd: no session secret readable and dev-bypass off — refusing to start")
+	}
+
+	// ── 2. Stores (the api.Server owns the passive pools) ────────────────────────────
+	server := api.New(verifier, paths)
+
+	// ── 3.–4. Boot reconcile (ghost exorcism + restart completion) ───────────────────
+	// TODO(B2): execstate.Open + MarkInterruptedAtBoot + restart.json completion, then
+	// server.SetExecution(docs, scheduler) — wired here once sched/execstate are filled.
+	// The settings store (env values seed the FIRST start only; runtime wins, REQ-013.2)
+	// and the scheduler construction (sched.New with the injected preflight gate, the
+	// executor ExecFunc, deliver.Maintain and the broker) land here in the same step.
+
+	// ── 5. HTTP (+ SSE via the same mux) + ready socket ──────────────────────────────
+	addr := os.Getenv("DEVLAB_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:8080"
+	}
+	httpServer := &http.Server{Addr: addr, Handler: server.Handler()}
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	// TODO(B2): go server.ServeReadySocket(rootCtx) — the Unix-socket readiness endpoint
+	// (statepath.ReadySocket; 204 free / 423 busy; dead ⇒ free). Never on the TCP mux.
+
+	// ── 6.–8. Asynchronous after listen: startup reconcile, resumes, ticks ───────────
+	server.StartReporter(rootCtx)
+	// TODO(B2/B3/B4): scheduler.Start(rootCtx) — resume enqueueing + due ticker + PR
+	// maintenance + protection verify + self-check.
+
 	go func() {
-		log.Printf("devlabd listening on %s", *listen)
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Printf("devlabd: listening on %s", addr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("devlabd: %v", err)
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	<-rootCtx.Done()
+	log.Printf("devlabd: shutdown requested — draining")
 
-	// Graceful restart: a `systemctl restart` (SIGTERM) is the restart signal. Gate new runs and let any
-	// in-flight run drain (bounded) BEFORE tearing anything down — so the restart never kills a run that
-	// just started, and no new run can begin once the restart is imminent. The HTTP server stays up
-	// through the drain so a trigger arriving meanwhile is queued (and told so), not refused silently.
-	// Only then cancel the scheduler and shut the server.
-	server.DrainForRestart()
-	schedCancel()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// SIGTERM drain (K-2): gate admissions, persist interrupted, then stop HTTP. The grace
+	// budget stays below systemd's TimeoutStopSec (90 s).
+	grace := 60 * time.Second
+	if v := os.Getenv("DEVLAB_RUNS_DRAIN_GRACE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			grace = d
+		}
+	}
+	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
-	log.Print("devlabd stopped")
+	// TODO(B2): scheduler.DrainAndPersist(drainCtx) before the HTTP shutdown.
+	if err := httpServer.Shutdown(drainCtx); err != nil {
+		log.Printf("devlabd: shutdown: %v", err)
+	}
+	log.Printf("devlabd: stopped")
 }

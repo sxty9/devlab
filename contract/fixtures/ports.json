@@ -1,0 +1,16 @@
+[
+  {
+    "port": 8781,
+    "service": "devlab",
+    "routed": true,
+    "bound": true,
+    "conflict": false
+  },
+  {
+    "port": 8542,
+    "service": "prizm",
+    "routed": true,
+    "bound": true,
+    "conflict": true
+  }
+]

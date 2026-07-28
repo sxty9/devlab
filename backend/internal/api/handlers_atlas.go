@@ -25,3 +25,9 @@ func repoIDs(repos []model.Repo) []string {
 	}
 	return ids
 }
+
+// atlasPorts reports the observed port allocations (F9): routes + /proc/net/tcp, derived
+// fresh on every call — no stored port state. B5 fills the body over atlas.Allocations.
+func (s *Server) atlasPorts(w http.ResponseWriter, _ *http.Request) {
+	writeErr(w, http.StatusNotImplemented, "GET /api/atlas/ports is not wired yet (deploy & ports, Welle 1)")
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/mercury"
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
 
@@ -38,7 +39,7 @@ type autoAssigner struct {
 	// Network seams (the only I/O), injected so tests drive the pass deterministically without aigentic.
 	// catalog returns the current axiom set (by id) and all Laufregeln; plan turns the uncovered axioms
 	// into a validated run plan.
-	catalog func(ctx context.Context, cookie string) (map[string]mercury.RunAxiom, []mercury.RunAxiom, error)
+	catalog func(ctx context.Context, cookie string) (runs.Catalog, error)
 	plan    func(ctx context.Context, cookie, csrf string, uncovered []mercury.RunAxiom, existing, known []string) (mercury.RunPlan, error)
 
 	mu      sync.Mutex
@@ -57,9 +58,9 @@ const assignPassTimeout = 10 * time.Minute
 // newAutoAssigner builds the assigner with the production seams wired to the reused machinery.
 func newAutoAssigner(s *Server) *autoAssigner {
 	a := &autoAssigner{s: s, delay: assignDelay()}
-	a.catalog = func(ctx context.Context, cookie string) (map[string]mercury.RunAxiom, []mercury.RunAxiom, error) {
-		byID, _, laufregeln, err := s.runCatalog(ctx, cookie)
-		return byID, laufregeln, err
+	a.catalog = func(ctx context.Context, cookie string) (runs.Catalog, error) {
+		cat, _, err := s.runCatalog(ctx, cookie)
+		return cat, err
 	}
 	a.plan = func(ctx context.Context, cookie, csrf string, uncovered []mercury.RunAxiom, existing, known []string) (mercury.RunPlan, error) {
 		return s.planRuns(ctx, cookie, csrf, known, func(correction string) string {
@@ -160,7 +161,7 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 	ctx, cancel := context.WithTimeout(context.Background(), assignPassTimeout)
 	defer cancel()
 
-	byID, laufregeln, err := a.catalog(ctx, cookie)
+	cat, err := a.catalog(ctx, cookie)
 	if err != nil {
 		// The scheme store is unreachable: the whole Mercury surface is down and we cannot even tell which
 		// axioms exist. Nothing known to assign — stay quiet (the outage is visible elsewhere) and retry on
@@ -176,15 +177,15 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 	covered := map[string]bool{}
 	existing := make([]string, 0, len(all))
 	for _, run := range all {
-		if !run.IsTodo() {
-			existing = append(existing, run.Name) // only auto runs carry axioms and may be extended
+		if run.Kind != "todo" {
+			existing = append(existing, run.Title) // only auto runs carry axioms and may be extended
 		}
 		for _, id := range run.AxiomIDs {
 			covered[id] = true
 		}
 	}
 	uncovered := make([]mercury.RunAxiom, 0)
-	for id, ax := range byID {
+	for id, ax := range cat.ByID {
 		if !covered[id] {
 			uncovered = append(uncovered, ax)
 		}
@@ -195,13 +196,13 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 	// Map iteration is random; sort for a stable prompt and stable notices.
 	sort.Slice(uncovered, func(i, j int) bool { return uncovered[i].ID < uncovered[j].ID })
 
-	plan, err := a.plan(ctx, cookie, csrf, uncovered, existing, keysOf(byID))
+	plan, err := a.plan(ctx, cookie, csrf, uncovered, existing, keysOf(cat.ByID))
 	if err != nil {
 		log.Printf("devlabd: auto-assign planning failed: %v", err)
-		a.recordFailure(uncovered, "KI-Planung nicht erreichbar")
+		a.recordFailure(uncovered, "AI planning unreachable")
 		return
 	}
-	a.applyPlan(actor, plan, byID, laufregeln, uncovered)
+	a.applyPlan(actor, plan, cat, uncovered)
 }
 
 // errNoAssignment aborts the apply Mutate when the plan, re-filtered against the live covered set, leaves
@@ -221,10 +222,15 @@ type assignOutcome struct {
 // STILL uncovered and known (re-checked under the lock), then extends a matching auto run or creates a
 // new one, recomposing the affected snapshot in the same step. On success it records one notice per
 // affected run; on a store error it records a single failure notice.
-func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, tried []mercury.RunAxiom) {
+func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, cat runs.Catalog, tried []mercury.RunAxiom) {
 	now := time.Now().UTC()
+	by := model.Actor{User: actor, Autonomous: actor == "", OnBehalfOf: ""}
 	var outcomes []assignOutcome
-	_, err := a.s.runs.Mutate("auto-assign", actor, func(cur []runs.Run) ([]runs.Run, error) {
+	err := func() error {
+		cur, err := a.s.runs.List()
+		if err != nil {
+			return err
+		}
 		covered := map[string]bool{}
 		for _, run := range cur {
 			for _, id := range run.AxiomIDs {
@@ -236,45 +242,42 @@ func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, byID map[st
 		for _, pr := range plan.Runs {
 			var ids []string
 			for _, id := range pr.AxiomIDs {
-				if _, known := byID[id]; known && !covered[id] {
+				if _, known := cat.ByID[id]; known && !covered[id] {
 					ids = append(ids, id)
 				}
 			}
-			ids = dedupStrings(ids)
+			ids = runs.DedupStrings(ids)
 			if len(ids) == 0 {
 				continue
 			}
 			np := runs.Run{
-				ID: runs.NewID(), Name: strings.TrimSpace(pr.Name), Enabled: true,
+				ID: runs.NewID(), Kind: "auto", Title: strings.TrimSpace(pr.Name), Active: true,
 				Schedule: toSchedule(pr.Schedule), AxiomIDs: ids,
-				CreatedAt: now, UpdatedAt: now,
+				Authorship: model.Authorship{Created: by, CreatedAt: now, Updated: by, UpdatedAt: now},
 			}
-			composeInto(&np, byID, laufregeln, now)
-			if nf, e := np.Schedule.Next(now); e == nil {
-				np.NextFireAt = &nf
-			}
+			runs.ComposeInto(&np, cat)
 			var affected runs.Run
 			var created bool
-			out, affected, created = upsertPlannedRun(out, np, byID, laufregeln, now)
+			out, affected, created = runs.UpsertPlannedRun(out, np, cat, now, by)
 			titles := make([]string, 0, len(ids))
 			for _, id := range ids {
-				titles = append(titles, mercury.RunAxiomTitle(byID[id]))
+				titles = append(titles, mercury.RunAxiomTitle(cat.ByID[id]))
 				covered[id] = true // a later plan entry must not re-grab the same axiom
 			}
-			oc = append(oc, assignOutcome{runID: affected.ID, runName: affected.Name, newRun: created, axiomIDs: ids, titles: titles})
+			oc = append(oc, assignOutcome{runID: affected.ID, runName: affected.Title, newRun: created, axiomIDs: ids, titles: titles})
 		}
 		if len(oc) == 0 {
-			return nil, errNoAssignment
+			return errNoAssignment
 		}
 		outcomes = oc
-		return out, nil
-	})
+		return a.s.runs.ReplaceAll(out, "auto-assign", by)
+	}()
 	if errors.Is(err, errNoAssignment) {
 		return // the plan named only already-covered axioms → genuine no-op, no notice
 	}
 	if err != nil {
 		log.Printf("devlabd: auto-assign save failed: %v", err)
-		a.recordFailure(tried, "Zuordnung konnte nicht gespeichert werden")
+		a.recordFailure(tried, "Assignment could not be saved")
 		return
 	}
 	for _, o := range outcomes {
@@ -313,7 +316,7 @@ func (s *Server) kickAutoAssign(r *http.Request) {
 	if s.assigner == nil {
 		return
 	}
-	s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actor(r))
+	s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actorOf(r).User)
 }
 
 // assignPending reports whether an automatic assignment is scheduled or in flight.

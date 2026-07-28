@@ -43,7 +43,7 @@ func TestRunAuthorship(t *testing.T) {
 	runGit(t, "", "git", "clone", "--quiet", remote, seed)
 	runGit(t, seed, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--quiet", "--allow-empty", "-m", "init")
 	runGit(t, seed, "git", "push", "--quiet", "origin", "HEAD:main")
-	s := &Server{runs: runs.NewStore(),
+	s := &Server{runs: runs.NewStore(nil),
 		axioms: axiomrepo.New(filepath.Join(dir, "work"), remote, func() (string, error) { return "", nil })}
 
 	call := func(h http.HandlerFunc, user, id string, body any) (*httptest.ResponseRecorder, runs.Run) {
@@ -61,7 +61,7 @@ func TestRunAuthorship(t *testing.T) {
 	}
 
 	todo := map[string]any{
-		"name": "Ship it", "type": "todo", "enabled": true, "task": "do the thing",
+		"title": "Ship it", "kind": "todo", "task": "do the thing",
 		"targets": []map[string]string{{"repo": "devlab"}},
 	}
 
@@ -70,8 +70,9 @@ func TestRunAuthorship(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create: status %d: %s", rec.Code, rec.Body)
 	}
-	if created.CreatedBy != "alice" || created.UpdatedBy != "alice" {
-		t.Fatalf("create must stamp createdBy and updatedBy = alice, got created=%q updated=%q", created.CreatedBy, created.UpdatedBy)
+	if created.Authorship.Created.User != "alice" || created.Authorship.Updated.User != "alice" {
+		t.Fatalf("create must stamp creator and editor = alice, got created=%q updated=%q",
+			created.Authorship.Created.User, created.Authorship.Updated.User)
 	}
 
 	// Edit as bob → the last editor changes; the original creator remains visible.
@@ -79,11 +80,11 @@ func TestRunAuthorship(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("update: status %d: %s", rec.Code, rec.Body)
 	}
-	if updated.CreatedBy != "alice" {
-		t.Errorf("update must preserve the creator: createdBy=%q want alice", updated.CreatedBy)
+	if updated.Authorship.Created.User != "alice" {
+		t.Errorf("update must preserve the creator: created=%q want alice", updated.Authorship.Created.User)
 	}
-	if updated.UpdatedBy != "bob" {
-		t.Errorf("update must record the last editor: updatedBy=%q want bob", updated.UpdatedBy)
+	if updated.Authorship.Updated.User != "bob" {
+		t.Errorf("update must record the last editor: updated=%q want bob", updated.Authorship.Updated.User)
 	}
 
 	// The config history carries the same actor per mutation — the existing author signal we reuse.
@@ -95,14 +96,15 @@ func TestRunAuthorship(t *testing.T) {
 		t.Errorf("history must record the actor per mutation; newest snapshot actor want bob (got %d snapshots)", len(snaps))
 	}
 
-	// A record written with no author stays unattributed (surfaced as unknown), never back-filled.
-	if _, err := s.runs.Mutate("create", "", func(cur []runs.Run) ([]runs.Run, error) {
-		return append(cur, runs.Run{ID: "run_legacy", Name: "Legacy"}), nil
+	// A record written with no author stays unattributed (surfaced as unknown), never
+	// back-filled to a person (REQ-041).
+	if _, err := s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
+		return append(cur, runs.Run{ID: "run_legacy", Title: "Legacy"}), nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	got, ok, _ := s.runs.Get("run_legacy")
-	if !ok || got.CreatedBy != "" || got.UpdatedBy != "" {
-		t.Errorf("an author-less record must stay unattributed: createdBy=%q updatedBy=%q", got.CreatedBy, got.UpdatedBy)
+	if !ok || got.Authorship.Created.User != "" || got.Authorship.Updated.User != "" {
+		t.Errorf("an author-less record must stay unattributed: %+v", got.Authorship)
 	}
 }

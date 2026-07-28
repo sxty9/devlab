@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/statepath"
 )
 
 // A Notice records ONE outcome of the automatic axiom→run assignment: either an axiom set was assigned
@@ -49,13 +51,16 @@ type NoticeStore struct {
 	mu   sync.Mutex
 }
 
-func NewNoticeStore() *NoticeStore { return &NoticeStore{path: noticesPath()} }
+func NewNoticeStore(p *statepath.Paths) *NoticeStore { return &NoticeStore{path: noticesPath(p)} }
 
-func noticesPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_NOTICES"); p != "" {
-		return p
+func noticesPath(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_RUNS_NOTICES"); v != "" {
+		return v
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-notices.json")
+	if p != nil {
+		return p.NoticesFile()
+	}
+	return ""
 }
 
 // NewNoticeID mints an unguessable notice id (front-matter of the feed file, never a path segment).

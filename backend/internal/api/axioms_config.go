@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"devlab/backend/internal/discover"
+
+	"devlab/backend/internal/statepath"
 )
 
 // Where the constitution lives. Instance-neutral: every value is configurable, and the defaults name a
@@ -19,11 +21,14 @@ func axiomsRepo() string {
 }
 
 // axiomsDir is the local working copy of that repository.
-func axiomsDir() string {
+func axiomsDir(p *statepath.Paths) string {
 	if v := strings.TrimSpace(os.Getenv("DEVLAB_AXIOMS_DIR")); v != "" {
 		return v
 	}
-	return "/var/lib/devlab/axioms"
+	if p != nil {
+		return p.AxiomsClone()
+	}
+	return ""
 }
 
 // axiomsTokenUser is the linked account whose token pushes constitution changes. It defaults to the

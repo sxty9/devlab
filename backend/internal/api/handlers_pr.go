@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/model"
 )
@@ -52,7 +53,9 @@ func (s *Server) openPR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Push the branch so GitHub has the head ref, then open the PR.
+	// Push the branch so GitHub has the head ref, then open (or adopt) the PR through the ONE
+	// PR path (B-1): deliver.OpenOrAdoptPR, non-ledger branch (DeliveryID "") — a human PR gets
+	// no ledger entry, and REQ-033 keeps it from merging without one.
 	if _, err := wc.exec.Push(r.Context(), wc.wt, wc.token); err != nil {
 		writeErr(w, http.StatusBadGateway, "Push failed: "+err.Error())
 		return
@@ -62,22 +65,16 @@ func (s *Server) openPR(w http.ResponseWriter, r *http.Request) {
 	if title == "" {
 		title = head
 	}
-	pr, err := github.CreatePullRequest(r.Context(), wc.token, full, head, base, title, body.Body)
+	ref, adopted, err := deliver.OpenOrAdoptPR(r.Context(), deliver.NewGitHub(wc.token), s.deliveries, deliver.PRIn{
+		Repo: full, Head: head, Base: base, Title: title, Body: body.Body,
+	})
 	if err != nil {
-		// A PR for this branch may already be open — focus it rather than failing.
-		if existing, found := github.FindOpenPullRequest(r.Context(), wc.token, full, head); found {
-			writeJSON(w, http.StatusOK, model.PullRequestResult{
-				Number: existing.Number, URL: existing.HTMLURL, State: existing.State,
-				Title: existing.Title, Branch: head, Base: base, Existed: true,
-			})
-			return
-		}
 		writeErr(w, http.StatusBadGateway, prError(err))
 		return
 	}
 	writeJSON(w, http.StatusOK, model.PullRequestResult{
-		Number: pr.Number, URL: pr.HTMLURL, State: pr.State,
-		Title: pr.Title, Branch: head, Base: base,
+		Number: ref.Number, URL: ref.URL, State: "open",
+		Title: title, Branch: head, Base: base, Existed: adopted,
 	})
 }
 

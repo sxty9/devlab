@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# service — DevLab's uniform holistic-service CLI (template convention; D 9/10, REQ-029.2).
+# Verbs and exit codes follow /home/…/holistic-service-template/service exactly:
+#   init (n/a here — the id is fixed) · setup · build · start|stop|restart · status · update ·
+#   uninstall [--purge] · version · help
+# Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+#
+# Role boundary (E §7.4): this CLI is the INTERACTIVE human path (a person with sudo present)
+# and the conformity marker Detect() recognizes. The UNATTENDED chain never runs it — it
+# delivers through the generic install-only wrapper (deploy/devlab-install). B5 fills setup/
+# build/lifecycle; the dispatch, verbs and exit codes below are the frozen skeleton.
+
+set -euo pipefail
+
+SERVICE_VERSION="0.2.0"
+SERVICE_ID="devlab"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+log() { printf '[%s] %s\n' "$SERVICE_ID" "$*"; }
+die() { printf '[%s] error: %s\n' "$SERVICE_ID" "$*" >&2; exit "${2:-1}"; }
+
+todo() { die "$1 is not implemented yet (deploy & ports, Welle 1 — B5)" 1; }
+
+cmd_status() {
+  # Honest minimal status without root: unit state + port + manifest presence.
+  log "repo: $REPO_ROOT"
+  if command -v systemctl >/dev/null 2>&1; then
+    log "unit: $(systemctl is-active "${SERVICE_ID}d" 2>/dev/null || echo unknown)"
+  fi
+  [ -f "$REPO_ROOT/permissions/${SERVICE_ID}.json" ] && log "rights manifest: present" || log "rights manifest: MISSING"
+}
+
+cmd_help() {
+  cat <<EOF
+service — CLI for the holistic service '${SERVICE_ID}' (v$SERVICE_VERSION).
+
+Usage:
+  ./service init <name>               n/a — the service id is fixed ('devlab')
+  sudo ./service setup                Install/repair: binary, SPA, wrappers, sudoers, unit
+  sudo ./service build                Rebuild the daemon only, restart if running
+  sudo ./service start|stop|restart   Control the daemon
+  ./service status                    Show daemon/route/rights health
+  sudo ./service update               git pull --ff-only + re-run setup
+  sudo ./service uninstall [--purge]  Remove (--purge also drops user + install prefix)
+  ./service help | version
+
+Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)                 die "the service id is fixed ('devlab'); init is not applicable" 2 ;;
+    setup)                todo "setup" ;;
+    build)                todo "build" ;;
+    start|stop|restart)   todo "$cmd" ;;
+    status)               cmd_status ;;
+    update)               todo "update" ;;
+    uninstall)            todo "uninstall" ;;
+    version|-v|--version) echo "$SERVICE_ID service $SERVICE_VERSION" ;;
+    help|-h|--help)       cmd_help ;;
+    *) die "unknown command: $cmd (run './service help')" 2 ;;
+  esac
+}
+
+main "$@"

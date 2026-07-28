@@ -1,0 +1,11 @@
+{
+  "id": "not_1",
+  "kind": "delivery-gap",
+  "repo": "svc-a",
+  "text": "delivery not yet set up",
+  "nextStep": "run the service setup once",
+  "count": 3,
+  "firstAt": "2026-07-28T03:00:00Z",
+  "lastAt": "2026-07-28T03:10:00Z",
+  "read": false
+}

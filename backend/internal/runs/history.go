@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+
+	"devlab/backend/internal/statepath"
 )
 
 // A Snapshot is the full run configuration at one instant, written on every Store mutation so any
@@ -35,15 +37,18 @@ type History struct {
 }
 
 // NewHistory builds the history store from the environment.
-func NewHistory() *History {
-	return &History{dir: historyDir()}
+func NewHistory(p *statepath.Paths) *History {
+	return &History{dir: historyDir(p)}
 }
 
-func historyDir() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_HISTORY"); p != "" {
-		return p
+func historyDir(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_RUNS_HISTORY"); v != "" {
+		return v
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-history")
+	if p != nil {
+		return p.HistoryDir()
+	}
+	return ""
 }
 
 // snapshot writes the resulting config; best-effort (a history write must never fail a mutation).

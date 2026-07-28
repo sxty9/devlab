@@ -17,7 +17,7 @@ import (
 func TestSnapshotWriteIsAtomic(t *testing.T) {
 	h := &History{dir: t.TempDir()}
 
-	h.snapshot("create", "tester", []Run{{ID: "run_a", Name: "A"}})
+	h.snapshot("create", "tester", []Run{{ID: "run_a", Title: "A"}})
 
 	entries, err := os.ReadDir(h.dir)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestSnapshotWriteIsAtomic(t *testing.T) {
 		t.Fatalf("List after snapshot: err=%v len=%d", err, len(snaps))
 	}
 	full, ok, err := h.Get(snaps[0].TS)
-	if err != nil || !ok || len(full.Runs) != 1 || full.Runs[0].Name != "A" {
+	if err != nil || !ok || len(full.Runs) != 1 || full.Runs[0].Title != "A" {
 		t.Fatalf("Get returned incomplete snapshot: ok=%v err=%v %+v", ok, err, full.Runs)
 	}
 

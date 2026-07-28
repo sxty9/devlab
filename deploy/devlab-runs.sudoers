@@ -1,9 +1,10 @@
-# /etc/sudoers.d/devlab-runs — Mercury autonomous-run deploy grant.
+# /etc/sudoers.d/devlab-runs — Mercury autonomous-run install grant.
 # Install with:  sudo install -o root -g root -m 0440 deploy/devlab-runs.sudoers /etc/sudoers.d/devlab-runs
 # Validate with: sudo visudo -cf /etc/sudoers.d/devlab-runs
 #
-# devlabd (user `devlab`) may invoke ONLY the deploy wrapper as root. The wrapper itself restricts
-# execution to per-repo vetted scripts in /etc/devlab/deploy.d/ — there is no arbitrary sudo here.
+# devlabd (user `devlab`) may invoke ONLY the install wrapper as root. The wrapper is generic and
+# install-only (validated artifact paths, inline root-owned templates) — it never executes
+# repo-provided code as root, and there is no arbitrary sudo here.
 #
 # The runner user `devlab-runs` gets NO sudo at all — deliberately. An unattended agent running with
 # `--permission-mode bypassPermissions` treats ANY sudo grant as arbitrary root: it can write a file
@@ -12,9 +13,9 @@
 # does NOT bound the blast radius the way it appears to — it is effectively full root for the agent.
 # So the runner has none. The constitution's "passwordless sudo vorausgesetzt" governs INTERACTIVE
 # implementation (a human is present); it does not extend to the unattended nightly runner. The one
-# privileged step the runner legitimately needs — deploy — goes through the root `devlab-deploy`
-# wrapper below (invoked by the `devlab` service, never by the agent's shell), which only ever runs
-# pre-vetted per-repo scripts. If the runner ever needs a further privileged action (e.g. restart one
+# privileged step the runner legitimately needs — install — goes through the root `devlab-install`
+# wrapper below (invoked by the `devlab` service, never by the agent's shell), which only ever
+# installs validated artifacts from root-owned templates. If the runner ever needs a further privileged action (e.g. restart one
 # named service to verify a change), add a NARROW dedicated wrapper for exactly that — never a raw
 # `systemctl *` / `apt-get *` / `journalctl *` grant.
-devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-deploy
+devlab ALL=(root) NOPASSWD: /usr/local/sbin/devlab-install

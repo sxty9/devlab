@@ -9,11 +9,12 @@ package report
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+
+	"devlab/backend/internal/statepath"
 )
 
 // Status is the delivery state of one day's report to one recipient.
@@ -57,18 +58,21 @@ type Ledger struct {
 	mu   sync.Mutex
 }
 
-// NewLedger builds the ledger from the environment (DEVLAB_MERCURY_REPORTS, default
-// /var/lib/devlab/mercury/daily-reports.json).
-func NewLedger() *Ledger { return &Ledger{path: ledgerPath()} }
+// NewLedger builds the ledger below the state root (DEVLAB_MERCURY_REPORTS overrides — a
+// ported test seam).
+func NewLedger(p *statepath.Paths) *Ledger { return &Ledger{path: ledgerPath(p)} }
 
 // NewLedgerAt builds a ledger backed by an explicit path (tests).
 func NewLedgerAt(path string) *Ledger { return &Ledger{path: path} }
 
-func ledgerPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_REPORTS"); p != "" {
-		return p
+func ledgerPath(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_REPORTS"); v != "" {
+		return v
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "daily-reports.json")
+	if p != nil {
+		return p.DailyReports()
+	}
+	return ""
 }
 
 func (l *Ledger) load() ([]Record, error) {

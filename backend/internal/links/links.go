@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+
+	"devlab/backend/internal/statepath"
 )
 
 // userRe bounds a username to safe filename characters (Linux account names). Defends the
@@ -55,13 +57,13 @@ type Store struct {
 	locks map[string]*sync.Mutex
 }
 
-// NewStore builds the store from the environment: DEVLAB_LINKS (dir, default /var/lib/devlab/links)
+// NewStore builds the store below the state root: DEVLAB_LINKS overrides the directory
 // and DEVLAB_LINK_ENC_KEY_FILE (a 32-byte key, raw or hex/base64-encoded). The directory is
 // created 0700 if missing.
-func NewStore() (*Store, error) {
-	dir := os.Getenv("DEVLAB_LINKS")
+func NewStore(p *statepath.Paths) (*Store, error) {
+	dir := linksDir(p)
 	if dir == "" {
-		dir = "/var/lib/devlab/links"
+		return nil, fmt.Errorf("links: no directory configured (state root missing)")
 	}
 	key, err := loadKey(os.Getenv("DEVLAB_LINK_ENC_KEY_FILE"))
 	if err != nil {
@@ -241,4 +243,16 @@ func (s *Store) Delete(user string) error {
 		return err
 	}
 	return nil
+}
+
+// linksDir resolves the pool directory: the historical env override first (a ported test
+// seam), else the state root.
+func linksDir(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_LINKS"); v != "" {
+		return v
+	}
+	if p != nil {
+		return p.Links()
+	}
+	return ""
 }

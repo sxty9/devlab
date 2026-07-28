@@ -1,289 +1,434 @@
-// Package model holds the JSON response shapes the DevLab API returns. Field names match
-// the TypeScript types in frontend src/types.ts exactly, so the UI consumes them unchanged.
+// Package model is the ONE typed wire contract of DevLab (REQ-040.4): the vocabulary and the
+// JSON shapes the API returns, mirrored field by field by the frontend's src/types.ts and pinned
+// by the golden fixtures under contract/fixtures/ (drift breaks both builds).
+//
+// Terminology mapping (German spec term → wire vocabulary; A2-9):
+//
+//	Verfassung            → axioms / rules / run rules
+//	automatischer Lauf    → run kind "auto"
+//	ToDo                  → run kind "todo"
+//	Ausführung            → execution
+//	Schritt               → step
+//	Kette / Stufe         → chain / stage
+//	Lieferung / Gegenbuchung → delivery / reversal
+//	Arbeitsstand          → workbench branch "mercury-dev"
+//	Vorprüfung            → preflight
+//	Platz / einreihen / zurückstellen / überladen → slot / queue / defer / overload
+//	Hinweis / Bericht     → notice / report
+//	Abo-Limit-Pause       → usage-limit pause
 package model
 
-// Repo is a selectable repository/service. The set is resolved per-user from GitHub (the single
-// source of truth for visibility and authorization), filtered to the holistic set.
-type Repo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	FullName    string `json:"fullName"` // owner/repo (GitHub canonical)
-	Kind        string `json:"kind"`     // service | repo | library
-	Description string `json:"description"`
-	Language    string `json:"language"`
-	Icon        string `json:"icon"`       // go | ts | rust | python | shell | service | repo | library
-	Tint        string `json:"tint"`       // accent | success | warning | gpu | net | ssd | ram
-	Permission  string `json:"permission"` // pull | push | admin (the viewer's effective right)
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// ── Chain vocabulary — the ONE place for wire literals (REQ-040.4; W-A) ──────────────────
+
+// Stage is one stage of the ONE delivery chain.
+type Stage string
+
+const (
+	StagePreflight   Stage = "preflight"
+	StageImplement   Stage = "implement"
+	StageDeliverDev  Stage = "deliver-dev"
+	StagePublish     Stage = "publish"
+	StagePullRequest Stage = "pull-request"
+)
+
+// ChainStages returns the chain order — the single definition of the chain as a list.
+func ChainStages() []Stage {
+	return []Stage{StagePreflight, StageImplement, StageDeliverDev, StagePublish, StagePullRequest}
 }
 
-// Branch is a git branch with tracking info.
-type Branch struct {
-	Name      string `json:"name"`
-	IsDefault bool   `json:"isDefault"`
-	Ahead     int    `json:"ahead"`
-	Behind    int    `json:"behind"`
-	Updated   string `json:"updated"`
+// StepState is a stage's state: two transient + four terminal. NORMATIVE: every stage ENDS in
+// exactly one of the FOUR terminal states (REQ-030; W-B) — never in pending or running.
+type StepState string
+
+const (
+	StepPending       StepState = "pending"
+	StepRunning       StepState = "running"
+	StepExecuted      StepState = "executed"
+	StepFailed        StepState = "failed"
+	StepNotApplicable StepState = "not-applicable"
+	StepNotExecuted   StepState = "not-executed"
+)
+
+// Terminal reports whether s is one of the four terminal states.
+func (s StepState) Terminal() bool {
+	switch s {
+	case StepExecuted, StepFailed, StepNotApplicable, StepNotExecuted:
+		return true
+	}
+	return false
 }
 
-// FileNode is a node in the project file tree (id == repo-relative path).
-type FileNode struct {
-	ID       string     `json:"id"`
-	Name     string     `json:"name"`
-	Kind     string     `json:"kind"` // file | dir
-	Children []FileNode `json:"children,omitempty"`
-	Lang     string     `json:"lang,omitempty"`
-	Status   string     `json:"status,omitempty"` // git status decoration
+// TaskState is the preflight observation of a task at a repo. "unknown" means the source of
+// truth was unreachable — never guessed (K-3).
+type TaskState string
+
+const (
+	TaskNotImplemented         TaskState = "not-implemented"
+	TaskImplementedUndelivered TaskState = "implemented-undelivered"
+	TaskDelivered              TaskState = "delivered"
+	TaskUnknown                TaskState = "unknown"
+)
+
+// ExecPhase is the phase of one execution's persisted state document.
+type ExecPhase string
+
+const (
+	PhaseCreated     ExecPhase = "created"
+	PhaseQueued      ExecPhase = "queued"
+	PhaseRunning     ExecPhase = "running"
+	PhasePaused      ExecPhase = "paused"
+	PhaseBlocked     ExecPhase = "blocked"
+	PhaseInterrupted ExecPhase = "interrupted"
+	PhaseCompleted   ExecPhase = "completed"
+	PhaseFailed      ExecPhase = "failed"
+	PhaseDiscarded   ExecPhase = "discarded"
+)
+
+// PauseReason is the ONE pause concept (W-C, REQ-015.1).
+type PauseReason string
+
+const (
+	PauseDeferredByUser PauseReason = "deferred-by-user"
+	PauseUsageLimit     PauseReason = "usage-limit"
+)
+
+// RunKind discriminates the two things sharing the run machinery (A2-9).
+type RunKind string
+
+const (
+	KindAuto RunKind = "auto"
+	KindTodo RunKind = "todo"
+)
+
+// ── Authorship (REQ-041): a label, never a barrier ───────────────────────────────────────
+
+// Actor names who acted: a person, the autonomous system, or the system on a person's behalf.
+// Legacy records carry User "" — surfaced as "unknown", never back-filled.
+type Actor struct {
+	User       string `json:"user"`
+	Autonomous bool   `json:"autonomous,omitempty"`
+	OnBehalfOf string `json:"onBehalfOf,omitempty"`
 }
 
-// FileContent is a file's text + Monaco language id.
-type FileContent struct {
-	Path string `json:"path"`
-	Lang string `json:"lang"`
-	Code string `json:"code"`
+// Authorship is who created and who last changed a record, kept separate so the creator stays
+// visible after later edits.
+type Authorship struct {
+	Created   Actor     `json:"created"`
+	CreatedAt time.Time `json:"createdAt"`
+	Updated   Actor     `json:"updated"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// Change is a row in the Version Control panel.
-type Change struct {
-	Path      string `json:"path"`
-	Status    string `json:"status"` // modified | added | deleted | untracked | renamed | conflict
-	Additions int    `json:"additions"`
-	Deletions int    `json:"deletions"`
-	Staged    bool   `json:"staged"`
+// ── The server stage array — the client ONLY renders it (B-17/B-35) ──────────────────────
+
+// StageView is one stage's honest, server-derived state.
+type StageView struct {
+	Stage Stage     `json:"stage"`
+	State StepState `json:"state"`
+	// Reason is mandatory for failed | not-applicable | not-executed.
+	Reason string `json:"reason,omitempty"`
+	// Evidence is mandatory for not-applicable: the attested repo property (REQ-031.3).
+	Evidence  string     `json:"evidence,omitempty"`
+	Log       string     `json:"log,omitempty"`
+	Link      string     `json:"link,omitempty"`
+	StartedAt *time.Time `json:"startedAt,omitempty"`
+	EndedAt   *time.Time `json:"endedAt,omitempty"`
 }
 
-// Diff is the before/after a DiffEditor renders.
-type Diff struct {
-	Before string `json:"before"`
-	After  string `json:"after"`
-	Lang   string `json:"lang"`
+// Backoff is a persisted retry state (K-5): why, how it is classified, how often it was tried,
+// and when the next attempt is due.
+type Backoff struct {
+	Reason   string    `json:"reason"`
+	Class    string    `json:"class"`
+	Attempts int       `json:"attempts"`
+	FirstAt  time.Time `json:"firstAt"`
+	LastAt   time.Time `json:"lastAt"`
+	NextAt   time.Time `json:"nextAt"`
 }
 
-// CommitLine is one drawn segment in a commit-graph row.
-type CommitLine struct {
-	From int `json:"from"`
-	To   int `json:"to"`
-	Lane int `json:"lane"`
+// RepoPipeline is one repo's chain progress inside an execution.
+type RepoPipeline struct {
+	Repo   string      `json:"repo"`
+	Stages []StageView `json:"stages"`
+	// TaskState is the preflight observation (its evidence sits in the preflight step).
+	TaskState TaskState `json:"taskState,omitempty"`
+	// Block is set while the repo is blocked (REQ-032) — nil otherwise.
+	Block *Backoff `json:"block,omitempty"`
+	// Done and Succeeded are NEVER stored; always computed via PipelineSucceeded.
+	Done      bool `json:"done"`
+	Succeeded bool `json:"succeeded"`
 }
 
-// Commit is a node in the Git log graph (lanes computed server-side).
-type Commit struct {
-	Hash    string       `json:"hash"`
-	Message string       `json:"message"`
-	Author  string       `json:"author"`
-	Time    string       `json:"time"`
-	Refs    []string     `json:"refs,omitempty"`
-	DotLane int          `json:"dotLane"`
-	Lines   []CommitLine `json:"lines"`
+// PipelineSucceeded derives a pipeline's completion: done ⇔ every stage state is terminal;
+// succeeded ⇔ done AND no stage failed AND no stage was skipped as not-executed (REQ-030.4).
+// An empty stage array is neither done nor succeeded.
+func PipelineSucceeded(stages []StageView) (done, succeeded bool) {
+	if len(stages) == 0 {
+		return false, false
+	}
+	succeeded = true
+	for _, sv := range stages {
+		if !sv.State.Terminal() {
+			return false, false
+		}
+		if sv.State == StepFailed || sv.State == StepNotExecuted {
+			succeeded = false
+		}
+	}
+	return true, succeeded
 }
 
-// Worktree is a git worktree (IntelliJ-style management).
-type Worktree struct {
-	Branch  string `json:"branch"`
-	Note    string `json:"note"`
-	URL     string `json:"url,omitempty"`
-	Current bool   `json:"current"`
+// UsageView is consumed tokens and their monetary equivalent — informative, NEVER a cap
+// (REQ-017, W1).
+type UsageView struct {
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	CostUSD      float64 `json:"costUsd"`
 }
 
-// VisionDoc is a "Vision Deposit" artifact.
-type VisionDoc struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Kind    string `json:"kind"` // spec | mindmap | jet | note
-	Summary string `json:"summary"`
-	State   string `json:"state"` // done | active | pending
-	Updated string `json:"updated"`
+// ContinuationView is the exact spot a paused/interrupted execution continues at.
+type ContinuationView struct {
+	Repo  string `json:"repo"`
+	Stage Stage  `json:"stage"`
 }
 
-// Stage is a delivery-pipeline stage.
-type Stage struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-	State string `json:"state"`
-	Hint  string `json:"hint"`
+// PauseView describes the ONE pause of an execution.
+type PauseView struct {
+	Reason         PauseReason `json:"reason"`
+	Message        string      `json:"message,omitempty"`
+	ResumeAttempts int         `json:"resumeAttempts"`
+	NotBefore      *time.Time  `json:"notBefore,omitempty"`
 }
 
-// Tab is an editor tab the workspace opens by default.
-type Tab struct {
-	ID    string `json:"id"`
-	Title string `json:"title"`
-	Kind  string `json:"kind"` // code | structure | diff
-	Path  string `json:"path,omitempty"`
-	Lang  string `json:"lang,omitempty"`
-	Dirty bool   `json:"dirty,omitempty"`
+// ExecutionView is the projection of one execution (state document + result) the active list,
+// the slot panel and the detail header render.
+type ExecutionView struct {
+	ID           string            `json:"id"`
+	RunID        string            `json:"runId"`
+	RunTitle     string            `json:"runTitle"`
+	Kind         RunKind           `json:"kind"`
+	Phase        ExecPhase         `json:"phase"`
+	Reason       string            `json:"reason,omitempty"`
+	Pause        *PauseView        `json:"pause,omitempty"`
+	Continuation *ContinuationView `json:"continuation,omitempty"`
+	Repos        []RepoPipeline    `json:"repos"`
+	Overload     bool              `json:"overload,omitempty"`
+	Usage        UsageView         `json:"usage"`
+	Requested    Authorship        `json:"requested"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	StartedAt    time.Time         `json:"startedAt"`
+	UpdatedAt    time.Time         `json:"updatedAt"`
+	// DeliveredCommit names the delivered state (REQ-022.3).
+	DeliveredCommit string `json:"deliveredCommit,omitempty"`
 }
 
-// StructureEntry is a row in a StructureSection.
-type StructureEntry struct {
-	Name string `json:"name"`
-	Kind string `json:"kind"` // dir | file
-	Note string `json:"note"`
+// DeferSuggestion proposes which execution to defer when all slots are taken (C F3 deferScore).
+type DeferSuggestion struct {
+	ExecutionID string `json:"executionId"`
+	Reason      string `json:"reason"`
+	Score       int    `json:"score"`
 }
 
-// StructureSection is a section of the repo "skeleton" overview.
-type StructureSection struct {
-	Title   string           `json:"title"`
-	Hint    string           `json:"hint"`
-	Entries []StructureEntry `json:"entries"`
+// QueuedStart is a start recorded while a restart was pending; it fires after the restart.
+type QueuedStart struct {
+	RunID string    `json:"runId"`
+	Title string    `json:"title"`
+	By    Actor     `json:"by"`
+	At    time.Time `json:"at"`
 }
 
-// RepoData is everything the workspace knows about one repo.
-type RepoData struct {
-	Branches    []Branch               `json:"branches"`
-	Tree        []FileNode             `json:"tree"`
-	Files       map[string]FileContent `json:"files"`
-	DiffBefore  map[string]string      `json:"diffBefore,omitempty"`
-	Changes     []Change               `json:"changes"`
-	Commits     []Commit               `json:"commits"`
-	Worktrees   []Worktree             `json:"worktrees"`
-	Vision      []VisionDoc            `json:"vision"`
-	Claude      []ClaudeMsg            `json:"claude"`
-	Terminal    []TermLine             `json:"terminal"`
-	Stages      []Stage                `json:"stages"`
-	DefaultTabs []Tab                  `json:"defaultTabs"`
-	ActiveTabID string                 `json:"activeTabId"`
-	Structure   []StructureSection     `json:"structure"`
+// SlotOverview is the read-only projection of the execution slots.
+type SlotOverview struct {
+	Capacity       int             `json:"capacity"`
+	Occupied       int             `json:"occupied"`
+	OverloadActive bool            `json:"overloadActive"`
+	RestartPending bool            `json:"restartPending"`
+	Active         []ExecutionView `json:"active"`
+	Deferred       []ExecutionView `json:"deferred"`
+	QueuedStarts   []QueuedStart   `json:"queuedStarts"`
 }
 
-// ClaudeMsg is a message in the Claude transcript (live via WS in phase 2d).
-type ClaudeMsg struct {
-	ID   string `json:"id"`
-	Role string `json:"role"`
-	Text string `json:"text"`
-	Tool string `json:"tool,omitempty"`
-	Ts   string `json:"ts"`
+// StartOutcome answers POST …/{id}/run honestly.
+type StartOutcome struct {
+	ExecutionID string `json:"executionId,omitempty"`
+	Started     bool   `json:"started"`
+	Queued      bool   `json:"queued,omitempty"`
+	Resumed     bool   `json:"resumed,omitempty"`
+	Fresh       bool   `json:"fresh,omitempty"`
+	// NotStarted is the named reason nothing was started (e.g. "already delivered"), with the
+	// per-target evidence in TaskStates (B-4).
+	NotStarted     string               `json:"notStarted,omitempty"`
+	TaskStates     map[string]TaskState `json:"taskStates,omitempty"`
+	Suggestion     *DeferSuggestion     `json:"suggestion,omitempty"`
+	RestartPending bool                 `json:"restartPending,omitempty"`
 }
 
-// TermLine is a terminal scrollback line (live via WS in phase 2c).
-type TermLine struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"`
-	Text string `json:"text"`
+// RestartState is the state of the ONE restart marker (B-13).
+type RestartState struct {
+	Pending      bool          `json:"pending"`
+	RequestedBy  Actor         `json:"requestedBy"`
+	RequestedAt  time.Time     `json:"requestedAt"`
+	Deadline     time.Time     `json:"deadline"`
+	QueuedStarts []QueuedStart `json:"queuedStarts,omitempty"`
 }
 
-// Preview is a live sxgate preview deployment.
-type Preview struct {
-	Slug    string `json:"slug"`
-	Branch  string `json:"branch"`
-	Service string `json:"service"`
-	URL     string `json:"url"`
-	State   string `json:"state"`
+// Delivery is the ledger view of one delivery (REQ-024).
+type Delivery struct {
+	ID         string     `json:"id"`
+	Repo       string     `json:"repo"`
+	Branch     string     `json:"branch"`
+	FromCommit string     `json:"fromCommit"`
+	ToCommit   string     `json:"toCommit"`
+	PRNumber   int        `json:"prNumber,omitempty"`
+	PRURL      string     `json:"prUrl,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	MergedAt   *time.Time `json:"mergedAt,omitempty"`
+	// ReversalOf points at the delivery this one counter-books (a reversal), "" otherwise.
+	ReversalOf string `json:"reversalOf,omitempty"`
+	// Stage is the reached stage for the deliveries view (F12).
+	Stage string `json:"stage,omitempty"`
 }
 
-// CommitResult is returned after a successful commit.
-type CommitResult struct {
-	Hash    string   `json:"hash"`
-	Branch  string   `json:"branch"`
-	Changes []Change `json:"changes"`
+// PRRef references one pull request.
+type PRRef struct {
+	Number     int    `json:"number"`
+	URL        string `json:"url"`
+	HeadBranch string `json:"headBranch"`
 }
 
-// PushResult is returned after push/pull, carrying refreshed tracking + the raw git message.
-type PushResult struct {
-	Branch   string   `json:"branch"`
-	Ahead    int      `json:"ahead"`
-	Behind   int      `json:"behind"`
-	Message  string   `json:"message"`
-	Branches []Branch `json:"branches"`
+// PortAllocation is one observed port (F9) — derived from routes + /proc/net/tcp, never stored.
+type PortAllocation struct {
+	Port     int    `json:"port"`
+	Service  string `json:"service"`
+	Routed   bool   `json:"routed"`
+	Bound    bool   `json:"bound"`
+	Conflict bool   `json:"conflict"`
 }
 
-// WriteResult is returned after a working-tree mutation (write/stage/unstage) with refreshed
-// change rows so the UI re-renders the VCS panel without a second round-trip.
-type WriteResult struct {
-	Changes []Change `json:"changes"`
+// Notice is one persistent hint, coalesced by key (REQ-032.5).
+type Notice struct {
+	ID       string    `json:"id"`
+	Kind     string    `json:"kind"`
+	Repo     string    `json:"repo,omitempty"`
+	Text     string    `json:"text"`
+	NextStep string    `json:"nextStep,omitempty"`
+	Count    int       `json:"count"`
+	FirstAt  time.Time `json:"firstAt"`
+	LastAt   time.Time `json:"lastAt"`
+	Read     bool      `json:"read"`
 }
 
-// BranchResult is returned after creating/checking out a branch.
-type BranchResult struct {
-	Branch   string   `json:"branch"`
-	Branches []Branch `json:"branches"`
+// Duration marshals as a Go duration string ("3h", "45m") — the wire form of every tunable
+// duration (service config).
+type Duration time.Duration
+
+// MarshalJSON renders the duration as its canonical string.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
 }
 
-// VisionFile is one tracked artifact in the repo's /vision folder (the Vision Catalog).
-type VisionFile struct {
-	Path   string `json:"path"`   // repo-relative, e.g. "vision/sketch.png"
-	Name   string `json:"name"`   // basename
-	Kind   string `json:"kind"`   // image | pdf | markdown | text | other
-	Size   int64  `json:"size"`   // bytes
-	Status string `json:"status"` // git status decoration (modified|added|untracked|…), if any
+// UnmarshalJSON accepts a duration string ("3h") or a number of nanoseconds (legacy tolerance).
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		v, perr := time.ParseDuration(s)
+		if perr != nil {
+			return fmt.Errorf("invalid duration %q: %w", s, perr)
+		}
+		*d = Duration(v)
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("invalid duration %s", string(b))
+	}
+	*d = Duration(n)
+	return nil
 }
 
-// AiMessage is one turn in the repo-scoped AI assistant transcript (persisted per user+repo).
-type AiMessage struct {
-	Role    string `json:"role"` // user | assistant
-	Content string `json:"content"`
-	Ts      string `json:"ts"`
-	// Ask is a structured question the assistant posed on an interactive turn; the SPA renders it
-	// as clickable options. Persisted so it survives a reload (only the last turn stays live).
-	Ask *AiAsk `json:"ask,omitempty"`
+// ServiceConfig is the service's runtime configuration (the config interface, cross-cutting 5).
+type ServiceConfig struct {
+	MaxConcurrency    int      `json:"maxConcurrency"`
+	DefaultTimeBudget Duration `json:"defaultTimeBudget"`
+	AutomergeWindow   Duration `json:"automergeWindow"`
 }
 
-// AiAsk is a structured multiple-choice question the AI posed, rendered as clickable options in the
-// chat bubble (à la Claude Code). It is aigentic's "interactive" protocol shape, surfaced verbatim;
-// this package owns the DTO so both the reply and the persisted transcript reference one definition.
-type AiAsk struct {
-	Questions []AiAskQuestion `json:"questions"`
+// PoolUsage is one pool's portioned storage share.
+type PoolUsage struct {
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes"`
+	Files int    `json:"files"`
 }
 
-// AiAskQuestion is one question: a short header chip, the question text, the offered options, and
-// whether several may be chosen together.
-type AiAskQuestion struct {
-	Header      string        `json:"header,omitempty"`
-	Question    string        `json:"question"`
-	Options     []AiAskOption `json:"options"`
-	MultiSelect bool          `json:"multiSelect,omitempty"`
+// StorageView reports which data the service holds, portioned per pool — reported, never judged.
+type StorageView struct {
+	Pools      []PoolUsage `json:"pools"`
+	TotalBytes int64       `json:"totalBytes"`
 }
 
-// AiAskOption is one offered choice: a short label plus an optional one-line description.
-type AiAskOption struct {
-	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
+// LoadView reports the process's own resource claim — reported, never judged.
+type LoadView struct {
+	CPUPercent float64 `json:"cpuPercent"`
+	RSSBytes   int64   `json:"rssBytes"`
+	Goroutines int     `json:"goroutines"`
 }
 
-// AssistantReply is what DevLab returns to the SPA after proxying an aigentic run.
-type AssistantReply struct {
-	Output string `json:"output"`
-	Engine string `json:"engine"`
-	Model  string `json:"model"`
-	Usage  struct {
-		InputTokens  int  `json:"inputTokens"`
-		OutputTokens int  `json:"outputTokens"`
-		TotalTokens  int  `json:"totalTokens"`
-		Truncated    bool `json:"truncated"`
-	} `json:"usage"`
-	// Ask is set when the model replied with a structured question instead of (or alongside) prose.
-	Ask *AiAsk `json:"ask,omitempty"`
+// AiUsageView aggregates the AI-usage pool over a window, per source.
+type AiUsageView struct {
+	WindowHours int                  `json:"windowHours"`
+	Samples     int                  `json:"samples"`
+	Totals      UsageView            `json:"totals"`
+	BySource    map[string]UsageView `json:"bySource"`
 }
 
-// AgentReply is what DevLab returns after a FULL agentic claude run in the user's workspace.
-// Unlike AssistantReply (a read-only aigentic proxy), the agent can edit the tree, so it carries
-// the refreshed change set. SessionID lets the SPA continue the conversation (--resume).
-type AgentReply struct {
-	Output    string   `json:"output"`
-	SessionID string   `json:"sessionId"`
-	CostUSD   float64  `json:"costUsd"`
-	NumTurns  int      `json:"numTurns"`
-	IsError   bool     `json:"isError"`
-	Changes   []Change `json:"changes"`
+// Health is deliberately MINIMAL (A1-5): no operational internals on the public endpoint.
+type Health struct {
+	OK   bool   `json:"ok"`
+	Mode string `json:"mode"`
 }
 
-// PullRequestResult is what DevLab returns after opening (or focusing) a GitHub PR for a branch.
-type PullRequestResult struct {
-	Number  int    `json:"number"`
-	URL     string `json:"url"`
-	State   string `json:"state"`
-	Title   string `json:"title"`
-	Branch  string `json:"branch"`
-	Base    string `json:"base"`
-	Existed bool   `json:"existed"` // true when we focused an already-open PR rather than creating one
+// User is the SPA's bootstrap identity probe.
+type User struct {
+	Username     string `json:"username"`
+	DisplayName  string `json:"displayName"`
+	IsAdmin      bool   `json:"isAdmin"`
+	CanUseDevlab bool   `json:"canUseDevlab"`
+	GithubLinked bool   `json:"githubLinked"`
+	GithubLogin  string `json:"githubLogin,omitempty"`
 }
 
-// Comment is one message in a per-file threaded discussion (DevLab-side store, shared per repo).
-type Comment struct {
-	ID         string `json:"id"`
-	Path       string `json:"path"`       // the vision file it's attached to
-	ParentID   string `json:"parentId"`   // "" for a top-level comment, else the parent's id
-	Author     string `json:"author"`     // Linux username (stable authorship key)
-	AuthorName string `json:"authorName"` // display name at post time
-	Body       string `json:"body"`
-	CreatedAt  string `json:"createdAt"` // RFC3339
-	EditedAt   string `json:"editedAt,omitempty"`
+// ── Calendar + coverage (ported wire forms; REQ-012) ─────────────────────────────────────
+
+// RunOccurrence is one calendar entry: a future firing (Schedule set) or a past execution
+// (ResultID set — the calendar opens the same detail as the history).
+type RunOccurrence struct {
+	RunID     string  `json:"runId"`
+	RunTitle  string  `json:"runTitle"`
+	Kind      RunKind `json:"kind"`
+	At        string  `json:"at"`
+	Schedule  string  `json:"schedule,omitempty"`
+	ResultID  string  `json:"resultId,omitempty"`
+	Succeeded *bool   `json:"succeeded,omitempty"`
+	Paused    bool    `json:"paused,omitempty"`
+}
+
+// RunCalendar is the occurrence window both calendars render.
+type RunCalendar struct {
+	From        string          `json:"from"`
+	To          string          `json:"to"`
+	Occurrences []RunOccurrence `json:"occurrences"`
+}
+
+// RunCoverage reports which axioms are backed by a run (honest; pending marks a transient gap).
+type RunCoverage struct {
+	Covered map[string][]string `json:"covered"`
+	Index   map[string]string   `json:"index"`
+	Axioms  map[string]string   `json:"axioms"`
+	Pending bool                `json:"pending,omitempty"`
 }

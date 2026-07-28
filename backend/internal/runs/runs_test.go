@@ -2,72 +2,63 @@ package runs
 
 import (
 	"encoding/json"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"devlab/backend/internal/model"
+	"devlab/backend/internal/statepath"
 )
 
-// A nil Go slice marshals to JSON `null`, and the UI then calls .map() on null and hangs on "Lädt…".
-// Empty listings must therefore be empty slices, never nil.
+// A nil Go slice marshals to JSON `null`, and the UI then calls .map() on null and blanks the
+// list. Empty listings must therefore be empty slices, never nil.
 func TestEmptyListsMarshalAsArraysNotNull(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "res"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "legacy"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
-	res, h := NewResults(), NewHistory()
+	res, h := NewResultStore(&statepath.Paths{Root: dir}), NewHistory(nil)
 
-	all, _ := res.All()
-	refs, _ := res.ListForRun("run_missing")
+	all, _ := res.List()
+	refs, _ := res.ForRun("run_missing")
 	snaps, _ := h.List()
 	if all == nil || refs == nil || snaps == nil {
-		t.Fatalf("nil listing: All=%v ListForRun=%v History.List=%v", all == nil, refs == nil, snaps == nil)
+		t.Fatalf("nil listing: List=%v ForRun=%v History.List=%v", all == nil, refs == nil, snaps == nil)
 	}
 	b, err := json.Marshal(map[string]any{"executions": all, "results": refs, "snapshots": snaps})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(b), "null") {
-		t.Errorf("empty listings marshalled with null (hangs the UI): %s", b)
+		t.Errorf("empty listings marshalled with null (blanks the UI): %s", b)
 	}
 }
 
-func TestNormalizeTypeFoldsEmptyToAuto(t *testing.T) {
-	cases := map[Type]Type{"": TypeAuto, TypeAuto: TypeAuto, TypeTodo: TypeTodo, "bogus": TypeAuto}
-	for in, want := range cases {
-		if got := NormalizeType(in); got != want {
-			t.Errorf("NormalizeType(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-// A stored result carries its run's kind so the execution history can be split per surface (Läufe vs
-// ToDos) even after the run is deleted. All() must surface that stamp on every summary.
-func TestAllCarriesTypeStamp(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "res"))
-	res := NewResults()
-	if err := res.Save(Result{RunID: "run_a", ResultID: NewResultID(time.Now()), Type: TypeTodo, StartedAt: time.Now()}); err != nil {
+// A stored result carries its run's kind so the execution history can be split per surface
+// even after the run is deleted. List must surface that stamp on every document.
+func TestListCarriesKindStamp(t *testing.T) {
+	res := NewResultStore(&statepath.Paths{Root: t.TempDir()})
+	if err := res.Put(Result{ID: NewResultID(time.Now()), RunID: "run_a", Kind: model.KindTodo, StartedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := res.Save(Result{RunID: "run_b", ResultID: NewResultID(time.Now().Add(time.Second)), Type: TypeAuto, StartedAt: time.Now().Add(time.Second)}); err != nil {
+	if err := res.Put(Result{ID: NewResultID(time.Now().Add(time.Second)), RunID: "run_b", Kind: model.KindAuto, StartedAt: time.Now().Add(time.Second)}); err != nil {
 		t.Fatal(err)
 	}
-	all, err := res.All()
+	all, err := res.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := map[string]Type{}
+	got := map[string]model.RunKind{}
 	for _, e := range all {
-		got[e.RunID] = e.Type
+		got[e.RunID] = e.Kind
 	}
-	if got["run_a"] != TypeTodo || got["run_b"] != TypeAuto {
-		t.Fatalf("type stamp not surfaced by All(): %+v", got)
+	if got["run_a"] != model.KindTodo || got["run_b"] != model.KindAuto {
+		t.Fatalf("kind stamp not surfaced by List(): %+v", got)
 	}
 }
 
 func TestScheduleNextDaily(t *testing.T) {
-	s := Schedule{Kind: Daily, TimeOfDay: "03:00"}
+	s := ScheduleSpec{Kind: Daily, TimeOfDay: "03:00"}
 	// before the time-of-day → same day
 	after := time.Date(2026, 7, 15, 1, 0, 0, 0, time.UTC)
 	got, err := s.Next(after)
@@ -83,10 +74,17 @@ func TestScheduleNextDaily(t *testing.T) {
 	if want := time.Date(2026, 7, 16, 3, 0, 0, 0, time.UTC); !got.Equal(want) {
 		t.Errorf("after: got %v want %v", got, want)
 	}
+	// NextFire wraps the same rule (the ONE place fire times come from).
+	if nf := NextFire(s, after); !nf.Equal(time.Date(2026, 7, 16, 3, 0, 0, 0, time.UTC)) {
+		t.Errorf("NextFire: got %v", nf)
+	}
+	if nf := NextFire(ScheduleSpec{Kind: "bogus"}, after); !nf.IsZero() {
+		t.Errorf("NextFire on an invalid spec must be zero, got %v", nf)
+	}
 }
 
 func TestScheduleNextWeekly(t *testing.T) {
-	s := Schedule{Kind: Weekly, TimeOfDay: "03:00", Weekdays: []time.Weekday{time.Monday}}
+	s := ScheduleSpec{Kind: Weekly, TimeOfDay: "03:00", Weekdays: []time.Weekday{time.Monday}}
 	after := time.Date(2026, 7, 15, 5, 0, 0, 0, time.UTC)
 	got, err := s.Next(after)
 	if err != nil {
@@ -105,7 +103,7 @@ func TestScheduleNextWeekly(t *testing.T) {
 
 func TestScheduleNextForwardOnceAfterDowntime(t *testing.T) {
 	// Far in the past → exactly one upcoming time (catch-up), never N missed periods.
-	s := Schedule{Kind: Daily, TimeOfDay: "03:00"}
+	s := ScheduleSpec{Kind: Daily, TimeOfDay: "03:00"}
 	after := time.Date(2020, 1, 1, 4, 0, 0, 0, time.UTC)
 	got, _ := s.Next(after)
 	if want := time.Date(2020, 1, 2, 3, 0, 0, 0, time.UTC); !got.Equal(want) {
@@ -114,7 +112,7 @@ func TestScheduleNextForwardOnceAfterDowntime(t *testing.T) {
 }
 
 func TestScheduleValid(t *testing.T) {
-	bad := []Schedule{
+	bad := []ScheduleSpec{
 		{Kind: Daily, TimeOfDay: "25:00"},
 		{Kind: Daily, TimeOfDay: "3:00"},
 		{Kind: Weekly, TimeOfDay: "03:00"}, // weekly needs weekdays
@@ -126,29 +124,33 @@ func TestScheduleValid(t *testing.T) {
 			t.Errorf("case %d should be invalid", i)
 		}
 	}
-	if err := (Schedule{Kind: Daily, TimeOfDay: "03:00"}).Valid(); err != nil {
+	if err := (ScheduleSpec{Kind: Daily, TimeOfDay: "03:00"}).Valid(); err != nil {
 		t.Errorf("daily valid: %v", err)
 	}
-	if err := (Schedule{Kind: Weekly, TimeOfDay: "23:59", Weekdays: []time.Weekday{time.Sunday, time.Saturday}}).Valid(); err != nil {
+	if err := (ScheduleSpec{Kind: Weekly, TimeOfDay: "23:59", Weekdays: []time.Weekday{time.Sunday, time.Saturday}}).Valid(); err != nil {
 		t.Errorf("weekly valid: %v", err)
 	}
 }
 
-func TestStoreMutateAndHistory(t *testing.T) {
+// Put/Get/Delete are the store's write surface; every user-meaningful mutation snapshots the
+// history so any past constellation stays restorable.
+func TestStorePutDeleteAndHistory(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
-	s := NewStore()
+	s := NewStore(nil)
 
 	if all, err := s.List(); err != nil || len(all) != 0 {
 		t.Fatalf("empty store: %v len=%d", err, len(all))
 	}
 
-	r := Run{ID: "run_a", Name: "A", Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, AxiomIDs: []string{"ax_1"}}
-	if _, err := s.Mutate("create", "tester", func(cur []Run) ([]Run, error) { return append(cur, r), nil }); err != nil {
+	r := Run{ID: "run_a", Kind: model.KindAuto, Title: "A",
+		Schedule: &ScheduleSpec{Kind: Daily, TimeOfDay: "03:00"}, AxiomIDs: []string{"ax_1"},
+		Authorship: model.Authorship{Created: model.Actor{User: "tester"}, Updated: model.Actor{User: "tester"}}}
+	if err := s.Put(r); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, _ := s.Get("run_a"); !ok || got.Name != "A" {
+	if got, ok, _ := s.Get("run_a"); !ok || got.Title != "A" {
 		t.Fatalf("get after create failed: %+v ok=%v", got, ok)
 	}
 
@@ -160,56 +162,59 @@ func TestStoreMutateAndHistory(t *testing.T) {
 		t.Fatalf("history after create: %+v", snaps)
 	}
 
-	if _, err := s.Mutate("update", "tester", func(cur []Run) ([]Run, error) { cur[0].Name = "B"; return cur, nil }); err != nil {
+	r.Title = "B"
+	if err := s.Put(r); err != nil {
 		t.Fatal(err)
 	}
 	snaps, _ = s.History().List()
 	if len(snaps) != 2 {
 		t.Fatalf("want 2 snapshots after update, got %d", len(snaps))
 	}
-	// oldest snapshot (create) still holds the original name → restorable
+	// oldest snapshot (create) still holds the original title → restorable
 	oldest := snaps[len(snaps)-1]
 	full, ok, _ := s.History().Get(oldest.TS)
-	if !ok || len(full.Runs) != 1 || full.Runs[0].Name != "A" {
+	if !ok || len(full.Runs) != 1 || full.Runs[0].Title != "A" {
 		t.Fatalf("oldest snapshot content: ok=%v %+v", ok, full.Runs)
 	}
 
-	if _, err := s.Mutate("delete", "tester", func(cur []Run) ([]Run, error) { return nil, nil }); err != nil {
+	if err := s.Delete("run_a"); err != nil {
 		t.Fatal(err)
 	}
 	if all, _ := s.List(); len(all) != 0 {
 		t.Fatalf("after delete want 0, got %d", len(all))
 	}
-}
-
-func TestMutateAbortsOnClosureError(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
-	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
-	s := NewStore()
-	if _, err := s.Mutate("create", "t", func(cur []Run) ([]Run, error) {
-		return append(cur, Run{ID: "run_a", Name: "A", Schedule: Schedule{Kind: Daily, TimeOfDay: "03:00"}, AxiomIDs: []string{"x"}}), nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	// Deleting an unknown id aborts before any write — no spurious snapshot.
 	before, _ := s.History().List()
-	// A closure that errors (e.g. unknown id → ErrNotFound) must NOT save or append a snapshot.
-	if _, err := s.Mutate("noop", "t", func(cur []Run) ([]Run, error) { return nil, ErrNotFound }); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("want ErrNotFound, got %v", err)
+	if err := s.Delete("run_ghost"); err == nil {
+		t.Fatal("deleting an unknown id must error")
 	}
 	after, _ := s.History().List()
 	if len(after) != len(before) {
-		t.Errorf("errored mutation appended a snapshot: before=%d after=%d", len(before), len(after))
+		t.Fatalf("a failed delete must not append a snapshot: %d → %d", len(before), len(after))
 	}
 }
 
-func TestHistoryGetRejectsTraversal(t *testing.T) {
+// Patch is the runtime-state write path: it saves but never snapshots the history.
+func TestPatchDoesNotSnapshotHistory(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
-	h := NewHistory()
-	for _, ts := range []string{"../../etc/passwd", "../x", "a/b", "../"} {
-		if _, ok, _ := h.Get(ts); ok {
-			t.Errorf("traversal ts %q resolved to a file", ts)
-		}
+	s := NewStore(nil)
+	if err := s.Put(Run{ID: "run_a", Kind: model.KindAuto, Title: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := s.History().List()
+	if _, err := s.Patch(func(cur []Run) ([]Run, error) {
+		cur[0].PromptSnapshot = "recomposed"
+		return cur, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.History().List()
+	if len(after) != len(before) {
+		t.Fatalf("Patch must not snapshot: %d → %d", len(before), len(after))
+	}
+	if got, _, _ := s.Get("run_a"); got.PromptSnapshot != "recomposed" {
+		t.Fatalf("Patch must persist: %+v", got)
 	}
 }

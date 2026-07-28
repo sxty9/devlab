@@ -1,7 +1,6 @@
 import { useWorkspace } from '@/state/workspace';
-import type { PanelId, Stage, StageState } from '@/types';
+import type { PanelId, RepoStage, StageState } from '@/types';
 import { ChevronRightIcon, GitBranchIcon } from '@/ui/icons';
-import { PREVIEW_URL, previewHost } from '@/lib/constants';
 import { cn } from '@/lib/cn';
 
 const dotCls: Record<StageState, string> = {
@@ -19,14 +18,11 @@ const textCls: Record<StageState, string> = {
 export function StatusBar() {
   const { data, activeRepo, activeBranch, setPanel } = useWorkspace();
   const { stages, changes } = data;
-  const previewStage = stages.find((s) => s.id === 'preview');
   const staged = changes.filter((c) => c.staged).length;
-  const previewLive = previewStage && previewStage.state !== 'pending';
 
-  // Some pipeline stages jump to a relevant surface; the rest are informational.
-  const onStage = (s: Stage) => {
+  // Some overview rows jump to a relevant surface; the rest are informational.
+  const onStage = (s: RepoStage) => {
     if (s.id === 'vision' || s.id === 'code') setPanel((s.id === 'code' ? 'project' : 'vision') as PanelId);
-    else if (s.id === 'preview') window.open(PREVIEW_URL, '_blank', 'noopener');
   };
 
   return (
@@ -56,24 +52,6 @@ export function StatusBar() {
       </div>
 
       <div className="ml-auto flex items-center gap-2.5">
-        {previewLive && (
-          <>
-            <a
-              href={PREVIEW_URL}
-              target="_blank"
-              rel="noreferrer"
-              title="Open the live sxgate preview"
-              className="flex items-center gap-1.5 rounded-sm px-1 py-0.5 text-text-secondary transition-colors hover:bg-fill/10 hover:text-accent"
-            >
-              <span className="relative flex h-1.5 w-1.5">
-                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success/70" />
-                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-success" />
-              </span>
-              <span className="hidden font-mono md:inline">{previewHost(activeRepo.name)}</span>
-            </a>
-            <span className="h-3.5 w-px bg-separator" />
-          </>
-        )}
         <span className="flex items-center gap-1">
           <GitBranchIcon className="h-3.5 w-3.5" />
           {activeBranch.name}

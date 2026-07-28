@@ -13,6 +13,8 @@ import (
 
 	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
+
+	"devlab/backend/internal/statepath"
 )
 
 var (
@@ -29,11 +31,14 @@ type Store struct {
 	locks map[string]*sync.Mutex
 }
 
-// NewStore builds the store from DEVLAB_CHATS (default /var/lib/devlab/chats), dir 0700.
-func NewStore() (*Store, error) {
+// NewStore builds the store below the state root (DEVLAB_CHATS overrides), dir 0700.
+func NewStore(p *statepath.Paths) (*Store, error) {
 	dir := os.Getenv("DEVLAB_CHATS")
+	if dir == "" && p != nil {
+		dir = p.Chats()
+	}
 	if dir == "" {
-		dir = "/var/lib/devlab/chats"
+		return nil, fmt.Errorf("chats: no directory configured (state root missing)")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chats: mkdir %s: %w", dir, err)

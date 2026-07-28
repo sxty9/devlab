@@ -1,0 +1,11 @@
+{
+  "id": "svc-a",
+  "name": "svc-a",
+  "fullName": "org/svc-a",
+  "kind": "service",
+  "description": "A service.",
+  "language": "Go",
+  "icon": "go",
+  "tint": "accent",
+  "permission": "push"
+}

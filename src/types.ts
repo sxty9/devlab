@@ -1,21 +1,24 @@
-// Shared domain types for the DevLab workspace. Phase 1 is mock-data only; these shapes are
-// deliberately close to what a real backend (git + sxgate + Claude) would return, so wiring
-// the backend later is a swap of the data source, not a rewrite of the UI.
+// The frontend wire contract — a FIELD-FOR-FIELD mirror of backend internal/model (and the
+// runs-domain wire forms), pinned by the golden fixtures under contract/fixtures/ via
+// types.contract.test.ts. Drift breaks both builds. Frozen after Welle 0.
 
 /** The tools in the left icon rail. */
 export type PanelId = 'vision' | 'project' | 'vcs' | 'git' | 'claude' | 'terminal';
 
-/** The signed-in DevLab user. Identity comes from the Holistic session (a Linux account);
- *  `canUseDevlab` reflects the single Holistic right (hp_devlab_access, admin implicit).
- *  `githubLinked` gates the workspace — repo visibility/authorization derive from GitHub. */
+/** The signed-in DevLab user (model.User). */
 export interface User {
   username: string;
   displayName: string;
   isAdmin: boolean;
   canUseDevlab: boolean;
   githubLinked: boolean;
-  /** The linked GitHub login, when linked. */
   githubLogin?: string;
+}
+
+/** The deliberately MINIMAL health probe (model.Health): no operational internals. */
+export interface Health {
+  ok: boolean;
+  mode: string;
 }
 
 /** User-tunable editor settings (Settings modal → Monaco). */
@@ -28,112 +31,85 @@ export interface EditorSettings {
 export type Overlay = 'settings' | 'help' | null;
 
 export type RepoKind = 'service' | 'repo' | 'library';
-
-/** The viewer's effective GitHub permission on a repo (the single source of truth for write). */
 export type RepoPermission = 'pull' | 'push' | 'admin';
-
-/** The repo's card glyph, derived server-side from its language and kind (discover.icon()).
- *  src/ui/repoIcon.ts maps each name to an SVG. */
 export type RepoIcon = 'go' | 'ts' | 'rust' | 'python' | 'shell' | 'service' | 'repo' | 'library';
 
-/** A selectable repository/service in the top-bar dropdown. */
+/** A selectable repository/service (model.Repo). */
 export interface Repo {
   id: string;
   name: string;
-  /** GitHub canonical "owner/repo". */
   fullName: string;
   kind: RepoKind;
   description: string;
-  /** Primary language label, e.g. "TypeScript", "Go", "Shell". */
   language: string;
-  /** The card glyph name; derived from language, falling back to kind. */
   icon: RepoIcon;
-  /** A design-token color name used as the repo's accent dot (accent | success | warning | gpu | net | ssd | ram). */
   tint: 'accent' | 'success' | 'warning' | 'gpu' | 'net' | 'ssd' | 'ram';
-  /** The viewer's effective right from GitHub; 'pull' repos are read-only in the UI. */
   permission: RepoPermission;
 }
 
-/** A git branch / working session for the active repo. */
 export interface Branch {
   name: string;
   isDefault: boolean;
   ahead: number;
   behind: number;
-  /** Human-relative last activity, e.g. "2h ago". */
   updated: string;
 }
 
 export type GitStatus = 'modified' | 'added' | 'deleted' | 'untracked' | 'renamed' | 'conflict';
 
-/** A node in the project file tree. `id` is the repo-relative path and is globally unique. */
 export interface FileNode {
   id: string;
   name: string;
   kind: 'file' | 'dir';
   children?: FileNode[];
-  /** Monaco language id for files (e.g. "typescript", "go", "shell", "json", "markdown"). */
   lang?: string;
-  /** Decorate the row when the file has an uncommitted change. */
   status?: GitStatus;
 }
 
-/** Editor contents for a file path. */
 export interface FileContent {
   path: string;
   lang: string;
   code: string;
 }
 
-/** A row in the Version Control panel. */
 export interface Change {
   path: string;
   status: GitStatus;
   additions: number;
   deletions: number;
-  /** false → unstaged (working tree), true → staged for commit. */
   staged: boolean;
 }
 
-/** A message in the Claude panel transcript. */
 export interface ClaudeMsg {
   id: string;
   role: 'user' | 'assistant' | 'tool';
   text: string;
-  /** For role: 'tool' — the tool name shown as a chip. */
   tool?: string;
   ts: string;
 }
 
-/** A line in the Terminal panel. */
 export interface TermLine {
   id: string;
   kind: 'cmd' | 'stdout' | 'stderr' | 'system';
   text: string;
 }
 
-/** An open editor tab. */
 export interface Tab {
   id: string;
   title: string;
   kind: 'code' | 'structure' | 'diff' | 'vision';
-  /** Present for kind: 'code' | 'diff' | 'vision'. */
   path?: string;
   lang?: string;
   dirty?: boolean;
 }
 
-/** One turn in the repo-scoped AI assistant transcript. */
 export interface AiMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: string;
-  /** A structured question the assistant posed (interactive turns); rendered as clickable options. */
   ask?: AiAsk;
 }
 
-/** A structured multiple-choice question the AI posed, answerable by clicking options in the chat
- * bubble (à la Claude Code). Mirrors aigentic's interactive protocol, surfaced verbatim. */
 export interface AiAskOption {
   label: string;
   description?: string;
@@ -148,41 +124,31 @@ export interface AiAsk {
   questions: AiAskQuestion[];
 }
 
-/** What the AI assistant returns after a run (proxied from aigentic). */
 export interface AssistantReply {
   output: string;
   engine: string;
   model: string;
   usage: { inputTokens: number; outputTokens: number; totalTokens: number; truncated: boolean };
-  /** Set when the model replied with a structured question instead of (or alongside) prose. */
   ask?: AiAsk;
 }
 
-/** The payload for one AI turn. */
 export interface AssistantAsk {
   prompt: string;
   contextPaths: string[];
   history: AiMessage[];
-  /** aigentic engine: 'choose' (router) | 'claude-cli' | 'claude-api' | 'ollama'. */
   kind?: string;
-  /** model id override (from the catalog); '' = the engine's default. */
   model?: string;
   effort?: string;
 }
 
-/** The payload for one agentic run — the full claude CLI, in the repo workspace, as the user. */
 export interface AgentAsk {
   prompt: string;
-  /** model id (from the catalog); '' = the CLI default. */
   model?: string;
   effort?: string;
-  /** 'plan' (read-only) | 'auto' (accept edits) | 'full' (autonomous, incl. shell). */
   mode?: string;
-  /** prior session id to continue the conversation (--resume). */
   resume?: string;
 }
 
-/** What an agentic run returns: the summary + the refreshed change set (edits it made). */
 export interface AgentReply {
   output: string;
   sessionId: string;
@@ -192,7 +158,6 @@ export interface AgentReply {
   changes: Change[];
 }
 
-/** Result of opening (or focusing) a GitHub pull request for the current branch. */
 export interface PullRequestResult {
   number: number;
   url: string;
@@ -200,34 +165,27 @@ export interface PullRequestResult {
   title: string;
   branch: string;
   base: string;
-  /** true when an already-open PR was focused rather than a new one created. */
   existed: boolean;
 }
 
-/** aigentic's model catalog (GET /api/assistant/models). */
 export interface AiModelCatalog {
   claude: { id: string; label: string }[];
   ollama: string[];
 }
 
-/** How a Vision-Catalog file is rendered. */
 export type VisionFileKind = 'image' | 'pdf' | 'markdown' | 'text' | 'other';
 
-/** One artifact in a repo's /vision folder (the Vision Catalog). */
 export interface VisionFile {
   path: string;
   name: string;
   kind: VisionFileKind;
   size: number;
-  /** git status decoration, if any. */
   status?: string;
 }
 
-/** One message in a per-file threaded discussion (nested via parentId). */
 export interface Comment {
   id: string;
   path: string;
-  /** '' for a top-level comment, else the parent comment's id. */
   parentId: string;
   author: string;
   authorName: string;
@@ -236,41 +194,33 @@ export interface Comment {
   editedAt?: string;
 }
 
-/** One drawn segment in a commit-graph row (a lane line from the row's top to its bottom). */
 export interface CommitLine {
   from: number;
   to: number;
-  /** Lane index that owns this segment's colour. */
   lane: number;
 }
 
-/** A commit in the Git log graph. */
 export interface Commit {
   hash: string;
   message: string;
   author: string;
   time: string;
-  /** Branch/tag labels on this commit (e.g. ['main', 'HEAD']). */
   refs?: string[];
-  /** Lane the commit node sits on. */
   dotLane: number;
-  /** Lines drawn through this row. */
   lines: CommitLine[];
 }
 
-/** A git worktree (IntelliJ-style management). */
 export interface Worktree {
   branch: string;
   note: string;
-  /** A live preview URL if this worktree is deployed. */
   url?: string;
   current?: boolean;
 }
 
 export type StageState = 'done' | 'active' | 'pending';
 
-/** A stage in the bottom delivery-pipeline bar (Vision → … → main merge). */
-export interface Stage {
+/** A row of the honest repo overview (model.RepoStage) — only git-attested rows exist. */
+export interface RepoStage {
   id: string;
   label: string;
   state: StageState;
@@ -279,43 +229,274 @@ export interface Stage {
 
 export type VisionKind = 'spec' | 'mindmap' | 'jet' | 'note';
 
-/** A "Vision Deposit" artifact — the front of the pipeline (specs, mindmaps, jets, notes). */
 export interface VisionDoc {
   id: string;
   title: string;
   kind: VisionKind;
   summary: string;
-  /** Pipeline state this idea has reached. */
   state: StageState;
   updated: string;
 }
 
-/** Everything the workspace knows about one repo (mock in phase 1). */
 export interface RepoData {
   branches: Branch[];
   tree: FileNode[];
   files: Record<string, FileContent>;
-  changes: Change[];
-  /** Optional explicit "before" content for changed files; otherwise synthesized for the diff. */
   diffBefore?: Record<string, string>;
+  changes: Change[];
   commits: Commit[];
   worktrees: Worktree[];
   vision: VisionDoc[];
   claude: ClaudeMsg[];
   terminal: TermLine[];
-  stages: Stage[];
-  /** Tabs opened by default when this repo becomes active. */
+  stages: RepoStage[];
   defaultTabs: Tab[];
-  /** Which default tab is focused. */
   activeTabId: string;
-  /** A short overview shown in StructureView / the repo skeleton. */
   structure: StructureSection[];
 }
 
-// ── Mercury — the axiom-management model (scheme-backed, via aigentic) ────────
+export interface StructureSection {
+  title: string;
+  hint: string;
+  entries: { name: string; kind: 'dir' | 'file'; note: string }[];
+}
 
-/** One node of a namespace tree: a category (folder) or an axiom (leaf). Categories nest to any
- *  depth; `path` is the node's stable scheme address. */
+// ── Chain vocabulary (model — the frozen wire literals) ───────────────────────
+
+/** The ONE chain (REQ-027). */
+export type Stage = 'preflight' | 'implement' | 'deliver-dev' | 'publish' | 'pull-request';
+
+/** Two transient + four terminal states; every stage ENDS in one of the four. */
+export type StepState = 'pending' | 'running' | 'executed' | 'failed' | 'not-applicable' | 'not-executed';
+
+/** The preflight observation; 'unknown' = source unreachable, never guessed. */
+export type TaskState = 'not-implemented' | 'implemented-undelivered' | 'delivered' | 'unknown';
+
+export type ExecPhase =
+  | 'created'
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'blocked'
+  | 'interrupted'
+  | 'completed'
+  | 'failed'
+  | 'discarded';
+
+export type PauseReason = 'deferred-by-user' | 'usage-limit';
+
+/** The two kinds sharing the run machinery. */
+export type RunKind = 'auto' | 'todo';
+
+/** Who acted (REQ-041): a label, never a barrier. Empty user = unknown, never invented. */
+export interface Actor {
+  user: string;
+  autonomous?: boolean;
+  onBehalfOf?: string;
+}
+
+export interface Authorship {
+  created: Actor;
+  createdAt: string;
+  updated: Actor;
+  updatedAt: string;
+}
+
+/** One stage's honest, server-derived state — the client ONLY renders it (B-17/B-35). */
+export interface StageView {
+  stage: Stage | string; // legacy archive stages carry their historical names verbatim
+  state: StepState;
+  reason?: string;
+  evidence?: string;
+  log?: string;
+  link?: string;
+  startedAt?: string;
+  endedAt?: string;
+}
+
+export interface Backoff {
+  reason: string;
+  class: string;
+  attempts: number;
+  firstAt: string;
+  lastAt: string;
+  nextAt: string;
+}
+
+export interface RepoPipeline {
+  repo: string;
+  stages: StageView[];
+  taskState?: TaskState;
+  block?: Backoff;
+  done: boolean;
+  succeeded: boolean;
+}
+
+/** Consumption and its monetary equivalent — informative, NEVER a cap (REQ-017). */
+export interface UsageView {
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
+export interface ContinuationView {
+  repo: string;
+  stage: Stage;
+}
+
+export interface PauseView {
+  reason: PauseReason;
+  message?: string;
+  resumeAttempts: number;
+  notBefore?: string;
+}
+
+export interface ExecutionView {
+  id: string;
+  runId: string;
+  runTitle: string;
+  kind: RunKind;
+  phase: ExecPhase;
+  reason?: string;
+  pause?: PauseView;
+  continuation?: ContinuationView;
+  repos: RepoPipeline[];
+  overload?: boolean;
+  usage: UsageView;
+  requested: Authorship;
+  createdAt: string;
+  startedAt: string;
+  updatedAt: string;
+  deliveredCommit?: string;
+}
+
+export interface DeferSuggestion {
+  executionId: string;
+  reason: string;
+  score: number;
+}
+
+export interface QueuedStart {
+  runId: string;
+  title: string;
+  by: Actor;
+  at: string;
+}
+
+export interface SlotOverview {
+  capacity: number;
+  occupied: number;
+  overloadActive: boolean;
+  restartPending: boolean;
+  active: ExecutionView[];
+  deferred: ExecutionView[];
+  queuedStarts: QueuedStart[];
+}
+
+export interface StartOutcome {
+  executionId?: string;
+  started: boolean;
+  queued?: boolean;
+  resumed?: boolean;
+  fresh?: boolean;
+  notStarted?: string;
+  taskStates?: Record<string, TaskState>;
+  suggestion?: DeferSuggestion;
+  restartPending?: boolean;
+}
+
+export interface RestartState {
+  pending: boolean;
+  requestedBy: Actor;
+  requestedAt: string;
+  deadline: string;
+  queuedStarts?: QueuedStart[];
+}
+
+/** The ledger view of one delivery (model.Delivery, REQ-024). */
+export interface Delivery {
+  id: string;
+  repo: string;
+  branch: string;
+  fromCommit: string;
+  toCommit: string;
+  prNumber?: number;
+  prUrl?: string;
+  createdAt: string;
+  mergedAt?: string;
+  reversalOf?: string;
+  stage?: string;
+}
+
+export interface PRRef {
+  number: number;
+  url: string;
+  headBranch: string;
+}
+
+export interface PortAllocation {
+  port: number;
+  service: string;
+  routed: boolean;
+  bound: boolean;
+  conflict: boolean;
+}
+
+/** One persistent hint, coalesced by key (model.Notice, REQ-032.5). */
+export interface ServiceNotice {
+  id: string;
+  kind: string;
+  repo?: string;
+  text: string;
+  nextStep?: string;
+  count: number;
+  firstAt: string;
+  lastAt: string;
+  read: boolean;
+}
+
+/** The service configuration (durations as Go duration strings, e.g. "3h"). */
+export interface ServiceConfig {
+  maxConcurrency: number;
+  defaultTimeBudget: string;
+  automergeWindow: string;
+}
+
+export interface PoolUsage {
+  name: string;
+  bytes: number;
+  files: number;
+}
+
+export interface StorageView {
+  pools: PoolUsage[];
+  totalBytes: number;
+}
+
+export interface LoadView {
+  cpuPercent: number;
+  rssBytes: number;
+  goroutines: number;
+}
+
+export interface AiUsageView {
+  windowHours: number;
+  samples: number;
+  totals: UsageView;
+  bySource: Record<string, UsageView>;
+}
+
+/** The preflight finding (preflight.Finding): state WITH evidence (REQ-031.3). */
+export interface Finding {
+  state: TaskState;
+  evidence: string[];
+  observedAt: string;
+  openPr?: PRRef;
+  err?: string;
+}
+
+// ── Mercury — constitution (ported wire forms) ────────────────────────────────
+
 export interface MercuryNode {
   name: string;
   path: string;
@@ -323,7 +504,6 @@ export interface MercuryNode {
   children?: MercuryNode[];
 }
 
-/** The whole model, grouped by namespace. */
 export interface MercuryTree {
   axiome: MercuryNode[];
   regeln: MercuryNode[];
@@ -331,23 +511,19 @@ export interface MercuryTree {
   meta: MercuryNode[];
 }
 
-/** One unmet meta-axiom: which requirement, and the concrete way the axiom fails it. */
 export interface MetaViolation {
   meta: string;
   issue: string;
 }
 
-/** The verdict of checking an axiom against every meta-axiom (with a corrected proposal when it fails). */
 export interface Conformance {
   conforms: boolean;
   violations: MetaViolation[];
   proposed?: { titel: string; body: string };
   metaCount: number;
-  unavailable?: boolean; // the checker (aigentic) was unreachable — treated as conforming
+  unavailable?: boolean;
 }
 
-/** Who created and last changed an axiom — from DevLab's local authorship pool, never the shared,
- *  instance-neutral axioms repo. Absent fields ⇒ unknown (an axiom predating authorship tracking). */
 export interface AxiomAuthor {
   createdBy?: string;
   createdAt?: string;
@@ -355,41 +531,32 @@ export interface AxiomAuthor {
   updatedAt?: string;
 }
 
-/** A parsed axiom record: front-matter fields + the body markdown. */
 export interface Axiom {
   id: string;
   titel: string;
   quelle?: string;
   body: string;
-  /** Authorship joined from the local pool by the stable id (absent ⇒ unknown). */
   author?: AxiomAuthor;
 }
 
-// ── Mercury — Automatische Läufe (scheduled autonomous run instances) ─────────
+// ── Mercury — tasks & runs (one machinery, two kinds) ─────────────────────────
 
 export type RunScheduleKind = 'daily' | 'weekly';
 
-/** A recurring schedule: a time-of-day, either every day or on selected weekdays (0=Sun..6=Sat). */
+/** A recurring schedule (runs.ScheduleSpec): time-of-day, daily or on weekdays (0=Sun..6=Sat). */
 export interface RunSchedule {
   kind: RunScheduleKind;
-  timeOfDay: string; // "HH:MM", 24h
+  timeOfDay: string;
   weekdays?: number[];
 }
 
-/** The two things that share the run machinery: `auto` = a recurring, axiom-driven run over all
- *  Holistic repos (Automatische Läufe); `todo` = a one-time concrete task against ONE repo
- *  (Konkrete ToDos) — an ad-hoc fix or a newly planned service. */
-export type RunType = 'auto' | 'todo';
-
-/** One destination of a ToDo: an existing Holistic repo (`repo` — its id) or a repo to be created
- *  first (`newRepo` — a newly planned service). Exactly one of the two is set. */
+/** One target of a todo (runs.Target): a repo, with create marking a repo to be created first. */
 export interface RunTarget {
-  repo?: string;
-  newRepo?: string;
+  repo: string;
+  create?: boolean;
 }
 
-/** One medium (image, document) attached to a ToDo. The bytes are served raw at the attachment endpoint;
- *  this is the metadata the list and previews render. The agent takes the media into account at run time. */
+/** One attached medium (runs.AttachmentRef). */
 export interface RunAttachment {
   id: string;
   filename: string;
@@ -400,110 +567,72 @@ export interface RunAttachment {
   uploadedBy?: string;
 }
 
-/** A run (`auto`) or a concrete one-time task (`todo`). An auto run's prompt is composed from its
- *  axioms + all Laufregeln and kept current by every scheme write (so it never drifts); a todo's prompt
- *  is just its task — axioms and rules reach the agent through the repo's CLAUDE.md. */
-export interface Run {
-  id: string;
-  name: string;
-  type?: RunType; // absent = auto (records predating ToDos)
-  enabled: boolean;
-  model?: string; // Claude model id/alias the executor drives; absent = runner default (opus)
-  effort?: string; // low|medium|high|xhigh|max|ultracode; absent = runner default (max)
-  schedule: RunSchedule;
-  axiomIds: string[];
-  // todo only
-  task?: string;
-  targets?: RunTarget[]; // one or more destinations (existing and/or newly-created repos)
-  attachments?: RunAttachment[]; // media (images, documents) the agent takes into account
-  repo?: string; // deprecated single target — read only for records predating `targets`
-  newRepo?: string; // deprecated single new-repo target — read only for legacy records
-  dueAt?: string; // optional one-time due date; absent = run it manually
-  done?: boolean; // set after a successful execution
-  prompt: string;
-  promptAt?: string;
-  promptHash?: string;
-  createdAt: string;
-  updatedAt: string;
-  /** Holistic username of who first created this run/ToDo and who last changed it — kept separate so
-   *  the creator stays visible after someone else edits. Empty on records predating authorship (shown
-   *  as "unknown", never back-filled). */
-  createdBy?: string;
-  updatedBy?: string;
-  nextFireAt?: string;
-  lastFiredAt?: string;
-  lastResult?: RunResultRef;
-
-  stale?: boolean;
-  // The run's still-open pull requests awaiting their merge to main. While non-empty a ToDo is not yet
-  // "erledigt" — it stays in the active list as "wartet auf Merge" until the last PR lands (then Done).
-  pendingPrs?: { repo: string; number: number; url: string }[];
-  // Set when an execution paused on the Claude usage limit and will auto-resume once the window resets.
-  suspended?: { resumeAt: string; resultId: string; attempts: number; reason?: string };
+/** A run's engine choice (runs.Tuning). Empty fields REFER to the service default
+ *  (REQ-010.2); a present timeBudget of "0s" means "no budget". */
+export interface RunTuning {
+  model?: string;
+  modelVersion?: string;
+  effort?: string;
+  timeBudget?: string;
 }
 
-/** The editable fields of a run or todo (create/update payload). */
+/** A run definition (runs.Run) — SLIM (B-20): no state flags; every execution fact is a
+ *  projection over the execution documents and results. */
+export interface Run {
+  id: string;
+  kind: RunKind;
+  title: string;
+  task?: string;
+  axiomIds?: string[];
+  schedule?: RunSchedule;
+  active?: boolean;
+  targets?: RunTarget[];
+  dueAt?: string;
+  tuning: RunTuning;
+  promptSnapshot?: string;
+  promptInputHash?: string;
+  attachments?: RunAttachment[];
+  authorship: Authorship;
+}
+
+/** The create/update payload (runs.RunInput). */
 export interface RunInput {
-  name: string;
-  type?: RunType; // default 'auto'
-  enabled: boolean;
-  model?: string; // Claude model id/alias; '' or absent = runner default (opus)
-  effort?: string; // low|medium|high|xhigh|max|ultracode; '' or absent = runner default (max)
-  schedule?: RunSchedule; // auto only
-  axiomIds?: string[]; // auto only
-  task?: string; // todo only
-  targets?: RunTarget[]; // todo only — one or more destinations (existing and/or new repos)
-  dueAt?: string | null; // todo only — optional one-time due date
+  kind?: RunKind;
+  title: string;
+  task?: string;
+  axiomIds?: string[];
+  schedule?: RunSchedule;
+  active?: boolean;
+  targets?: RunTarget[];
+  dueAt?: string | null;
+  tuning?: RunTuning;
 }
 
 export interface RunList {
   runs: Run[];
-  axioms: Record<string, string>; // axiom id → title, for display
+  axioms: Record<string, string>;
 }
 
-/** One repo the last automatic rollout could not update, with a short reason (not a raw log). */
-export interface RolloutSkip {
-  repo: string;
-  reason: string;
-}
-
-/** The portioned outcome of the last automatic CLAUDE.md rollout: when it ran, which repos received a
- *  new commit, how many were already current, and which were skipped. `error` is a whole-rollout
- *  failure (e.g. no runner token). Absent (`last: null`) until the first rollout since startup. */
-export interface RolloutReport {
-  at: string;
-  repos: number;
-  changed: string[];
-  unchanged: number;
-  skipped?: RolloutSkip[];
-  error?: string;
-}
-
-/** Which axioms are already backed by a run (badges), plus id→path and id→title lookups. */
 export interface RunCoverage {
-  covered: Record<string, string[]>; // axiom id → run ids
-  index: Record<string, string>; // axiom id → scheme path
-  axioms: Record<string, string>; // axiom id → title
-  // An automatic assignment is scheduled or running, so a currently-uncovered axiom is only TEMPORARILY
-  // uncovered. Coverage itself stays honest; this merely lets the UI show the state as transient.
+  covered: Record<string, string[]>;
+  index: Record<string, string>;
+  axioms: Record<string, string>;
   pending?: boolean;
 }
 
-/** One entry in the automatic axiom→run assignment feed: either an assignment happened (`assigned`) or
- *  it could not be carried out (`failed`). Portioned, and free of any raw log. */
+/** One entry in the automatic axiom→run assignment feed. */
 export interface RunNotice {
   id: string;
   at: string;
   kind: 'assigned' | 'failed';
-  runId?: string; // assigned only — the run the axioms landed in (click-through to adjust it)
-  runName?: string; // assigned only
-  newRun?: boolean; // assigned only — a fresh run was created (vs. an existing one extended)
+  runId?: string;
+  runName?: string;
+  newRun?: boolean;
   axiomIds: string[];
-  axioms: string[]; // title snapshot, so the feed reads without a live lookup
-  reason?: string; // failed only — a short human reason
+  axioms: string[];
+  reason?: string;
 }
 
-/** One proposed run from an AI-planning button (reviewable before it is applied). */
 export interface PlannedRun {
   name: string;
   axiomIds: string[];
@@ -517,10 +646,9 @@ export interface RunPlan {
 
 export interface RunProposal {
   proposal: RunPlan;
-  axioms: Record<string, string>; // axiom id → title, so the review can name the axioms
+  axioms: Record<string, string>;
 }
 
-/** One entry in the run-config history (each mutation snapshots the full config). */
 export interface RunSnapshotMeta {
   ts: string;
   action: string;
@@ -528,198 +656,36 @@ export interface RunSnapshotMeta {
   runCount: number;
 }
 
-/** How an execution was set going: autonomous (a scheduled firing) or a named person (a manual
- *  run-now). Both empty ⇒ the origin was not recorded (shown as unknown, never guessed). */
-export interface RunTrigger {
-  auto?: boolean;
-  by?: string;
-}
-
-export interface RunResultRef {
-  resultId: string;
-  at: string;
-  ok: boolean;
-  repoCount: number;
-  inputTokens?: number;
-  outputTokens?: number;
-  costUsd?: number;
-  /** How far delivery got. A finished execution is not "done" — it sits on a rung: implemented →
-   *  dev-deployed → PR offen → gemergt → prod-live. The server attests each rung (the executor the
-   *  first two, the PR maintenance the last two); `runStage` turns them into the label. */
-  deployed?: boolean;
-  prUrl?: string;
-  merged?: boolean;
-  prodDeployed?: boolean;
-  /** How this execution started, and the run's author it acted for. */
-  trigger?: RunTrigger;
-  requestedBy?: string;
-}
-
-/** The delivery ladder, mirroring runs.Stage on the server: the furthest rung actually reached.
- *  Deliberately NOT a green "Erledigt" — a run whose PR is still open has delivered nothing yet. */
-export type RunStage = 'failed' | 'suspended' | 'implemented' | 'dev-deployed' | 'pr-open' | 'merged' | 'prod-deployed';
-
-/** Derives the stage from a result reference (most-advanced rung first). */
-export function runStage(ref: RunResultRef | null | undefined): RunStage | null {
-  if (!ref) return null;
-  if (ref.prodDeployed) return 'prod-deployed';
-  if (ref.merged) return 'merged';
-  if (!ref.ok) return 'failed';
-  if (ref.prUrl) return 'pr-open';
-  if (ref.deployed) return 'dev-deployed';
-  return 'implemented';
-}
-
-/** The German label + tint for each rung, so every surface names a stage identically. */
-export const RUN_STAGE_LABEL: Record<RunStage, { label: string; tint: 'success' | 'accent' | 'warning' | 'danger' }> = {
-  'prod-deployed': { label: 'prod-live', tint: 'success' },
-  merged: { label: 'main-merged', tint: 'success' },
-  'pr-open': { label: 'PR offen', tint: 'accent' },
-  'dev-deployed': { label: 'dev-deployed', tint: 'accent' },
-  implemented: { label: 'implementiert', tint: 'warning' },
-  suspended: { label: 'pausiert', tint: 'warning' },
-  failed: { label: 'fehlgeschlagen', tint: 'danger' },
-};
-
-/** A pipeline step's honest outcome: executed and succeeded (ok), executed and failed, structurally
- *  not-applicable to this repo, or never executed because an earlier step failed. Only `ok` is a success
- *  — a not-applicable step is never rendered green, and a not-executed one marks where the chain stopped. */
-export type RunStepStatus = 'ok' | 'failed' | 'not-applicable' | 'not-executed';
-
-export interface RunStep {
-  name: string; // analyze | implement | dev-deploy | push | pr
-  running?: boolean; // in flight — while true, `log` carries the agent's streaming transcript
-  status: RunStepStatus;
-  /** Legacy pre-status flag; the server now always sends `status`, but a mock/older cache may carry ok. */
-  ok?: boolean;
-  // for analyze/implement `log` is the agent's full report (what was done / blocked); for a
-  // not-applicable or not-executed step it is a short reason in the user's language (what was not done, why)
-  log?: string;
-  at: string;
-}
-
-export interface RepoResult {
-  repo: string;
-  running?: boolean; // the repo currently being worked (only ever set on RunResult.live)
-  ok: boolean;
-  deployed: boolean;
-  prUrl?: string;
-  /** The delivered dev state: the persistent integration branch this run grew (mercury-dev) and the
-   *  exact commit dev serves. Always set once a run reaches the dev branch — even when it added nothing. */
-  devBranch?: string;
-  devCommit?: string;
-  /** This delivery's stacked-PR base: the previous still-open delivery's branch, else the default branch. */
-  prBase?: string;
-  /** The recorded delivery id (rollback target), when this run produced a delivery for the repo. */
-  deliveryId?: string;
-  steps: RunStep[] | null; // null when the repo failed before any step ran (Go marshals the empty slice as null)
-  error?: string;
-  inputTokens?: number;
-  outputTokens?: number;
-  costUsd?: number;
-  numTurns?: number;
-}
-
-/** One recorded delivery — a run's addressable unit of work at a repo (commit range + stacked PR). */
-export interface Delivery {
+/** One execution result document (runs.Result) — carries THE server stage array. */
+export interface RunResult {
   id: string;
   runId: string;
-  resultId: string;
-  runName?: string;
-  repo: string;
-  branch: string;
-  devBranch: string;
-  baseBranch: string;
-  fromCommit: string;
-  toCommit: string;
-  prNumber?: number;
-  prUrl?: string;
-  createdAt: string;
-  status: 'open' | 'merged' | 'closed' | 'reverted';
-  revertedAt?: string;
-  revertedBy?: string;
-  revertOf?: string;
-}
-
-export interface RunResult {
-  runId: string;
-  resultId: string;
-  runName?: string;
-  startedAt: string;
-  finishedAt?: string;
-  promptHash?: string;
-  /** The run's Promptstellung for THIS execution — the exact prompt the agent was driven by,
-   *  snapshotted at run time. Absent on executions recorded before it was captured. */
-  prompt?: string;
-  /** Which Claude engine drove THIS execution: the resolved model, and the selected effort tier
-   *  (absent = the runner default max, 'ultracode' = the maximal tier). Absent on older executions. */
+  runTitle?: string;
+  kind: RunKind;
   model?: string;
-  effort?: string;
-  ok: boolean;
-  repos: RepoResult[] | null; // null when the execution failed before any repo completed (Go marshals the empty slice as null) — every reader must guard
-  // The repo in flight while the run executes — kept apart from `repos` (which holds only completed
-  // repos) so the live view can show it with its running steps and the agent's streaming output.
-  live?: RepoResult;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  numTurns: number;
-  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
-  trigger?: RunTrigger;
-  requestedBy?: string;
-}
-
-/** One run executing right now, as the server sees it: its id, name, the live result id, and when it
- *  started. The server reports EVERY active run (they run concurrently); read on mount so running runs
- *  survive a page reload, and polled to follow them live. Reflects actually-running processes, so the
- *  list is empty again after a server restart. */
-export interface RunActive {
-  runId: string;
-  runName?: string;
-  resultId: string;
   startedAt: string;
+  endedAt?: string;
+  mergedAt?: string;
+  repos: RepoPipeline[];
+  report?: string;
+  usage: UsageView;
+  prompt?: string;
+  requested: Authorship;
+  synthetic?: boolean;
+  legacy?: boolean;
 }
 
-/** One run the system is currently working, for the transparent "Aktive Läufe" overview: either
- *  EXECUTING right now or SUSPENDED on the usage limit mid-execution (paused, waiting to resume). Enough
- *  to render a list row — which run, on which repo/step, how far, how much spent — without a per-run
- *  fetch. Server-assembled from the live Activity + the run's result document; purely observational. */
-export interface RunInFlight {
-  runId: string;
-  runName: string;
-  type: RunType; // auto | todo
-  state: 'executing' | 'suspended';
-  resultId?: string;
-  startedAt?: string; // execution start (executing)
-  resumeAt?: string; // when a suspended run resumes
-  attempts?: number; // suspended: resume attempts so far
-  currentRepo?: string; // the repo in flight (executing)
-  currentStep?: string; // the step running right now (executing)
-  reposDone: number; // repos already completed this execution
-  reposTotal?: number; // known only for ToDos (exact target count); omitted for automatic runs
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  numTurns: number;
-}
-
-/** One entry in the calendar — the union of past and upcoming runs. `type` separates automatic runs
- *  from ToDos (colour). A FUTURE firing carries its `schedule`; a completed (PAST) execution carries
- *  `resultId` and status (`ok`/`suspended`) instead. The presence of `resultId` marks an occurrence as
- *  past — the calendar shows its outcome and opens the full report on click. */
+/** One calendar entry (model.RunOccurrence): future firing (schedule) or past execution
+ *  (resultId) — the calendar opens the same detail as the history (REQ-012). */
 export interface RunOccurrence {
   runId: string;
-  runName: string;
-  type: RunType;
+  runTitle: string;
+  kind: RunKind;
   at: string;
-  /** Future firing: how the run recurs. Absent on a past execution. */
   schedule?: string;
-  /** Past execution: its result id — opens the full status/report via mercuryRunResult. */
   resultId?: string;
-  /** Past execution: pass/fail outcome. */
-  ok?: boolean;
-  /** Past execution: paused on the Claude usage limit. */
-  suspended?: boolean;
+  succeeded?: boolean;
+  paused?: boolean;
 }
 
 export interface RunCalendar {
@@ -728,31 +694,9 @@ export interface RunCalendar {
   occurrences: RunOccurrence[];
 }
 
-/** One completed execution in the execution history (with token/cost; survives run deletion). */
-export interface RunExecution {
-  runId: string;
-  runName: string;
-  type?: RunType; // auto|todo — the run's kind, so each surface shows only its own executions
-  resultId: string;
-  at: string;
-  finishedAt?: string;
-  ok: boolean;
-  repoCount: number;
-  inputTokens: number;
-  outputTokens: number;
-  costUsd: number;
-  numTurns: number;
-  /** How this execution started (autonomous vs a named person) and the run's author it acted for. */
-  trigger?: RunTrigger;
-  requestedBy?: string;
-}
-
-/** Delivery record of one day's run-report email to the owner. `status` is 'sent' once the mail
- *  service accepted it, or 'failed' while a send has errored — surfaced so a failed send is visible,
- *  not silent, and understood to be retried automatically. */
 export interface ReportDelivery {
   recipient: string;
-  day: string; // YYYY-MM-DD
+  day: string;
   status: 'sent' | 'failed';
   executions: number;
   attempts: number;
@@ -761,21 +705,18 @@ export interface ReportDelivery {
   lastError?: string;
 }
 
-/** One turn of the free-form run-planning chat. */
+// ── Mercury chat (reviewable single-action proposals) ─────────────────────────
+
 export interface RunChatMessage {
   role: 'user' | 'assistant';
   content: string;
 }
 
-/** One destination of a proposed ToDo action: exactly an existing repo id OR a new repo name. */
 export interface ActionTarget {
   repo?: string;
   newRepo?: string;
 }
 
-/** A single mutating operation the Mercury-wide assistant proposes for the user to review and apply.
- *  Each kind mirrors one operation of the Mercury UI and is applied through the SAME data-source method
- *  the UI uses — the chat opens no parallel path. Discriminated on `kind`. */
 export type MercuryAction =
   | { kind: 'create_todo'; name: string; task: string; targets: ActionTarget[]; dueAt?: string }
   | { kind: 'create_run'; name: string; axiomIds: string[]; schedule: RunSchedule }
@@ -786,28 +727,23 @@ export type MercuryAction =
   | { kind: 'run_now'; runId: string }
   | { kind: 'plan_runs'; mode: 'fill' | 'replace'; runs: PlannedRun[] };
 
-/** A chat reply, optionally carrying ONE reviewable action the model proposed. */
 export interface RunChatReply {
   reply: string;
+  model?: string;
   action?: MercuryAction;
 }
 
-// ── Atlas — the deployed Holistic landscape ──────────────────────────────────
+// ── Atlas ─────────────────────────────────────────────────────────────────────
 
-/** A deployed Holistic service, derived from its rights manifest and its Caddy route. */
 export interface AtlasNode {
   id: string;
-  /** The port it answers on; 0 when it has no route. */
   port: number;
-  /** The hp_* groups it declares. */
   rights: string[];
   hasManifest: boolean;
   hasRoute: boolean;
-  /** The repo it is built from, when the viewer can see one — '' otherwise. */
   repo: string;
 }
 
-/** An inconsistency between what is deployed and what is declared. */
 export interface AtlasFinding {
   severity: 'warn' | 'error';
   message: string;
@@ -820,9 +756,15 @@ export interface AtlasGraph {
   scannedAt: string;
 }
 
-/** A section of the repo "skeleton" overview rendered by StructureView. */
-export interface StructureSection {
-  title: string;
-  hint: string;
-  entries: { name: string; kind: 'dir' | 'file'; note: string }[];
-}
+// ── Live updates (S12) ────────────────────────────────────────────────────────
+
+/** The EXACTLY EIGHT topics of the one SSE stream. */
+export type LiveTopic =
+  | 'axioms'
+  | 'runs'
+  | 'active'
+  | 'progress'
+  | 'deliveries'
+  | 'notices'
+  | 'slots'
+  | 'restart';

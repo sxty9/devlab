@@ -1,11 +1,9 @@
-// Package runs is the model for Mercury's "Automatische Läufe" — scheduled autonomous runs. A run is
-// a named, recurring job whose Claude prompt is composed from its Axioms + all global Laufregeln and
-// which (in the execution phase) runs across every Holistic repo. The composed prompt is stored as a
-// SNAPSHOT because composition needs the scheme store, reachable only in a cookie-bearing request —
-// so the background scheduler can fire with no live session.
+// Package runs holds the passive pools of the run domain: run DEFINITIONS (this file),
+// execution results, deliveries, PRs, notices, attachments, history and axiom checks. A run is a
+// definition only — execution state lives exclusively in the per-execution state document
+// (package execstate); the definition carries no state flags (B-20).
 //
-// This package owns persistence and scheduling; it never imports the api layer. Execution is injected
-// as an Executor interface, so there is no import cycle.
+// This package never imports the api layer and never schedules anything itself.
 package runs
 
 import (
@@ -14,151 +12,83 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
+	"devlab/backend/internal/statepath"
 )
 
-// ErrNotFound is returned by a Mutate closure that matched no run, so Mutate aborts before writing —
-// an unknown-id update/recompose/delete must not rewrite the file or append a spurious history snapshot.
+// ErrNotFound is returned when an operation names a run id that does not exist, so an unknown-id
+// update/delete never rewrites the pool or appends a spurious history snapshot.
 var ErrNotFound = errors.New("run not found")
 
-// Type discriminates the two things that share this machinery (store, scheduler, executor, results,
-// history) rather than duplicating it:
-//
-//	auto — a recurring, axiom-driven run over ALL Holistic repos (Automatische Läufe)
-//	todo — a ONE-TIME, manually planned concrete task against ONE repo (Konkrete ToDos): an ad-hoc fix
-//	       or a newly planned service. Its prompt is the free-text task; no axioms or Laufregeln are
-//	       folded in, because the constitution already reaches the agent via the repo's CLAUDE.md.
-type Type string
-
-const (
-	TypeAuto Type = "auto"
-	TypeTodo Type = "todo"
-)
-
-// NormalizeType folds the zero value (records predating ToDos) to auto, so a run's kind is always
-// exactly TypeAuto or TypeTodo. It is the single rule behind the "" == auto convention the Run model
-// documents, reused wherever a stored kind must be resolved (execution history, calendars).
-func NormalizeType(t Type) Type {
-	if t == TypeTodo {
-		return TypeTodo
-	}
-	return TypeAuto
-}
-
-// Run is one scheduled autonomous run (Type auto) or one concrete one-time task (Type todo).
-type Run struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Type    Type   `json:"type"` // "" is read as auto (records predating ToDos)
-	Enabled bool   `json:"enabled"`
-
-	// Model + Effort tune the Claude engine the executor drives for THIS run/todo. Both are shared by
-	// auto and todo. Empty selects the runner default (opus / max), so records predating this field keep
-	// behaving exactly as before. Model is a CLI model id or alias (e.g. "opus", "claude-opus-4-8"); Effort
-	// is one of low|medium|high|xhigh|max|ultracode — "ultracode" being the maximal tier the executor maps
-	// to max reasoning plus multi-agent orchestration.
-	Model  string `json:"model,omitempty"`
-	Effort string `json:"effort,omitempty"`
-
-	// auto only
-	Schedule Schedule `json:"schedule"`
-	AxiomIDs []string `json:"axiomIds"`
-
-	// todo only
-	Task        string       `json:"task,omitempty"`        // the concrete task; the prompt is built from it
-	Targets     []Target     `json:"targets,omitempty"`     // one or more destinations (existing and/or newly-created repos)
-	Attachments []Attachment `json:"attachments,omitempty"` // media (images, documents) the agent must take into account
-	DueAt       *time.Time   `json:"dueAt,omitempty"`       // optional one-time due date; nil = run it manually
-	Done        bool         `json:"done,omitempty"`        // set after a successful execution — a ToDo fires once
-
-	// BranchDesc is an optional, AI-optimized description for this run's git branch (both run types push
-	// branches). It is set at create/update time ONLY when Name does not slugify into something usable on
-	// its own (see BranchDescGoodEnough); the executor prefers it over Name when naming the run branch, and
-	// empty means "the name was good enough, slug that". Display metadata, never a path segment as stored —
-	// the executor slugifies it.
-	BranchDesc string `json:"branchDesc,omitempty"`
-
-	// Deprecated: the single-target fields. Retained ONLY to read ToDo records written before a ToDo
-	// could reach several repos; new writes populate Targets instead, and TodoTargets() bridges the two.
-	Repo       string    `json:"repo,omitempty"`
-	NewRepo    string    `json:"newRepo,omitempty"`
-	Prompt     string    `json:"prompt"`               // composed snapshot (Axiom bodies + all Laufregeln + preamble)
-	PromptAt   time.Time `json:"promptAt,omitempty"`   // when the snapshot was composed
-	PromptHash string    `json:"promptHash,omitempty"` // fingerprint of the scheme inputs → staleness detection
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
-	// CreatedBy and UpdatedBy are the Holistic usernames of who first created this run/ToDo and who last
-	// changed it — kept SEPARATE so the creator stays visible even after someone else edits it. They are
-	// stamped from the same actor already flowing into Store.Mutate, so no second author signal is
-	// introduced. Empty on records written before authorship was tracked: surfaced as "unknown", never
-	// back-filled to a person (no invented history).
-	CreatedBy   string     `json:"createdBy,omitempty"`
-	UpdatedBy   string     `json:"updatedBy,omitempty"`
-	NextFireAt  *time.Time `json:"nextFireAt,omitempty"`  // nil = not scheduled (disabled); persisted → survives a restart
-	LastFiredAt *time.Time `json:"lastFiredAt,omitempty"` // nil = never fired
-	LastResult  *ResultRef `json:"lastResult,omitempty"`
-
-	// Suspended is set when an execution stopped on the Claude usage limit and is waiting to resume.
-	// While set it OVERRIDES the schedule (the run does not fire on NextFireAt), and the scheduler
-	// resumes the SAME execution — only the not-yet-done repos — once ResumeAt passes.
-	Suspended *Suspension `json:"suspended,omitempty"`
-
-	// StartPending is a persisted "start this as soon as possible" flag that overrides the schedule
-	// (isDue returns true while it is set). It is the queue that survives a restart, set in two cases:
-	//   1. a manual "Jetzt ausführen" that arrived while a restart was draining — it is not started now
-	//      (no run may begin once a restart is imminent) but recorded so it starts by itself afterwards;
-	//   2. startup self-heal — a run whose execution was interrupted by a restart/crash is re-queued so
-	//      it resumes promptly, including a ToDo whose DueAt was already consumed at its first fire.
-	// The scheduler clears it the moment the run actually starts, so it fires exactly once per request.
-	StartPending bool `json:"startPending,omitempty"`
-}
-
-// Suspension records that a run hit the usage limit and should resume automatically. It points at the
-// open execution (ResultID) so resume continues it instead of starting fresh, and counts attempts so a
-// pathological loop (limit hit every resume) eventually gives up rather than spinning forever.
-type Suspension struct {
-	ResumeAt time.Time `json:"resumeAt"`
-	ResultID string    `json:"resultId"`
-	Attempts int       `json:"attempts"`
-	Reason   string    `json:"reason,omitempty"` // e.g. "usage-limit"
-}
-
-// IsTodo reports whether this is a one-time concrete task rather than a recurring axiom run.
-func (r Run) IsTodo() bool { return r.Type == TypeTodo }
-
-// Target is one destination of a ToDo: an existing Holistic repo (Repo — its id or name) or a repo to
-// be created first (NewRepo — a newly planned service). Exactly one of the two is set. A ToDo carries a
-// list of these, so one task can reach several repos in a single sweep.
+// Target is one destination of a task: an existing repo, or — with Create — a repo to be created
+// first (REQ-006.2). The chain creates the repo and sets branch protection in the same pass.
 type Target struct {
-	Repo    string `json:"repo,omitempty"`
-	NewRepo string `json:"newRepo,omitempty"`
+	Repo   string `json:"repo"`
+	Create bool   `json:"create,omitempty"`
 }
 
-// TodoTargets is the single source of truth for a ToDo's destinations: the Targets list as stored, or —
-// for a record written before multi-target support — the legacy single Repo/NewRepo folded into one
-// target. Every reader (validation, execution, display) goes through this so the two shapes never
-// diverge.
-func (r Run) TodoTargets() []Target {
-	if len(r.Targets) > 0 {
-		return r.Targets
-	}
-	if r.Repo != "" || r.NewRepo != "" {
-		return []Target{{Repo: r.Repo, NewRepo: r.NewRepo}}
-	}
-	return nil
+// Tuning is a run's engine choice. Empty strings and a nil TimeBudget REFER to the service
+// defaults (REQ-010.2) — resolution happens in exactly one place, EffectiveTuning. A present
+// TimeBudget of 0 means "no budget" (explicitly unlimited).
+type Tuning struct {
+	Model        string          `json:"model,omitempty"`
+	ModelVersion string          `json:"modelVersion,omitempty"`
+	Effort       string          `json:"effort,omitempty"`
+	TimeBudget   *model.Duration `json:"timeBudget,omitempty"`
 }
 
-// Attachment is metadata for one media file attached to a ToDo (an image, a document, …). The bytes
-// live in the passive attachment pool (see AttachmentStore), keyed by (run id, attachment id); this
-// record — stored inline on the Run — is the single source of truth for WHICH attachments exist. A
-// ToDo carries media so the agent can take it into account while implementing the task; the executor
-// materializes the pool into the agent's workspace at run time.
-type Attachment struct {
+// Run is one run definition — recurring and axiom-driven (kind "auto") or a concrete one-time
+// task (kind "todo"). SLIMMED (B-20): no StartPending, no Suspended, no Done, no LastResult —
+// every execution fact is a projection over the execution documents and results.
+type Run struct {
+	ID    string        `json:"id"`
+	Kind  model.RunKind `json:"kind"`
+	Title string        `json:"title"`
+	Task  string        `json:"task,omitempty"`
+
+	// kind=auto
+	AxiomIDs []string      `json:"axiomIds,omitempty"`
+	Schedule *ScheduleSpec `json:"schedule,omitempty"`
+	Active   bool          `json:"active,omitempty"`
+
+	// kind=todo
+	Targets []Target   `json:"targets,omitempty"`
+	DueAt   *time.Time `json:"dueAt,omitempty"`
+
+	Tuning Tuning `json:"tuning"`
+
+	// PromptSnapshot is the ONE composed prompt (constitution included); PromptInputHash
+	// fingerprints the composition inputs INCLUDING the title (REQ-003).
+	PromptSnapshot  string `json:"promptSnapshot,omitempty"`
+	PromptInputHash string `json:"promptInputHash,omitempty"`
+
+	Attachments []AttachmentRef  `json:"attachments,omitempty"`
+	Authorship  model.Authorship `json:"authorship"`
+}
+
+// RunInput is the create/update request shape (the ONE parse target of the runs handler and the
+// run MCP tools).
+type RunInput struct {
+	Kind     model.RunKind `json:"kind,omitempty"`
+	Title    string        `json:"title"`
+	Task     string        `json:"task,omitempty"`
+	AxiomIDs []string      `json:"axiomIds,omitempty"`
+	Schedule *ScheduleSpec `json:"schedule,omitempty"`
+	Active   *bool         `json:"active,omitempty"`
+	Targets  []Target      `json:"targets,omitempty"`
+	DueAt    *time.Time    `json:"dueAt,omitempty"`
+	Tuning   *Tuning       `json:"tuning,omitempty"`
+}
+
+// AttachmentRef is metadata for one media file attached to a run. The bytes live in the passive
+// attachment pool (AttachmentStore), keyed by (run id, attachment id); this record is the single
+// source of truth for WHICH attachments exist.
+type AttachmentRef struct {
 	ID         string    `json:"id"`
 	Filename   string    `json:"filename"`
 	MIME       string    `json:"mime,omitempty"`
@@ -168,100 +98,33 @@ type Attachment struct {
 	UploadedBy string    `json:"uploadedBy,omitempty"`
 }
 
-// ResultRef is a lightweight pointer to a stored execution result (with its token/cost totals so the
-// history list can show consumption without loading the full result).
-//
-// It also carries HOW FAR the work got — implemented, dev-deployed, PR open, merged, prod-live. A run
-// that merely produced an unmerged PR is not "done" in any sense the owner cares about, so the surface
-// shows the furthest stage actually reached instead of a single green tick. Delivery is a ladder, and
-// these are the rungs the system can attest to: the executor fills Deployed/PRUrl, Maintain fills
-// Merged/ProdDeployed when it observes the merge and ships prod.
-type ResultRef struct {
-	ResultID     string     `json:"resultId"`
-	At           time.Time  `json:"at"`
-	OK           bool       `json:"ok"`
-	RepoCount    int        `json:"repoCount"`
-	InputTokens  int        `json:"inputTokens,omitempty"`
-	OutputTokens int        `json:"outputTokens,omitempty"`
-	CostUSD      float64    `json:"costUsd,omitempty"`
-	Suspended    bool       `json:"suspended,omitempty"` // execution paused on the usage limit
-	ResumeAt     *time.Time `json:"resumeAt,omitempty"`  // when the paused execution will resume
-
-	Deployed     bool   `json:"deployed,omitempty"`     // at least one repo went live on dev
-	PRUrl        string `json:"prUrl,omitempty"`        // the PR this execution opened (first, if several)
-	Merged       bool   `json:"merged,omitempty"`       // that PR reached the default branch
-	ProdDeployed bool   `json:"prodDeployed,omitempty"` // and prod was shipped from the merge
-
-	// Who this execution acted for: autonomous, or the person who asked for it.
-	Trigger     Trigger `json:"trigger,omitempty"`
-	RequestedBy string  `json:"requestedBy,omitempty"`
-
-	// PRsOpen marks a FINISHED execution that opened one or more pull requests still awaiting their merge
-	// to main. It gates a ToDo's completion: a ToDo is not "erledigt" the instant its PR is opened — it
-	// stays in the active list until the main-merge is through, at which point Maintain flips Done. It is
-	// meaningless on a suspended/carried-over ref (those are not finished) and false for a report-mode or
-	// no-change execution (nothing to merge → done at once).
-	PRsOpen bool `json:"prsOpen,omitempty"`
-}
-
-// Stage is the furthest rung of the delivery ladder an execution reached. It is derived, never stored:
-// one definition, used by the API and mirrored by the UI label.
-type Stage string
-
-const (
-	StageFailed    Stage = "failed"        // the execution did not succeed
-	StageSuspended Stage = "suspended"     // paused on the usage limit, waiting to resume
-	StageImplement Stage = "implemented"   // work done, nothing shipped or pushed (yet)
-	StageDevLive   Stage = "dev-deployed"  // live on the dev box
-	StagePROpen    Stage = "pr-open"       // pushed and a PR is waiting for its merge
-	StageMerged    Stage = "merged"        // merged into the default branch
-	StageProdLive  Stage = "prod-deployed" // shipped to prod
-)
-
-// Stage reports the furthest stage this reference attests to, most-advanced first.
-func (r ResultRef) Stage() Stage {
-	switch {
-	case r.Suspended:
-		return StageSuspended
-	case r.ProdDeployed:
-		return StageProdLive
-	case r.Merged:
-		return StageMerged
-	case !r.OK:
-		return StageFailed
-	case r.PRUrl != "":
-		return StagePROpen
-	case r.Deployed:
-		return StageDevLive
-	default:
-		return StageImplement
-	}
-}
-
-type file struct {
+type runFile struct {
 	Runs []Run `json:"runs"`
 }
 
-// Store is the single source of truth for run instances: a JSON file, mutated under a mutex, each
-// mutation snapshotting the full resulting config into the history so any past constellation can be
-// restored. Storage mirrors mercury/order.go (atomic tmp+rename, 0600, missing → empty).
+// Store is the passive pool of run definitions: one JSON file, mutated under a mutex, each
+// user-meaningful mutation snapshotting the full config into the history so any past
+// constellation can be restored.
 type Store struct {
 	path string
 	hist *History
 	mu   sync.Mutex
 }
 
-// NewStore builds the store (and its history) from the environment. It never errors — a missing file
-// is an empty store, matching the order/comments stores.
-func NewStore() *Store {
-	return &Store{path: runsPath(), hist: NewHistory()}
+// NewStore builds the store (and its history) below the given state root. The historical
+// per-store env override (DEVLAB_MERCURY_RUNS) is honored first — a ported test seam.
+func NewStore(p *statepath.Paths) *Store {
+	return &Store{path: runsPath(p), hist: NewHistory(p)}
 }
 
-func runsPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS"); p != "" {
-		return p
+func runsPath(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_RUNS"); v != "" {
+		return v
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs.json")
+	if p != nil {
+		return p.Runs()
+	}
+	return ""
 }
 
 // NewID mints a stable, unguessable run id (front-matter of the runs file, never a path segment).
@@ -271,8 +134,8 @@ func NewID() string {
 	return "run_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
 }
 
-// NewAttachmentID mints an unguessable attachment id. It is used as a path segment in the attachment
-// pool, so it is bounded to the same [a-z0-9] shape the pool's guard enforces.
+// NewAttachmentID mints an unguessable attachment id. It is used as a path segment in the
+// attachment pool, so it is bounded to the same [a-z0-9] shape the pool's guard enforces.
 func NewAttachmentID() string {
 	var b [10]byte
 	_, _ = rand.Read(b[:])
@@ -287,7 +150,7 @@ func (s *Store) load() ([]Run, error) {
 		}
 		return nil, err
 	}
-	var f file
+	var f runFile
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, err
 	}
@@ -315,29 +178,80 @@ func (s *Store) Get(id string) (Run, bool, error) {
 	return Run{}, false, nil
 }
 
-// Mutate is the write path for user-meaningful config edits: load → fn → atomic save → history
-// snapshot, all under the mutex. action/actor are recorded in the snapshot. fn returns the new list.
-func (s *Store) Mutate(action, actor string, fn func([]Run) ([]Run, error)) ([]Run, error) {
+// Put inserts or replaces one run (matched by ID) and snapshots the resulting config into the
+// history. The actor recorded is the run's Authorship.Updated.
+func (s *Store) Put(r Run) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next, err := s.apply(fn)
+	cur, err := s.load()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	s.hist.snapshot(action, actor, next) // best-effort: a history write must never lose the mutation
-	return next, nil
+	replaced := false
+	for i := range cur {
+		if cur[i].ID == r.ID {
+			cur[i] = r
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		cur = append(cur, r)
+	}
+	if err := s.save(cur); err != nil {
+		return err
+	}
+	s.hist.snapshot(actionFor(replaced), actorName(r.Authorship.Updated), cur) // best-effort
+	return nil
 }
 
-// Patch is Mutate WITHOUT a history snapshot — for runtime-state changes (advancing NextFireAt,
-// attaching a result) that are not user config edits, so the restore history stays meaningful.
+func actionFor(replaced bool) string {
+	if replaced {
+		return "update"
+	}
+	return "create"
+}
+
+func actorName(a model.Actor) string {
+	if a.Autonomous {
+		return "autonomous"
+	}
+	return a.User
+}
+
+// Delete removes one run by id (ErrNotFound if absent) and snapshots the history.
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return err
+	}
+	next := cur[:0:0]
+	found := false
+	for _, r := range cur {
+		if r.ID == id {
+			found = true
+			continue
+		}
+		next = append(next, r)
+	}
+	if !found {
+		return ErrNotFound
+	}
+	if err := s.save(next); err != nil {
+		return err
+	}
+	s.hist.snapshot("delete", "", next)
+	return nil
+}
+
+// Patch applies a runtime-state mutation WITHOUT a history snapshot (e.g. snapshot
+// recomposition after an axiom write) so the restore history stays a history of
+// user-meaningful config edits.
 func (s *Store) Patch(fn func([]Run) ([]Run, error)) ([]Run, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.apply(fn)
-}
-
-// apply loads, applies fn, and atomically saves. The caller holds s.mu.
-func (s *Store) apply(fn func([]Run) ([]Run, error)) ([]Run, error) {
 	cur, err := s.load()
 	if err != nil {
 		return nil, err
@@ -352,9 +266,20 @@ func (s *Store) apply(fn func([]Run) ([]Run, error)) ([]Run, error) {
 	return next, nil
 }
 
+// ReplaceAll replaces the whole set (history restore / reviewed AI proposals) and snapshots it.
+func (s *Store) ReplaceAll(runs []Run, action string, by model.Actor) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.save(runs); err != nil {
+		return err
+	}
+	s.hist.snapshot(action, actorName(by), runs)
+	return nil
+}
+
 // History exposes the config-snapshot history for listing and restore.
 func (s *Store) History() *History { return s.hist }
 
 func (s *Store) save(runs []Run) error {
-	return fsatomic.WriteJSON(s.path, file{Runs: runs})
+	return fsatomic.WriteJSON(s.path, runFile{Runs: runs})
 }

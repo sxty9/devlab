@@ -1,9 +1,6 @@
 import { useWorkspace } from '@/state/workspace';
-import { useToast } from '@/ui/Toast';
-import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
-import { Button } from '@/ui/Button';
+import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon } from '@/ui/icons';
 import { tintSoftBg, tintText } from '@/ui/tint';
-import { PREVIEW_URL, previewHost } from '@/lib/constants';
 import { basename, guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { StructureSection } from '@/types';
@@ -13,7 +10,6 @@ const QUICK_LINKS = ['README.md', 'package.json'];
 /** The repo "skeleton" overview — a navigable landing surface for structure & delivery. */
 export function StructureView() {
   const { data, activeRepo, activeBranch, openFile, setPanel } = useWorkspace();
-  const { toast } = useToast();
 
   const openPath = (path: string) => openFile({ id: path, name: basename(path), lang: guessLang(path) });
 
@@ -21,14 +17,6 @@ export function StructureView() {
     const looksLikePath = !/[ ()]/.test(e.name);
     if (e.kind === 'file' && looksLikePath) openPath(e.name);
     else setPanel('project');
-  };
-
-  const deploy = () => {
-    toast({ title: 'Building preview…', description: `${activeRepo.name} · sxgate · MODE=static` });
-    window.setTimeout(
-      () => toast({ title: 'Preview is live', description: previewHost(activeRepo.name), variant: 'success' }),
-      1500,
-    );
   };
 
   return (
@@ -55,15 +43,6 @@ export function StructureView() {
                 {activeBranch.name}
               </span>
             </div>
-          </div>
-          <div className="ml-auto mt-1 flex shrink-0 items-center gap-1.5">
-            <Button variant="primary" size="sm" onClick={deploy} title="Simulate a sxgate preview deploy">
-              <RocketIcon className="h-3.5 w-3.5" />
-              Deploy preview
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')} title="Open the live preview">
-              Open ↗
-            </Button>
           </div>
         </div>
 

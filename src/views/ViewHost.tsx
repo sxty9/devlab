@@ -1,7 +1,7 @@
 import { useSession } from '@/state/session';
 import { IdeShell } from '@/shell/IdeShell';
 import { Dashboard } from '@/views/Dashboard';
-import { MercuryView } from '@/views/MercuryView';
+import { MercuryView } from '@/views/mercury/MercuryView';
 import { AtlasView } from '@/views/AtlasView';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
 

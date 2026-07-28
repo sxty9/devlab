@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+
+	"devlab/backend/internal/statepath"
 )
 
 var (
@@ -29,11 +31,11 @@ type Manager struct {
 	locks map[string]*sync.Mutex
 }
 
-// NewManager builds the manager from DEVLAB_WORKSPACES (default /var/lib/devlab/workspaces).
-func NewManager() *Manager {
+// NewManager builds the manager below the state root (DEVLAB_WORKSPACES overrides).
+func NewManager(p *statepath.Paths) *Manager {
 	base := os.Getenv("DEVLAB_WORKSPACES")
-	if base == "" {
-		base = "/var/lib/devlab/workspaces"
+	if base == "" && p != nil {
+		base = p.Workspaces()
 	}
 	return &Manager{base: base, locks: map[string]*sync.Mutex{}}
 }

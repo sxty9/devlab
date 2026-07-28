@@ -1,0 +1,8 @@
+{
+  "username": "alice",
+  "displayName": "Alice",
+  "isAdmin": false,
+  "canUseDevlab": true,
+  "githubLinked": true,
+  "githubLogin": "alice-gh"
+}

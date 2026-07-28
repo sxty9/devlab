@@ -1,7 +1,16 @@
+// Execution results — ONE document per execution (Welle-0 contract, A1-7).
+//
+// New format: executions/<id>/result.json carries the per-repo server stage array
+// ([]model.RepoPipeline); the live transcript is an append journal executions/<id>/transcript.jsonl.
+// Legacy format: runs-results/<runId>/<resultId>.json (the pre-rebuild shape) is read TOLERANTLY
+// and mapped onto the new shape so old executions stay viewable (REQ-027.3). Legacy states are
+// display-only: they are never written again.
 package runs
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -9,471 +18,351 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
+	"devlab/backend/internal/statepath"
 )
 
-// Trigger records how an execution was set going. A scheduled (autonomous) firing sets Auto and
-// leaves By empty — an autonomous run is NEVER attributed to a person. A manual "run now" sets By to
-// the initiating username. It is snapshotted onto the Result at start so the execution history shows
-// its origin honestly even after the run is deleted. An all-zero Trigger (Auto false, By empty) means
-// the origin was not recorded (a result predating this) — surfaced as unknown, never guessed.
-type Trigger struct {
-	Auto bool   `json:"auto,omitempty"`
-	By   string `json:"by,omitempty"`
-}
-
-// Result is one execution of a run: the per-repo pipeline outcomes. Stored under the run id and kept
-// even after the run is deleted — logs are historized and persistent, viewable via the orphan-logs
-// listing. The scheduler/executor (Phase 2) writes these; the management layer only reads them.
+// Result is one execution of a run — the ONE result document (new stage-array format).
 type Result struct {
-	RunID    string `json:"runId"`
-	ResultID string `json:"resultId"`
-	RunName  string `json:"runName,omitempty"` // snapshot of the run's name (survives run deletion)
-	// Type snapshots the run's kind (auto|todo) at execution time, like RunName — so the Lauf- and
-	// ToDo-History can each show ONLY their own executions even after the run is deleted. "" (results
-	// written before this field) reads as auto, and the reader falls back to the live run's kind.
-	Type      Type      `json:"type,omitempty"`
-	StartedAt time.Time `json:"startedAt"`
-	// UpdatedAt is refreshed on every Save (i.e. after every repo and every carry-over), so it tracks
-	// when the execution was last worked — not just when it began. FindStranded bounds resume by this,
-	// so a multi-night carry-over that is touched each night never ages out, while a genuinely abandoned
-	// husk does. Zero on results written before this field existed (FindStranded falls back to StartedAt).
-	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
-	FinishedAt time.Time `json:"finishedAt,omitempty"`
-	PromptHash string    `json:"promptHash,omitempty"`
-	// Prompt is the run's Promptstellung snapshotted at execution start — the exact prompt the agent was
-	// driven by (auto: axioms + Laufregeln; todo: the task). Snapshotted like RunName/Type/PromptHash so
-	// the History shows THIS execution's prompt even after the run — or its axioms — later change, or the
-	// run is deleted. Empty on results written before this field existed.
-	Prompt string `json:"prompt,omitempty"`
-	// Mode is the safety-ladder mode (report | pr | full) this execution was started under. A resume
-	// must not continue a husk from a DIFFERENT mode: a report husk marks repos "done" after mere
-	// analysis, so resuming it in pr mode would skip implementing them. resumeOrNew reaps a
-	// mode-mismatched husk instead of continuing it. Empty on results predating this field.
-	Mode string `json:"mode,omitempty"`
-	// Model + Effort record which Claude engine drove THIS execution: the resolved model and the selected
-	// effort tier ("" = the runner default max, "ultracode" = the maximal tier). Stamped when the execution
-	// is minted and re-stamped on resume to track the run's current tuning, so the report can label the
-	// answer with its model — a Holistic requirement now that the model is chosen per run — and the History
-	// shows how each run was tuned. Empty on older results.
-	Model  string `json:"model,omitempty"`
-	Effort string `json:"effort,omitempty"`
-	// Trigger records how THIS execution started: autonomous (a scheduled firing) or a named person (a
-	// manual run-now). RequestedBy is the run/ToDo's creator, snapshotted at start — so an autonomous
-	// execution still names the person it acts on behalf of (a person's ToDo run by the runner names
-	// both). Both are empty on results written before authorship was tracked (surfaced as unknown).
-	Trigger     Trigger `json:"trigger,omitempty"`
-	RequestedBy string  `json:"requestedBy,omitempty"`
-	OK          bool    `json:"ok"`
-	// Suspended marks an execution paused on the Claude usage limit; ResumeAt is when the scheduler
-	// will continue it (with only the repos NOT already in Repos). Cleared once it finishes.
-	Suspended bool         `json:"suspended,omitempty"`
-	ResumeAt  *time.Time   `json:"resumeAt,omitempty"`
-	Repos     []RepoResult `json:"repos"`
-	// Live is the repo CURRENTLY being worked, published as the execution progresses so the UI can
-	// follow a run step by step (and the agent's output as it streams). It is deliberately SEPARATE from
-	// Repos: Repos holds only COMPLETED repos (DoneRepos/resume skip exactly those), so a half-done repo
-	// must never leak into it — a crash would otherwise make a resume treat it as finished and never
-	// re-implement it. Cleared the instant a repo completes (its finished result moves into Repos) and on
-	// finish. Purely additive for observation — no scheduling or resume logic reads it.
-	Live *RepoResult `json:"live,omitempty"`
-	// Token/cost totals across all repos of this execution.
-	InputTokens  int     `json:"inputTokens"`
-	OutputTokens int     `json:"outputTokens"`
-	CostUSD      float64 `json:"costUsd"`
-	NumTurns     int     `json:"numTurns"`
+	ID        string        `json:"id"`
+	RunID     string        `json:"runId"`
+	RunTitle  string        `json:"runTitle,omitempty"` // snapshot; survives run deletion
+	Kind      model.RunKind `json:"kind"`
+	Model     string        `json:"model,omitempty"`
+	StartedAt time.Time     `json:"startedAt"`
+	EndedAt   *time.Time    `json:"endedAt,omitempty"`
+	// MergedAt is set once ALL deliveries of this execution are merged/rolled back/closed with
+	// reason — the time of the LAST one (B-8 rule, ARCHITEKTUR §6.5).
+	MergedAt *time.Time `json:"mergedAt,omitempty"`
+	// Repos is THE server stage array — the client only renders it (B-17).
+	Repos []model.RepoPipeline `json:"repos"`
+	// Report is the three-part execution report (done / running or outstanding / open, blocked
+	// or needing a decision — D 41), Markdown.
+	Report string          `json:"report,omitempty"`
+	Usage  model.UsageView `json:"usage"`
+	// Prompt is the exact prompt this execution was driven by (snapshot).
+	Prompt    string           `json:"prompt,omitempty"`
+	Requested model.Authorship `json:"requested"`
+	// Synthetic marks a result synthesized by the startup reconciliation (B-5), never by a run.
+	Synthetic bool `json:"synthetic,omitempty"`
+	// Legacy is true for a document read from the pre-rebuild archive — display-only provenance.
+	Legacy bool `json:"legacy,omitempty"`
 }
 
-// Ref projects an execution to the lightweight reference stored on the run — including how far the
-// work got (dev-deploy, PR), so the surface can name the stage reached instead of a bare tick. One
-// definition for every return path of an execution; Maintain later adds the merge/prod rungs.
-func (r Result) Ref() ResultRef {
-	ref := ResultRef{
-		ResultID: r.ResultID, At: r.StartedAt, OK: r.OK, RepoCount: len(r.Repos),
-		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens, CostUSD: r.CostUSD,
-		Suspended: r.Suspended, ResumeAt: r.ResumeAt,
-	}
-	for _, rr := range r.Repos {
-		if rr.Deployed {
-			ref.Deployed = true
-		}
-		if ref.PRUrl == "" && rr.PRUrl != "" {
-			ref.PRUrl = rr.PRUrl
-		}
-	}
-	return ref
-}
-
-// RepoResult is the outcome of a run against one repository.
-type RepoResult struct {
-	Repo string `json:"repo"`
-	// Base is the commit this repo stood at when the agent examined it — the stand recorded per axiom so
-	// the NEXT run only has to look at what came after it.
-	Base string `json:"base,omitempty"`
-	// Running marks the repo still in flight — set only on Result.Live, cleared once it moves into Repos.
-	Running  bool   `json:"running,omitempty"`
-	OK       bool   `json:"ok"`
-	Deployed bool   `json:"deployed"`
-	PRUrl    string `json:"prUrl,omitempty"`
-	// DevBranch/DevCommit NAME the delivered dev state (req 2): the persistent integration branch the run
-	// grew (mercury-dev) and the exact commit dev serves. PRBase is this delivery's stacked PR base — the
-	// previous open delivery's branch, else the default branch (req 9). DeliveryID points at the recorded
-	// delivery. All empty when the run made no delivery for this repo (and DevBranch/DevCommit still name
-	// the unchanged state).
-	DevBranch    string  `json:"devBranch,omitempty"`
-	DevCommit    string  `json:"devCommit,omitempty"`
-	PRBase       string  `json:"prBase,omitempty"`
-	DeliveryID   string  `json:"deliveryId,omitempty"`
-	Steps        []Step  `json:"steps"`
-	Error        string  `json:"error,omitempty"`
-	InputTokens  int     `json:"inputTokens,omitempty"`
-	OutputTokens int     `json:"outputTokens,omitempty"`
-	CostUSD      float64 `json:"costUsd,omitempty"`
-	NumTurns     int     `json:"numTurns,omitempty"`
-}
-
-// StepStatus is a pipeline step's honest outcome. A step is EXECUTED and succeeded, EXECUTED and failed,
-// structurally NOT-APPLICABLE to this repo, or NOT-EXECUTED because an earlier step failed. Only StepOK
-// is a success — a not-applicable step is NEVER reported as one (that false green was how a service that
-// never re-deployed passed for delivered). A failed step HALTS the chain (every later step becomes
-// not-executed); a not-applicable step lets the chain continue.
-type StepStatus string
-
-const (
-	StepOK            StepStatus = "ok"             // ran and succeeded
-	StepFailed        StepStatus = "failed"         // ran and failed — halts the chain
-	StepNotApplicable StepStatus = "not-applicable" // does not apply to this repo — chain continues
-	StepNotExecuted   StepStatus = "not-executed"   // never attempted — an earlier step failed
-)
-
-// IsSuccess is true only for a genuinely executed, successful step. A not-applicable step is neither a
-// success nor a failure; this single guard is what keeps a skipped step from ever rendering as green.
-func (s StepStatus) IsSuccess() bool { return s == StepOK }
-
-// Step is one stage of the per-repo pipeline (analyze | implement | dev-deploy | push | pr).
-type Step struct {
-	Name string `json:"name"`
-	// Running marks a step still in progress — the agent step carries its streaming transcript in Log
-	// while Running is true, and the finished report once it clears. Set only on a Live repo's steps.
-	Running bool       `json:"running,omitempty"`
-	Status  StepStatus `json:"status"`
-	Log     string     `json:"log,omitempty"`
-	At      time.Time  `json:"at"`
-}
-
-// UnmarshalJSON reads a Step, mapping a LEGACY result file — which stored a bool `ok` instead of the
-// four-state `status` — onto Status so history recorded before the honest states still renders:
-// ok:true → StepOK, ok:false → StepFailed. New results are written with `status` only, no redundant `ok`.
-func (s *Step) UnmarshalJSON(b []byte) error {
-	type wire struct {
-		Name    string     `json:"name"`
-		Running bool       `json:"running"`
-		Status  StepStatus `json:"status"`
-		OK      *bool      `json:"ok"` // legacy, pre-status
-		Log     string     `json:"log"`
-		At      time.Time  `json:"at"`
-	}
-	var w wire
-	if err := json.Unmarshal(b, &w); err != nil {
-		return err
-	}
-	*s = Step{Name: w.Name, Running: w.Running, Status: w.Status, Log: w.Log, At: w.At}
-	if s.Status == "" && w.OK != nil {
-		if *w.OK {
-			s.Status = StepOK
-		} else {
-			s.Status = StepFailed
-		}
-	}
-	return nil
-}
-
-// StepsSucceeded reports whether a repo's recorded steps describe a clean chain: not one of them failed
-// or was left not-executed. This is the honest reading of "a repository counts as successfully processed
-// only if no step failed; a result with not-executed steps is no success". A not-applicable (or a
-// still-running) step does not, on its own, sink the chain.
-func StepsSucceeded(steps []Step) bool {
-	for _, s := range steps {
-		if s.Status == StepFailed || s.Status == StepNotExecuted {
-			return false
-		}
-	}
-	return true
-}
-
-// Results stores execution results at runs-results/<runId>/<resultId>.json.
-type Results struct {
-	dir string
-}
-
-// NewResults builds the result store from the environment.
-func NewResults() *Results {
-	return &Results{dir: resultsDir()}
-}
-
-func resultsDir() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_RESULTS"); p != "" {
-		return p
-	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-results")
-}
-
-// NewResultID mints a time-sortable result id (RFC3339Nano, colon-escaped) so filenames sort by time.
+// NewResultID mints a time-sortable execution id (a filename-safe path segment).
 func NewResultID(t time.Time) string {
-	return stem(t.UTC().Format(time.RFC3339Nano))
+	return "exec_" + strings.ReplaceAll(t.UTC().Format("20060102-150405.000000000"), ".", "-")
 }
 
-// Save writes a result atomically under its run's directory. It stamps UpdatedAt so the file records
-// when the execution was last worked (used by FindStranded to bound resume by recency of activity).
-func (r *Results) Save(res Result) error {
-	res.UpdatedAt = time.Now().UTC()
-	// A nil slice marshals to JSON null, which the UI iterates directly and crashes on (a black screen on
-	// a failed/husk execution that completed no repo). Persist an empty slice instead — same guarantee the
-	// aggregate listings already make (see All/ListForRun).
+// ResultStore reads and writes result documents. It writes ONLY the new format below
+// executions/<id>/; it additionally reads the legacy archive runs-results/ tolerantly.
+type ResultStore struct {
+	execDir   string
+	legacyDir string
+}
+
+// NewResultStore builds the store below the given state root. The env overrides
+// DEVLAB_MERCURY_EXECUTIONS (new) and DEVLAB_MERCURY_RUNS_RESULTS (legacy archive) are honored
+// first — ported test seams.
+func NewResultStore(p *statepath.Paths) *ResultStore {
+	execDir := os.Getenv("DEVLAB_MERCURY_EXECUTIONS")
+	legacyDir := os.Getenv("DEVLAB_MERCURY_RUNS_RESULTS")
+	if execDir == "" && p != nil {
+		execDir = p.Executions()
+	}
+	if legacyDir == "" && p != nil {
+		legacyDir = p.LegacyResults()
+	}
+	return &ResultStore{execDir: execDir, legacyDir: legacyDir}
+}
+
+// Put writes one result document atomically (written live; coalescing is the recorder's concern).
+func (r *ResultStore) Put(res Result) error {
+	if res.ID == "" {
+		return errors.New("result without id")
+	}
 	if res.Repos == nil {
-		res.Repos = []RepoResult{}
+		// A nil slice marshals to JSON null, which every array consumer must otherwise guard.
+		res.Repos = []model.RepoPipeline{}
 	}
-	final := filepath.Join(r.dir, res.RunID, res.ResultID+".json")
-	return fsatomic.WriteJSON(final, res)
+	return fsatomic.WriteJSON(filepath.Join(r.execDir, res.ID, "result.json"), res)
 }
 
-// ListForRun returns result summaries for a run, newest first.
-func (r *Results) ListForRun(runID string) ([]ResultRef, error) {
-	dir := filepath.Join(r.dir, runID)
-	refs := []ResultRef{} // never nil (see All)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return refs, nil
+// Get returns one result by execution id — new format first, then the legacy archive.
+func (r *ResultStore) Get(id string) (Result, bool, error) {
+	b, err := os.ReadFile(filepath.Join(r.execDir, id, "result.json"))
+	if err == nil {
+		var res Result
+		if uerr := json.Unmarshal(b, &res); uerr != nil {
+			return Result{}, false, uerr
 		}
-		return refs, err
+		normalizeResult(&res)
+		return res, true, nil
 	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		res, err := r.readFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		refs = append(refs, ResultRef{
-			ResultID: res.ResultID, At: res.StartedAt, OK: res.OK, RepoCount: len(res.Repos),
-			InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD,
-			Suspended: res.Suspended, ResumeAt: res.ResumeAt,
-			Trigger: res.Trigger, RequestedBy: res.RequestedBy,
-		})
-	}
-	// Newest first, by the real time (not the string id — trimmed RFC3339Nano fractions mis-sort).
-	sort.Slice(refs, func(i, j int) bool { return refs[i].At.After(refs[j].At) })
-	return refs, nil
-}
-
-// DoneRepos is the set of repo ids already recorded in this execution — the ones a resume must skip.
-func (res Result) DoneRepos() map[string]bool {
-	done := make(map[string]bool, len(res.Repos))
-	for _, rr := range res.Repos {
-		done[rr.Repo] = true
-	}
-	return done
-}
-
-// newestHusk returns the newest unfinished (FinishedAt zero) execution of a run worked at or after
-// notBefore. includeSuspended decides whether a usage-limit-suspended husk counts. Recency is bounded
-// by last activity (UpdatedAt), not the frozen StartedAt, so a carry-over touched every night stays
-// eligible however many nights it spans while a truly abandoned husk ages out (older files predating
-// UpdatedAt fall back to StartedAt). Shared by FindStranded and FindResumable.
-func (r *Results) newestHusk(runID string, notBefore time.Time, includeSuspended bool) (Result, bool) {
-	dir := filepath.Join(r.dir, runID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return Result{}, false
-	}
-	var best Result
-	found := false
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		res, err := r.readFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if !res.FinishedAt.IsZero() {
-			continue // already finished
-		}
-		if res.Suspended && !includeSuspended {
-			continue // a live suspension owned by the run.Suspended pointer path
-		}
-		touched := res.UpdatedAt
-		if touched.IsZero() {
-			touched = res.StartedAt
-		}
-		if touched.Before(notBefore) {
-			continue // not worked within the window — treat as abandoned
-		}
-		if !found || res.StartedAt.After(best.StartedAt) {
-			best, found = res, true
-		}
-	}
-	return best, found
-}
-
-// FindStranded returns the newest execution of a run that was interrupted mid-flight — never finished
-// (FinishedAt zero) and not paused on the usage limit (Suspended false) — provided it was worked at or
-// after notBefore. That is the signature of a run killed by a devlabd restart / crash: the scheduler
-// advanced NextFireAt before executing, so the next fire would otherwise start a FRESH execution and
-// re-implement every repo into a duplicate PR set. Resuming this result instead skips the repos it had
-// already completed. notBefore bounds it so a long-dead result after extended downtime is not
-// resurrected. ok=false when there is nothing to resume.
-func (r *Results) FindStranded(runID string, notBefore time.Time) (Result, bool) {
-	return r.newestHusk(runID, notBefore, false)
-}
-
-// FindResumable is FindStranded PLUS orphaned usage-limit suspensions: an execution that suspended on
-// the limit but whose run lost its Suspended pointer (e.g. a devlabd restart landed between writing the
-// result and patching the run) would otherwise NEVER resume — it is skipped by FindStranded and no
-// pointer references it, so it freezes forever, stranding its spend. Including suspended husks here lets
-// the next fire pick it up and continue the not-yet-done repos, self-healing the lost pointer. A healthy
-// suspension (pointer intact) is resumed by resumeOrNew's pointer check first and never reaches here.
-func (r *Results) FindResumable(runID string, notBefore time.Time) (Result, bool) {
-	return r.newestHusk(runID, notBefore, true)
-}
-
-// FindStaleHusk returns the newest crash/carry-over husk (unfinished, unsuspended) of a run whose last
-// activity is OLDER than olderThan — one that has been abandoned and, for a fire-once ToDo, will never be
-// resumed on a schedule. It is the reap detector: the executor finalizes such a husk so it stops
-// lingering forever as a running "Leiche" and the run becomes cleanly restartable. Recency is the SAME
-// "last worked" measure (UpdatedAt, falling back to StartedAt) FindStranded uses, so a husk still being
-// actively carried over (touched within the grace) is never reaped out from under an in-flight resume.
-func (r *Results) FindStaleHusk(runID string, olderThan time.Time) (Result, bool) {
-	dir := filepath.Join(r.dir, runID)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return Result{}, false
-	}
-	var best Result
-	found := false
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		res, err := r.readFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		if !res.FinishedAt.IsZero() || res.Suspended {
-			continue // finished, or a live suspension that resumes itself
-		}
-		touched := res.UpdatedAt
-		if touched.IsZero() {
-			touched = res.StartedAt
-		}
-		if !touched.Before(olderThan) {
-			continue // worked recently — not (yet) abandoned
-		}
-		if !found || res.StartedAt.After(best.StartedAt) {
-			best, found = res, true
-		}
-	}
-	return best, found
-}
-
-// Get returns one result document.
-func (r *Results) Get(runID, resultID string) (Result, bool, error) {
-	res, err := r.readFile(filepath.Join(r.dir, runID, resultID+".json"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return Result{}, false, nil
-		}
+	if !os.IsNotExist(err) {
 		return Result{}, false, err
 	}
-	return res, true, nil
+	all, err := r.legacyAll()
+	if err != nil {
+		return Result{}, false, err
+	}
+	for _, res := range all {
+		if res.ID == id {
+			return res, true, nil
+		}
+	}
+	return Result{}, false, nil
 }
 
-// ExecutionSummary is one completed execution across all runs — the Lauf-History row (with token/cost
-// and the run name snapshot so it survives the run's deletion).
-type ExecutionSummary struct {
-	RunID        string     `json:"runId"`
-	RunName      string     `json:"runName"`
-	Type         Type       `json:"type,omitempty"` // auto|todo — the run's kind, so history is split per surface
-	ResultID     string     `json:"resultId"`
-	At           time.Time  `json:"at"`
-	FinishedAt   time.Time  `json:"finishedAt,omitempty"`
-	OK           bool       `json:"ok"`
-	Suspended    bool       `json:"suspended,omitempty"`
-	ResumeAt     *time.Time `json:"resumeAt,omitempty"`
-	RepoCount    int        `json:"repoCount"`
-	InputTokens  int        `json:"inputTokens"`
-	OutputTokens int        `json:"outputTokens"`
-	CostUSD      float64    `json:"costUsd"`
-	NumTurns     int        `json:"numTurns"`
-	// Trigger + RequestedBy: how the execution started (autonomous vs a named person) and the run's
-	// author it acted for — snapshotted so the global history shows origin even after the run is gone.
-	Trigger     Trigger `json:"trigger,omitempty"`
-	RequestedBy string  `json:"requestedBy,omitempty"`
-}
-
-// All returns every stored execution across all runs (including runs since deleted), newest first —
-// the Lauf-History.
-func (r *Results) All() ([]ExecutionSummary, error) {
-	runIDs, err := r.Runs()
+// ForRun returns all results of one run (new + legacy), newest first.
+func (r *ResultStore) ForRun(runID string) ([]Result, error) {
+	all, err := r.List()
 	if err != nil {
 		return nil, err
 	}
-	out := []ExecutionSummary{} // never nil: a nil slice marshals to JSON null and hangs the UI
-	for _, id := range runIDs {
-		dir := filepath.Join(r.dir, id)
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-				continue
-			}
-			res, err := r.readFile(filepath.Join(dir, e.Name()))
-			if err != nil {
-				continue
-			}
-			out = append(out, ExecutionSummary{
-				RunID: res.RunID, RunName: res.RunName, Type: res.Type, ResultID: res.ResultID,
-				At: res.StartedAt, FinishedAt: res.FinishedAt, OK: res.OK, RepoCount: len(res.Repos),
-				Suspended: res.Suspended, ResumeAt: res.ResumeAt,
-				InputTokens: res.InputTokens, OutputTokens: res.OutputTokens, CostUSD: res.CostUSD, NumTurns: res.NumTurns,
-				Trigger: res.Trigger, RequestedBy: res.RequestedBy,
-			})
+	out := []Result{}
+	for _, res := range all {
+		if res.RunID == runID {
+			out = append(out, res)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
 	return out, nil
 }
 
-// Runs returns the run ids that have stored results (including runs since deleted — orphan logs).
-func (r *Results) Runs() ([]string, error) {
-	entries, err := os.ReadDir(r.dir)
+// List returns every result (new + legacy), newest first. A torn or foreign file is skipped,
+// never fatal — an old husk must not black out the history.
+func (r *ResultStore) List() ([]Result, error) {
+	out := []Result{}
+	entries, err := os.ReadDir(r.execDir)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(r.execDir, e.Name(), "result.json"))
+		if err != nil {
+			continue
+		}
+		var res Result
+		if err := json.Unmarshal(b, &res); err != nil {
+			continue
+		}
+		normalizeResult(&res)
+		out = append(out, res)
+	}
+	legacy, err := r.legacyAll()
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, legacy...)
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.After(out[j].StartedAt) })
+	return out, nil
+}
+
+// AppendTranscript appends one compact transcript line to the execution's journal
+// (fsatomic.AppendLine — the one append primitive; B-11).
+func (r *ResultStore) AppendTranscript(execID string, line []byte) error {
+	if execID == "" {
+		return errors.New("transcript without execution id")
+	}
+	return fsatomic.AppendLine(filepath.Join(r.execDir, execID, "transcript.jsonl"), line)
+}
+
+// ReadTranscriptTail returns up to maxBytes from the end of the execution's transcript journal,
+// starting at a line boundary (the torn first line of a mid-file cut is dropped).
+func (r *ResultStore) ReadTranscriptTail(execID string, maxBytes int) (string, error) {
+	f, err := os.Open(filepath.Join(r.execDir, execID, "transcript.jsonl"))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return "", nil
+		}
+		return "", err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	var offset int64
+	if maxBytes > 0 && fi.Size() > int64(maxBytes) {
+		offset = fi.Size() - int64(maxBytes)
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return "", err
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	s := string(b)
+	if offset > 0 {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			s = s[i+1:]
+		}
+	}
+	return s, nil
+}
+
+func normalizeResult(res *Result) {
+	if res.Repos == nil {
+		res.Repos = []model.RepoPipeline{}
+	}
+	for i := range res.Repos {
+		res.Repos[i].Done, res.Repos[i].Succeeded = model.PipelineSucceeded(res.Repos[i].Stages)
+	}
+}
+
+// ── Tolerant legacy reading (REQ-027.3) ─────────────────────────────────────────────────
+
+// legacyResult is the pre-rebuild result shape — only the fields the mapping needs. Unknown
+// fields are ignored; missing fields default. Derived from the archived format (fixture:
+// testdata/legacy-result.json, taken from the old runs-results layout at ae5eed5).
+type legacyResult struct {
+	RunID      string    `json:"runId"`
+	ResultID   string    `json:"resultId"`
+	RunName    string    `json:"runName"`
+	Type       string    `json:"type"` // "" reads as auto
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
+	Prompt     string    `json:"prompt"`
+	Model      string    `json:"model"`
+	OK         bool      `json:"ok"`
+	Trigger    struct {
+		Auto bool   `json:"auto"`
+		By   string `json:"by"`
+	} `json:"trigger"`
+	RequestedBy  string             `json:"requestedBy"`
+	Repos        []legacyRepoResult `json:"repos"`
+	Live         *legacyRepoResult  `json:"live"`
+	InputTokens  int64              `json:"inputTokens"`
+	OutputTokens int64              `json:"outputTokens"`
+	CostUSD      float64            `json:"costUsd"`
+}
+
+type legacyRepoResult struct {
+	Repo  string `json:"repo"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+	Steps []struct {
+		Name    string    `json:"name"`
+		Running bool      `json:"running"`
+		Status  string    `json:"status"`
+		OK      *bool     `json:"ok"` // the pre-status legacy of the legacy
+		Log     string    `json:"log"`
+		At      time.Time `json:"at"`
+	} `json:"steps"`
+}
+
+// mapLegacy maps one archived result onto the new shape. Legacy step names (analyze, dev-deploy,
+// push, pr, …) are carried VERBATIM as stage names — displayable, never produced anew.
+func mapLegacy(lr legacyResult) Result {
+	res := Result{
+		ID:        lr.ResultID,
+		RunID:     lr.RunID,
+		RunTitle:  lr.RunName,
+		Kind:      model.KindAuto,
+		Model:     lr.Model,
+		StartedAt: lr.StartedAt,
+		Prompt:    lr.Prompt,
+		Usage:     model.UsageView{InputTokens: lr.InputTokens, OutputTokens: lr.OutputTokens, CostUSD: lr.CostUSD},
+		Legacy:    true,
+	}
+	if lr.Type == string(model.KindTodo) {
+		res.Kind = model.KindTodo
+	}
+	if !lr.FinishedAt.IsZero() {
+		t := lr.FinishedAt
+		res.EndedAt = &t
+	}
+	if lr.Trigger.By != "" {
+		res.Requested.Created = model.Actor{User: lr.Trigger.By}
+	} else if lr.Trigger.Auto {
+		res.Requested.Created = model.Actor{Autonomous: true, OnBehalfOf: lr.RequestedBy}
+	}
+	repos := lr.Repos
+	if lr.Live != nil {
+		repos = append(repos, *lr.Live)
+	}
+	res.Repos = make([]model.RepoPipeline, 0, len(repos))
+	for _, rr := range repos {
+		rp := model.RepoPipeline{Repo: rr.Repo}
+		for _, st := range rr.Steps {
+			sv := model.StageView{Stage: model.Stage(st.Name), Log: st.Log}
+			switch {
+			case st.Running:
+				sv.State = model.StepRunning
+			case st.Status == "ok" || (st.Status == "" && st.OK != nil && *st.OK):
+				sv.State = model.StepExecuted
+			case st.Status == "not-applicable":
+				sv.State = model.StepNotApplicable
+				sv.Reason = st.Log
+			case st.Status == "not-executed":
+				sv.State = model.StepNotExecuted
+				sv.Reason = st.Log
+			default:
+				sv.State = model.StepFailed
+				sv.Reason = st.Log
+			}
+			if !st.At.IsZero() {
+				at := st.At
+				sv.EndedAt = &at
+			}
+			rp.Stages = append(rp.Stages, sv)
+		}
+		if len(rp.Stages) == 0 && rr.Error != "" {
+			// A repo that failed before any step ran still renders a defined state.
+			rp.Stages = []model.StageView{{Stage: model.StagePreflight, State: model.StepFailed, Reason: rr.Error}}
+		}
+		rp.Done, rp.Succeeded = model.PipelineSucceeded(rp.Stages)
+		res.Repos = append(res.Repos, rp)
+	}
+	return res
+}
+
+// legacyAll reads the whole legacy archive tolerantly: any file that does not parse is skipped,
+// never fatal.
+func (r *ResultStore) legacyAll() ([]Result, error) {
+	out := []Result{}
+	if r.legacyDir == "" {
+		return out, nil
+	}
+	runDirs, err := os.ReadDir(r.legacyDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
 		}
 		return nil, err
 	}
-	var ids []string
-	for _, e := range entries {
-		if e.IsDir() {
-			ids = append(ids, e.Name())
+	for _, rd := range runDirs {
+		if !rd.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(r.legacyDir, rd.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasSuffix(f.Name(), ".json") {
+				continue
+			}
+			b, err := os.ReadFile(filepath.Join(r.legacyDir, rd.Name(), f.Name()))
+			if err != nil {
+				continue
+			}
+			var lr legacyResult
+			if err := json.Unmarshal(b, &lr); err != nil {
+				continue
+			}
+			if lr.ResultID == "" {
+				lr.ResultID = strings.TrimSuffix(f.Name(), ".json")
+			}
+			if lr.RunID == "" {
+				lr.RunID = rd.Name()
+			}
+			out = append(out, mapLegacy(lr))
 		}
 	}
-	sort.Strings(ids)
-	return ids, nil
-}
-
-func (r *Results) readFile(path string) (Result, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return Result{}, err
-	}
-	var res Result
-	if err := json.Unmarshal(b, &res); err != nil {
-		return Result{}, err
-	}
-	return res, nil
+	return out, nil
 }

@@ -7,6 +7,8 @@ import (
 	"regexp"
 
 	"devlab/backend/internal/fsatomic"
+
+	"devlab/backend/internal/statepath"
 )
 
 // AttachmentStore is the passive media pool for ToDo attachments: a plain on-disk blob store holding
@@ -32,13 +34,18 @@ var ErrBadID = errors.New("invalid id")
 
 // NewAttachmentStore builds the pool from the environment. Like NewStore it never errors — a missing
 // directory is an empty pool. The pool lives next to runs.json so all Mercury run state is co-located.
-func NewAttachmentStore() *AttachmentStore { return &AttachmentStore{base: attachmentsDir()} }
+func NewAttachmentStore(p *statepath.Paths) *AttachmentStore {
+	return &AttachmentStore{base: attachmentsDir(p)}
+}
 
-func attachmentsDir() string {
-	if p := os.Getenv("DEVLAB_MERCURY_ATTACHMENTS"); p != "" {
-		return p
+func attachmentsDir(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_ATTACHMENTS"); v != "" {
+		return v
 	}
-	return filepath.Join(filepath.Dir(runsPath()), "attachments")
+	if p != nil {
+		return p.Attachments()
+	}
+	return ""
 }
 
 // path resolves the on-disk file for one attachment, refusing any id that is not of the minted shape.
@@ -55,7 +62,7 @@ func (a *AttachmentStore) Put(runID, attID string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return fsatomic.WriteFile(p, data)
+	return fsatomic.WriteFile(p, data, 0o600)
 }
 
 // Get returns an attachment's bytes (os.ErrNotExist when absent).

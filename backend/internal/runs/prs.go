@@ -3,11 +3,12 @@ package runs
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+
+	"devlab/backend/internal/statepath"
 )
 
 // A run in pr/full mode opens a PR per repo. A human may merge it anytime; if none does within the
@@ -33,13 +34,16 @@ type PRStore struct {
 	mu   sync.Mutex
 }
 
-func NewPRStore() *PRStore { return &PRStore{path: prsPath()} }
+func NewPRStore(p *statepath.Paths) *PRStore { return &PRStore{path: prsPath(p)} }
 
-func prsPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_PRS"); p != "" {
-		return p
+func prsPath(p *statepath.Paths) string {
+	if v := os.Getenv("DEVLAB_MERCURY_RUNS_PRS"); v != "" {
+		return v
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-prs.json")
+	if p != nil {
+		return p.PRs()
+	}
+	return ""
 }
 
 type prFile struct {

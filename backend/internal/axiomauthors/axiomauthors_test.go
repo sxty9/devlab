@@ -12,7 +12,7 @@ import (
 func TestAxiomAuthorship(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_AXIOM_AUTHORS", filepath.Join(dir, "axiom-authors.json"))
-	s := NewStore()
+	s := NewStore(nil)
 
 	t0 := time.Now().UTC().Truncate(time.Second)
 
@@ -55,7 +55,7 @@ func TestAxiomAuthorship(t *testing.T) {
 	}
 
 	// Reload from disk (fresh store) → the record persisted.
-	if a, ok := NewStore().Get("ax_1"); !ok || a.CreatedBy != "alice" || a.UpdatedBy != "bob" {
+	if a, ok := NewStore(nil).Get("ax_1"); !ok || a.CreatedBy != "alice" || a.UpdatedBy != "bob" {
 		t.Errorf("authorship did not persist across reload: %+v (ok=%v)", a, ok)
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"devlab/backend/internal/runs"
+	"devlab/backend/internal/model"
 )
 
 // Item is one execution as it appears in a day's report — a summary, never a protocol. It carries the
@@ -208,68 +208,51 @@ func totals(items []Item) (in, out int, cost float64, repos int) {
 	return
 }
 
-// deliveryStage derives the delivery stage a run actually reached for one repository. It reports the
-// furthest completed step honestly: a failure is named at the step it failed, not glossed as success.
-func deliveryStage(rr runs.RepoResult) string {
-	// A failing repo: name the step it stalled at, so a failure is never hidden as progress.
-	if !rr.OK {
-		if step := lastAttemptedStep(rr); step != "" {
-			return "failed at " + stageWord(step)
+// deliveryStage derives the delivery stage a run actually reached for one repository — read
+// straight off the server stage array, honestly: a failure is named at the stage it failed,
+// never glossed as progress; a blocked repo names its block.
+func deliveryStage(rr model.RepoPipeline) string {
+	if rr.Block != nil {
+		return "blocked: " + rr.Block.Reason
+	}
+	lastExecuted := ""
+	for _, sv := range rr.Stages {
+		switch sv.State {
+		case model.StepFailed:
+			return "failed at " + stageWord(string(sv.Stage))
+		case model.StepExecuted:
+			lastExecuted = string(sv.Stage)
+		case model.StepRunning:
+			return "working on " + stageWord(string(sv.Stage))
 		}
-		return "failed"
 	}
-	if rr.Deployed {
-		return "deployed"
+	if lastExecuted != "" {
+		return stageWord(lastExecuted)
 	}
-	if rr.PRUrl != "" {
-		return "PR opened"
-	}
-	if step := lastOKStep(rr); step != "" {
-		return stageWord(step)
-	}
-	return "analyzed"
+	return "not started"
 }
 
 // stageWord maps a pipeline step name to the noun for the stage it represents.
 func stageWord(step string) string {
 	switch step {
-	case "analyze":
+	case "preflight", "analyze":
 		return "analyzed"
 	case "implement":
 		return "implemented"
-	case "push":
-		return "pushed"
-	case "pr":
+	case "publish", "push":
+		return "published"
+	case "pull-request", "pr":
 		return "PR opened"
-	case "deploy":
+	case "deliver-dev", "dev-deploy", "deploy":
 		return "deployed"
 	default:
 		return step
 	}
 }
 
-func lastOKStep(rr runs.RepoResult) string {
-	name := ""
-	for _, s := range rr.Steps {
-		if s.Status == runs.StepOK {
-			name = s.Name
-		}
-	}
-	return name
-}
-
-// lastAttemptedStep returns the name of the last step in the pipeline (the one work reached), used to
-// locate where a failing repo stalled.
-func lastAttemptedStep(rr runs.RepoResult) string {
-	if len(rr.Steps) == 0 {
-		return ""
-	}
-	return rr.Steps[len(rr.Steps)-1].Name
-}
-
 // typeLabel renders a run kind for humans.
-func typeLabel(t runs.Type) string {
-	if runs.NormalizeType(t) == runs.TypeTodo {
+func typeLabel(t model.RunKind) string {
+	if t == model.KindTodo {
 		return "ToDo"
 	}
 	return "Automatic run"

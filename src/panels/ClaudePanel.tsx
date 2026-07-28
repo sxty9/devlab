@@ -8,7 +8,7 @@ import { renderMarkdown } from '@/lib/markdown';
 import { basename } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { AiAsk, AiMessage, AiModelCatalog } from '@/types';
-import { NATIVE_EFFORTS } from '@/views/RunTuning';
+import { NATIVE_EFFORTS } from '@/ui/RunTuning';
 
 const ENGINES = [
   { id: 'choose', label: 'Auto (Router)' },

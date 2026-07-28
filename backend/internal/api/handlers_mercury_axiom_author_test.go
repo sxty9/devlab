@@ -37,7 +37,7 @@ func TestMercuryItemSurfacesAuthorship(t *testing.T) {
 	defer stub.Close()
 	t.Setenv("DEVLAB_AIGENTIC_URL", stub.URL)
 
-	authors := axiomauthors.NewStore()
+	authors := axiomauthors.NewStore(nil)
 	authors.Mutate("ax_known", func(a axiomauthors.Author) axiomauthors.Author {
 		a.CreatedBy, a.CreatedAt, a.UpdatedBy, a.UpdatedAt = "alice", time.Now().UTC(), "bob", time.Now().UTC()
 		return a
@@ -82,7 +82,7 @@ func TestMercuryItemSurfacesAuthorship(t *testing.T) {
 	// An axiom with no recorded authorship carries no author key — the surface shows unknown. Point the
 	// env at an empty pool BEFORE constructing the store (NewStore captures the path at construction).
 	t.Setenv("DEVLAB_MERCURY_AXIOM_AUTHORS", filepath.Join(dir, "empty.json"))
-	s.axiomAuthors = axiomauthors.NewStore()
+	s.axiomAuthors = axiomauthors.NewStore(nil)
 	if _, present := get()["author"]; present {
 		t.Error("an axiom with no recorded author must not carry an author (shown as unknown)")
 	}

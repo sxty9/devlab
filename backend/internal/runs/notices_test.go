@@ -9,7 +9,7 @@ import (
 func newTestNotices(t *testing.T) *NoticeStore {
 	t.Helper()
 	t.Setenv("DEVLAB_MERCURY_RUNS_NOTICES", filepath.Join(t.TempDir(), "notices.json"))
-	return NewNoticeStore()
+	return NewNoticeStore(nil)
 }
 
 // The feed stays portioned: only the newest noticeCap notices survive, newest first.

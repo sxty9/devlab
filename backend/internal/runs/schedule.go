@@ -8,17 +8,17 @@ import (
 
 // Kind is a recurrence kind. Deliberately minimal — no cron dependency; daily or weekly covers the
 // intended cadence and computes trivially with time.Now.
-type Kind string
+type ScheduleKind string
 
 const (
-	Daily  Kind = "daily"
-	Weekly Kind = "weekly"
+	Daily  ScheduleKind = "daily"
+	Weekly ScheduleKind = "weekly"
 )
 
-// Schedule is a recurring schedule: a time-of-day, either every day or on selected weekdays. Times
+// ScheduleSpec is a recurring schedule: a time-of-day, either every day or on selected weekdays. Times
 // are interpreted in the server's local timezone.
-type Schedule struct {
-	Kind      Kind           `json:"kind"`
+type ScheduleSpec struct {
+	Kind      ScheduleKind   `json:"kind"`
 	TimeOfDay string         `json:"timeOfDay"`          // "HH:MM", 24h
 	Weekdays  []time.Weekday `json:"weekdays,omitempty"` // weekly only; 0=Sunday … 6=Saturday
 }
@@ -26,7 +26,7 @@ type Schedule struct {
 var timeOfDayRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
 
 // Valid reports whether the schedule is well-formed.
-func (s Schedule) Valid() error {
+func (s ScheduleSpec) Valid() error {
 	if !timeOfDayRe.MatchString(s.TimeOfDay) {
 		return fmt.Errorf("timeOfDay %q ist nicht HH:MM (24h)", s.TimeOfDay)
 	}
@@ -50,7 +50,7 @@ func (s Schedule) Valid() error {
 	return nil
 }
 
-func (s Schedule) hourMin() (int, int) {
+func (s ScheduleSpec) hourMin() (int, int) {
 	var h, m int
 	_, _ = fmt.Sscanf(s.TimeOfDay, "%d:%d", &h, &m)
 	return h, m
@@ -59,7 +59,7 @@ func (s Schedule) hourMin() (int, int) {
 // Next returns the first fire time strictly after `after`, in after's location. Always computed
 // forward from the given instant — so after downtime the scheduler fires once (catch-up), never N
 // times for the missed periods.
-func (s Schedule) Next(after time.Time) (time.Time, error) {
+func (s ScheduleSpec) Next(after time.Time) (time.Time, error) {
 	if err := s.Valid(); err != nil {
 		return time.Time{}, err
 	}
@@ -85,4 +85,15 @@ func (s Schedule) Next(after time.Time) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("kein nächster Zeitpunkt bestimmbar")
+}
+
+// NextFire returns the first fire time strictly after `after` — the one place fire times come
+// from. The schedule pointer on a run is advanced only when an execution ACTUALLY starts, so a
+// missed window fires once (catch-up), never N times. An invalid spec yields the zero time.
+func NextFire(spec ScheduleSpec, after time.Time) time.Time {
+	t, err := spec.Next(after)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

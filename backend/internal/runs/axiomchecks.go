@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/statepath"
 )
 
 // AxiomChecks is the passive record of WHICH COMMIT a repository was last examined against, per axiom.
@@ -36,10 +38,10 @@ type checksFile struct {
 
 // NewAxiomChecks builds the store from the environment. Like the other Mercury stores it never errors:
 // a missing file is an empty record.
-func NewAxiomChecks() *AxiomChecks {
+func NewAxiomChecks(sp *statepath.Paths) *AxiomChecks {
 	p := os.Getenv("DEVLAB_MERCURY_AXIOM_CHECKS")
-	if p == "" {
-		p = filepath.Join(filepath.Dir(runsPath()), "axiom-checks.json")
+	if p == "" && sp != nil {
+		p = sp.AxiomChecks()
 	}
 	return &AxiomChecks{path: p}
 }

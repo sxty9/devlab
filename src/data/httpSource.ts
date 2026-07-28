@@ -82,7 +82,7 @@ export const httpSource: DataSource = {
   async init(): Promise<InitResult> {
     try {
       const h = await fetch('/api/health', opts);
-      if (!h.ok) return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
+      if (!h.ok) return { mode: 'stub', signedIn: true, canUseDevlab: true, githubLinked: true };
       // /api/user requires only a session (not the right), so we can tell "signed in but no
       // access" from "not signed in". request() refreshes once on 401 so an expired access
       // token (with a still-valid refresh) does not bounce the user to the login gate.
@@ -92,8 +92,8 @@ export const httpSource: DataSource = {
       const body = (await u.json()) as { canUseDevlab?: boolean; githubLinked?: boolean };
       return { mode: 'api', signedIn: true, canUseDevlab: !!body.canUseDevlab, githubLinked: !!body.githubLinked };
     } catch {
-      // Backend unreachable (offline dev) → caller falls back to mock.
-      return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
+      // Backend unreachable (offline dev) → caller falls back to the stub's empty states.
+      return { mode: 'stub', signedIn: true, canUseDevlab: true, githubLinked: true };
     }
   },
 
@@ -195,13 +195,17 @@ export const httpSource: DataSource = {
     return json(await request('/api/assistant/models'));
   },
 
-  terminalUrl(id) {
+  terminalUrl(id, sessionKey) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    return `${proto}://${location.host}/api/repos/${enc(id)}/pty`;
+    const q = sessionKey ? `?session=${enc(sessionKey)}` : '';
+    return `${proto}://${location.host}/api/repos/${enc(id)}/pty${q}`;
   },
 
   async atlas() {
     return json(await request('/api/atlas'));
+  },
+  async atlasPorts() {
+    return json(await request('/api/atlas/ports'));
   },
 
   async mercuryTree() {
@@ -238,10 +242,6 @@ export const httpSource: DataSource = {
   async mercuryReorder(category, order) {
     await json<void>(await post('/api/mercury/reorder', { category, order }));
   },
-  async mercuryRolloutStatus() {
-    return json(await request('/api/mercury/rollout'));
-  },
-
   async mercuryRuns() {
     return json(await request('/api/mercury/runs'));
   },
@@ -293,15 +293,15 @@ export const httpSource: DataSource = {
   async mercuryRunResult(id, resultId) {
     return json(await request(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}`));
   },
-  async mercuryRunCalendar(days, type) {
+  async mercuryRunCalendar(days, kind) {
     const p = new URLSearchParams();
     if (days) p.set('days', String(days));
-    if (type) p.set('type', type);
+    if (kind) p.set('type', kind);
     const q = p.toString();
     return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
   },
-  async mercuryRunExecutions(type) {
-    return json(await request(`/api/mercury/runs/executions${type ? `?type=${enc(type)}` : ''}`));
+  async mercuryRunExecutions(kind) {
+    return json(await request(`/api/mercury/runs/executions${kind ? `?type=${enc(kind)}` : ''}`));
   },
   async mercuryReportStatus() {
     return json(await request('/api/mercury/runs/report-status'));
@@ -309,14 +309,36 @@ export const httpSource: DataSource = {
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
-  async mercuryRunNow(id) {
-    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {}));
+  async mercuryRunNow(id, opts) {
+    return json(await post(`/api/mercury/runs/${enc(id)}/run`, {
+      placement: opts?.placement, fresh: opts?.fresh ?? false,
+    }));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
+  async mercurySlots() {
+    return json(await request('/api/mercury/runs/slots'));
+  },
   async mercuryCancelRun(runId) {
     await json<void>(await post(`/api/mercury/runs/${enc(runId)}/cancel`, {}));
+  },
+  async mercuryDeferRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
+  },
+  async mercuryResumeRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/resume`, {}));
+  },
+  async mercuryDeliveries() {
+    return json<{ deliveries: import('@/types').Delivery[] }>(
+      await request('/api/mercury/runs/deliveries'),
+    ).then((r) => r.deliveries);
+  },
+  async mercuryRollbackDelivery(deliveryId) {
+    return json(await post(`/api/mercury/runs/deliveries/${enc(deliveryId)}/rollback`, {}));
+  },
+  async mercuryRepoReset(repoId) {
+    await json<void>(await post('/api/mercury/runs/reset', { repo: repoId }));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(
@@ -330,6 +352,25 @@ export const httpSource: DataSource = {
   },
   mercuryAttachmentRawUrl(id, attachmentId) {
     return `/api/mercury/runs/${enc(id)}/attachments/${enc(attachmentId)}/raw`;
+  },
+
+  events() {
+    // The ONE stream. Reconnect-with-refresh selfheals in lib/live.ts (C F5); this hands out
+    // the raw source for the provider to manage.
+    return new EventSource('/api/events', { withCredentials: true });
+  },
+
+  async serviceConfig() {
+    return json(await request('/api/service/config'));
+  },
+  async serviceStorage() {
+    return json(await request('/api/service/storage'));
+  },
+  async serviceTelemetry() {
+    return json(await request('/api/service/telemetry'));
+  },
+  async serviceAiUsage() {
+    return json(await request('/api/service/ai-usage'));
   },
 };
 

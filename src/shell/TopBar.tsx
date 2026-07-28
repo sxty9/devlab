@@ -3,11 +3,10 @@ import { Brand } from './Brand';
 import { RepoDropdown } from './RepoDropdown';
 import { BranchDropdown } from './BranchDropdown';
 import { ThemeToggle } from './ThemeToggle';
-import { Button, IconButton } from '@/ui/Button';
-import { HelpIcon, RocketIcon, SettingsIcon } from '@/ui/icons';
+import { IconButton } from '@/ui/Button';
+import { HelpIcon, SettingsIcon } from '@/ui/icons';
 import { Tooltip } from '@/ui/Tooltip';
 import { Person } from '@/ui/Person';
-import { PREVIEW_URL } from '@/lib/constants';
 import { CAPABILITIES } from '@/views/capabilities';
 
 /** The window chrome: brand · (repository · branch, in the IDE) ……  actions. */
@@ -44,17 +43,6 @@ export function TopBar() {
 
       {/* Actions zone */}
       <div className="ml-auto flex items-center gap-1.5">
-        <Button
-          variant="secondary"
-          size="sm"
-          className="gap-1.5"
-          onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')}
-          title="Open the live sxgate preview"
-        >
-          <RocketIcon className="h-3.5 w-3.5 text-accent" />
-          Preview
-        </Button>
-        <div className="mx-0.5 h-5 w-px bg-separator" />
         <ThemeToggle />
         <IconButton label="Keyboard shortcuts" title="Keyboard shortcuts  (?)" onClick={() => setOverlay('help')}>
           <HelpIcon className="h-4 w-4" />

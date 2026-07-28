@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# devlab-install — the generic, install-only root wrapper (S11; replaces the retired
+# per-repo devlab-deploy mechanics, B-44). Invoked ONLY via the pinned sudoers grant:
+#     sudo -n /usr/local/sbin/devlab-install <repo> <artifact-dir> <env> [--handover] [--check]
+#
+# Contract (B5 implements; this skeleton pins the validation cascade and the seams):
+#   * name grammar: <repo> must match ^[a-z][a-z0-9-]{2,30}$ — nothing else ever reaches a path
+#   * path canonicalization: <artifact-dir> resolves via `realpath -e` and MUST lie under the
+#     workspace root; a traversal (…/../../tmp/evil) dies before any effect
+#   * env is exactly `dev` or `prod` (prod is NOT armed in this phase — it dies)
+#   * install-only: root copies validated artifacts and restarts the unit; root NEVER builds
+#     and NEVER executes repo-provided code (E §7.4)
+#   * first-time setup of template-conforming services generates unit/route/rights from
+#     root-owned INLINE templates with validated values (port via the atlas proposal)
+#   * --handover (self-repo only): install + `systemd-run --unit=devlab-restart-<ts> --collect
+#     /usr/local/sbin/devlab-restart-when-free` in ONE call (B-2). devlabd itself never runs
+#     systemd-run; a failed systemd-run fails the stage — there is NO inline restart (K-2)
+#   * --check: dry-run — run the FULL validation cascade, print the decision, change nothing
+#     (the testable seam; wrapper logic is verified without root)
+#
+# Exit codes: 0 ok · 1 generic · 2 usage/validation · 4 external tool failed · 5 config-state
+set -euo pipefail
+
+die() { printf 'devlab-install: error: %s\n' "$*" >&2; exit "${2:-2}"; }
+
+echo "devlab-install: not implemented yet (deploy & ports, Welle 1 — B5)" >&2
+exit 1
