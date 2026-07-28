@@ -155,6 +155,22 @@ fehlt. Vor dem Hochstufen zu erledigen:
 2. Je Repo ein geprüftes Deploy-Skript nach `/etc/devlab/deploy.d/<repo>` (Vorlage:
    `deploy/deploy.d.example-devlab`). Ohne Eintrag überspringt der Wrapper das Repo (Exit 3).
 
+## Portvergabe (zentral)
+
+Ports werden **nicht** mehr von Hand oder aus einer Vorlage übernommen (so lief `prizm` auf
+aigentics 8780 tot). Die Vergabe wird zentral aus dem tatsächlichen Host-Zustand abgeleitet — den
+Caddy-Routen und den offenen Sockets — und ist im Dashboard sichtbar (Atlas → *Port allocation*).
+
+- **Ledger:** `GET /api/atlas/ports` — welcher Dienst welchen Port hält, welche im Band frei sind.
+- **Einrichtung:** Die einheitliche `service setup` (im `holistic-service-template`) muss ihren Port
+  über `GET /api/atlas/ports/propose?id=<id>&desired=<port>` beziehen, statt einen Vorlagenwert zu
+  kopieren. Ist der gewünschte belegt, nennt die Antwort den Halter und schlägt einen freien vor —
+  die Einrichtung endet nie stillschweigend mit einem Dienst, der nicht startet.
+- **Auslieferung:** Das Deploy-Skript (`deploy.d.goservice`) meldet „installed and started" erst,
+  wenn der Dienst nachweislich läuft und seinen Port hält; sonst Exit 12 (gescheiterte Einrichtung).
+- **Band:** Vorgabe `8770–8799`, per `DEVLAB_PORT_BAND="lo-hi"` überschreibbar. Ports außerhalb des
+  Bands erscheinen als Atlas-Finding (Abweichung von der Vergabe).
+
 ## Kill-Switch / Rückbau
 - `DEVLAB_RUNS_MODE=off` (oder Drop-in entfernen) + `systemctl restart devlabd` → Scheduler aus.
 - Laufender Lauf: „Abbrechen" im UI (`POST /api/mercury/runs/cancel`).
