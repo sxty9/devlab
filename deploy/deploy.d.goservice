@@ -5,7 +5,8 @@
 # Run by devlab-deploy AS ROOT with: <script> <artifactDir> <env>. The repo is the invoked name
 # (basename "$0"), so ONE script serves every uniform Go service. THIS SCRIPT NEVER BUILDS — the runner
 # built the artifact unprivileged; here root only installs prebuilt bytes (env=dev, local) or ships them
-# to the prod VPS (env=prod). Exit: 0 ok · 2 unknown env · 10 missing prebuilt input · 11 missing prod cfg.
+# to the prod VPS (env=prod). Exit: 0 ok · 2 unknown env · 10 missing prebuilt input · 11 missing prod cfg ·
+# 12 service not running after install (failed setup — Kein stummes Ausbleiben).
 set -euo pipefail
 ART="${1:?artifact dir required}"
 ENVN="${2:?env required}"
@@ -13,13 +14,92 @@ REPO="$(basename "$0")"
 BIN="$ART/${REPO}d"   # go build ./cmd/... writes cmd/<repo>d into the artifact
 [[ -f "$BIN" ]] || { echo "[deploy $REPO] missing prebuilt binary: $BIN" >&2; exit 10; }
 
+# ── health gate (Kein stummes Ausbleiben) ────────────────────────────────────────────────────────
+# A restart is not a start. A service that dies on its bind — prizm on aigentic's 8780 — is restarted
+# forever and never becomes active, so reporting "started" off a bare `systemctl restart` is a lie the
+# deploy chain then builds on. "installed and started" is therefore reported ONLY after the unit is seen
+# active AND holding its port; otherwise the install is a FAILED SETUP (exit 12) and, when the port is the
+# reason, the holder is named and a free one proposed — read from the same actual state the central
+# allocation reads (the Caddy routes), never a maintained list. Knobs (test seams) default to production.
+CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+BAND_LO="${DEVLAB_PORT_BAND_LO:-8770}"
+BAND_HI="${DEVLAB_PORT_BAND_HI:-8799}"
+HEALTH_WAIT="${DEVLAB_DEPLOY_HEALTH_WAIT:-15}"   # seconds to wait for the unit to come up
+
+port_of() {  # the routed port in a caddy drop-in, or nothing
+  sed -n 's/.*reverse_proxy[[:space:]]\{1,\}127\.0\.0\.1:\([0-9]\{1,\}\).*/\1/p' "$1" 2>/dev/null | head -n1
+}
+
+port_listening() {  # 0 when something is in LISTEN on port $1, straight off the running kernel
+  if command -v ss >/dev/null 2>&1; then
+    [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]
+    return
+  fi
+  local hex; hex="$(printf '%04X' "$1")"
+  awk -v h="$hex" 'NR>1 && $4=="0A" { split($2,a,":"); if (a[2]==h) { print "y"; exit } }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q y
+}
+
+service_on_port() {  # the service(s) OTHER than $REPO routed to port $1, from the caddy drop-ins
+  local want="$1" f id p
+  for f in "$CADDY_CONF"/*.caddy; do
+    [[ -e "$f" ]] || continue
+    id="$(basename "$f" .caddy)"
+    [[ "$id" == "$REPO" ]] && continue
+    p="$(port_of "$f")"
+    [[ "$p" == "$want" ]] && echo "$id"
+  done
+  return 0
+}
+
+lowest_free_port() {  # lowest band port no caddy drop-in routes
+  local used p f
+  used=" $(for f in "$CADDY_CONF"/*.caddy; do [[ -e "$f" ]] && port_of "$f"; done | tr '\n' ' ') "
+  for (( p = BAND_LO; p <= BAND_HI; p++ )); do
+    [[ "$used" == *" $p "* ]] || { echo "$p"; return 0; }
+  done
+  return 0
+}
+
+verify_started() {  # <unit> <port>; 0 once active AND (no known port OR the port is listening)
+  local unit="$1" port="$2" i
+  for (( i = 0; i < HEALTH_WAIT; i++ )); do
+    if systemctl is-active --quiet "$unit"; then
+      [[ -z "$port" ]] && return 0
+      port_listening "$port" && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+report_failed_setup() {  # <unit> <port>; state the failure, name any port conflict, propose a free port
+  echo "[deploy $REPO] FAILED: '$1' is not running after install — failed setup (Kein stummes Ausbleiben)." >&2
+  local port="$2" holder free
+  [[ -n "$port" ]] || return 0
+  holder="$(service_on_port "$port" | paste -sd, - || true)"
+  free="$(lowest_free_port || true)"
+  if [[ -n "$holder" ]]; then
+    echo "[deploy $REPO] port $port is already held by $holder${free:+; free is $free}." >&2
+  elif port_listening "$port"; then
+    echo "[deploy $REPO] port $port is already in use${free:+; free is $free}." >&2
+  fi
+  return 0
+}
+
 case "$ENVN" in
   dev)
-    # Local install on THIS (dev) box + restart the dev unit.
+    # Local install on THIS (dev) box + restart the dev unit, then PROVE it came up before saying so.
     install -d -o root -g root -m 0755 "/opt/$REPO/bin"
     install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
-    systemctl restart "$REPO"
-    echo "[deploy $REPO] dev: installed + restarted"
+    port="$(port_of "$CADDY_CONF/$REPO.caddy" || true)"
+    systemctl restart "$REPO" || true   # a failed restart still falls through to the health gate below
+    if verify_started "$REPO" "$port"; then
+      echo "[deploy $REPO] dev: installed and started (active, holding :${port:-?})"
+    else
+      report_failed_setup "$REPO" "$port"
+      exit 12
+    fi
     ;;
   prod)
     # Ship the prebuilt binary to the prod VPS (server-side target + root-held forced-command key), then
