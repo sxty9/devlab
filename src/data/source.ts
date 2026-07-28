@@ -1,4 +1,4 @@
-import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunConfig, RunResult, RunResultRef, RunSnapshotMeta, RunType, SlotOverview, StartResult, StartStrategy, User, VisionFile } from '@/types';
+import type { AgentAsk, AgentReply, AiMessage, AiModelCatalog, AssistantAsk, AssistantReply, AtlasAllocation, AtlasGraph, Axiom, BlockedDeploy, Branch, Change, Comment, Conformance, FileContent, MercuryTree, MetaViolation, PullRequestResult, Repo, RepoData, RolloutReport, Run, RunActive, RunAttachment, RunCalendar, RunChatMessage, RunChatReply, RunCoverage, RunExecution, RunInFlight, RunInput, RunList, RunNotice, RunPlan, RunProposal, RunConfig, RunResult, RunResultRef, RunSnapshotMeta, RunType, SlotOverview, StartResult, StartStrategy, User, VisionFile } from '@/types';
 
 export interface DiffPayload {
   before: string;
@@ -97,6 +97,8 @@ export interface DataSource {
 
   // ── Atlas (the deployed Holistic landscape, derived from the host's own config) ──
   atlas(): Promise<AtlasGraph>;
+  /** The central port ledger: who holds which port, and which ports in the band are free. */
+  atlasPorts(): Promise<AtlasAllocation>;
 
   // ── Mercury (the axiom model over aigentic's scheme graveyard) ──────────────
   mercuryTree(): Promise<MercuryTree>;

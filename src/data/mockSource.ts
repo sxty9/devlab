@@ -236,6 +236,28 @@ export const mockSource: DataSource = {
     };
   },
 
+  async atlasPorts() {
+    // The port ledger that matches the mock nodes above, so `vite dev` renders the Portvergabe offline.
+    return {
+      band: [8770, 8799],
+      held: [
+        { port: 8771, ids: ['hostek'] },
+        { port: 8772, ids: ['privleg'] },
+        { port: 8774, ids: ['remshel'] },
+        { port: 8775, ids: ['mail'] },
+        { port: 8776, ids: ['icaly'] },
+        { port: 8777, ids: ['contax'] },
+        { port: 8778, ids: ['notify'] },
+        { port: 8780, ids: ['aigentic'] },
+      ],
+      free: [
+        8770, 8773, 8779, 8781, 8782, 8783, 8784, 8785, 8786, 8787, 8788, 8789, 8790, 8791, 8792,
+        8793, 8794, 8795, 8796, 8797, 8798, 8799,
+      ],
+      scannedAt: '2026-07-14T09:00:00Z',
+    };
+  },
+
   async mercuryTree() {
     // A fresh deep copy each read: setTree must see a NEW reference or React skips the re-render — the
     // very reason a freshly added axiom would not appear. Adds/removes mutate axiomTree (see below).

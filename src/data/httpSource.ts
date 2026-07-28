@@ -204,6 +204,10 @@ export const httpSource: DataSource = {
     return json(await request('/api/atlas'));
   },
 
+  async atlasPorts() {
+    return json(await request('/api/atlas/ports'));
+  },
+
   async mercuryTree() {
     return json(await request('/api/mercury/tree'));
   },

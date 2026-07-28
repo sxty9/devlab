@@ -58,6 +58,7 @@ export const dataSource: DataSource = {
   assistantModels: () => impl.assistantModels(),
   terminalUrl: (id) => impl.terminalUrl(id),
   atlas: () => impl.atlas(),
+  atlasPorts: () => impl.atlasPorts(),
   mercuryTree: () => impl.mercuryTree(),
   mercuryItem: (path) => impl.mercuryItem(path),
   mercuryAddAxiom: (titel, body, section, force) => impl.mercuryAddAxiom(titel, body, section, force),

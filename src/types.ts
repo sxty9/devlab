@@ -856,6 +856,21 @@ export interface AtlasGraph {
   scannedAt: string;
 }
 
+/** A routed port and the service(s) pointed at it. More than one id is a double-booking. */
+export interface AtlasPortHolder {
+  port: number;
+  ids: string[];
+}
+
+/** The central port ledger, derived from the host's actual routes + bound sockets: which service
+ *  holds which port, and which ports in the managed band are free. */
+export interface AtlasAllocation {
+  band: [number, number];
+  held: AtlasPortHolder[];
+  free: number[];
+  scannedAt: string;
+}
+
 /** A section of the repo "skeleton" overview rendered by StructureView. */
 export interface StructureSection {
   title: string;
