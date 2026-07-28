@@ -206,6 +206,11 @@ func (s *Server) Handler() http.Handler {
 	// Atlas — the deployed Holistic landscape, derived from the host's own config (the services'
 	// rights manifests + their Caddy routes). Read-only, host-scoped, no workspace access.
 	mux.HandleFunc("GET /api/atlas", s.guard(s.atlasGraph))
+	// Central port allocation, derived from the same actual state: the ledger (who holds which port,
+	// which are free) for the dashboard, and a proposal endpoint setup consults for a free port
+	// instead of copying a template default. Both read-only.
+	mux.HandleFunc("GET /api/atlas/ports", s.guard(s.atlasPorts))
+	mux.HandleFunc("GET /api/atlas/ports/propose", s.guard(s.atlasProposePort))
 
 	// Mercury — the axiom-management model over the constitution's own Git repository (package
 	// axiomrepo). Read tier (the tree and a record); both are served from the local working copy.
