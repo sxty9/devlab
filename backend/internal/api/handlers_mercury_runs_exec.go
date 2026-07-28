@@ -971,6 +971,15 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		return rr, repoSignal{}
 	}
 
+	// Publish the dev state as it GROWS (req 3): while the agent implements — routinely committing on its
+	// own, sometimes for a long time — a background checkpoint pushes mercury-dev whenever it advances, so
+	// an interruption costs at most the work since the last checkpoint, never the whole run. It is stopped
+	// explicitly before the deploy/publish stages (so it can never race the authoritative atomic push) and
+	// deferred as well, to cover the early-return paths below. It uses the outer ctx, not the budget actx,
+	// so a spent time budget still lets the last checkpoint land.
+	stopCheckpoint := x.startDevCheckpoint(ctx, ex, wt, token, devBranch)
+	defer stopCheckpoint()
+
 	// PR / FULL: implement ON the dev branch (it already carries the accumulated work).
 	final, lim, err := x.runAgentLive(actx, ex, wt, prompt, "bypassPermissions", "implement", tuningFor(run), atts, &rr, saver)
 	if lim.limited {
@@ -999,6 +1008,7 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 			return rr, repoSignal{}
 		}
 	}
+	stopCheckpoint() // implement done; publish deliberately from here, no more background checkpoints
 
 	finalTip, err := ex.RevParse(ctx, wt, "HEAD")
 	if err != nil {
@@ -1025,6 +1035,13 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 		step("implement", "keine neuen Änderungen — dev-Stand unverändert ("+devBranch+"@"+short(finalTip)+"), nichts auszuliefern", runs.StepOK)
 		rr.OK = runs.StepsSucceeded(rr.Steps) // the repo result follows the chain (req 5)
 		return rr, repoSignal{}
+	}
+
+	// Publish the grown dev state NOW — before the (possibly slow) dev-deploy and the delivery-branch/PR
+	// stages — so a crash in any of them cannot cost the implement step's work (req 3). Best-effort: the
+	// authoritative atomic push below still gates the delivery, so a transient failure here is not terminal.
+	if _, err := ex.PushRefs(ctx, wt, token, false, devBranch); err != nil {
+		log.Printf("devlabd: pre-deploy dev publish (%s) failed, deferring to the final push: %v", devBranch, err)
 	}
 
 	// DEV-DEPLOY (full mode only) — delivers EXACTLY the dev branch: nothing folded together, filtered or
@@ -1844,6 +1861,55 @@ func (x *runExecutor) runAgentLive(actx context.Context, ex workspace.Executor, 
 	}
 	ag.finish(parseClaudeResult(final).Output)
 	return final, repoSignal{}, nil
+}
+
+// devCheckpointInterval bounds how much freshly-committed work an interruption can leave unpublished:
+// while the agent implements (routinely committing on its own, sometimes for a long time), the dev branch
+// is pushed to origin at most this far apart. Short enough that a crash costs minutes, not hours (req 3).
+const devCheckpointInterval = 2 * time.Minute
+
+// startDevCheckpoint publishes the dev branch to origin as a best-effort BACKUP whenever it advances, on a
+// ticker, so an interruption during a long implement step costs at most the work since the last checkpoint
+// — never the whole run (req 3). It is NON-fatal by design: a failed checkpoint (a network blip, or the
+// remote briefly ahead) is logged and retried on the next tick; the authoritative end-of-repo push still
+// gates the delivery. The push is a plain fast-forward of the dev branch (the repo is locked, so origin/
+// mercury-dev only ever moves under this run). The returned stop is idempotent and BLOCKS until the ticker
+// goroutine has exited, so a checkpoint can never race the final atomic publish. It is only ever called
+// sequentially from the executeRepo goroutine (explicitly, then via defer), so it needs no lock.
+func (x *runExecutor) startDevCheckpoint(ctx context.Context, ex workspace.Executor, wt, token, devBranch string) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(devCheckpointInterval)
+		defer t.Stop()
+		var last string
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				tip, err := ex.RevParse(ctx, wt, "HEAD")
+				if err != nil || tip == "" || tip == last {
+					continue // nothing new committed since the last checkpoint
+				}
+				if _, err := ex.PushRefs(ctx, wt, token, false, devBranch); err != nil {
+					log.Printf("devlabd: dev checkpoint push (%s) failed, retrying next tick: %v", devBranch, err)
+					continue
+				}
+				last = tip
+			}
+		}
+	}()
+	stopped := false
+	return func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		close(stop)
+		<-done
+	}
 }
 
 // deploy hands a PREBUILT artifact to the root wrapper, which INSTALLS ONLY — it never builds (Finding
