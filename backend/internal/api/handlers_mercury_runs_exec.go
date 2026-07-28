@@ -900,11 +900,13 @@ func (x *runExecutor) executeRepo(ctx context.Context, run runs.Run, repo model.
 	// workspace. They are NOT silently absorbed — the step names them, and marking devPrep.Recovered on the
 	// dev-advance decision below guarantees the dev push publishes them even if this run adds nothing else.
 	if devPrep.Recovered > 0 {
+		log.Printf("devlabd: run %s repo %s — recovered %d committed-but-unpublished commit(s) an interrupted run left on %s; retained and republishing", run.ID, repo.ID, devPrep.Recovered, devBranch)
 		step("dev-branch", fmt.Sprintf("%d festgeschriebene(r) Commit(s) eines unterbrochenen Laufs im Arbeitsstand gefunden, übernommen und mit ausgeliefert", devPrep.Recovered), runs.StepOK)
 	}
 	// A pushed dev state that will not fold cleanly is non-fatal (req 2): the local state is kept as-is and
 	// the run continues on it, simply without the very newest pushed commits until a later run resolves it.
 	if devPrep.RemoteConflict {
+		log.Printf("devlabd: run %s repo %s — pushed %s did not fold cleanly into the local dev state; kept local, continuing", run.ID, repo.ID, devBranch)
 		step("dev-branch", "veröffentlichter dev-Stand ("+devBranch+") nicht konfliktfrei einfaltbar — auf dem lokalen Stand fortgeführt", runs.StepNotApplicable)
 	}
 	// Hygiene without loss of history: clear an aborted run's half-changes (uncommitted edits + untracked
