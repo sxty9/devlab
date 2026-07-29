@@ -31,3 +31,18 @@ export const tintSoftBg: Record<Repo['tint'], string> = {
   ssd: 'bg-ssd/15',
   ram: 'bg-ram/15',
 };
+
+/** A semantic status tone. Distinct from the Repo channel tints above (a hardware-style palette):
+ *  these are the meanings a status/stage chip carries anywhere in the app — a stage's outcome, a
+ *  delivery's lifecycle, a pass/fail marker. */
+export type BadgeTone = 'success' | 'accent' | 'warning' | 'danger' | 'neutral';
+
+/** Tone → soft background + matching text for every status pill. ONE definition, so a stage badge,
+ *  a delivery badge and a pass/fail pill can never drift into three palettes (B-42). */
+export const badgeTone: Record<BadgeTone, string> = {
+  success: 'bg-success/15 text-success',
+  accent: 'bg-accent/15 text-accent',
+  warning: 'bg-warning/15 text-warning',
+  danger: 'bg-danger/15 text-danger',
+  neutral: 'bg-fill/15 text-text-tertiary',
+};

@@ -9,34 +9,16 @@ import { basename } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { AiAsk, AiMessage, AiModelCatalog } from '@/types';
 import { NATIVE_EFFORTS } from '@/ui/RunTuning';
-
-const ENGINES = [
-  { id: 'choose', label: 'Auto (Router)' },
-  { id: 'claude-agent', label: 'Claude Agent (Repo)' },
-  { id: 'claude-cli', label: 'Claude Code' },
-  { id: 'claude-api', label: 'Claude API' },
-  { id: 'ollama', label: 'Ollama (lokal)' },
-];
-
-// The agentic engine runs the FULL claude CLI in the workspace, as the user — it can edit files.
-const AGENT_MODES = [
-  { id: 'plan', label: 'Plan (nur lesen)' },
-  { id: 'auto', label: 'Auto (bearbeiten)' },
-  { id: 'full', label: 'Full (autonom)' },
-];
-
-/** Leak the model + version into one option label: the catalog's friendly name plus the version
- *  encoded in the model id (claude-opus-4-8 → "4.8", claude-fable-5 → "5"), so the picker shows
- *  WHICH version it selects instead of a bare family name. Targets the current family-first id
- *  scheme; leaves the label untouched when it already carries the version or the id has none
- *  (e.g. an Ollama tag). */
-function modelLabel(m: { id: string; label: string }): string {
-  const parts = m.id.replace(/^claude-/, '').split('-');
-  const ver: string[] = [];
-  for (let i = 1; i < parts.length && /^\d{1,2}$/.test(parts[i]); i++) ver.push(parts[i]);
-  const v = ver.join('.');
-  return v && !m.label.includes(v) ? `${m.label} ${v}` : m.label;
-}
+import {
+  AGENT_ENGINE,
+  AGENT_MODES,
+  ENGINES,
+  answerMark,
+  capTranscript,
+  changeNote,
+  modelLabel,
+  modelsForEngine,
+} from './aiChat';
 
 /** Resolve the Holistic dashboard origin so we can deep-link to the aigentic settings. */
 function aigenticUrl(): string {
@@ -177,7 +159,20 @@ function AskOptions({ ask, onAnswer, disabled }: { ask: AiAsk; onAnswer: (t: str
   );
 }
 
-function Bubble({ msg, onAnswer, disabled }: { msg: AiMessage; onAnswer?: (t: string) => void; disabled?: boolean }) {
+// Bubble renders one turn. An assistant turn carries the mark of the model that produced it
+// (labeling duty, D 26); a turn whose model is unknown — a transcript read back from the store —
+// carries no mark rather than a guessed one.
+function Bubble({
+  msg,
+  mark,
+  onAnswer,
+  disabled,
+}: {
+  msg: AiMessage;
+  mark?: string;
+  onAnswer?: (t: string) => void;
+  disabled?: boolean;
+}) {
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -190,10 +185,11 @@ function Bubble({ msg, onAnswer, disabled }: { msg: AiMessage; onAnswer?: (t: st
       <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-gpu/15 text-gpu shadow-elev-1">
         <ClaudeIcon className="h-3.5 w-3.5" />
       </span>
-      <div className="min-w-0 max-w-[85%] space-y-2">
+      <div className="min-w-0 max-w-[85%] space-y-1">
         {msg.content && (
           <div className="dl-markdown rounded-md rounded-tl-sm bg-fill/[0.07] px-3 py-2 text-footnote leading-relaxed text-text-primary" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
         )}
+        {mark && <span className="block px-1 font-mono text-[10px] text-text-tertiary">{mark}</span>}
         {msg.ask && msg.ask.questions.length > 0 && onAnswer && <AskOptions ask={msg.ask} onAnswer={onAnswer} disabled={disabled} />}
       </div>
     </div>
@@ -215,8 +211,13 @@ export function ClaudePanel() {
   const [mode, setMode] = useState('auto'); // agent permission mode (plan | auto | full)
   const [sessionId, setSessionId] = useState(''); // agent session, for multi-turn --resume
   const [catalog, setCatalog] = useState<AiModelCatalog | null>(null);
+  // The model mark of each answer, keyed by the turn's timestamp (stable across a transcript trim,
+  // unlike its position). Filled from the reply of a live turn; a transcript loaded from the store
+  // carries no marks, because the store does not keep them — and an unmarked answer shows no mark
+  // rather than a borrowed one.
+  const [marks, setMarks] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
-  const isAgent = engine === 'claude-agent';
+  const isAgent = engine === AGENT_ENGINE;
 
   useEffect(() => {
     let cancelled = false;
@@ -230,12 +231,7 @@ export function ClaudePanel() {
   }, [source]);
 
   // Model options depend on the chosen engine; Auto/router leaves the model to aigentic.
-  const models = useMemo<{ id: string; label: string }[]>(() => {
-    if (!catalog) return [];
-    if (engine === 'ollama') return catalog.ollama.map((m) => ({ id: m, label: m }));
-    if (engine === 'claude-cli' || engine === 'claude-api' || engine === 'claude-agent') return catalog.claude;
-    return [];
-  }, [catalog, engine]);
+  const models = useMemo(() => modelsForEngine(engine, catalog), [catalog, engine]);
 
   const activeFile = useMemo(() => {
     const t = openTabs.find((x) => x.id === activeTabId);
@@ -245,6 +241,7 @@ export function ClaudePanel() {
   useEffect(() => {
     let cancelled = false;
     setSessionId(''); // a new repo starts a fresh agent session
+    setMarks({}); // the store keeps no model marks, so none are claimed for a loaded transcript
     source
       .getAssistantHistory(activeRepo.id)
       .then((h) => !cancelled && setMessages(h))
@@ -273,21 +270,31 @@ export function ClaudePanel() {
     try {
       let output: string;
       let ask: AiAsk | undefined;
+      let mark: string;
       if (isAgent) {
         // Full agentic run: claude CLI in the workspace, as the user — it can edit the tree.
         const reply = await source.askAgent(activeRepo.id, { prompt: text, model, effort, mode, resume: sessionId });
         if (reply.sessionId) setSessionId(reply.sessionId);
         const n = reply.changes.length;
-        output = reply.output + (n ? `\n\n_(${n} ${n === 1 ? 'file' : 'files'} changed — open Source Control to review)_` : '');
+        output = reply.output + changeNote(n);
+        // The agent reply carries no model of its own, so the answer is marked with the model that
+        // was asked for; with none chosen the engine that ran is the honest mark.
+        mark = answerMark({ model, engine });
         if (n) void reloadRepo(); // surface the edits in the tree + VCS panel
       } else {
         const contextPaths = includeFile && activeFile ? [activeFile] : [];
         const reply = await source.askAssistant(activeRepo.id, { prompt: text, contextPaths, history, kind: engine, model, effort });
         output = reply.output;
         ask = reply.ask; // a structured question the model posed → rendered as clickable options
+        mark = answerMark(reply); // the model that actually answered
       }
-      const withReply: AiMessage[] = [...next, { role: 'assistant', content: output, ts: new Date().toISOString(), ask }];
+      const answeredAt = new Date().toISOString();
+      const withReply: AiMessage[] = capTranscript([
+        ...next,
+        { role: 'assistant', content: output, ts: answeredAt, ask },
+      ]);
       setMessages(withReply);
+      setMarks((m) => ({ ...m, [answeredAt]: mark }));
       source.saveAssistantHistory(activeRepo.id, withReply).catch(() => {});
     } catch (e) {
       setError(String((e as Error)?.message ?? e));
@@ -299,6 +306,7 @@ export function ClaudePanel() {
 
   const clear = () => {
     setMessages([]);
+    setMarks({});
     setError(null);
     setSessionId(''); // drop the agent session so the next turn starts fresh
     source.saveAssistantHistory(activeRepo.id, []).catch(() => {});
@@ -309,7 +317,7 @@ export function ClaudePanel() {
       <PanelHeader
         title="KI"
         actions={
-          <IconButton label="Clear conversation" title="Clear conversation" onClick={clear}>
+          <IconButton label="Clear conversation" onClick={clear}>
             <PlusIcon className="h-4 w-4" />
           </IconButton>
         }
@@ -319,16 +327,20 @@ export function ClaudePanel() {
       <div className="dl-no-select flex flex-col gap-1.5 border-b border-separator px-3 py-1.5 text-caption text-text-tertiary">
         <div className="flex flex-wrap items-center gap-1.5">
           {isAgent ? (
-            <span>Agent im Workspace <span className="text-text-secondary">{activeRepo.name}</span> — läuft als du, kann Dateien ändern</span>
+            <span>
+              Agent in <span className="text-text-secondary">{activeRepo.name}</span> — runs as you, edits files
+            </span>
           ) : (
-            <span>Kontext: <span className="text-text-secondary">{activeRepo.name}</span> (ganzes Repo)</span>
+            <span>
+              Context: <span className="text-text-secondary">{activeRepo.name}</span> (whole repo)
+            </span>
           )}
           {!isAgent && activeFile && (
             <button
               type="button"
+              aria-pressed={includeFile}
               onClick={() => setIncludeFile((v) => !v)}
               className={cn('truncate rounded-sm px-1.5 py-0.5 font-mono text-[11px] transition', includeFile ? 'bg-accent/15 text-accent' : 'bg-fill/10 text-text-tertiary line-through')}
-              title={includeFile ? 'Offene Datei priorisiert' : 'Offene Datei nicht priorisiert'}
             >
               +{basename(activeFile)}
             </button>
@@ -342,7 +354,7 @@ export function ClaudePanel() {
               setModel('');
             }}
             className="rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
-            title="Engine"
+            aria-label="Engine"
           >
             {ENGINES.map((x) => (
               <option key={x.id} value={x.id}>{x.label}</option>
@@ -353,9 +365,9 @@ export function ClaudePanel() {
               value={model}
               onChange={(e) => setModel(e.target.value)}
               className="max-w-[10rem] rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
-              title="Modell"
+              aria-label="Model"
             >
-              <option value="">Modell: Auto</option>
+              <option value="">Model: auto</option>
               {models.map((m) => (
                 <option key={m.id} value={m.id}>{modelLabel(m)}</option>
               ))}
@@ -366,7 +378,7 @@ export function ClaudePanel() {
               value={mode}
               onChange={(e) => setMode(e.target.value)}
               className="rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
-              title="Agent-Modus"
+              aria-label="Agent mode"
             >
               {AGENT_MODES.map((x) => (
                 <option key={x.id} value={x.id}>{x.label}</option>
@@ -377,7 +389,7 @@ export function ClaudePanel() {
             value={effort}
             onChange={(e) => setEffort(e.target.value)}
             className="ml-auto rounded-sm bg-fill/10 px-1 py-0.5 text-[11px] text-text-secondary focus:outline-none"
-            title="Reasoning effort"
+            aria-label="Reasoning effort"
           >
             {NATIVE_EFFORTS.map((x) => (
               <option key={x} value={x}>{x}</option>
@@ -391,7 +403,7 @@ export function ClaudePanel() {
           <p className="px-1 py-4 text-center text-caption text-text-tertiary">Ask about {activeRepo.name} — the assistant uses the repo (and the open file) as context.</p>
         )}
         {messages.map((m, i) => (
-          <Bubble key={i} msg={m} onAnswer={(t) => void send(t)} disabled={busy || i !== messages.length - 1} />
+          <Bubble key={i} msg={m} mark={marks[m.ts]} onAnswer={(t) => void send(t)} disabled={busy || i !== messages.length - 1} />
         ))}
         {busy && (
           <div className="flex gap-2">
@@ -406,7 +418,7 @@ export function ClaudePanel() {
             {error}
             <div className="mt-1">
               <a href={aigenticUrl()} target="_blank" rel="noreferrer" className="text-accent hover:underline">
-                aigentic öffnen ↗
+                Open aigentic ↗
               </a>
             </div>
           </div>

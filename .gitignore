@@ -15,7 +15,9 @@ dist/
 # go backend build artifacts
 /devlabd
 backend/devlabd
+backend/devlab-migrate
 deploy/devlabd
+deploy/devlab-migrate
 backend/deploy/
 
 # per-run deploy build output (the Mercury executor builds <workspace>/.mercury-artifact;

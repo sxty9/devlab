@@ -14,13 +14,31 @@ const x = (lane: number) => X0 + lane * LANE_W;
 function refTone(ref: string): string {
   if (ref === 'HEAD') return 'bg-accent/20 text-accent';
   if (ref === 'main' || ref === 'master') return 'bg-success/15 text-success';
-  if (ref.startsWith('preview')) return 'bg-gpu/15 text-gpu';
   return 'bg-fill/10 text-text-secondary';
 }
 
-/** An IntelliJ-style commit log: a coloured lane graph gutter + commit metadata per row. */
+/** An IntelliJ-style commit log: a coloured lane graph gutter + commit metadata per row. Arrow
+ *  keys walk the rows and Cmd/Ctrl+C copies the selected commit's hash (D 17). */
 export function CommitGraph({ commits }: { commits: Commit[] }) {
   const [selected, setSelected] = useState<string | null>(null);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (commits.length === 0) return;
+    const at = commits.findIndex((c) => c.hash === selected);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const next = e.key === 'ArrowDown' ? Math.min(at + 1, commits.length - 1) : Math.max(at <= 0 ? 0 : at - 1, 0);
+      setSelected(commits[next].hash);
+      requestAnimationFrame(() => {
+        document.querySelector<HTMLElement>(`[data-commit="${CSS.escape(commits[next].hash)}"]`)?.focus();
+      });
+      return;
+    }
+    if (at >= 0 && (e.metaKey || e.ctrlKey) && (e.key === 'c' || e.key === 'C')) {
+      e.preventDefault();
+      navigator.clipboard?.writeText(commits[at].hash);
+    }
+  };
 
   const maxLane = commits.reduce(
     (m, c) => Math.max(m, c.dotLane, ...c.lines.map((l) => Math.max(l.from, l.to))),
@@ -29,15 +47,17 @@ export function CommitGraph({ commits }: { commits: Commit[] }) {
   const gutterW = x(maxLane) + 12;
 
   return (
-    <ul role="list">
+    <ul role="listbox" aria-label="Commits" onKeyDown={onKeyDown}>
       {commits.map((c) => {
         const isSel = selected === c.hash;
         return (
           <li key={c.hash}>
             <button
               type="button"
+              role="option"
+              aria-selected={isSel}
+              data-commit={c.hash}
               onClick={() => setSelected(c.hash)}
-              title={`${c.hash} · ${c.author}`}
               className={cn(
                 'flex w-full items-stretch gap-2 text-left transition-colors',
                 isSel ? 'bg-accent/15' : 'hover:bg-fill/[0.06]',
@@ -57,7 +77,7 @@ export function CommitGraph({ commits }: { commits: Commit[] }) {
                     />
                   ),
                 )}
-                <circle cx={x(c.dotLane)} cy={ROW_H / 2} r={4.5} fill={laneColor(c.dotLane)} stroke="#1c1c1e" strokeWidth={2} />
+                <circle cx={x(c.dotLane)} cy={ROW_H / 2} r={4.5} fill={laneColor(c.dotLane)} stroke="var(--bg-base)" strokeWidth={2} />
               </svg>
 
               <span className="flex min-w-0 flex-1 flex-col justify-center py-1.5 pr-3">

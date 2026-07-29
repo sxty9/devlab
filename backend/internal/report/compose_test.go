@@ -3,6 +3,7 @@ package report
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"devlab/backend/internal/model"
 )
@@ -59,7 +60,7 @@ func sampleItems() []Item {
 }
 
 func TestComposeSectionsTotalsAndSubject(t *testing.T) {
-	c := Compose("2026-07-26", sampleItems(), "https://holistic.example/devlab#/mercury")
+	c := Compose("2026-07-26", sampleItems(), nil, "https://holistic.example/devlab#/mercury")
 
 	// Subject: count + explicit attention flag (failures are not hidden).
 	if !strings.Contains(c.Subject, "2026-07-26") || !strings.Contains(c.Subject, "3 executions") {
@@ -100,7 +101,7 @@ func TestComposeSectionsTotalsAndSubject(t *testing.T) {
 }
 
 func TestComposeWithoutLinkFallsBackToText(t *testing.T) {
-	c := Compose("2026-07-26", sampleItems(), "")
+	c := Compose("2026-07-26", sampleItems(), nil, "")
 	if strings.Contains(c.Text, "http") {
 		t.Errorf("expected no URL in text without a link: %q", c.Text)
 	}
@@ -112,12 +113,73 @@ func TestComposeWithoutLinkFallsBackToText(t *testing.T) {
 func TestComposeHTMLEscapesDynamicValues(t *testing.T) {
 	items := []Item{{RunName: `<script>x</script>`, TypeLabel: "ToDo", Finished: true, OK: true,
 		Repos: []RepoLine{{Repo: `a&b`, Stage: "deployed"}}}}
-	c := Compose("2026-07-26", items, "")
+	c := Compose("2026-07-26", items, nil, "")
 	if strings.Contains(c.HTML, "<script>x</script>") {
 		t.Errorf("run name not escaped in HTML")
 	}
 	if !strings.Contains(c.HTML, "a&amp;b") {
 		t.Errorf("repo name not escaped in HTML")
+	}
+}
+
+// REQ-042.6: the report carries its three rubrics — delivery alarms, emergency-route overrides,
+// protection deviations — with the finding, its repository, the next step and, for a bundled
+// notice, the count and the period. An alarm-free day states no alarms at all.
+func TestComposeRendersTheThreeRubrics(t *testing.T) {
+	first := time.Date(2026, 7, 26, 8, 0, 0, 0, time.UTC)
+	rubrics := []Rubric{
+		{Title: RubricDeliveryAlarms, Lines: []RubricLine{{
+			Repo: "devlab", Text: "implemented without dev delivery",
+			NextStep: "fix the delivery path and resume the execution",
+			Count:    7, FirstAt: first, LastAt: first.Add(3 * time.Hour),
+		}}},
+		{Title: RubricOverrides, Lines: []RubricLine{{
+			Text: "ada overrode the delivery-origin protection for PR #12", Count: 1, FirstAt: first, LastAt: first,
+		}}},
+		{Title: RubricProtection, Lines: []RubricLine{{
+			Repo: "aigentic", Text: "branch protection deviated (required review off) and was restored",
+			Count: 1, FirstAt: first, LastAt: first,
+		}}},
+	}
+	c := Compose("2026-07-26", sampleItems(), rubrics, "")
+
+	if !strings.Contains(c.Subject, "3 alarms") {
+		t.Errorf("subject must state the alarms: %q", c.Subject)
+	}
+	for _, body := range []string{c.Text, c.HTML} {
+		for _, want := range []string{
+			RubricDeliveryAlarms, RubricOverrides, RubricProtection,
+			"implemented without dev delivery", "fix the delivery path and resume the execution",
+			"overrode the delivery-origin protection", "branch protection deviated",
+			"7 times between",
+		} {
+			if !strings.Contains(strings.ToLower(body), strings.ToLower(want)) {
+				t.Errorf("body missing %q", want)
+			}
+		}
+		// No transcripts, no raw logs — the report summarizes and points into the UI.
+		if !strings.Contains(strings.ToLower(body), "mercury runs view") {
+			t.Errorf("body must point into the UI for details")
+		}
+	}
+
+	// An alarm-free day: no empty headings.
+	clean := Compose("2026-07-26", sampleItems(), nil, "")
+	if strings.Contains(clean.Text, RubricDeliveryAlarms) || strings.Contains(clean.Subject, "alarm") {
+		t.Errorf("a day without findings must state no rubrics:\n%s\n%s", clean.Subject, clean.Text)
+	}
+}
+
+// The rubric renderer escapes what it renders: a finding's text is data, never markup.
+func TestComposeRubricHTMLEscapes(t *testing.T) {
+	c := Compose("2026-07-26", sampleItems(), []Rubric{{Title: RubricOverrides, Lines: []RubricLine{
+		{Repo: `a&b`, Text: `<script>x</script>`, NextStep: `<b>no</b>`, Count: 1},
+	}}}, "")
+	if strings.Contains(c.HTML, "<script>x</script>") || strings.Contains(c.HTML, "<b>no</b>") {
+		t.Errorf("rubric values must be escaped:\n%s", c.HTML)
+	}
+	if !strings.Contains(c.HTML, "a&amp;b") {
+		t.Error("rubric repo not escaped")
 	}
 }
 

@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react';
 import { useWorkspace } from '@/state/workspace';
-import { ensureDevlabTheme } from './monacoTheme';
+import { devlabThemeName, ensureDevlabTheme } from './monacoTheme';
 import { PathBreadcrumb } from '@/ui/PathBreadcrumb';
 import { DiffIcon } from '@/ui/icons';
 
@@ -29,7 +29,7 @@ export function DiffView({ path }: { path: string }) {
           original={before}
           modified={after}
           language={lang}
-          theme="devlab-dark"
+          theme={devlabThemeName()}
           onMount={onMount}
           loading={<div className="p-4 text-footnote text-text-tertiary">Loading diff…</div>}
           options={{

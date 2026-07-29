@@ -6,8 +6,9 @@ import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
 import { FileIcon, FileTextIcon, PlusIcon, RefreshIcon, XIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
-import { humanSize, toBase64 } from '@/lib/file';
+import { filesFromClipboard, humanSize, toBase64 } from '@/lib/file';
 import { usePasteFiles } from '@/lib/usePasteFiles';
+import { dragHasFiles } from './treeOps';
 import type { VisionFile } from '@/types';
 
 /** The Vision Catalog: idea deposits (images, PDFs, specs, notes) from the repo's /vision folder,
@@ -83,13 +84,29 @@ export function VisionPanel() {
   // A clipboard paste while the Vision panel is open deposits its files — equal to the dialog.
   usePasteFiles(uploadFiles, canWrite);
 
+  // A browser drag & drop is the third equal way in: the catalog IS a collection of files, so it
+  // must accept dropped ones (D 12). All three ways run the same deposit path.
+  const [dragOver, setDragOver] = useState(false);
+  const onDragOver = (e: React.DragEvent) => {
+    if (!canWrite || !dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDragOver(true);
+  };
+  const onDrop = (e: React.DragEvent) => {
+    if (!canWrite || !dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    setDragOver(false);
+    void uploadFiles(filesFromClipboard({ clipboardData: e.dataTransfer }));
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <PanelHeader
         title="Vision"
         actions={
           <>
-            <IconButton label="Attach file" title={canWrite ? 'Attach a file to /vision' : 'Read-only repository'} disabled={!canWrite || busy} onClick={() => fileInput.current?.click()}>
+            <IconButton label="Attach a file to the vision catalog" disabled={!canWrite || busy} onClick={() => fileInput.current?.click()}>
               <PlusIcon className="h-4 w-4" />
             </IconButton>
             <IconButton label="Refresh" onClick={() => void reload()}>
@@ -114,7 +131,15 @@ export function VisionPanel() {
         {loading ? 'Loading…' : `${files.length} in ${activeRepo.name}/vision`}
       </p>
 
-      <div className="dl-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-3">
+      <div
+        className={cn(
+          'dl-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-3',
+          dragOver && 'rounded-md ring-1 ring-inset ring-accent/60',
+        )}
+        onDragOver={onDragOver}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={onDrop}
+      >
         {!loading && files.length === 0 && (
           <p className="px-2 py-3 text-caption text-text-tertiary">
             No vision files yet. {canWrite ? 'Attach an image, PDF or spec to start the catalog.' : 'Ideas will appear here once collaborators add them.'}
@@ -146,7 +171,6 @@ export function VisionPanel() {
                 onClick={() => void removeFile(f)}
                 disabled={busy}
                 aria-label={`Delete ${f.name}`}
-                title="Delete vision file"
                 className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-text-tertiary opacity-0 transition hover:bg-fill/15 hover:text-danger focus-visible:opacity-100 group-hover:opacity-100 disabled:opacity-30"
               >
                 <XIcon className="h-3.5 w-3.5" />

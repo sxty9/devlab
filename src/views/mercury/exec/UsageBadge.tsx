@@ -1,10 +1,20 @@
-// UsageBadge — Welle-0 stub (B9 fills it). Live token/cost counter — informative, never a cap (REQ-017).
-export function UsageBadge() {
+// UsageBadge — the consumption readout of one execution: input tokens, output tokens and their
+// monetary equivalent, climbing LIVE while the agent works (REQ-017, F7). It is informative only:
+// there is no cap, no remaining budget and no "x of y spent" anywhere on this surface — the only
+// binding limits are the collective usage-limit pause and the time budget.
+import { cn } from '@/lib/cn';
+import { fmtCost, fmtNum } from '@/lib/format';
+import type { UsageView } from '@/types';
+import { usageParts } from './logic';
+
+export function UsageBadge({ usage, className }: { usage?: UsageView; className?: string }) {
+  const { input, output, costUsd, any } = usageParts(usage);
+  if (!any) return null;
   return (
-    <div className="flex h-full min-h-0 items-center justify-center p-8">
-      <p className="max-w-md text-center text-footnote text-text-tertiary">
-        UsageBadge arrives with its building block (B9).
-      </p>
-    </div>
+    <span className={cn('flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-text-tertiary', className)}>
+      <span aria-label="input tokens">↓ {fmtNum(input)}</span>
+      <span aria-label="output tokens">↑ {fmtNum(output)}</span>
+      <span className="font-medium text-text-secondary">{fmtCost(costUsd)}</span>
+    </span>
   );
 }

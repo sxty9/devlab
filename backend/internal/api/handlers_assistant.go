@@ -1,14 +1,17 @@
 package api
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"devlab/backend/internal/aigentic"
 	"devlab/backend/internal/git"
 	"devlab/backend/internal/model"
+	"devlab/backend/internal/telemetry"
 	"devlab/backend/internal/workspace"
 )
 
@@ -78,12 +81,61 @@ func (s *Server) assistant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "AI request failed")
 		return
 	}
-	reply := model.AssistantReply{Output: result.Output, Engine: result.Engine, Model: result.Model, Ask: result.Ask}
+	reply := model.AssistantReply{Output: result.Output, Engine: result.Engine, Model: answerModel(result.Model, result.Engine), Ask: result.Ask}
 	reply.Usage.InputTokens = result.Usage.InputTokens
 	reply.Usage.OutputTokens = result.Usage.OutputTokens
 	reply.Usage.TotalTokens = result.Usage.TotalTokens
 	reply.Usage.Truncated = result.Usage.Truncated
+	// Both AI paths report their consumption to the ONE usage pool (cross-cutting 5): no AI call
+	// of this service happens past the central accounting.
+	s.recordAiUsage(telemetry.UsageSample{
+		Source: usageSourceAssistant,
+		User:   usernameOf(r),
+		Repo:   repo,
+		Model:  reply.Model,
+		In:     int64(result.Usage.InputTokens),
+		Out:    int64(result.Usage.OutputTokens),
+	})
 	writeJSON(w, http.StatusOK, reply)
+}
+
+// The AI sources of this service, named once — the `source` vocabulary of the usage pool.
+const (
+	usageSourceAssistant = "assistant"
+	usageSourceAgent     = "agent"
+)
+
+// recordAiUsage appends one sample to the ONE AI-usage pool. Reporting is fail-soft: a ledger
+// that cannot be written must never cost the user their answer — telemetry reports, it neither
+// judges nor gates.
+func (s *Server) recordAiUsage(sample telemetry.UsageSample) {
+	if s.usage == nil {
+		return
+	}
+	if sample.At.IsZero() {
+		sample.At = time.Now()
+	}
+	if err := s.usage.Record(sample); err != nil {
+		log.Printf("devlabd: AI usage sample (%s) not recorded: %v", sample.Source, err)
+	}
+}
+
+// answerModel is the label an AI answer carries (labeling duty, D 26): the model the engine
+// reported, or — when it named none — the engine that answered. It never invents a model name;
+// an answer nobody labelled stays unlabelled.
+func answerModel(model, engine string) string {
+	if m := strings.TrimSpace(model); m != "" {
+		return m
+	}
+	return strings.TrimSpace(engine)
+}
+
+// usernameOf is the caller's username, or "" when no guard resolved one.
+func usernameOf(r *http.Request) string {
+	if u := userFrom(r); u != nil {
+		return u.Username
+	}
+	return ""
 }
 
 // buildPrompt folds a repo-aware preamble + the prior transcript into aigentic's single prompt

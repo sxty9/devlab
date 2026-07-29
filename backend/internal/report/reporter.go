@@ -36,6 +36,7 @@ type Sender interface {
 type Reporter struct {
 	recipient string
 	execs     Executions
+	notices   Notices
 	ledger    *Ledger
 	sender    Sender
 
@@ -47,10 +48,12 @@ type Reporter struct {
 }
 
 // Config configures a Reporter. recipient is the Holistic user the runs are assigned to (the owner);
-// an empty recipient makes the Reporter inert.
+// an empty recipient makes the Reporter inert. Notices feeds the report's rubrics (REQ-042.6) and
+// may be nil — the report then carries its executions without them.
 type Config struct {
 	Recipient string
 	Execs     Executions
+	Notices   Notices
 	Ledger    *Ledger
 	Sender    Sender
 	Now       func() time.Time
@@ -66,6 +69,7 @@ func NewReporter(c Config) *Reporter {
 	rp := &Reporter{
 		recipient: strings.TrimSpace(c.Recipient),
 		execs:     c.Execs,
+		notices:   c.Notices,
 		ledger:    c.Ledger,
 		sender:    c.Sender,
 		now:       c.Now,
@@ -89,34 +93,18 @@ func NewReporter(c Config) *Reporter {
 	return rp
 }
 
-// Run ticks the Reporter on an interval until ctx is done. It is panic-isolated so a bad pass never
-// takes devlabd down.
+// Run ticks the Reporter on an interval until ctx is done, through the shared ticker (loop.go) —
+// panic-isolated, with one pass at startup so a report due right after a restart is not delayed.
 func (rp *Reporter) Run(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	rp.logf("devlabd: daily-report reporter started (recipient=%q, interval=%s)", rp.recipient, interval)
-	rp.safeTick(ctx) // one pass at startup so a report due right after a restart is not delayed a full interval
-	for {
-		select {
-		case <-ctx.Done():
-			rp.logf("devlabd: daily-report reporter stopped")
-			return
-		case <-t.C:
-			rp.safeTick(ctx)
-		}
-	}
-}
-
-func (rp *Reporter) safeTick(ctx context.Context) {
-	defer func() {
-		if r := recover(); r != nil {
-			rp.logf("devlabd: daily-report tick panicked (contained): %v", r)
-		}
-	}()
-	rp.tick(ctx)
+	ticker{
+		label:    "daily-report reporter (recipient=" + rp.recipient + ")",
+		interval: interval,
+		logf:     rp.logf,
+		tick:     rp.tick,
+	}.run(ctx)
 }
 
 // tick performs one pass: it is the whole decision, kept free of I/O timing so tests can drive it
@@ -183,7 +171,7 @@ func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs
 	}
 
 	items := rp.buildItems(summaries)
-	content := Compose(day, items, rp.dayLink())
+	content := Compose(day, items, rp.rubrics(day), rp.dayLink())
 
 	at := now
 	attempts := rec.Attempts + 1
@@ -200,6 +188,21 @@ func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs
 		Recipient: rp.recipient, Day: day, Status: StatusSent, Executions: len(items),
 		Attempts: attempts, SentAt: &at, LastAttempt: &at,
 	})
+}
+
+// rubrics reads the day's findings out of the notice pool (REQ-042.6). An unreadable pool costs
+// the report its rubrics, never the report itself — the executions are the substance, the rubrics
+// the addition.
+func (rp *Reporter) rubrics(day string) []Rubric {
+	if rp.notices == nil {
+		return nil
+	}
+	list, err := rp.notices.List()
+	if err != nil {
+		rp.logf("devlabd: daily-report notices for %s: %v", day, err)
+		return nil
+	}
+	return BuildRubrics(list, day, rp.loc)
 }
 
 // buildItems turns a day's results (oldest first) into report items — each result already

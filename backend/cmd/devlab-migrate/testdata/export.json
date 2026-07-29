@@ -1,0 +1,170 @@
+{
+  "runs": [
+    {
+      "id": "run_auto1",
+      "name": "Reuse and shared building blocks",
+      "type": "",
+      "enabled": true,
+      "schedule": { "kind": "weekly", "timeOfDay": "07:00", "weekdays": [1] },
+      "axiomIds": ["ax_reuse", "ax_no_redundancy"],
+      "prompt": "# Automatic run: Reuse and shared building blocks\n\nold composed prompt including the constitution",
+      "promptHash": "sha256:0001",
+      "promptAt": "2026-06-01T05:00:00Z",
+      "createdAt": "2026-06-01T05:00:00Z",
+      "updatedAt": "2026-06-20T05:00:00Z",
+      "nextFireAt": "2026-07-06T07:00:00Z"
+    },
+    {
+      "id": "run_auto2",
+      "name": "Repository structure and hygiene",
+      "type": "",
+      "enabled": true,
+      "schedule": { "kind": "daily", "timeOfDay": "06:30" },
+      "axiomIds": ["ax_structure"],
+      "prompt": "# Automatic run: Repository structure and hygiene\n\nold composed prompt",
+      "promptAt": "2026-06-02T05:00:00Z",
+      "createdAt": "2026-06-02T05:00:00Z",
+      "updatedAt": "2026-06-02T05:00:00Z"
+    },
+    {
+      "id": "run_own1",
+      "name": "The service itself: one delivery chain, no modes",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "task": "A requirement ON this service — its substance lives in the acceptance matrix.",
+      "targets": [{ "repo": "devlab" }],
+      "prompt": "# Task\n\nrequirement on this service",
+      "promptAt": "2026-07-01T09:00:00Z",
+      "createdAt": "2026-07-01T09:00:00Z",
+      "updatedAt": "2026-07-01T09:00:00Z"
+    },
+    {
+      "id": "run_own2",
+      "name": "The service itself: honest execution states",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "done": true,
+      "repo": "devlab",
+      "task": "Another requirement ON this service.",
+      "prompt": "# Task\n\nanother requirement on this service",
+      "promptAt": "2026-07-02T09:00:00Z",
+      "createdAt": "2026-07-02T09:00:00Z",
+      "updatedAt": "2026-07-02T09:00:00Z",
+      "lastFiredAt": "2026-07-03T09:00:00Z",
+      "lastResult": {
+        "resultId": "2026-07-03T09-00-00.000000000Z",
+        "at": "2026-07-03T09:00:00Z",
+        "ok": true,
+        "repoCount": 1,
+        "inputTokens": 100,
+        "outputTokens": 10,
+        "costUsd": 0.5
+      }
+    },
+    {
+      "id": "run_foreign_open",
+      "name": "alpha: move the surface onto the shared package",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "task": "The setup of alpha fails because its surface imports a package the environment does not provide. Switch the imports and prove the check passes.",
+      "targets": [{ "repo": "alpha" }],
+      "prompt": "# Task: alpha: move the surface onto the shared package\n\nold composed task prompt",
+      "promptAt": "2026-07-20T10:00:00Z",
+      "createdAt": "2026-07-19T19:00:00Z",
+      "updatedAt": "2026-07-20T10:00:00Z",
+      "lastFiredAt": "2026-07-20T12:00:00Z"
+    },
+    {
+      "id": "run_foreign_done1",
+      "name": "beta: full-screen mode for sessions",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "done": true,
+      "repo": "beta",
+      "task": "Sessions should gain a full-screen mode.",
+      "prompt": "# Task: beta: full-screen mode for sessions\n\nold composed task prompt",
+      "promptAt": "2026-07-10T13:00:00Z",
+      "createdAt": "2026-07-10T13:00:00Z",
+      "updatedAt": "2026-07-10T13:00:00Z",
+      "lastFiredAt": "2026-07-12T11:49:52Z",
+      "lastResult": {
+        "resultId": "2026-07-12T11-49-52.236015668Z",
+        "at": "2026-07-12T11:49:52.236015668Z",
+        "ok": true,
+        "repoCount": 1,
+        "inputTokens": 7711682,
+        "outputTokens": 115915,
+        "costUsd": 9.591169
+      }
+    },
+    {
+      "id": "run_foreign_done2",
+      "name": "extract the shared library out of gamma",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "done": true,
+      "targets": [{ "repo": "gamma" }, { "newRepo": "gammalib" }],
+      "attachments": [
+        {
+          "id": "att_note1",
+          "filename": "note.jpg",
+          "mime": "image/jpeg",
+          "size": 143376,
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+          "uploadedAt": "2026-07-14T19:06:15Z",
+          "uploadedBy": "owner"
+        }
+      ],
+      "task": "Move the shared parts into their own repository.",
+      "prompt": "# Task: extract the shared library out of gamma\n\nold composed task prompt",
+      "promptAt": "2026-07-14T12:15:58Z",
+      "createdAt": "2026-07-14T12:15:58Z",
+      "updatedAt": "2026-07-14T12:15:58Z",
+      "lastFiredAt": "2026-07-14T14:52:28Z",
+      "lastResult": {
+        "resultId": "2026-07-14T14-52-28.048904010Z",
+        "at": "2026-07-14T14:52:28.048904010Z",
+        "ok": true,
+        "repoCount": 2,
+        "inputTokens": 22905150,
+        "outputTokens": 224201,
+        "costUsd": 20.8365925
+      }
+    },
+    {
+      "id": "run_foreign_done3",
+      "name": "delta: interfaces across the landscape",
+      "type": "todo",
+      "enabled": true,
+      "schedule": { "kind": "", "timeOfDay": "" },
+      "axiomIds": null,
+      "done": true,
+      "targets": [{ "repo": "delta" }],
+      "task": "Roll the interfaces out across the landscape.",
+      "prompt": "# Task: delta: interfaces across the landscape\n\nold composed task prompt",
+      "promptAt": "2026-07-16T17:15:18Z",
+      "createdAt": "2026-07-16T14:49:41Z",
+      "updatedAt": "2026-07-16T17:15:18Z",
+      "lastFiredAt": "2026-07-16T18:00:12Z",
+      "lastResult": {
+        "resultId": "2026-07-16T18-00-12.382259604Z",
+        "at": "2026-07-16T18:00:12.382259604Z",
+        "ok": false,
+        "repoCount": 1,
+        "inputTokens": 21669576,
+        "outputTokens": 157278,
+        "costUsd": 18.0697995
+      }
+    }
+  ]
+}

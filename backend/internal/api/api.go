@@ -325,11 +325,11 @@ func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filepath.Join(root, "index.html"))
 }
 
-// resolveUser is the ONE user-resolution entry of the guards. Today it is the cookie path;
-// B11 extends it to accept `Authorization: Bearer` equivalently (auth.FromRequest) — the
-// extension point is deliberately here so every guard changes at once.
+// resolveUser is the ONE user-resolution entry of the guards: the session cookie OR an
+// `Authorization: Bearer` token, verified by the same verifier (auth.FromRequest, D 34). The
+// entry point sits here so every guard resolves identity the one same way.
 func (s *Server) resolveUser(r *http.Request) (*auth.User, error) {
-	return s.v.User(r)
+	return s.v.FromRequest(r)
 }
 
 // guardAuthed requires a valid Holistic session and stashes the resolved user on the request.
@@ -355,10 +355,10 @@ func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
-// checkCSRF applies the double-submit check on the cookie path. On a bearer request (B11) the
-// check is waived — a bearer header cannot be sent cross-site by a browser form.
+// checkCSRF applies the double-submit check on the cookie path. On a bearer request the check is
+// waived — a bearer header cannot be sent cross-site by a browser form (D 34).
 func (s *Server) checkCSRF(r *http.Request) bool {
-	return s.v.CheckCSRF(r)
+	return auth.BearerPresented(r) || s.v.CheckCSRF(r)
 }
 
 // guardWrite gates mutating requests: a DevLab session (guard) + CSRF + a linked GitHub

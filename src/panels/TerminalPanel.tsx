@@ -8,21 +8,16 @@ import { PanelHeader } from './PanelHeader';
 import { IconButton } from '@/ui/Button';
 import { RefreshIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
-
-type Status = 'connecting' | 'connected' | 'closed' | 'offline';
-
-const statusText: Record<Status, string> = {
-  connecting: 'connecting…',
-  connected: 'connected',
-  closed: 'disconnected',
-  offline: 'offline (mock)',
-};
-const statusColor: Record<Status, string> = {
-  connecting: 'text-warning',
-  connected: 'text-success',
-  closed: 'text-text-tertiary',
-  offline: 'text-text-tertiary',
-};
+import {
+  applyNotice,
+  isSessionNotice,
+  parseControlFrame,
+  recallSession,
+  rememberSession,
+  statusText,
+  statusTone,
+  type TerminalStatus,
+} from './terminalSession';
 
 // xtermTheme derives an xterm palette from the app's live design tokens so the terminal
 // matches the active light/dark theme. Background/foreground follow --bg-base; the ANSI 16
@@ -68,10 +63,13 @@ function isDark(color: string): boolean {
   return true; // default to a dark assumption when we can't parse (safer contrast)
 }
 
+/** A shell in the repo workspace, served by remshel. After a reload the panel asks for the session
+ *  it was attached to; the server's session notice says whether that session was picked up or a new
+ *  shell was started, and a new one is always shown as new (S3, D 19). */
 export function TerminalPanel() {
   const { activeRepo } = useWorkspace();
   const hostRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState<Status>('connecting');
+  const [status, setStatus] = useState<TerminalStatus>('connecting');
   // Bumping this nonce tears down and re-opens the terminal (the reconnect button).
   const [nonce, setNonce] = useState(0);
 
@@ -79,7 +77,9 @@ export function TerminalPanel() {
     const host = hostRef.current;
     if (!host) return;
 
-    const url = getDataSource().terminalUrl(activeRepo.id);
+    const keyStore = typeof localStorage !== 'undefined' ? localStorage : null;
+    const requested = recallSession(activeRepo.id, keyStore);
+    const url = getDataSource().terminalUrl(activeRepo.id, requested || undefined);
     const term = new Terminal({
       fontFamily: 'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace)',
       fontSize: 12.5,
@@ -101,11 +101,10 @@ export function TerminalPanel() {
     };
     safeFit();
 
-    // Offline / mock: no live provider. Show a notice instead of dialling.
+    // No live provider (the stub data source): say so instead of dialling nowhere.
     if (!url) {
-      setStatus('offline');
-      term.writeln('\x1b[90mTerminal is offline (mock data source).\x1b[0m');
-      term.writeln('\x1b[90mRun against the devlabd backend for a real shell in this workspace.\x1b[0m');
+      setStatus('unavailable');
+      term.writeln('\x1b[90m[no terminal provider]\x1b[0m');
       const ro = new ResizeObserver(safeFit);
       ro.observe(host);
       return () => {
@@ -114,7 +113,7 @@ export function TerminalPanel() {
       };
     }
 
-    setStatus('connecting');
+    setStatus(requested ? 'reattaching' : 'connecting');
     const ws = new WebSocket(url);
     ws.binaryType = 'arraybuffer';
     const encoder = new TextEncoder();
@@ -127,19 +126,21 @@ export function TerminalPanel() {
     };
 
     ws.onopen = () => {
-      setStatus('connected');
       safeFit();
       sendResize();
       term.focus();
     };
     ws.onmessage = (e) => {
       if (typeof e.data === 'string') {
-        // Control frame (e.g. a remshel error JSON) — surface its message dimly.
-        try {
-          const c = JSON.parse(e.data) as { type?: string; message?: string };
-          if (c.message) term.writeln(`\x1b[33m${c.message}\x1b[0m`);
-        } catch {
-          /* ignore non-JSON text */
+        const frame = parseControlFrame(e.data);
+        if (isSessionNotice(frame)) {
+          // Which session this terminal is on — the one fact the panel must not guess.
+          const { status: next, keep, announce } = applyNotice(frame, requested);
+          setStatus(next);
+          rememberSession(activeRepo.id, keep, keyStore);
+          if (announce) term.writeln(`\x1b[33m${announce}\x1b[0m`);
+        } else if (frame) {
+          term.writeln(`\x1b[33m${frame.message}\x1b[0m`);
         }
         return;
       }
@@ -181,7 +182,7 @@ export function TerminalPanel() {
         title="Terminal"
         actions={
           <>
-            <span className={cn('mr-1 text-[11px]', statusColor[status])}>{statusText[status]}</span>
+            <span className={cn('mr-1 text-[11px]', statusTone[status])}>{statusText[status]}</span>
             <IconButton label="Reconnect" onClick={() => setNonce((n) => n + 1)}>
               <RefreshIcon className="h-4 w-4" />
             </IconButton>

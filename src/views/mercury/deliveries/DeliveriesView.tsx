@@ -1,10 +1,233 @@
-// DeliveriesView — Welle-0 stub (B9 fills it). The delivery ledger with rollback/reset behind an effect+consequence+undo confirmation (F12).
+// DeliveriesView — the delivery ledger (REQ-024/040.2, F12): per repository what has been shipped,
+// each delivery with its commit span, its pull request, the stage it reached and when. Rolling one
+// back is triggered from here as a COUNTER-BOOKING — the ledger only grows, history is never
+// rewritten (REQ-025) — and the deliberate dev reset of a repository lives at the same place
+// (REQ-022.4).
+//
+// Both are dangerous actions, so both state their effect, the state they leave behind and the way
+// back before they run (REQ-040.6). The view refreshes on the `deliveries` topic — no polling.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getDataSource } from '@/data';
+import { cn } from '@/lib/cn';
+import { fmtDateTime } from '@/lib/format';
+import { Button } from '@/ui/Button';
+import { Modal } from '@/ui/Modal';
+import { useToast } from '@/ui/Toast';
+import { badgeTone } from '@/ui/tint';
+import { useLiveTopic } from '@/state/live';
+import type { Delivery } from '@/types';
+import {
+  canRollback,
+  commitRange,
+  deliveryBadge,
+  groupDeliveriesByRepo,
+  resetConfirmation,
+  rollbackConfirmation,
+  shortSha,
+  type Consequence,
+} from './deliveries';
+
+/** Uniform error-to-string, mirroring the rest of the Mercury surface. */
+const msg = (e: unknown) => String((e as Error)?.message ?? e);
+
+type Pending =
+  | { kind: 'rollback'; delivery: Delivery; consequence: Consequence }
+  | { kind: 'reset'; repo: string; consequence: Consequence };
+
 export function DeliveriesView() {
+  const source = useMemo(() => getDataSource(), []);
+  const { toast } = useToast();
+  const [list, setList] = useState<Delivery[] | null>(null);
+  const [failed, setFailed] = useState<string | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const gotRef = useRef(false);
+
+  const load = useCallback(async () => {
+    try {
+      setList(await source.mercuryDeliveries());
+      gotRef.current = true;
+      setFailed(null);
+    } catch (e) {
+      // A transient tick never blanks a ledger that is already on screen.
+      if (!gotRef.current) setFailed(msg(e));
+    }
+  }, [source]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useLiveTopic('deliveries', load);
+
+  const confirm = useCallback(async () => {
+    if (!pending || busy) return;
+    setBusy(true);
+    try {
+      if (pending.kind === 'rollback') {
+        // The outcome is the server's own honest line: counter-booked, reversing PR opened, PR
+        // closed, or a conflict that raised a todo for the manual counter-booking.
+        const out = await source.mercuryRollbackDelivery(pending.delivery.id);
+        toast({
+          title: out.todoId ? 'Manual counter-booking needed' : 'Rolled back',
+          description: out.outcome,
+          variant: out.todoId ? 'default' : 'success',
+        });
+      } else {
+        await source.mercuryRepoReset(pending.repo);
+        toast({ title: 'Dev state reset', description: `${pending.repo} is back at its default branch.`, variant: 'success' });
+      }
+      setPending(null);
+      await load();
+    } catch (e) {
+      toast({ title: pending.kind === 'rollback' ? 'Rollback failed' : 'Reset failed', description: msg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  }, [pending, busy, source, toast, load]);
+
+  if (failed) {
+    return (
+      <div className="flex h-full min-h-0 w-full items-center justify-center bg-bg-base px-6">
+        <p className="max-w-md text-center text-footnote text-text-secondary">{failed}</p>
+      </div>
+    );
+  }
+  if (list === null) {
+    return (
+      <div className="flex h-full min-h-0 w-full items-center justify-center bg-bg-base">
+        <p className="text-footnote text-text-tertiary">Loading…</p>
+      </div>
+    );
+  }
+
+  const groups = groupDeliveriesByRepo(list);
+
   return (
-    <div className="flex h-full min-h-0 items-center justify-center p-8">
-      <p className="max-w-md text-center text-footnote text-text-tertiary">
-        DeliveriesView arrives with its building block (B9).
-      </p>
+    <div className="dl-scroll min-h-0 w-full flex-1 overflow-y-auto bg-bg-base">
+      <div className="mx-auto max-w-4xl px-8 py-7">
+        <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Deliveries</h1>
+
+        {groups.length === 0 ? (
+          <p className="mt-4 text-footnote text-text-tertiary">Nothing has been delivered yet.</p>
+        ) : (
+          <div className="mt-5 flex flex-col gap-5">
+            {groups.map((g) => (
+              <section key={g.repo}>
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <h2 className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
+                  <span className="text-caption text-text-tertiary">
+                    {g.devServes
+                      ? `dev serves ${shortSha(g.devServes.toCommit)} · ${g.openCount} open`
+                      : 'dev equals the default branch'}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="ml-auto"
+                    onClick={() => setPending({ kind: 'reset', repo: g.repo, consequence: resetConfirmation(g.repo) })}
+                  >
+                    Reset dev state
+                  </Button>
+                </div>
+                <ul className="flex flex-col gap-1.5">
+                  {g.deliveries.map((d) => (
+                    <DeliveryRow
+                      key={d.id}
+                      delivery={d}
+                      onRollback={() => setPending({ kind: 'rollback', delivery: d, consequence: rollbackConfirmation(d) })}
+                    />
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <ConsequenceDialog
+        pending={pending}
+        busy={busy}
+        onClose={() => setPending(null)}
+        onConfirm={() => void confirm()}
+      />
     </div>
+  );
+}
+
+/** One delivery: stage, commit span, branch, pull request, time — and its rollback where one is
+ *  still possible. A reversal names the delivery it counter-books. */
+function DeliveryRow({ delivery, onRollback }: { delivery: Delivery; onRollback: () => void }) {
+  const badge = deliveryBadge(delivery);
+  return (
+    <li className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
+      <span className={cn('shrink-0 rounded px-1.5 py-0.5 text-caption font-medium', badgeTone[badge.tone])}>{badge.label}</span>
+      <span className="shrink-0 font-mono text-caption text-text-secondary">{commitRange(delivery)}</span>
+      <span className="min-w-0 flex-1 truncate font-mono text-caption text-text-tertiary">{delivery.branch}</span>
+      {delivery.reversalOf && <span className="shrink-0 text-caption text-text-tertiary">counter-books {delivery.reversalOf}</span>}
+      {delivery.prUrl && (
+        <a href={delivery.prUrl} target="_blank" rel="noreferrer" className="shrink-0 text-caption font-medium text-accent hover:underline">
+          {delivery.prNumber ? `PR #${delivery.prNumber}` : 'PR'} ↗
+        </a>
+      )}
+      <span className="shrink-0 text-caption text-text-tertiary">{fmtDateTime(delivery.mergedAt || delivery.createdAt)}</span>
+      {canRollback(delivery) && (
+        <Button variant="ghost" size="sm" onClick={onRollback}>
+          Roll back
+        </Button>
+      )}
+    </li>
+  );
+}
+
+/** The one confirmation of this surface: what the action does, what state follows, and the way back
+ *  (REQ-040.6) — shared by the rollback and the dev reset, so both read identically. */
+function ConsequenceDialog({
+  pending,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  pending: Pending | null;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  if (!pending) return null;
+  const rollback = pending.kind === 'rollback';
+  const { effect, result, undo } = pending.consequence;
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={rollback ? 'Roll this delivery back?' : 'Reset the dev state?'}
+      description={rollback ? pending.delivery.repo : pending.repo}
+      size="md"
+      footer={
+        <>
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="danger" size="sm" disabled={busy} onClick={onConfirm}>
+            {busy ? 'Working…' : rollback ? 'Roll back' : 'Reset'}
+          </Button>
+        </>
+      }
+    >
+      <dl className="flex flex-col gap-2 text-footnote">
+        <div>
+          <dt className="font-medium text-text-primary">What it does</dt>
+          <dd className="text-text-secondary">{effect}</dd>
+        </div>
+        <div>
+          <dt className="font-medium text-text-primary">What follows</dt>
+          <dd className="text-text-secondary">{result}</dd>
+        </div>
+        <div>
+          <dt className="font-medium text-text-primary">The way back</dt>
+          <dd className="text-text-secondary">{undo}</dd>
+        </div>
+      </dl>
+    </Modal>
   );
 }

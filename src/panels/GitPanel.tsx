@@ -70,7 +70,7 @@ export function GitPanel() {
       <PanelHeader
         title="Git"
         actions={
-          <IconButton label="Pull" title="Pull (fast-forward)" onClick={doPull} disabled={busy}>
+          <IconButton label="Pull (fast-forward)" onClick={doPull} disabled={busy}>
             <RefreshIcon className="h-4 w-4" />
           </IconButton>
         }
@@ -81,11 +81,11 @@ export function GitPanel() {
           Pull
           {activeBranch.behind > 0 && <span className="ml-1 font-mono text-warning">↓{activeBranch.behind}</span>}
         </Button>
-        <Button variant="primary" size="sm" className="flex-1" onClick={doPush} disabled={busy || !canWrite} title={canWrite ? 'Push current branch' : 'Read-only repository'}>
+        <Button variant="primary" size="sm" className="flex-1" onClick={doPush} disabled={busy || !canWrite}>
           Push
           {activeBranch.ahead > 0 && <span className="ml-1 font-mono">↑{activeBranch.ahead}</span>}
         </Button>
-        <IconButton label="New branch" title="New branch" onClick={doNewBranch} disabled={busy || !canWrite}>
+        <IconButton label="New branch" onClick={doNewBranch} disabled={busy || !canWrite}>
           <PlusIcon className="h-4 w-4" />
         </IconButton>
       </div>
@@ -99,7 +99,6 @@ export function GitPanel() {
             className="w-full gap-1.5"
             onClick={doPR}
             disabled={busy || !canWrite}
-            title={canWrite ? `Push ${activeBranch.name} and open a pull request` : 'Read-only repository'}
           >
             <GitBranchIcon className="h-3.5 w-3.5" />
             Open Pull Request
@@ -151,7 +150,6 @@ export function GitPanel() {
                 <button
                   type="button"
                   onClick={() => setBranch(b.name)}
-                  title={current ? 'Current branch' : `Checkout ${b.name}`}
                   className={cn(
                     'group flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left transition-colors',
                     current ? 'bg-fill/[0.08]' : 'hover:bg-fill/10',

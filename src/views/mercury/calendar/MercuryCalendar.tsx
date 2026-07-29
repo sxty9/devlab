@@ -4,34 +4,48 @@ import { Button, IconButton } from '@/ui/Button';
 import { ChevronRightIcon } from '@/ui/icons';
 import { Modal } from '@/ui/Modal';
 import { ExecutionDetail } from '../exec/ExecutionDetail';
-import { OkPill } from '../exec/PipelineStages';
+import { OkPill, TonePill } from '../exec/PipelineStages';
 import { fmtDateTime, fmtTime } from '@/lib/format';
 import type { RunKind, RunOccurrence } from '@/types';
 
 /** The two kinds an occurrence can carry, spelled out so Tailwind sees whole class names. `auto`
- *  (Automatische Läufe) takes the accent, `todo` (Konkrete ToDos) the warning token — matching the
- *  global calendar's colour split. `NEUTRAL` is used when the caller does not colour-separate. */
+ *  (automatic runs) takes the accent, `todo` the warning token — matching the global calendar's
+ *  colour split. `NEUTRAL` is used when the caller does not colour-separate. */
 interface TypeStyle {
   label: string;
   dot: string;
   text: string;
   borderLeft: string;
-  tint: string;
 }
 const TYPE_STYLE: Record<RunKind, TypeStyle> = {
-  auto: { label: 'Automatischer Lauf', dot: 'bg-accent', text: 'text-accent', borderLeft: 'border-l-accent', tint: 'bg-accent/10' },
-  todo: { label: 'Konkretes ToDo', dot: 'bg-warning', text: 'text-warning', borderLeft: 'border-l-warning', tint: 'bg-warning/10' },
+  auto: { label: 'Automatic run', dot: 'bg-accent', text: 'text-accent', borderLeft: 'border-l-accent' },
+  todo: { label: 'Todo', dot: 'bg-warning', text: 'text-warning', borderLeft: 'border-l-warning' },
 };
-const NEUTRAL_STYLE: TypeStyle = { label: 'Lauf', dot: 'bg-accent', text: 'text-accent', borderLeft: 'border-l-accent', tint: 'bg-accent/10' };
+const NEUTRAL_STYLE: TypeStyle = { label: 'Run', dot: 'bg-accent', text: 'text-accent', borderLeft: 'border-l-accent' };
 
-type CalView = 'tag' | 'woche' | 'agenda';
+type CalView = 'day' | 'week' | 'agenda';
 const VIEWS: { id: CalView; label: string }[] = [
-  { id: 'tag', label: 'Tag' },
-  { id: 'woche', label: 'Woche' },
+  { id: 'day', label: 'Day' },
+  { id: 'week', label: 'Week' },
   { id: 'agenda', label: 'Agenda' },
 ];
 
-const WEEKDAY_LABELS = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
+// Day and month names as static English labels: the surface is implemented in English and
+// translated later, so no locale is hard-wired into a date call here (the numeric date/time forms
+// come from the shared formatters in lib/format). WEEKDAY_LABELS is Monday-first, WEEKDAY_LONG is
+// indexed by Date#getDay (0 = Sunday).
+const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const WEEKDAY_LONG = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const MONTH_LONG = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+];
+const MONTH_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const fmtMonthYear = (d: Date) => `${MONTH_LONG[d.getMonth()]} ${d.getFullYear()}`;
+const fmtDayLong = (d: Date) => `${WEEKDAY_LONG[d.getDay()]}, ${MONTH_LONG[d.getMonth()]} ${d.getDate()}`;
+const fmtDayShort = (d: Date) => `${MONTH_SHORT[d.getMonth()]} ${d.getDate()}`;
+const weekdayShort = (d: Date) => WEEKDAY_LABELS[(d.getDay() + 6) % 7];
 
 // ── date helpers (all Monday-first, viewer timezone) ──────────────────────────
 const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -51,17 +65,17 @@ const startOfWeek = (d: Date) => addDays(d, -((d.getDay() + 6) % 7)); // back to
 const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 const dayKey = (d: Date) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 
-/** MercuryCalendar — the one shared calendar behind every Mercury surface (Laufkalender, ToDo-Kalender
- *  and „Kalender — alles"). It renders the union the parent fetches: past executions AND upcoming
- *  firings. A past occurrence (it carries a resultId) shows its outcome and opens the full report on
- *  click; a future firing shows its schedule. Modelled on a real calendar app: a month mini-grid with
- *  clickable days beside a Tag / Woche / Agenda view, navigable by day or week. `showTypes` colour-
- *  separates automatic runs from ToDos (accent vs warning) and shows a legend; without it a single
- *  accent style is used. */
+/** MercuryCalendar — the one shared calendar behind every Mercury surface (the run calendar, the todo
+ *  calendar and "Calendar — everything"). It renders the union the parent fetches: past executions AND
+ *  upcoming firings. A past occurrence (it carries a resultId) shows its outcome and opens the SAME
+ *  execution detail the history opens, through the same access point (REQ-012); a future firing shows
+ *  its schedule. Modelled on a real calendar app: a month mini-grid with clickable days beside a Day /
+ *  Week / Agenda view, navigable by day or week. `showTypes` colour-separates automatic runs from
+ *  todos (accent vs warning) and shows a legend; without it a single accent style is used. */
 export function MercuryCalendar({
   occurrences,
   showTypes = false,
-  heading = 'Kalender',
+  heading = 'Calendar',
 }: {
   occurrences: RunOccurrence[];
   showTypes?: boolean;
@@ -101,20 +115,17 @@ export function MercuryCalendar({
     return out.sort((a, b) => a.date.getTime() - b.date.getTime());
   }, [byDay]);
 
-  const shift = (delta: number) => setFocusDate((d) => addDays(d, delta * (view === 'woche' ? 7 : 1)));
+  const shift = (delta: number) => setFocusDate((d) => addDays(d, delta * (view === 'week' ? 7 : 1)));
   const pickDay = (d: Date) => {
     setFocusDate(startOfDay(d));
-    setView('tag');
+    setView('day');
   };
 
   const weekStart = startOfWeek(focusDate);
   const weekDays = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
   const weekEnd = weekDays[6];
 
-  const navLabel =
-    view === 'woche'
-      ? `${weekStart.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' })} – ${weekEnd.toLocaleDateString('de-DE', { day: 'numeric', month: 'short' })}`
-      : focusDate.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' });
+  const navLabel = view === 'week' ? `${fmtDayShort(weekStart)} – ${fmtDayShort(weekEnd)}` : fmtDayLong(focusDate);
 
   return (
     <div className="dl-scroll min-h-0 w-full flex-1 overflow-y-auto bg-bg-base">
@@ -156,25 +167,25 @@ export function MercuryCalendar({
 
               {view !== 'agenda' && (
                 <div className="flex items-center gap-1.5">
-                  <IconButton label="Zurück" onClick={() => shift(-1)}>
+                  <IconButton label="Back" onClick={() => shift(-1)}>
                     <ChevronRightIcon className="h-4 w-4 rotate-180" />
                   </IconButton>
                   <span className="min-w-[11rem] text-center text-footnote font-medium text-text-primary">{navLabel}</span>
-                  <IconButton label="Weiter" onClick={() => shift(1)}>
+                  <IconButton label="Next" onClick={() => shift(1)}>
                     <ChevronRightIcon className="h-4 w-4" />
                   </IconButton>
                   <Button variant="ghost" size="sm" onClick={() => setFocusDate(startOfDay(new Date()))}>
-                    Heute
+                    Today
                   </Button>
                 </div>
               )}
             </div>
 
-            {view === 'tag' && (
-              <TagView occ={byDay.get(dayKey(focusDate)) ?? []} styleOf={styleOf} showTypes={showTypes} onOpen={openOcc} />
+            {view === 'day' && (
+              <DayView occ={byDay.get(dayKey(focusDate)) ?? []} styleOf={styleOf} showTypes={showTypes} onOpen={openOcc} />
             )}
-            {view === 'woche' && (
-              <WocheView days={weekDays} today={today} byDay={byDay} styleOf={styleOf} onPickDay={pickDay} onOpen={openOcc} />
+            {view === 'week' && (
+              <WeekView days={weekDays} today={today} byDay={byDay} styleOf={styleOf} onPickDay={pickDay} onOpen={openOcc} />
             )}
             {view === 'agenda' && <AgendaView groups={agendaGroups} styleOf={styleOf} showTypes={showTypes} onOpen={openOcc} today={today} />}
           </div>
@@ -185,8 +196,8 @@ export function MercuryCalendar({
         <Modal
           open
           onClose={() => setSelected(null)}
-          title={selected.runTitle || 'Ausführung'}
-          description={`${fmtDateTime(selected.at)} · ${selected.paused ? 'Pausiert' : selected.succeeded ? 'Erfolgreich' : 'Fehlgeschlagen'}`}
+          title={selected.runTitle || 'Execution'}
+          description={fmtDateTime(selected.at)}
           size="lg"
         >
           <ExecutionDetail runId={selected.runId} resultId={selected.resultId} hideHeader />
@@ -203,18 +214,17 @@ function Legend() {
       {(['auto', 'todo'] as const).map((t) => (
         <span key={t} className="flex items-center gap-1.5">
           <span className={cn('h-2 w-2 rounded-full', TYPE_STYLE[t].dot)} />
-          {t === 'auto' ? 'Automatische Läufe' : 'Konkrete ToDos'}
+          {t === 'auto' ? 'Automatic runs' : 'Todos'}
         </span>
       ))}
     </div>
   );
 }
 
-/** The inline status of a past execution: paused on the usage limit, else the pass/fail pill. */
+/** The inline status of a past execution — the server's own two flags: paused on the collective
+ *  usage limit, else the pass/fail pill. Nothing is derived here. */
 function OccStatus({ occ }: { occ: RunOccurrence }) {
-  if (occ.paused) {
-    return <span className="shrink-0 rounded bg-warning/15 px-1.5 py-0.5 text-caption font-medium text-warning">Pausiert</span>;
-  }
+  if (occ.paused) return <TonePill label="paused" tone="warning" />;
   return <OkPill ok={occ.succeeded ?? false} />;
 }
 
@@ -233,7 +243,7 @@ function OccurrenceRow({
   onOpen: (o: RunOccurrence) => void;
 }) {
   const past = !!occ.resultId;
-  const subLine = past ? (showType ? style.label : 'Ausführung') : showType ? `${style.label} · ${occ.schedule ?? ''}` : (occ.schedule ?? '');
+  const subLine = past ? (showType ? style.label : 'Execution') : showType ? `${style.label} · ${occ.schedule ?? ''}` : (occ.schedule ?? '');
   const body = (
     <>
       <span className={cn('w-14 shrink-0 font-mono text-footnote tabular-nums', style.text)}>{fmtTime(occ.at)}</span>
@@ -253,8 +263,8 @@ function OccurrenceRow({
   );
 }
 
-/** Tag — the focused day as a vertical time-of-day list. */
-function TagView({
+/** Day — the focused day as a vertical time-of-day list. */
+function DayView({
   occ,
   styleOf,
   showTypes,
@@ -268,7 +278,7 @@ function TagView({
   if (occ.length === 0) {
     return (
       <div className="rounded-card border border-separator bg-surface px-4 py-8 text-center">
-        <p className="text-footnote text-text-tertiary">An diesem Tag sind keine Läufe.</p>
+        <p className="text-footnote text-text-tertiary">Nothing on this day.</p>
       </div>
     );
   }
@@ -281,9 +291,9 @@ function TagView({
   );
 }
 
-/** Woche — the focused week as a 7-column Mo→So grid; each column stacks that day's occurrences as
- *  small chips and scrolls if it grows tall. The column header opens the day in the Tag view. */
-function WocheView({
+/** Week — the focused week as a 7-column Mon→Sun grid; each column stacks that day's occurrences as
+ *  small chips and scrolls if it grows tall. The column header opens the day in the Day view. */
+function WeekView({
   days,
   today,
   byDay,
@@ -313,7 +323,7 @@ function WocheView({
                 isToday && 'bg-accent/10',
               )}
             >
-              <p className="text-caption text-text-tertiary">{day.toLocaleDateString('de-DE', { weekday: 'short' })}</p>
+              <p className="text-caption text-text-tertiary">{weekdayShort(day)}</p>
               <p className={cn('text-footnote font-semibold', isToday ? 'text-accent' : 'text-text-primary')}>{day.getDate()}</p>
             </button>
             <div className="dl-scroll flex max-h-[60vh] min-h-[3rem] flex-1 flex-col gap-1 overflow-y-auto p-1.5">
@@ -359,8 +369,8 @@ function WocheView({
   );
 }
 
-/** Agenda — the union grouped by day, split into what is still to come (Anstehend, soonest first) and
- *  what already ran (Verlauf, most recent first), so both halves of the calendar are legible however
+/** Agenda — the union grouped by day, split into what is still to come (Upcoming, soonest first) and
+ *  what already ran (Past, most recent first), so both halves of the calendar are legible however
  *  much history has piled up. Each half flows into as many columns as the pane affords. */
 function AgendaView({
   groups,
@@ -376,14 +386,14 @@ function AgendaView({
   today: Date;
 }) {
   if (groups.length === 0) {
-    return <p className="text-footnote text-text-tertiary">Keine Läufe im Zeitraum.</p>;
+    return <p className="text-footnote text-text-tertiary">Nothing in this window.</p>;
   }
   // groups arrive oldest-first: upcoming (today onward) keeps that order; the past reads newest-first.
   const upcoming = groups.filter((g) => g.date.getTime() >= today.getTime());
   const past = groups.filter((g) => g.date.getTime() < today.getTime()).reverse();
   const sections = [
-    { title: 'Anstehend', items: upcoming },
-    { title: 'Verlauf', items: past },
+    { title: 'Upcoming', items: upcoming },
+    { title: 'Past', items: past },
   ].filter((s) => s.items.length > 0);
   return (
     <div className="flex flex-col gap-6">
@@ -393,9 +403,7 @@ function AgendaView({
           <div className="grid gap-5 sm:grid-cols-2 2xl:grid-cols-3">
             {s.items.map((g) => (
               <div key={g.key}>
-                <p className="mb-2 text-footnote font-semibold text-text-primary">
-                  {g.date.toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' })}
-                </p>
+                <p className="mb-2 text-footnote font-semibold text-text-primary">{fmtDayLong(g.date)}</p>
                 <div className="flex flex-col gap-1.5">
                   {g.occ.map((o, i) => (
                     <OccurrenceRow key={`${o.runId}:${o.at}:${i}`} occ={o} style={styleOf(o)} showType={showTypes} onOpen={onOpen} />
@@ -442,14 +450,12 @@ function MiniMonth({
   return (
     <div className="rounded-card border border-separator bg-surface p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <p className="text-footnote font-medium text-text-primary">
-          {first.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' })}
-        </p>
+        <p className="text-footnote font-medium text-text-primary">{fmtMonthYear(first)}</p>
         <div className="flex items-center gap-0.5">
-          <IconButton label="Vorheriger Monat" onClick={() => onShiftMonth(-1)}>
+          <IconButton label="Previous month" onClick={() => onShiftMonth(-1)}>
             <ChevronRightIcon className="h-4 w-4 rotate-180" />
           </IconButton>
-          <IconButton label="Nächster Monat" onClick={() => onShiftMonth(1)}>
+          <IconButton label="Next month" onClick={() => onShiftMonth(1)}>
             <ChevronRightIcon className="h-4 w-4" />
           </IconButton>
         </div>
@@ -478,7 +484,7 @@ function MiniMonth({
               key={`d${c}`}
               type="button"
               onClick={() => onPick(date)}
-              title={has ? `${occ.length} ${occ.length === 1 ? 'Eintrag' : 'Einträge'}` : undefined}
+              title={has ? `${occ.length} ${occ.length === 1 ? 'entry' : 'entries'}` : undefined}
               className={cn(
                 'flex h-10 flex-col items-center justify-center gap-0.5 rounded-md text-caption transition duration-fast',
                 isSelected

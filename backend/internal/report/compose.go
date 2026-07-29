@@ -58,25 +58,28 @@ func buckets(items []Item) (completed, pending, attention []Item) {
 	return
 }
 
-// Compose builds the day's report from its items. day is "YYYY-MM-DD". linkURL, when non-empty, is a
-// link into the Mercury UI for the reader who needs details. items must be non-empty (the Reporter
-// only composes for a day that had executions).
-func Compose(day string, items []Item, linkURL string) Content {
+// Compose builds the day's report from its items and the day's rubrics (REQ-042.6). day is
+// "YYYY-MM-DD". linkURL, when non-empty, is a link into the Mercury UI for the reader who needs
+// details. items must be non-empty (the Reporter only composes for a day that had executions).
+func Compose(day string, items []Item, rubrics []Rubric, linkURL string) Content {
 	completed, pending, attention := buckets(items)
 
 	subject := fmt.Sprintf("Mercury daily report — %s · %s", day, countPhrase(len(items)))
 	if len(attention) > 0 {
 		subject += fmt.Sprintf(" · %d need attention", len(attention))
 	}
+	if n := rubricLineCount(rubrics); n > 0 {
+		subject += fmt.Sprintf(" · %s", alarmPhrase(n))
+	}
 
 	return Content{
 		Subject: subject,
-		Text:    composeText(day, items, completed, pending, attention, linkURL),
-		HTML:    composeHTML(day, items, completed, pending, attention, linkURL),
+		Text:    composeText(day, items, completed, pending, attention, rubrics, linkURL),
+		HTML:    composeHTML(day, items, completed, pending, attention, rubrics, linkURL),
 	}
 }
 
-func composeText(day string, all, completed, pending, attention []Item, linkURL string) string {
+func composeText(day string, all, completed, pending, attention []Item, rubrics []Rubric, linkURL string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Mercury daily report for %s\n\n", day)
 	b.WriteString("Mercury ran your automated jobs and concrete ToDos across the Holistic\n")
@@ -85,6 +88,9 @@ func composeText(day string, all, completed, pending, attention []Item, linkURL 
 	textSection(&b, "COMPLETED", completed)
 	textSection(&b, "IN PROGRESS / PENDING", pending)
 	textSection(&b, "NEEDS ATTENTION", attention)
+	for _, r := range rubrics {
+		textRubric(&b, r)
+	}
 
 	in, out, cost, repos := totals(all)
 	b.WriteString("\nTOTALS\n")
@@ -117,6 +123,54 @@ func textSection(b *strings.Builder, title string, items []Item) {
 	}
 }
 
+// textRubric renders one rubric: the finding, the repository it concerns, the next step, and —
+// when the message repeated — how often over which period (REQ-032.5).
+func textRubric(b *strings.Builder, r Rubric) {
+	fmt.Fprintf(b, "\n%s (%d)\n", strings.ToUpper(r.Title), len(r.Lines))
+	for _, l := range r.Lines {
+		fmt.Fprintf(b, "  • %s\n", lineHead(l))
+		if l.NextStep != "" {
+			fmt.Fprintf(b, "      next: %s\n", l.NextStep)
+		}
+		if s := repeatPhrase(l); s != "" {
+			fmt.Fprintf(b, "      %s\n", s)
+		}
+	}
+}
+
+// lineHead is "<repo>: <text>" — or just the text for a finding that concerns no single repo.
+func lineHead(l RubricLine) string {
+	if l.Repo == "" {
+		return l.Text
+	}
+	return l.Repo + ": " + l.Text
+}
+
+// repeatPhrase states a bundled finding's count and period, and stays empty for a single
+// occurrence (nothing to bundle, nothing to say).
+func repeatPhrase(l RubricLine) string {
+	if l.Count <= 1 {
+		return ""
+	}
+	return fmt.Sprintf("%d times between %s and %s",
+		l.Count, l.FirstAt.UTC().Format(time.RFC3339), l.LastAt.UTC().Format(time.RFC3339))
+}
+
+func rubricLineCount(rubrics []Rubric) int {
+	n := 0
+	for _, r := range rubrics {
+		n += len(r.Lines)
+	}
+	return n
+}
+
+func alarmPhrase(n int) string {
+	if n == 1 {
+		return "1 alarm"
+	}
+	return fmt.Sprintf("%d alarms", n)
+}
+
 func reposText(it Item) string {
 	if len(it.Repos) == 0 {
 		return ""
@@ -128,7 +182,7 @@ func reposText(it Item) string {
 	return strings.Join(parts, ", ")
 }
 
-func composeHTML(day string, all, completed, pending, attention []Item, linkURL string) string {
+func composeHTML(day string, all, completed, pending, attention []Item, rubrics []Rubric, linkURL string) string {
 	var b strings.Builder
 	b.WriteString(`<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;line-height:1.5">`)
 	fmt.Fprintf(&b, `<h1 style="font-size:18px;margin:0 0 4px">Mercury daily report — %s</h1>`, html.EscapeString(day))
@@ -137,6 +191,9 @@ func composeHTML(day string, all, completed, pending, attention []Item, linkURL 
 	htmlSection(&b, "Completed", "#137333", completed)
 	htmlSection(&b, "In progress / pending", "#8a6d00", pending)
 	htmlSection(&b, "Needs attention", "#b00020", attention)
+	for _, r := range rubrics {
+		htmlRubric(&b, r)
+	}
 
 	in, out, cost, repos := totals(all)
 	b.WriteString(`<h2 style="font-size:14px;margin:20px 0 6px">Totals</h2>`)
@@ -175,6 +232,26 @@ func htmlSection(b *strings.Builder, title, color string, items []Item) {
 		}
 		fmt.Fprintf(b, `<br><span style="color:#777">%s tokens · %s</span>`,
 			html.EscapeString(tokenPhrase(it.InTokens, it.OutTokens)), html.EscapeString(costPhrase(it.CostUSD)))
+		b.WriteString(`</li>`)
+	}
+	b.WriteString(`</ul>`)
+}
+
+// htmlRubric renders one rubric as its own titled list — same findings, same wording as the text
+// part (one composition, two renderings).
+func htmlRubric(b *strings.Builder, r Rubric) {
+	fmt.Fprintf(b, `<h2 style="font-size:14px;margin:20px 0 6px;color:#b00020">%s (%d)</h2>`,
+		html.EscapeString(r.Title), len(r.Lines))
+	b.WriteString(`<ul style="margin:0;padding-left:18px">`)
+	for _, l := range r.Lines {
+		b.WriteString(`<li style="margin:0 0 8px">`)
+		fmt.Fprintf(b, `<span style="color:#333">%s</span>`, html.EscapeString(lineHead(l)))
+		if l.NextStep != "" {
+			fmt.Fprintf(b, `<br><span style="color:#555">next: %s</span>`, html.EscapeString(l.NextStep))
+		}
+		if s := repeatPhrase(l); s != "" {
+			fmt.Fprintf(b, `<br><span style="color:#777">%s</span>`, html.EscapeString(s))
+		}
 		b.WriteString(`</li>`)
 	}
 	b.WriteString(`</ul>`)
