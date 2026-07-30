@@ -18,6 +18,24 @@
 #   DEVLAB_RUNS_MAX_COST*     REMOVED. There is no cost cap (REQ-017): consumption is counted
 #                             live and reported, never capped. The time budget is a per-run
 #                             tunable in the runtime settings, not an env variable.
+#   DEVLAB_RUNS_AUTOMERGE     RENAMED to DEVLAB_RUNS_AUTOMERGE_WINDOW, and demoted: it SEEDS the
+#                             runtime settings pool on the first start only (REQ-013.2), so the
+#                             stored window wins from the first write on. The old name is read by
+#                             nothing — left in a drop-in it silently does nothing.
+#   DEVLAB_RUNS_LIMIT_MAXRESUMES
+#                             RENAMED to DEVLAB_RUNS_LIMIT_MAX_RESUMES (one word boundary, so the
+#                             name matches every other DEVLAB_RUNS_* knob). Read by nothing under
+#                             the old spelling: a usage-limit cap left behind would silently become
+#                             the default of 8 resumes.
+#   DEVLAB_RUNS_AGENT_TIMEOUT REMOVED. The per-attempt wall-clock budget is the settings pool's
+#                             DefaultTimeBudget, seeded once by DEVLAB_RUNS_TIME_BUDGET and tuned
+#                             per run afterwards (REQ-010); DEVLAB_RUNS_MAX_DURATION remains the
+#                             scheduler's hard stop per attempt.
+#   DEVLAB_RUNS_PROTECTION_START_DELAY / DEVLAB_RUNS_PROTECTION_ENFORCE
+#                             NEW. The branch-protection pass reaches every repository of the
+#                             configured organisation, so it is held: the first pass waits (default
+#                             15m) instead of running at boot, and it only READS and REPORTS until
+#                             the operator arms writing. See the hardening block below.
 #   run-active/runs-active    REMOVED (REQ-039.3). Activity is a projection over the execution
 #                             documents; the only marker file is mercury/restart.json.
 #   DEVLAB_LINKS, DEVLAB_WORKSPACES, DEVLAB_STATIC_DIR, DEVLAB_REPOS_PATH
@@ -77,6 +95,12 @@ Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
 # Drain/resume knobs (runtime settings win over env where a settings value exists).
 Environment=DEVLAB_RUNS_DRAIN_GRACE=60s
 Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
+# Branch protection (REQ-033.7) is the ONE recurring pass whose effect leaves DevLab: it walks every
+# repository of the configured organisation and, armed, PATCHes the default branch of each one that
+# deviates. So it is held by default — the first pass waits, and an unarmed pass reads and reports
+# without changing anything. Arm it in the drop-in once the reported findings are the intended ones:
+#   Environment=DEVLAB_RUNS_PROTECTION_ENFORCE=1
+Environment=DEVLAB_RUNS_PROTECTION_START_DELAY=15m
 
 # Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo
 # wrappers to run ops as the end user); ProtectHome false so per-user git/claude configs
@@ -92,7 +116,15 @@ StateDirectoryMode=0711
 # Security-relevant modes are still set explicitly at the site (e.g. api.SocketMode) — this is the
 # floor, never the guarantee.
 UMask=0027
-ReadWritePaths=/var/lib/devlab
+# ProtectSystem=strict makes the WHOLE hierarchy read-only apart from what is listed here — /tmp
+# included. Every per-user child this service starts through devlab-exec needs a writable one: the
+# claude CLI keeps its scratch in /tmp/claude-<uid>, and `go build` / `npm run build` put their work
+# there. So /tmp is writable explicitly rather than through PrivateTmp: a private /tmp would give the
+# service a namespace of its own, where the per-user scratch is invisible to the user's own session and
+# to every other service, while the isolation this service actually relies on is the OS user
+# (devlab-exec), not the mount namespace. A drop-in that sets PrivateTmp=true silently takes that
+# decision back — the cutover removes it.
+ReadWritePaths=/var/lib/devlab /tmp
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=false

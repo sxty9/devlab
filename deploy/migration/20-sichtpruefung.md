@@ -33,10 +33,13 @@ is the STATE of each line, in exactly four kinds:
 
 A line with several kinds needs all of them.
 
-Fourteen lines name E2E in the matrix: REQ-007, REQ-012, REQ-035, REQ-036, B-25, B-27, B-28, B-31,
-B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open** below. Three of them (B-27,
-B-40, REQ-035) previously read "Test green" and nothing else — an acceptance claim wider than the
-evidence, which is the one thing this document may never make.
+Fifteen lines name an end-to-end walk-through in the matrix: REQ-007, REQ-012, REQ-035, REQ-036,
+REQ-037, B-25, B-27, B-28, B-31, B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open**
+below. Four of them previously read "Test green" and nothing else — an acceptance claim wider than the
+evidence, which is the one thing this document may never make. B-27, B-40 and REQ-035 were corrected in
+repair wave 2; REQ-037 in wave 3, where the kind was still misread: its cell asks for a
+"Klick-Durchgang" over every history entry (including the dead and the failed ones), which is a person
+clicking the running instance — an E2E proof under a different word, not a unit test.
 
 ### How the automated half is established
 
@@ -53,17 +56,20 @@ commands and the rule each must satisfy. Run them in the repository root.
 | 6 | `npm test` | `fail 0`, and `pass` equals `tests` |
 | 7 | `npm run build` | exits 0 |
 
-Record the reading when an inspection is performed. The commit it was taken at is what makes a row
-re-checkable — and a row is a MEASUREMENT of that commit, never a promise about the working tree: if
-tree and row disagree, the tree is right and the row is stale.
+Record the reading when an inspection is performed, and record it AT A COMMIT: the first column holds
+`git rev-parse HEAD` (short form is enough), never a wave name. A wave is not a state of this
+repository — two rows of the same wave can disagree — while a commit is re-checkable by anyone who
+reads the row later. A row is a MEASUREMENT of that commit and never a promise about the working tree:
+if tree and row disagree, the tree is right and the row is stale.
 
-| Taken at | 1 acceptance | 4 go test | 6 node --test | 2 · 3 · 5 · 7 |
+| Commit (`git rev-parse --short HEAD`) | 1 acceptance | 4 go test | 6 node --test | 2 · 3 · 5 · 7 |
 |---|---|---|---|---|
-| repair wave 2, 2026-07-30 | 69 passed, 0 failed | whole suite ok (`go test ./... -count=1`) | 183 tests, 0 fail | 2 · 3 · 5 silent; 7 (`npm run build`) NOT run in this wave |
+| c98d4a9 | 67 passed, 0 failed | whole suite ok (`go test ./... -count=1`) | 183 tests, 0 fail | 2 · 3 · 5 silent; 7 (`npm run build`) NOT run |
 
 The row states what was actually run, and nothing further: an unrun command is recorded as unrun,
 never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
-edits rather than the delivered state, so the closing row belongs to whoever closes the wave.
+edits rather than the delivered state, so the closing row belongs to whoever closes the wave — and it
+carries the commit that wave produced, not the commit it started from.
 
 ### §1 — the six construction faults (K-1 … K-6)
 
@@ -116,7 +122,7 @@ edits rather than the delivered state, so the closing row belongs to whoever clo
 | REQ-034 | Grep green (REQ-034a, REQ-034b) · Test green · Visual inspection open (visual/measurement) |
 | REQ-035 | Test green (the structural half: `src/reload.test.ts`) · E2E open (reload in every main view) |
 | REQ-036 | Test green · Visual inspection open (visual) · E2E open (live transcript during a real run) |
-| REQ-037 | Test green |
+| REQ-037 | Test green · E2E open (click every history entry, the dead and the failed ones included) |
 | REQ-038 | Visual inspection open (visual) |
 | REQ-039 | Grep green (REQ-039a, REQ-039b) · Test green |
 | REQ-040 | Grep green (REQ-040a, REQ-040b, REQ-040c, REQ-040d, REQ-040e, REQ-040f, REQ-040g) · Visual inspection open (visual/review) |

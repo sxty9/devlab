@@ -46,6 +46,45 @@ without a prompt, or a task with a due date but no task text. The refusal names 
 bar mirrors the scheduler's own due conditions; it is the reason the import can be run again
 without thinking twice.
 
+## The takeover of the pre-rebuild stock
+
+The import does not write **beside** the old data — it carries the state over. The reason is a
+property of the two record shapes: a pre-rebuild run record is
+`{type,name,enabled,prompt,promptAt,lastFiredAt,lastResult,done,…}`, a rebuilt one is
+`{kind,title,active,promptSnapshot,authorship,…}`, and **both carry the same `id`**. An import that
+asks "do I already know this id?" therefore answers YES for every pre-rebuild record, imports
+nothing, and leaves a pool whose records the daemon decodes into runs without a kind and without a
+title. So the question the import asks is never *which id* but **which shape**: only a record in the
+rebuilt form counts as already imported.
+
+| Pool | What the rebuilt code makes of it as it lies | What the import does |
+|---|---|---|
+| `mercury/runs.json` | every pre-rebuild record decodes into a run **without kind and without title**, and its id reads as "already imported" | the pool is **replaced** by the records in the rebuilt form plus the imported ones; the old stock is copied verbatim to `runs.json.pre-migration` first |
+| `mercury/runs-deliveries.json` | the source recorded a status **word**; the rebuilt record expresses merged and closed as **times**, so every record reads as **open** — and the next pull request stacks on the newest open delivery of the repository while the preflight reports it as an outstanding arrival | converted in place through the ledger's own write path: `merged`/`closed` become the corresponding time, `resultId` becomes the execution reference. The outcome **time** is the delivery's own creation time — the source carried no second timestamp — and a converted closed delivery states that in its closing reason. Copy first to `runs-deliveries.json.pre-migration` |
+| `mercury/runs-history/` | a snapshot is a **full** run configuration and "restore" writes it back verbatim, so one restore of a pre-rebuild snapshot re-injects exactly what the import just removed | every snapshot holding a pre-rebuild (or unreadable) run set is moved to `runs-history.pre-migration/`. A snapshot in the rebuilt form and one holding no runs stay restorable, and the import leaves **one** snapshot of its own (`migrate`) as the restore point |
+| `mercury/runs-prs.json` | read as it lies: repository, number, URL, run, times and the blockade all arrive | **nothing** — the file is not touched. The single field with no counterpart is the pre-rebuild deploy-attempt counter; the rebuilt record keeps retry state in `backoff`, and the counter only ever accompanied an already **blocked** record whose attempts are spent |
+| `mercury/runs-notices.json` | read as it lies; the bundling fields that postdate these rows are filled on read | **nothing** — the migration protocol below is *added* beside the existing rows |
+| `mercury/runs-results/` | read tolerantly and mapped, including a step recorded as `ok` before statuses existed, historical stage names in the instance's own language, the separate live block and a zero finishing time (which stays "never finished") | imported into `mercury/executions/`, then moved aside (row above). The auxiliary fields of the old document — `mode`, `timeBudget`, `numTurns`, `effort`, `promptHash`, `interrupted`, `suspended`, `resumeAt` — have no place in the rebuilt result and are **not** carried: the archive is display-only, its stages carry the observable truth, and the moved-aside archive keeps the originals |
+| `mercury/runs-settings.json`, `mercury/runs-incidents.json` | **no rebuilt store opens them** | moved to `<name>.pre-migration` with the reason in the protocol, so nothing is left that looks live and is not. The old slot capacity is **not** carried over: set it as `DEVLAB_RUNS_MAX_CONCURRENCY` in the drop-in (step 2 of `00-cutover.md`) if the pre-rebuild value is still wanted — read it out of `runs-settings.json.pre-migration` |
+| the pre-rebuild single-execution marker | no reader — the twin-marker trap does not exist in the rebuild (REQ-039.3) | **not** the import's job: it is a trap to remove, not stock to keep, and step **3** of `00-cutover.md` deletes it by name before the import runs |
+
+A record that is in **neither** shape — one carrying markers of both, or none at all — is never
+interpreted: it is set aside with the rest of the stock and **named with its find location** in the
+protocol. A pool file that is not readable at all aborts the whole import (exit `5`) and is left
+exactly as it was.
+
+Nothing is deleted anywhere: every set-aside artifact keeps its bytes under a `.pre-migration`
+name, and a repeated takeover never overwrites an earlier copy (it takes `.pre-migration.2`, `…3`).
+
+Check the outcome after the import — the target state is the eight records of the table above and
+nothing else:
+
+```sh
+sudo -u devlab jq '[.runs[] | {id, kind, title, active}] | length, .' $STATE_DIR/mercury/runs.json
+sudo -u devlab jq '[.runs[] | keys] | flatten | unique' $STATE_DIR/mercury/runs.json   # no type/name/enabled/done/prompt
+sudo -u devlab ls -l $STATE_DIR/mercury/*.pre-migration $STATE_DIR/mercury/runs-history.pre-migration
+```
+
 ## Step A — the axiom assignment (mandatory before any run is switched on)
 
 This step is part of the cutover, not an afterthought: until it is done and checked, the seven
@@ -99,10 +138,27 @@ way: acknowledging its notice.
 - The imported open task is executed on demand, not by the migration.
 - The imported history entries are archive states: they carry the recorded outcome and no run
   definition, so they are read, not started.
-- Re-running the import is safe: it prints what is already there and writes nothing.
+- Re-running the import is safe: it prints what is already there and writes nothing — not one byte.
+  What makes that true is the shape check above, not a marker file.
+- The restore history holds exactly one entry right after the import (`migrate`). The pre-rebuild
+  snapshots are in `mercury/runs-history.pre-migration/` and are deliberately not offered: each one
+  would write a full pre-rebuild configuration back into the pool.
 
 ## Rollback
 
-The import only adds — it deletes nothing. To undo it: stop the daemon, restore the state
-tarball from step 0 of `00-cutover.md`, and (if the archive was moved) rename
-`mercury/runs-results.imported` back to `mercury/runs-results`.
+The import **deletes** nothing, but it does **replace** the run pool and rewrite the delivery
+ledger. To undo it: stop the daemon and restore the state tarball from step 0 of `00-cutover.md`.
+
+Without the tarball, everything the import moved is still on disk under its own name and can be put
+back by hand — in this order, with the daemon stopped:
+
+```sh
+sudo -u devlab mv $STATE_DIR/mercury/runs.json.pre-migration            $STATE_DIR/mercury/runs.json
+sudo -u devlab mv $STATE_DIR/mercury/runs-deliveries.json.pre-migration $STATE_DIR/mercury/runs-deliveries.json
+sudo -u devlab mv $STATE_DIR/mercury/runs-results.imported              $STATE_DIR/mercury/runs-results
+sudo -u devlab mv $STATE_DIR/mercury/runs-history.pre-migration/*.json  $STATE_DIR/mercury/runs-history/
+sudo -u devlab sh -c 'cd '$STATE_DIR'/mercury && for f in *.pre-migration; do mv "$f" "${f%.pre-migration}"; done'
+```
+
+The executions the import wrote into `mercury/executions/` stay: they are archive documents of
+executions that happened, and the pre-rebuild service never read that directory.

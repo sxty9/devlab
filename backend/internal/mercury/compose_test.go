@@ -204,7 +204,7 @@ func TestPromptInputsHash(t *testing.T) {
 // leave the agent guessing), and the misleading word "Checkpoint" appears nowhere.
 func TestRepoScopeSection(t *testing.T) {
 	axioms := []RunAxiom{{ID: "ax_a", Titel: "Passive Speicher"}, {ID: "ax_b", Titel: "Atomare Zugriffe"}}
-	out := RepoScopeSection(axioms, map[string]LastCheck{"ax_a": {Commit: "abc1234", At: "2026-07-20"}})
+	out := RepoScopeSection(axioms, map[string]LastCheck{"ax_a": {Commit: "abc1234", At: "2026-07-20"}}, "")
 
 	for _, want := range []string{"Passive Speicher", "abc1234", "2026-07-20", "Atomare Zugriffe", "GESAMTE Repository"} {
 		if !strings.Contains(out, want) {
@@ -214,8 +214,25 @@ func TestRepoScopeSection(t *testing.T) {
 	if strings.Contains(strings.ToLower(out), "checkpoint") {
 		t.Errorf("the scope section must not use the misleading term 'Checkpoint':\n%s", out)
 	}
-	if RepoScopeSection(nil, nil) != "" {
+	if RepoScopeSection(nil, nil, "") != "" {
 		t.Error("a run without axioms must add no scope section")
+	}
+}
+
+// A record that could not be READ is a named gap, never the claim "never examined here". It is the
+// same distinction REQ-001.3 draws for the corpus: silence about a damaged file would make the prompt
+// assert something nobody established — and in the one direction that also hides the damage.
+func TestRepoScopeSectionNamesAnUnreadableRecord(t *testing.T) {
+	axioms := []RunAxiom{{ID: "ax_a", Titel: "Passive Speicher"}}
+	out := RepoScopeSection(axioms, nil, "axiom-check pool unreadable: /state/axiom-checks.json")
+
+	for _, want := range []string{"NICHT gelesen", "benannte Lücke", "GESAMTE Repository", "Abschlussbericht", "/state/axiom-checks.json"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the unreadable record is not named as a gap, missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "liegt keine frühere Prüfung") {
+		t.Errorf("an unreadable record was presented as 'never examined here':\n%s", out)
 	}
 }
 

@@ -455,14 +455,44 @@ func (s *Server) MaintainDeliveries(ctx context.Context) error {
 	return deliver.Maintain(ctx, deliverOps(s, token), s.runPRs, s.deliveries, s.results, s.runNotices, pub)
 }
 
+// protectionEnforcementArmed reports whether the operator has armed protection WRITES.
+//
+// The check reaches every repository of the configured organisation, and restoring a deviation PATCHes
+// that repository — an effect outside DevLab, on repositories nobody asked about in this session. So it
+// is held: unarmed (the default), a pass READS and REPORTS; only DEVLAB_RUNS_PROTECTION_ENFORCE turns
+// the findings into writes. REQ-033.7 asks for the deviation to be found and recorded, which the held
+// pass does in full; the restoring half is the operator's decision, not the daemon's.
+func protectionEnforcementArmed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROTECTION_ENFORCE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// errProtectionHeld is what the held pass answers instead of writing. It is a refusal of THIS daemon,
+// never a GitHub failure, so the caller distinguishes the two.
+var errProtectionHeld = errors.New("protection enforcement is not armed (DEVLAB_RUNS_PROTECTION_ENFORCE) — the deviation is reported, not changed")
+
+// heldProtectionOps is the report-only wrapper around the production ops: everything reads through,
+// and the ONE writing call answers errProtectionHeld. Wrapping instead of re-deciding keeps a single
+// definition of what "satisfied" means (deliver.VerifyProtection stays the only judge).
+type heldProtectionOps struct{ deliver.GitHubOps }
+
+func (heldProtectionOps) ProtectDefaultBranch(context.Context, string, string) error {
+	return errProtectionHeld
+}
+
 // VerifyRepoProtection is the recurring protection check (REQ-033.7) over every repo of the
-// instance set — restores deviations and records them.
+// instance set: it finds deviations and records them, and restores them only where the operator has
+// armed enforcement. The repo set comes through the same seam every other surface resolves it with,
+// so this path resolves no second set of its own.
 func (s *Server) VerifyRepoProtection(ctx context.Context) ([]deliver.ProtectionReport, error) {
 	token, err := s.runnerToken()
 	if err != nil {
 		return nil, err
 	}
-	repos, err := discover.ReposForUser(ctx, runsTokenUser(), token)
+	repos, err := runnerRepoSet(ctx, runsTokenUser(), token)
 	if err != nil {
 		return nil, err
 	}
@@ -470,5 +500,32 @@ func (s *Server) VerifyRepoProtection(ctx context.Context) ([]deliver.Protection
 	for _, r := range repos {
 		full = append(full, r.FullName)
 	}
-	return deliver.VerifyProtection(ctx, deliverOps(s, token), full, s.runNotices)
+
+	if protectionEnforcementArmed() {
+		return deliver.VerifyProtection(ctx, deliverOps(s, token), full, s.runNotices)
+	}
+
+	// Held: no notice store is handed down, because deliver's wording would report a failed
+	// RESTORATION. The finding is recorded here in the words that are true — found, not changed. Only
+	// the OUTCOME half of deliver's sentence is rewritten; the deviation itself keeps the wording of
+	// the ONE place that formats it, so there is no second description of what "satisfied" means.
+	reports, err := deliver.VerifyProtection(ctx, heldProtectionOps{deliverOps(s, token)}, full, nil)
+	notify, held := s.NoticeFunc(), false
+	for i := range reports {
+		if !strings.Contains(reports[i].Detail, errProtectionHeld.Error()) {
+			continue
+		}
+		held = true
+		reports[i].OK, reports[i].Restored = false, false
+		reports[i].Detail = strings.Replace(reports[i].Detail,
+			") but restoring failed: "+errProtectionHeld.Error(),
+			") — reported, NOT changed; arm DEVLAB_RUNS_PROTECTION_ENFORCE to have it restored", 1)
+		if notify != nil {
+			notify("protection-deviation", reports[i].Repo+": "+reports[i].Detail)
+		}
+	}
+	if held && errors.Is(err, errProtectionHeld) {
+		err = nil // the hold is this daemon's own decision, not a failure to report upwards
+	}
+	return reports, err
 }

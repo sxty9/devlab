@@ -1,0 +1,11 @@
+{
+  "incidents": [
+    {
+      "id": "inc_khytgdjjqkwbkotj",
+      "at": "2026-07-28T05:47:34.05599592Z",
+      "kind": "drift",
+      "repo": "acme/alpha",
+      "condition": "status check mercury/delivery was missing"
+    }
+  ]
+}

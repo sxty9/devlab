@@ -1,0 +1,27 @@
+{
+  "prs": [
+    {
+      "repo": "acme/alpha",
+      "number": 12,
+      "url": "https://github.com/acme/alpha/pull/12",
+      "runId": "run_auto1",
+      "createdAt": "2026-07-26T10:13:26.734107756Z",
+      "mergeBy": "2026-08-25T10:13:26.734107826Z",
+      "lastChecked": "2026-07-30T05:52:23.645508919+02:00",
+      "blockedAt": "0001-01-01T00:00:00Z"
+    },
+    {
+      "repo": "acme/beta",
+      "number": 1,
+      "url": "https://github.com/acme/beta/pull/1",
+      "runId": "run_foreign_open",
+      "createdAt": "2026-07-21T00:16:47.039148444Z",
+      "mergeBy": "2026-08-20T00:16:47.039148584Z",
+      "lastChecked": "2026-07-27T22:16:49.102745159+02:00",
+      "deployAttempts": 3,
+      "blocked": true,
+      "blockedReason": "service \"beta\" is not set up in target \"prod\": unit beta.service not found",
+      "blockedAt": "2026-07-27T22:16:49.102745159+02:00"
+    }
+  ]
+}

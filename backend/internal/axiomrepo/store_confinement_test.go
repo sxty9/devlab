@@ -2,10 +2,12 @@ package axiomrepo
 
 // Two security properties of the constitution store, each pinned by the attack it must survive:
 // the push credential never becomes an argument (it would be world-readable in /proc), and a record
-// path can never leave the clone through a symlink the repository itself carries.
+// path can never leave the clone — neither out of the repository nor into its `.git` — through a
+// symlink the repository itself carries.
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,7 +73,10 @@ func TestCredentialNeverReachesTheCommandLine(t *testing.T) {
 		if strings.Contains(arg, token) {
 			t.Errorf("argv[%d] carries the raw token — visible in `ps auxww` to every local user: %q", i, arg)
 		}
-		if strings.Contains(arg, basicAuth(token)) {
+		// The base64 Basic form is built HERE, by the test that forbids it: production has no
+		// encoder for it, and a helper kept alive only so a test could call it would be dead
+		// shipped code asserting its own existence.
+		if enc := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token)); strings.Contains(arg, enc) {
 			t.Errorf("argv[%d] carries the base64 credential — equally world-readable: %q", i, arg)
 		}
 		if strings.Contains(arg, "Authorization") {
@@ -95,9 +100,9 @@ func TestCredentialNeverReachesTheCommandLine(t *testing.T) {
 	}
 }
 
-// plantEscape commits a symlink INSIDE the constitution repository that points out of it, and
-// returns the outside directory. This is the hostile-content case: whoever can commit to the
-// (deliberately unprotected) constitution repository can plant such a link.
+// plantEscape commits a symlink INSIDE the constitution repository that points somewhere it must
+// never reach. This is the hostile-content case: whoever can commit to the (deliberately
+// unprotected) constitution repository can plant such a link.
 func plantEscape(t *testing.T, s *Store, name, target string) {
 	t.Helper()
 	seed := filepath.Join(t.TempDir(), "plant")
@@ -139,9 +144,12 @@ func TestRecordPathCannotEscapeThroughSymlink(t *testing.T) {
 	if strings.Contains(string(data), "NOT A RECORD") {
 		t.Errorf("Get served a file from outside the repository: %q", data)
 	}
-	// The link itself is not a record either.
-	if _, _, err := s.Get(ctx, "axiome/escape"); err == nil {
-		t.Error("Get of the escaping link itself must refuse")
+	// The link itself never became one: the clone checks a committed symlink out as a plain file
+	// holding the link text, so there is nothing to traverse in the first place.
+	if fi, lerr := os.Lstat(filepath.Join(s.Dir(), "axiome", "escape")); lerr != nil {
+		t.Errorf("the committed link is not in the clone at all: %v", lerr)
+	} else if fi.Mode()&os.ModeSymlink != 0 {
+		t.Error("the clone materialized the committed symlink — core.symlinks=false is not in force")
 	}
 
 	// A write THROUGH the link must fail and must leave nothing outside.
@@ -176,6 +184,121 @@ func TestRecordPathCannotEscapeThroughSymlink(t *testing.T) {
 	}
 	if b, found, err := s.Get(ctx, "axiome/ok.md"); err != nil || !found || string(b) != "OK" {
 		t.Fatalf("ordinary record round-trip: b=%q found=%v err=%v", b, found, err)
+	}
+}
+
+// TestCommittedSymlinkNeverMaterialises pins the ENABLER half. The confinement was pure resolution,
+// and resolution ran against a clone that had already turned every committed symlink into a real one
+// — while the per-user git primitives one package over disarm exactly that with core.symlinks=false.
+// A link on `.git/config` is the sharpest case: it resolves INSIDE the clone, so "stays under the
+// root" said yes and the config (remote URL and everything else in it) was served as a record.
+func TestCommittedSymlinkNeverMaterialises(t *testing.T) {
+	ctx := context.Background()
+	s := newLocalStore(t)
+
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.md")
+	if err := os.WriteFile(secret, []byte("NOT A RECORD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plantEscape(t, s, "gitconfig", "../.git/config") // inside the clone, but not data
+	plantEscape(t, s, "outside", outside)
+
+	if _, err := s.List(ctx, ""); err != nil { // the first use clones
+		t.Fatalf("List: %v", err)
+	}
+	for _, name := range []string{"gitconfig", "outside"} {
+		fi, err := os.Lstat(filepath.Join(s.Dir(), "axiome", name))
+		if err != nil {
+			t.Fatalf("axiome/%s is not in the clone at all: %v", name, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			t.Errorf("axiome/%s materialized as a symlink — the clone did not disarm it", name)
+		}
+	}
+
+	// Neither link can serve what it points at: the git config, nor a file outside.
+	if b, _, err := s.Get(ctx, "axiome/gitconfig"); err == nil && strings.Contains(string(b), "[remote") {
+		t.Errorf("Get served the clone's git config as a record: %q", b)
+	}
+	if b, _, err := s.Get(ctx, "axiome/outside/secret.md"); err == nil {
+		t.Errorf("Get read through the committed link, outside the repository: %q", b)
+	}
+
+	// …and no write reaches either. The git directory must be untouched afterwards, hooks included.
+	cfgPath := filepath.Join(s.Dir(), ".git", "config")
+	before, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Put(ctx, "axiome/gitconfig", "PWNED", "write", "tester", true)
+	if after, err := os.ReadFile(cfgPath); err != nil || string(after) != string(before) {
+		t.Errorf("a record write reached the clone's git config: err=%v content=%q", err, after)
+	}
+	_ = s.Put(ctx, "axiome/outside/planted.md", "PLANTED", "write", "tester", true)
+	if _, err := os.Stat(filepath.Join(outside, "planted.md")); err == nil {
+		t.Error("a record write landed outside the constitution repository")
+	}
+}
+
+// TestResolutionRefusesTheClonesGitDirectory pins the RESOLUTION half on its own, in the state the
+// enabler cannot repair: a clone made before core.symlinks=false holds its links materialized, and a
+// refresh does not undo them (`reset --hard` rewrites tracked content, never an untracked link a
+// checkout left behind). So the resolution must draw the same line safePath draws for a `.git` path
+// segment — inside the clone is NOT the whole boundary, the clone's own git directory is not data.
+func TestResolutionRefusesTheClonesGitDirectory(t *testing.T) {
+	ctx := context.Background()
+	s := newLocalStore(t)
+	if _, err := s.List(ctx, ""); err != nil { // the first use clones
+		t.Fatalf("List: %v", err)
+	}
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.md"), []byte("NOT A RECORD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(s.Dir(), "axiome")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range map[string]string{
+		"gitdir":    "../.git",
+		"gitconfig": "../.git/config",
+		"outside":   outside,
+	} {
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfgPath := filepath.Join(s.Dir(), ".git", "config")
+	before, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"axiome/gitconfig", "axiome/gitdir/config", "axiome/outside/secret.md"} {
+		if b, found, err := s.Get(ctx, p); err == nil {
+			t.Errorf("Get(%q) = %q (found=%v) — it must refuse, the path leaves the record space", p, b, found)
+		}
+	}
+	for _, p := range []string{"axiome/gitconfig", "axiome/gitdir/config", "axiome/gitdir/hooks/pre-commit", "axiome/outside/planted.md"} {
+		if err := s.Put(ctx, p, "PWNED", "write", "tester", true); err == nil {
+			t.Errorf("Put(%q) succeeded — it must refuse", p)
+		}
+	}
+	if after, err := os.ReadFile(cfgPath); err != nil || string(after) != string(before) {
+		t.Errorf("a record write reached the clone's git config: err=%v content=%q", err, after)
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir(), ".git", "hooks", "pre-commit")); err == nil {
+		t.Error("a record write installed a git hook in the clone")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "planted.md")); err == nil {
+		t.Error("a record write landed outside the constitution repository")
+	}
+
+	// The line is drawn at the git directory, not at the letters: an ordinary record still writes.
+	if err := s.Put(ctx, "axiome/ok.md", "OK", "write", "tester", false); err != nil {
+		t.Fatalf("an ordinary record must still be writable: %v", err)
 	}
 }
 

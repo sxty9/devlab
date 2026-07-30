@@ -278,16 +278,27 @@ func TestExecDerivesWorkspaceRootFromTheStateRoot(t *testing.T) {
 	}
 }
 
-// Both wrappers must derive the workspace root the SAME way — ONE definition, mirrored verbatim, and
-// no absolute path assigned to a root variable anywhere. A second, drifting derivation is the defect
-// this pins; the pattern below catches it whatever literal it drifts to.
+// EVERY wrapper must derive its state paths the SAME way — ONE definition, mirrored verbatim, and no
+// absolute path assigned to a root variable anywhere. A second, drifting derivation is the defect this
+// pins (four scripts once carried four definitions of the same root); the pattern below catches it
+// whatever literal it drifts to.
+//
+// The state-root line is owed by all four. The workspaces line is owed by the three that reach into a
+// per-user working tree; devlab-deploy-recv is the prod receiver, which has no workspaces and derives
+// the staging and web roots from the same state root instead.
 func TestWrappersShareOneWorkspaceDerivation(t *testing.T) {
-	want := []string{
-		`STATE_DIR="${DEVLAB_STATE_DIR:-`,
-		`WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"`,
+	const (
+		stateRoot  = `STATE_DIR="${DEVLAB_STATE_DIR:-`
+		workspaces = `WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"`
+	)
+	scripts := map[string][]string{
+		"deploy/devlab-install":     {stateRoot, workspaces},
+		"deploy/devlab-exec":        {stateRoot, workspaces},
+		"deploy/devlab-mkworkspace": {stateRoot, workspaces},
+		"deploy/devlab-deploy-recv": {stateRoot, `STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"`},
 	}
 	hardcoded := regexp.MustCompile(`(?m)^[A-Z_]*(ROOT|STATE_DIR|WORKSPACES)[A-Z_]*="/[^"$]*"`)
-	for _, script := range []string{"deploy/devlab-install", "deploy/devlab-exec"} {
+	for script, want := range scripts {
 		b, err := os.ReadFile(filepath.Join(repoRoot(t), script))
 		if err != nil {
 			t.Fatal(err)

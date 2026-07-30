@@ -70,6 +70,15 @@ type plan struct {
 	notices   []OneOff
 	arch      archive
 
+	// The takeover of the pre-rebuild stock (takeover.go): the run pool split by form, the
+	// delivery ledger's conversion, the config snapshots that hold pre-rebuild records, and the
+	// pools the rebuild has no reader for. They are the reason the import CARRIES the state over
+	// instead of writing beside it.
+	pool    *runPool
+	ledger  *ledgerTakeover
+	snaps   *snapshotTakeover
+	orphans []orphan
+
 	skippedOwn     int
 	presentRuns    []string
 	presentHistory []string
@@ -82,49 +91,79 @@ type plan struct {
 	refusals     []string
 }
 
-// empty reports whether applying the plan would write nothing.
+// empty reports whether applying the plan would write nothing. The takeover counts: a state
+// directory whose pools are already in the rebuilt form is what makes a second run a no-op — not
+// the absence of records to import.
 func (p *plan) empty() bool {
 	return len(p.autoRuns) == 0 && len(p.openTodos) == 0 && len(p.history) == 0 &&
-		len(p.notices) == 0 && len(p.arch.imports) == 0 && p.arch.movedTo == ""
+		len(p.notices) == 0 && len(p.arch.imports) == 0 && p.arch.movedTo == "" &&
+		!p.pool.takenOver() && p.ledger.count() == 0 && len(p.snaps.moved) == 0 &&
+		len(p.orphans) == 0
+}
+
+// poolAfter is the run pool the takeover writes: the records already in the rebuilt form, then the
+// ones this import adds. The deduplication happened ONCE, while planning (haveRunID/haveAutoTitle
+// are seeded from exactly these existing records), so there is no second dedup here that could
+// disagree with it.
+func (p *plan) poolAfter() []runs.Run {
+	out := make([]runs.Run, 0, len(p.pool.newForm)+len(p.autoRuns)+len(p.openTodos))
+	out = append(out, p.pool.newForm...)
+	out = append(out, p.autoRuns...)
+	return append(out, p.openTodos...)
 }
 
 // migrator holds the pools the import touches. They are the SAME access points the daemon uses —
 // the migration adds no second data path.
 type migrator struct {
-	paths   *statepath.Paths
-	runs    *runs.Store
-	results *runs.ResultStore
-	notices *runs.NoticeStore
-	own     string
-	now     time.Time
+	paths      *statepath.Paths
+	runs       *runs.Store
+	results    *runs.ResultStore
+	notices    *runs.NoticeStore
+	deliveries *runs.DeliveryStore
+	own        string
+	now        time.Time
 }
 
 func newMigrator(p *statepath.Paths, own string, now time.Time) *migrator {
 	return &migrator{
-		paths:   p,
-		runs:    runs.NewStore(p),
-		results: runs.NewResultStore(p),
-		notices: runs.NewNoticeStore(p),
-		own:     own,
-		now:     now.UTC(),
+		paths:      p,
+		runs:       runs.NewStore(p),
+		results:    runs.NewResultStore(p),
+		notices:    runs.NewNoticeStore(p),
+		deliveries: runs.NewDeliveryStore(p),
+		own:        own,
+		now:        now.UTC(),
 	}
 }
 
-// execDir and archiveDir mirror the frozen result store's own resolution (its documented per-pool
-// env seams first, the state root otherwise) so the import's "is it already there?" checks look
-// exactly where the store reads and writes.
-func (m *migrator) execDir() string {
-	if v := os.Getenv("DEVLAB_MERCURY_EXECUTIONS"); v != "" {
+// poolPath mirrors a store's OWN path resolution — its documented per-pool env seam first, the
+// state root otherwise — so every read and every write of the import lands exactly where the
+// daemon's store reads and writes. One helper, one rule, for all of them.
+func (m *migrator) poolPath(env string, fromRoot func() string) string {
+	if v := os.Getenv(env); v != "" {
 		return v
 	}
-	return m.paths.Executions()
+	return fromRoot()
+}
+
+func (m *migrator) execDir() string {
+	return m.poolPath("DEVLAB_MERCURY_EXECUTIONS", m.paths.Executions)
 }
 
 func (m *migrator) archiveDir() string {
-	if v := os.Getenv("DEVLAB_MERCURY_RUNS_RESULTS"); v != "" {
-		return v
-	}
-	return m.paths.LegacyResults()
+	return m.poolPath("DEVLAB_MERCURY_RUNS_RESULTS", m.paths.LegacyResults)
+}
+
+func (m *migrator) runsPath() string {
+	return m.poolPath("DEVLAB_MERCURY_RUNS", m.paths.Runs)
+}
+
+func (m *migrator) ledgerPath() string {
+	return m.poolPath("DEVLAB_MERCURY_RUNS_DELIVERIES", m.paths.Deliveries)
+}
+
+func (m *migrator) historyDir() string {
+	return m.poolPath("DEVLAB_MERCURY_RUNS_HISTORY", m.paths.HistoryDir)
 }
 
 // imported reports whether an execution document already lives in the execution tree.
@@ -141,13 +180,20 @@ func (m *migrator) plan(inputPath string) (*plan, error) {
 	}
 	p := &plan{stateRoot: m.paths.Root, inputPath: inputPath, records: len(exp.Runs)}
 
-	existingRuns, err := m.runs.List()
+	// The run pool is read BY FORM, not through the store's typed decode. This is the whole
+	// difference between an import that carries the state over and one that lies down beside it:
+	// the pre-rebuild record and the rebuilt record share their `id`, so the typed decode yields a
+	// blank run per pre-rebuild record and every id then answers "already imported" — the import
+	// writes nothing and the pool keeps a set of runs the surface shows as nameless. Only records
+	// in the REBUILT form count as present; the rest is set aside by the takeover below.
+	pool, err := readRunPool(m.runsPath())
 	if err != nil {
 		return nil, fmt.Errorf("run pool unreadable: %w", err)
 	}
+	p.pool = pool
 	haveRunID := map[string]bool{}
 	haveAutoTitle := map[string]bool{}
-	for _, r := range existingRuns {
+	for _, r := range pool.newForm {
 		haveRunID[r.ID] = true
 		if r.Kind == model.KindAuto {
 			haveAutoTitle[strings.ToLower(strings.TrimSpace(r.Title))] = true
@@ -189,12 +235,46 @@ func (m *migrator) plan(inputPath string) (*plan, error) {
 	if err := m.planNotices(p); err != nil {
 		return nil, err
 	}
+	if err := m.planTakeover(p); err != nil {
+		return nil, err
+	}
 	// The bar comes LAST, over everything the import would create: nothing may enter the pool
 	// able to fire without a prompt that names its subject.
 	barUnsubstantiated(p)
 	sort.Strings(p.presentRuns)
 	sort.Strings(p.presentHistory)
 	return p, nil
+}
+
+// planTakeover plans everything the import carries over rather than adds: the delivery ledger's
+// conversion, the config snapshots that would re-inject pre-rebuild records, and the pools the
+// rebuild has no reader for. The run pool itself was already classified in plan().
+func (m *migrator) planTakeover(p *plan) error {
+	ledger, err := readLedgerTakeover(m.ledgerPath())
+	if err != nil {
+		return err
+	}
+	p.ledger = ledger
+	p.refusals = append(p.refusals, ledger.refusals...)
+
+	snaps, err := readSnapshotTakeover(m.historyDir())
+	if err != nil {
+		return err
+	}
+	p.snaps = snaps
+
+	for _, o := range orphanPools() {
+		from := filepath.Join(m.paths.Mercury(), o.name)
+		if _, err := os.Stat(from); err != nil {
+			continue // not on this instance
+		}
+		to, err := freeAsidePath(from)
+		if err != nil {
+			return err
+		}
+		p.orphans = append(p.orphans, orphan{from: from, to: to, why: o.why})
+	}
+	return nil
 }
 
 // wouldFire answers "would the scheduler start this freshly imported record?" by the SAME two
@@ -543,7 +623,21 @@ func (m *migrator) apply(p *plan) error {
 	if err := m.paths.CheckWritable(); err != nil {
 		return err
 	}
+	// The pre-rebuild stock is set aside BEFORE anything is rewritten, so no step can lose it:
+	// the snapshots and the orphaned pools move out of the way first, and each pool that is
+	// rewritten gets its verbatim copy beside it before the rewrite.
+	if err := moveFilesAside(p.snaps.dir, p.snaps.to, p.snaps.moved); err != nil {
+		return fmt.Errorf("setting the pre-rebuild config snapshots aside: %w", err)
+	}
+	for _, o := range p.orphans {
+		if err := os.Rename(o.from, o.to); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("setting %s aside: %w", o.from, err)
+		}
+	}
 	if err := m.applyRuns(p); err != nil {
+		return err
+	}
+	if err := m.applyLedger(p); err != nil {
 		return err
 	}
 	// The archive first: its records carry per-stage detail, so they win over an export summary
@@ -577,39 +671,49 @@ func (m *migrator) apply(p *plan) error {
 	return nil
 }
 
-// applyRuns folds the missing run definitions into the pool in ONE atomic mutation — no snapshot
-// per record: the import is a single bulk write, not a series of user edits.
+// applyRuns writes the run pool the takeover decided: the records already in the rebuilt form plus
+// the imported ones, in ONE atomic replacement — no snapshot per record, because the import is a
+// single bulk event, not a series of user edits.
+//
+// It REPLACES rather than folds in, and that is the point: folding in would have to read the pool
+// back through the typed decode, which is what turns a pre-rebuild record into a blank run and
+// writes it straight back (measured: a no-op fold over the real pool rewrote 63 records into 63
+// nameless ones and lost 171 of 309 KB). The verbatim copy is written first, so the old stock
+// exists under its own name before a byte of the pool changes.
+//
+// The one snapshot ReplaceAll takes is deliberate: the pre-rebuild snapshots were just set aside,
+// so this is the operator's first — and, right after the import, only — restore point.
 func (m *migrator) applyRuns(p *plan) error {
-	add := append(append([]runs.Run{}, p.autoRuns...), p.openTodos...)
-	if len(add) == 0 {
+	if !p.pool.takenOver() && len(p.autoRuns)+len(p.openTodos) == 0 {
 		return nil
 	}
-	_, err := m.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
-		have := map[string]bool{}
-		titles := map[string]bool{}
-		for _, r := range cur {
-			have[r.ID] = true
-			if r.Kind == model.KindAuto {
-				titles[strings.ToLower(strings.TrimSpace(r.Title))] = true
-			}
+	if p.pool.takenOver() {
+		if err := copyAside(p.pool.path, p.pool.aside); err != nil {
+			return fmt.Errorf("setting the pre-rebuild run pool aside: %w", err)
 		}
-		for _, r := range add {
-			if have[r.ID] {
-				continue
-			}
-			if r.Kind == model.KindAuto && titles[strings.ToLower(r.Title)] {
-				continue
-			}
-			cur = append(cur, r)
-			have[r.ID] = true
-			if r.Kind == model.KindAuto {
-				titles[strings.ToLower(r.Title)] = true
-			}
-		}
-		return cur, nil
-	})
-	if err != nil {
+	}
+	if err := m.runs.ReplaceAll(p.poolAfter(), "migrate", model.Actor{Autonomous: true}); err != nil {
 		return fmt.Errorf("run pool: %w", err)
+	}
+	return nil
+}
+
+// applyLedger writes the converted deliveries back through the ledger's OWN access point, one
+// record at a time — there is exactly one writer for a delivery and the import does not open a
+// second path to the same entity. The verbatim copy is written first: the store's write path reads
+// the whole ledger and writes it back in the rebuilt shape, so from the first record on the status
+// words are gone from the file and only the copy still holds them.
+func (m *migrator) applyLedger(p *plan) error {
+	if p.ledger.count() == 0 {
+		return nil
+	}
+	if err := copyAside(p.ledger.path, p.ledger.aside); err != nil {
+		return fmt.Errorf("setting the pre-rebuild delivery ledger aside: %w", err)
+	}
+	for _, d := range p.ledger.converted {
+		if err := m.deliveries.Put(d); err != nil {
+			return fmt.Errorf("delivery %s: %w", d.ID, err)
+		}
 	}
 	return nil
 }

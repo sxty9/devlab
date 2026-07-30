@@ -33,11 +33,15 @@ func stateRoot(t *testing.T) *statepath.Paths {
 	t.Helper()
 	root := t.TempDir()
 	t.Setenv("DEVLAB_STATE_DIR", root)
-	// The per-pool env seams must not leak in from the developer's shell.
-	t.Setenv("DEVLAB_MERCURY_RUNS", "")
-	t.Setenv("DEVLAB_MERCURY_EXECUTIONS", "")
-	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", "")
-	t.Setenv("DEVLAB_MERCURY_RUNS_NOTICES", "")
+	// The per-pool env seams must not leak in from the developer's shell — every seam the import
+	// mirrors, so a set variable can never make a test read one pool and write another.
+	for _, seam := range []string{
+		"DEVLAB_MERCURY_RUNS", "DEVLAB_MERCURY_EXECUTIONS", "DEVLAB_MERCURY_RUNS_RESULTS",
+		"DEVLAB_MERCURY_RUNS_NOTICES", "DEVLAB_MERCURY_RUNS_PRS", "DEVLAB_MERCURY_RUNS_DELIVERIES",
+		"DEVLAB_MERCURY_RUNS_HISTORY", "DEVLAB_MERCURY_SETTINGS",
+	} {
+		t.Setenv(seam, "")
+	}
 	p, err := statepath.FromEnv()
 	if err != nil {
 		t.Fatalf("state root: %v", err)
@@ -521,7 +525,7 @@ func TestOpenTaskCarriesTheComposedPromptTheAgentReceives(t *testing.T) {
 	if !strings.Contains(withWording.PromptSnapshot, "Keep it small.") {
 		t.Errorf("recomposing with the constitution must fold in the wording:\n%s", withWording.PromptSnapshot)
 	}
-	full := executor.AssemblePrompt(todo.PromptSnapshot, preflight.Finding{State: model.TaskNotImplemented}, "")
+	full := executor.AssemblePrompt(todo.PromptSnapshot, preflight.Finding{State: model.TaskNotImplemented}, "", "")
 	if !strings.Contains(full, "Switch the imports and prove the check passes.") {
 		t.Errorf("the assembled execution prompt names no task:\n%s", full)
 	}
@@ -699,8 +703,10 @@ func TestLegacyArchiveImportKeepsLegacyStatesViewable(t *testing.T) {
 	installArchive(t, p)
 	pl := migrate(t, p)
 
-	if len(pl.arch.imports) != 1 {
-		t.Fatalf("expected the one readable archived execution, got %d", len(pl.arch.imports))
+	// Two readable archived executions: the hand-written one below, plus the record derived from
+	// the real archive that carries its real-world traits (takeover_test.go).
+	if len(pl.arch.imports) != 2 {
+		t.Fatalf("expected the two readable archived executions, got %d", len(pl.arch.imports))
 	}
 	if len(pl.arch.unmatched) != 1 || pl.arch.unmatched[0] != "broken" {
 		t.Fatalf("the unreadable archive file must be named, got %v", pl.arch.unmatched)

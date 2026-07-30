@@ -122,6 +122,16 @@ func credentialArgs() []string {
 	}
 }
 
+// noSymlinkArgs disarms committed symlinks: with core.symlinks=false git checks a symlink out as a
+// small PLAIN FILE holding the link text, so no record path can ever traverse one. This is the same
+// characteristic the per-user git primitives set on their clones (workspace.clone) — a clone this
+// service makes never materializes what a repository committed, wherever the clone is made.
+//
+// They are passed BOTH on the clone (where -c persists into the new repository's config) and on
+// every later invocation: a clone created before this existed carries neither the config nor the
+// disarmed state, and its refresh must not re-materialize a link the remote still holds.
+func noSymlinkArgs() []string { return []string{"-c", "core.symlinks=false"} }
+
 // gitEnv is the environment of one git invocation: the terminal prompt is off (a missing credential
 // must fail, never block) and the token — when there is one — travels here, never on argv.
 func gitEnv(token string) []string {
@@ -137,6 +147,7 @@ func gitEnv(token string) []string {
 func (s *Store) git(ctx context.Context, args ...string) (string, error) {
 	var token string
 	full := []string{"-C", s.dir, "-c", "user.name=Mercury", "-c", "user.email=mercury@holistic.local"}
+	full = append(full, noSymlinkArgs()...)
 	if !s.local {
 		t, err := s.credential()
 		if err != nil {
@@ -194,7 +205,7 @@ func (s *Store) clone(ctx context.Context) error {
 		return err
 	}
 	var token string
-	args := []string{}
+	args := noSymlinkArgs()
 	url := s.fullName // a local path / URL remote is used verbatim
 	if !s.local {
 		t, err := s.credential()
@@ -442,6 +453,13 @@ func safePath(p string) error {
 // Like the root wrappers, the deepest EXISTING ancestor is resolved (so a record that does not exist
 // yet is confined through its parent) and required to stay inside the clone. Callers hold the lock
 // and call this AFTER the refresh, because a refresh can re-materialise such a link.
+//
+// "Inside the clone" is not the whole boundary: the clone's own `.git` lies inside it, and that
+// directory is not data — it holds the refs, the hooks and the config. Resolving into it is refused
+// for exactly the reason safePath refuses a `.git` path segment, so both halves of the confinement
+// draw the SAME line: a link `axiome/x -> .git` would otherwise serve the config as a record and let
+// a write install a hook. Newer clones cannot carry such a link at all (noSymlinkArgs), but a clone
+// made before that holds its links materialized and its refresh does not undo them.
 func (s *Store) resolveInClone(rel string) (string, error) {
 	if err := safePath(rel); err != nil {
 		return "", err
@@ -450,12 +468,16 @@ func (s *Store) resolveInClone(rel string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("constitution clone unusable: %w", err)
 	}
+	gitDir := filepath.Join(root, ".git")
 	abs := filepath.Join(s.dir, filepath.FromSlash(rel))
 	for probe := abs; ; {
 		real, err := filepath.EvalSymlinks(probe)
 		if err == nil {
 			if real != root && !strings.HasPrefix(real, root+string(os.PathSeparator)) {
 				return "", fmt.Errorf("invalid path %q: it resolves to %q, outside the constitution repository", rel, real)
+			}
+			if real == gitDir || strings.HasPrefix(real, gitDir+string(os.PathSeparator)) {
+				return "", fmt.Errorf("invalid path %q: it resolves to %q, inside the clone's git directory", rel, real)
 			}
 			return abs, nil
 		}
@@ -475,11 +497,9 @@ func (s *Store) resolveInClone(rel string) (string, error) {
 	}
 }
 
-func basicAuth(token string) string {
-	return base64Std("x-access-token:" + token)
-}
-
-// redact removes the token from any message that is about to be logged or returned.
+// redact removes the token from any message that is about to be logged or returned. The base64 form
+// is redacted too: nothing here BUILDS it (the credential travels in the environment), but git
+// assembles a Basic header from the helper's answer itself and a verbose failure can echo it.
 func redact(msg, token string) string {
 	if token == "" {
 		return msg

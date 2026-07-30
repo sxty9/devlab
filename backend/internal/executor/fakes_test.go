@@ -298,6 +298,18 @@ type fakeDeps struct {
 	pauses       []pauseCall
 	usageSamples []telemetry.UsageSample
 	topics       []live.Topic
+
+	// the examined-stand pool, faked as what it is: a passive record per repo (BEFUND 3).
+	scope        map[string]string // repo → the section the renderer produced
+	scopeAsked   []string          // repos the motor asked about, in order
+	scopeRecords []scopeRecord     // what the motor wrote back
+	scopeErr     error             // a pool that cannot be written
+}
+
+// scopeRecord is one write into the faked examined-stand pool.
+type scopeRecord struct {
+	repo, commit string
+	ids          []string
 }
 
 func newFakeDeps(repos ...string) *fakeDeps {
@@ -349,6 +361,20 @@ func (d *fakeDeps) Preflight(ctx context.Context, repo string, run runs.Run) (pr
 	}
 	return d.findings[repo], nil
 }
+func (d *fakeDeps) AxiomScope(ctx context.Context, repo string, run runs.Run) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.scopeAsked = append(d.scopeAsked, repo)
+	return d.scope[repo]
+}
+
+func (d *fakeDeps) RecordAxiomScope(repo string, run runs.Run, commit string, at time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.scopeRecords = append(d.scopeRecords, scopeRecord{repo: repo, commit: commit, ids: run.AxiomIDs})
+	return d.scopeErr
+}
+
 func (d *fakeDeps) RequestRestart(by model.Actor) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

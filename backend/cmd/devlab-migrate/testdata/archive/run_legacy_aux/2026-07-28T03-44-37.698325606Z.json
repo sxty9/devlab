@@ -1,0 +1,72 @@
+{
+  "runId": "run_legacy_aux",
+  "resultId": "2026-07-28T03-44-37.698325606Z",
+  "runName": "Interrupted nightly sweep",
+  "type": "todo",
+  "startedAt": "2026-07-28T03:44:37.698325606Z",
+  "updatedAt": "2026-07-28T04:52:50.139552364Z",
+  "finishedAt": "0001-01-01T00:00:00Z",
+  "prompt": "# Automatic run\n\nlegacy prompt snapshot",
+  "mode": "full",
+  "model": "opus",
+  "timeBudget": "3h",
+  "ok": false,
+  "interrupted": true,
+  "repos": [
+    {
+      "repo": "alpha",
+      "ok": true,
+      "deployed": false,
+      "prUrl": "https://github.com/acme/alpha/pull/3",
+      "steps": [
+        {
+          "name": "übersprungen",
+          "ok": true,
+          "log": "recorded by the pre-rebuild chain",
+          "at": "2026-07-24T01:30:34.591306823Z"
+        }
+      ]
+    },
+    {
+      "repo": "beta",
+      "base": "1a04bbc3fa14fa0256fa014dd4e064464471d243",
+      "ok": false,
+      "deployed": false,
+      "steps": [
+        {
+          "name": "implement",
+          "ok": false,
+          "log": "recorded by the pre-rebuild chain",
+          "at": "2026-07-26T19:10:19.280010745Z"
+        }
+      ],
+      "error": "recorded by the pre-rebuild chain"
+    }
+  ],
+  "inputTokens": 0,
+  "outputTokens": 0,
+  "costUsd": 0,
+  "numTurns": 0,
+  "live": {
+    "repo": "gamma",
+    "base": "ae5eed5acf1e5eab33f60205f28b44af72212d3e",
+    "running": true,
+    "ok": false,
+    "deployed": false,
+    "devBranch": "mercury-dev",
+    "steps": [
+      {
+        "name": "fold",
+        "status": "not-applicable",
+        "log": "recorded by the pre-rebuild chain",
+        "at": "2026-07-28T06:45:20.263859664Z"
+      },
+      {
+        "name": "implement",
+        "status": "ok",
+        "log": "recorded by the pre-rebuild chain",
+        "at": "2026-07-28T06:45:20.30551825Z"
+      }
+    ]
+  }
+}

@@ -29,14 +29,27 @@ You are the autonomous Holistic runner, executing unattended on the server.
   conclusions.`
 
 // AssemblePrompt builds the execution prompt: preamble (REQ-021.1) + the composed snapshot
-// (constitution included, REQ-002.1) + the preflight finding (REQ-020.2) + the attachment
-// manifest (REQ-007.3, "" when there are none). The addenda never compose constitution text.
-func AssemblePrompt(snapshot string, f preflight.Finding, attManifest string) string {
+// (constitution included, REQ-002.1) + the examined stand of THIS repository + the preflight
+// finding (REQ-020.2) + the attachment manifest (REQ-007.3, "" when there are none). The addenda
+// never compose constitution text.
+//
+// scope is the per-repository examined stand as the ONE renderer wrote it
+// (mercury.RepoScopeSection, handed in by Deps.AxiomScope) — "" when the run names no axiom. It
+// belongs HERE and not in the snapshot: one run addresses many repositories, while the stand is
+// true of exactly one of them. The snapshot's role text refers to this section by name, so
+// omitting it is not a smaller prompt but a prompt that falls back to "never examined ⇒ scan
+// everything" on every single run.
+func AssemblePrompt(snapshot string, f preflight.Finding, scope, attManifest string) string {
 	var b strings.Builder
 	b.WriteString(promptPreamble)
 	b.WriteString("\n\n")
 	b.WriteString(strings.TrimRight(snapshot, "\n"))
 	b.WriteString("\n")
+
+	if strings.TrimSpace(scope) != "" {
+		b.WriteString(strings.TrimRight(scope, "\n"))
+		b.WriteString("\n")
+	}
 
 	b.WriteString("\n## Preflight — observed state of this repository\n\n")
 	b.WriteString("State: " + string(f.State) + "\n")

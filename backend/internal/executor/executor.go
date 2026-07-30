@@ -143,6 +143,17 @@ type Deps interface {
 	Deliver() DeliverOps
 	Deploy() DeployOps
 	Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error)
+	// AxiomScope names the stand THIS repository was last examined against, per axiom of the run —
+	// the section that makes an execution incremental instead of re-reading whole repositories
+	// every night. "" when there is nothing to say (a ToDo carries no axioms). It is a per-REPO
+	// fact, so it can never live in the run's shared prompt snapshot; the wording is composed by
+	// the ONE renderer outside the motor, and an unreadable record is NAMED there, never presented
+	// as "never examined".
+	AxiomScope(ctx context.Context, repo string, run runs.Run) string
+	// RecordAxiomScope notes the stand this repository was examined against, for every axiom of the
+	// run. A failure costs the NEXT run its incrementality, never its correctness (it re-examines in
+	// full), so the motor reports it and carries on.
+	RecordAxiomScope(repo string, run runs.Run, commit string, at time.Time) error
 	// RequestRestart is the B-3 seam — implemented by sched, injected; called by the SELF
 	// repo's deliver-dev stage after a successful install.
 	RequestRestart(by model.Actor) error

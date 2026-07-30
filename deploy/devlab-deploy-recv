@@ -26,7 +26,19 @@
 # Install (on the VPS): sudo install -o root -g root -m 0755 devlab-deploy-recv /usr/local/sbin/devlab-deploy-recv
 set -euo pipefail
 
-STAGING_ROOT="/var/lib/devlab/staging"
+# The ONE state-root derivation shared by every DevLab wrapper (devlab-install, devlab-exec,
+# devlab-mkworkspace carry it verbatim): every path this receiver touches DERIVES from the state root,
+# so an instance with a different root does not end up with a receiver staging in one place and a
+# daemon serving from another. This host has no per-user workspaces — it is install-only — so what it
+# derives are the staging root the forced command receives into and the web root it serves from
+# (mirroring statepath.Www()).
+#
+# The overrides are a DIRECT-INVOCATION seam, never an input of the forced command: sshd hands the
+# client no environment (AcceptEnv does not list these names, and the key's `restrict` option disables
+# user-rc), so a client cannot move the staging boundary it is confined to.
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
+WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
@@ -80,8 +92,8 @@ case "$REPO" in
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
-    mkdir -p /var/lib/devlab/www
-    rsync -a --delete "$WEB"/ /var/lib/devlab/www/
+    mkdir -p "$WWW_DIR"
+    rsync -a --delete "$WEB"/ "$WWW_DIR"/
     systemctl restart devlabd
     ;;
   *)

@@ -202,12 +202,41 @@ func execute(ctx context.Context, server *api.Server, scheduler *sched.Scheduler
 
 // verifyProtectionLoop re-checks branch protection on the maintenance cadence (REQ-033.7),
 // contained: a failing pass is logged, never fatal.
+//
+// FOREIGN EFFECT, HELD BY DEFAULT: one pass reaches EVERY repository of the configured organisation,
+// and restoring a deviation WRITES to that repository's default branch — the one thing in this daemon
+// that changes something outside DevLab. Two bounds make a boot harmless, and the cutover runbook
+// names both:
+//
+//   - the first pass does NOT run at boot. It waits DEVLAB_RUNS_PROTECTION_START_DELAY (default 15m),
+//     so a cutover, a restart loop or a mis-set organisation cannot reach GitHub before an operator
+//     has seen the daemon come up; stopping the service inside that window costs nothing at all.
+//   - writing is off until the operator ARMS it (DEVLAB_RUNS_PROTECTION_ENFORCE, read in
+//     api.VerifyRepoProtection). Unarmed, a pass only READS and reports what deviates.
 func verifyProtectionLoop(ctx context.Context, server *api.Server) {
-	interval := envDuration("DEVLAB_RUNS_PROTECTION_INTERVAL", 6*time.Hour)
+	protectionLoop(ctx,
+		envDuration("DEVLAB_RUNS_PROTECTION_START_DELAY", 15*time.Minute),
+		envDuration("DEVLAB_RUNS_PROTECTION_INTERVAL", 6*time.Hour),
+		func(c context.Context) error { _, err := server.VerifyRepoProtection(c); return err })
+}
+
+// protectionLoop is the loop itself, with the pass injected — the shape the delay and the cadence are
+// provable in. It sleeps FIRST, so a cancelled context during the initial delay means no pass ever ran.
+func protectionLoop(ctx context.Context, delay, interval time.Duration, pass func(context.Context) error) {
+	if delay > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+	if interval <= 0 {
+		interval = 6 * time.Hour
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		if _, err := server.VerifyRepoProtection(ctx); err != nil {
+		if err := pass(ctx); err != nil {
 			log.Printf("devlabd: protection verify: %v", err)
 		}
 		select {

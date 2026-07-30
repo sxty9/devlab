@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"devlab/backend/internal/api"
 	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/deploy"
 	"devlab/backend/internal/executor"
@@ -519,6 +520,17 @@ func (d *fixtureDeps) Preflight(ctx context.Context, repo string, run runs.Run) 
 	// Not pinned: the SHIPPED derivation over this fixture's own sources (the repository, the
 	// ledger, the pull requests) — the observation is derived, never asserted.
 	return preflight.Derive(ctx, d, repo, run)
+}
+
+// AxiomScope / RecordAxiomScope run on the SHIPPED join (api.ChainDeps over the real pools and the
+// real constitution store): the examined stand is not an I/O edge, so a fixture that answered it
+// itself would prove nothing about the code that has to carry it into the prompt.
+func (d *fixtureDeps) AxiomScope(ctx context.Context, repo string, run runs.Run) string {
+	return d.e.srv.ChainDeps(api.ChainHooks{}).AxiomScope(ctx, repo, run)
+}
+
+func (d *fixtureDeps) RecordAxiomScope(repo string, run runs.Run, commit string, at time.Time) error {
+	return d.e.srv.ChainDeps(api.ChainHooks{}).RecordAxiomScope(repo, run, commit, at)
 }
 
 func (d *fixtureDeps) RequestRestart(by model.Actor) error {

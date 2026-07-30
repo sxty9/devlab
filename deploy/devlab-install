@@ -7,15 +7,25 @@
 #   * name grammar: <repo> must match ^[a-z][a-z0-9-]{2,30}$ — nothing else ever reaches a path
 #   * NAMESPACE (the grammar alone is not one — `root`, `caddy`, `sshd` and `postgres` all satisfy
 #     it, and the generated unit carries `User=<repo>`, so a repository called `root` would have
-#     run its own artifact as uid 0). A foreign repository must additionally
-#       – not be a reserved system or landscape identity (RESERVED_REPOS below),
-#       – be the checkout the artifact was built in AND belong to the configured organisation
-#         (the checkout's origin remote, read as text — git is never RUN on repo content as root),
-#       – own its service account: an existing account must be the nologin system account under
-#         /var/lib/<repo> that this wrapper creates, never a foreign identity we adopt,
+#     run its own artifact as uid 0). EVERY name is measured, the SELF repo included — it is the
+#     most privileged one, and exempting it would have let any checkout's artifact be installed as
+#     this service's own binary. Every repository must
+#       – not be a reserved OS or third-party-package identity (RESERVED_REPOS below),
+#       – be the RUNNER'S STAGED ARTIFACT of the checkout that carries this name:
+#         <workspaces>/<user>/<repo>/.mercury-artifact and nothing else,
+#       – belong to the configured organisation (the checkout's origin remote, read as text — git
+#         is never RUN on repo content as root),
+#     and a FOREIGN repository additionally must
 #       – be unknown to systemd or known ONLY through this wrapper's own unit file: existence is
 #         asked of `systemctl show -p FragmentPath`, not of a path, so a vendor unit under
-#         /lib|/usr/lib (or a masked one) is SEEN and refused instead of being shadowed
+#         /lib|/usr/lib (or a masked one) is SEEN and refused instead of being shadowed,
+#       – own its service account WHERE THAT IS DECIDED HERE: at first-time setup, which runs
+#         `useradd` and generates `User=<repo>`, an existing account must be the nologin system
+#         account under /var/lib/<repo> this wrapper creates. On an UPDATE of an already installed
+#         service the unit is root-owned and its `User=` was settled when it was written, so there
+#         is no identity to adopt. A landscape may well run a service whose account legitimately
+#         predates DevLab — a `mail` service running as the OS `mail` account — and judging that here
+#         made it permanently undeliverable.
 #   * path canonicalization: <artifact-dir> resolves via `realpath -e` and MUST lie under the
 #     workspace root; a traversal (…/../../tmp/evil) dies before any effect
 #   * env is exactly `dev` or `prod` (prod is NOT armed in this phase — it dies)
@@ -45,8 +55,15 @@ WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"
 SELF_REPO="${DEVLAB_SELF_REPO:-devlab}"
 SELF_UNIT="${DEVLAB_UNIT:-devlabd}"
 CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+# The edge's assembled configuration, validated before a route of ours is adopted (see the route
+# step). Instance-neutral defaults of this template, like every value above.
+CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
+CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
 PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
 RESTART_HELPER="/usr/local/sbin/devlab-restart-when-free"
+# The ONE artifact directory the unprivileged per-user build produces inside a working tree
+# (mirrors deploy.ArtifactDirName). Nothing else is ever installed from.
+ARTIFACT_DIR_NAME=".mercury-artifact"
 # systemd is the authority on which units exist — asked through this binary so the question is
 # answerable in a dry run without a bus (the seam is stripped by sudo's env_reset in production).
 SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
@@ -56,14 +73,23 @@ UNIT_DIR="/etc/systemd/system"
 # in root-owned runtime configuration and never as a literal in this template.
 OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
 
-# Reserved names. Every one of them satisfies the grammar, and for every one the generated unit and
-# service account would collide with an identity that already means something else — `root` most
-# sharply, because the unit template carries `User=<repo>`.
-RESERVED_REPOS="root daemon bin sys sync games man lp mail news uucp proxy backup list irc gnats
-nobody nogroup www-data adm admin operator halt shutdown reboot init systemd udev dbus messagebus
-polkitd syslog rsyslog sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
-caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod docker containerd
-kubelet etcd snapd holistic"
+# Reserved names, and the RULE they follow. Reserved is an identity that belongs to the operating
+# system, to a third-party package, or to the landscape as a whole — one that can appear on this host
+# without anybody's decision and that this wrapper must therefore never create, borrow or shadow.
+# `root` is the sharpest case, because the unit template carries `User=<repo>`.
+#
+# A name the ORGANISATION can legitimately give a service of its own is NOT on this list, even where
+# a like-named OS account exists: a landscape may run a service called `mail`, and blocking the name
+# here made it permanently undeliverable. What decides there are the checks that ask about the actual
+# identity rather than the spelling — the origin check (is this OUR repository?), the unit check (is the
+# unit ours?) and, at first-time setup only, the account check (are we about to squat an account?).
+# Those three see every already-existing account and unit; this list carries what a lookup cannot see
+# today, namely software the host may acquire tomorrow.
+RESERVED_REPOS="root daemon bin sys nobody nogroup www-data adm
+halt shutdown reboot init systemd udev dbus messagebus polkitd syslog rsyslog
+sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
+caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod
+docker containerd kubelet etcd snapd holistic"
 
 log() { logger -t devlab-install -- "$*" 2>/dev/null || true; echo "devlab-install: $*"; }
 die() { printf 'devlab-install: error: %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -127,42 +153,56 @@ if [ "$PORT" != 0 ]; then
   [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "invalid --port '$PORT'" 2
 fi
 
-# 5) THE NAMESPACE (foreign repositories only — the self repo is this wrapper's own service and takes
-#    the branch below). Six independent narrowings, every one read-only and before any effect.
+# 5) THE NAMESPACE. Every narrowing that can judge a NAME judges every name, the self repo included
+#    (it is the most privileged one). The three that decide something only about a foreign SERVICE —
+#    whose unit is ours, whose account we are about to create, whose rights manifest we publish — run
+#    for foreign repositories only. All of them are read-only and happen before any effect.
 UNIT_FILE="$UNIT_DIR/${REPO}.service"
 FIRST_TIME=0
 MANIFEST=""
-if [ "$REPO" != "$SELF_REPO" ]; then
-  # 5a) reserved identities: no repository may be named after a system or landscape component.
-  for r in $RESERVED_REPOS; do
-    if [ "$REPO" = "$r" ]; then
-      die "repo name '$REPO' is reserved (system or landscape identity) — a unit and a service account under this name would collide with an existing one" 2
-    fi
-  done
-  case "$REPO" in
-    systemd-*) die "repo name '$REPO' lies in systemd's own namespace" 2 ;;
-  esac
 
-  # 5b) the repository must BE the checkout the artifact was built in. The canonical artifact path
-  #     is <workspaces>/<user>/<repo>/.mercury-artifact, so the checkout carries the identity — the
-  #     <repo> argument is never a free-form string that only happens to look like a name.
-  CHECKOUT="$(dirname -- "$real")"
-  if [ "$(basename -- "$CHECKOUT")" != "$REPO" ]; then
-    die "repo '$REPO' does not name the checkout the artifact was built in ($CHECKOUT)" 2
+# 5a) reserved identities: no repository may be named after an OS, package or landscape component.
+for r in $RESERVED_REPOS; do
+  if [ "$REPO" = "$r" ]; then
+    die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one" 2
   fi
+done
+case "$REPO" in
+  systemd-*) die "repo name '$REPO' lies in systemd's own namespace" 2 ;;
+esac
 
-  # 5c) …and it must belong to the CONFIGURED organisation. The owner comes from root-owned runtime
-  #     configuration (never from the caller, who would otherwise widen its own namespace), and the
-  #     checkout's origin remote is read as TEXT — git is never executed on repo content as root.
-  #     Every url of the origin section must match, so a decoy first entry buys nothing.
-  OWNER="${DEVLAB_GH_OWNER:-}"
-  if [ -z "$OWNER" ]; then
-    [ -r "$OWNER_FILE" ] || die "no managed organisation configured: $OWNER_FILE is missing (operator-provisioned instance value)" 5
-    OWNER="$(head -n1 -- "$OWNER_FILE" | tr -d '[:space:]')"
-  fi
-  [[ "$OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || die "invalid managed organisation '$OWNER' (from $OWNER_FILE)" 5
+# 5b) the artifact must be the RUNNER'S STAGED ARTIFACT of the checkout that carries this name:
+#     <workspaces>/<user>/<repo>/.mercury-artifact. Two facts follow from it — the <repo> argument is
+#     never a free-form string that merely satisfies the grammar, and an arbitrary directory under the
+#     workspace root (a user-writable place) is not an artifact.
+CHECKOUT="$(dirname -- "$real")"
+if [ "$(basename -- "$real")" != "$ARTIFACT_DIR_NAME" ]; then
+  die "artifact dir '$real' is not a staged $ARTIFACT_DIR_NAME — only the artifact the per-user build produces is installed" 2
+fi
+if [ "$(basename -- "$CHECKOUT")" != "$REPO" ]; then
+  die "repo '$REPO' does not name the checkout the artifact was built in ($CHECKOUT)" 2
+fi
 
-  GITCONF="$CHECKOUT/.git/config"
+# 5c) …and the checkout must belong to the CONFIGURED organisation. The owner comes from root-owned
+#     runtime configuration (never from the caller, who would otherwise widen its own namespace), and
+#     the checkout's origin remote is read as TEXT — git is never executed on repo content as root.
+#     Every url of the origin section must match, so a decoy first entry buys nothing.
+OWNER="${DEVLAB_GH_OWNER:-}"
+if [ -z "$OWNER" ]; then
+  [ -r "$OWNER_FILE" ] || die "no managed organisation configured: $OWNER_FILE is missing (operator-provisioned instance value)" 5
+  OWNER="$(head -n1 -- "$OWNER_FILE" | tr -d '[:space:]')"
+fi
+[[ "$OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || die "invalid managed organisation '$OWNER' (from $OWNER_FILE)" 5
+
+GITCONF="$CHECKOUT/.git/config"
+if [ "$REPO" = "$SELF_REPO" ] && [ ! -e "$GITCONF" ]; then
+  # The ONE named limit of this cascade: the self repo's very first install can ship from a directory
+  # that is not yet a clone (this service bootstraps its own workspace). Where the self checkout DOES
+  # present an origin it is held to it exactly like every other repository; where it does not, the
+  # identity rests on 5b — the artifact must be the staged artifact of a checkout named after the self
+  # repo, inside the workspace root.
+  log "self checkout '$CHECKOUT' presents no git config — origin not verifiable, identity rests on the checkout name"
+else
   { [ -f "$GITCONF" ] && [ ! -L "$GITCONF" ]; } || die "checkout '$CHECKOUT' carries no git config — its repository cannot be identified" 2
   # Fed on stdin, never as an argument: a path containing '=' would otherwise read as an awk
   # variable assignment rather than a file.
@@ -179,21 +219,10 @@ if [ "$REPO" != "$SELF_REPO" ]; then
       *) die "checkout origin '$u' is not $OWNER/$REPO — only repositories of the configured organisation are installed" 2 ;;
     esac
   done <<<"$ORIGINS"
+fi
 
-  # 5d) the service account: an account that already exists must be the one THIS wrapper creates for
-  #     this service (system account, nologin, home /var/lib/<repo>). Anything else is a foreign
-  #     identity the generated `User=<repo>` would silently borrow.
-  if getent passwd "$REPO" >/dev/null 2>&1; then
-    IFS=: read -r _pname _ppw puid _pgid _pgecos phome pshell <<<"$(getent passwd "$REPO")"
-    [ "${puid:-0}" -gt 0 ] 2>/dev/null || die "account '$REPO' is uid 0 — refusing to install a service under it" 2
-    [ "${phome:-}" = "/var/lib/$REPO" ] || die "account '$REPO' already exists with home '${phome:-}' (expected /var/lib/$REPO) — refusing to adopt a foreign account" 2
-    case "${pshell:-}" in
-      */nologin | */false) : ;;
-      *) die "account '$REPO' already exists with an interactive shell '${pshell:-}' — refusing to adopt a foreign account" 2 ;;
-    esac
-  fi
-
-  # 5e) unit existence is asked of SYSTEMD, not of a path: a vendor unit lives under /lib or
+if [ "$REPO" != "$SELF_REPO" ]; then
+  # 5d) unit existence is asked of SYSTEMD, not of a path: a vendor unit lives under /lib or
   #     /usr/lib and a path test in $UNIT_DIR does not see it, so "first time" would happily
   #     generate a second unit that SHADOWS a running system service (and `systemctl restart` would
   #     then start our artifact in its place). A fragment outside $UNIT_DIR — vendor, /run, or the
@@ -206,6 +235,23 @@ if [ "$REPO" != "$SELF_REPO" ]; then
     "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
     *) die "unit ${REPO}.service already exists outside this wrapper's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
   esac
+
+  # 5e) the service account — judged WHERE IT IS DECIDED: at first-time setup, which runs `useradd`
+  #     and writes `User=<repo>` into a generated unit. An account that already exists must then be
+  #     the one THIS wrapper creates (system account, nologin, home /var/lib/<repo>); anything else
+  #     is a foreign identity the generated unit would silently borrow.
+  #     On an UPDATE the unit already exists, is root-owned, and its `User=` was settled when it was
+  #     written — nothing is adopted here, so a service whose account legitimately predates DevLab
+  #     stays deliverable instead of being refused for the spelling of its name.
+  if [ "$FIRST_TIME" = 1 ] && getent passwd "$REPO" >/dev/null 2>&1; then
+    IFS=: read -r _pname _ppw puid _pgid _pgecos phome pshell <<<"$(getent passwd "$REPO")"
+    [ "${puid:-0}" -gt 0 ] 2>/dev/null || die "account '$REPO' is uid 0 — refusing to install a service under it" 2
+    [ "${phome:-}" = "/var/lib/$REPO" ] || die "account '$REPO' already exists with home '${phome:-}' (expected /var/lib/$REPO) — refusing to adopt a foreign account" 2
+    case "${pshell:-}" in
+      */nologin | */false) : ;;
+      *) die "account '$REPO' already exists with an interactive shell '${pshell:-}' — refusing to adopt a foreign account" 2 ;;
+    esac
+  fi
 
   # 5f) the rights manifest is a validated FILE COPY out of the checkout. It is resolved here so a
   #     symlink pointing out of the checkout (…/permissions/<repo>.json -> /etc/shadow) cannot make
@@ -263,6 +309,8 @@ if [ "$FIRST_TIME" = 1 ]; then
     echo "PLAN: create system user '$REPO' (nologin) if missing"
     echo "PLAN: write $UNIT_FILE from the inline template (ExecStart /opt/$REPO/bin/${REPO}d --listen 127.0.0.1:$PORT)"
     echo "PLAN: write $CADDY_CONF/$REPO.caddy (route /api/services/$REPO/* -> 127.0.0.1:$PORT)"
+    echo "PLAN: $CADDY_BIN validate --config $CADDY_MAIN before adopting the route; on failure remove $CADDY_CONF/$REPO.caddy and fail (the route dir is shared with every other service)"
+    echo "PLAN: $SYSTEMCTL reload caddy (a failed reload fails this install — the route is taken back out)"
     if [ -n "$MANIFEST" ]; then
       echo "PLAN: install rights manifest $MANIFEST (validated copy) + groupadd its hp_* groups"
     else
@@ -293,13 +341,37 @@ PrivateTmp=true
 WantedBy=multi-user.target
 UNIT
     if [ -d "$CADDY_CONF" ]; then
-      cat > "$CADDY_CONF/$REPO.caddy" <<ROUTE
+      # This directory is SHARED: the edge serves every other service of the host out of it, so an
+      # unparseable file of ours does not break "our" route — it breaks the whole edge at the next
+      # reload. So the ASSEMBLED configuration is validated first and OUR file is taken back out when
+      # it does not hold, and the reload's failure is NAMED instead of swallowed: the caller must not
+      # read "installed" over a service that has no route.
+      ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
+      cat > "$ROUTE_FILE" <<ROUTE
 # Generated by devlab-install. Routes the service API to the daemon.
 handle /api/services/${REPO}/* {
 	reverse_proxy 127.0.0.1:${PORT}
 }
 ROUTE
-      "$SYSTEMCTL" reload caddy 2>/dev/null || log "caddy reload unavailable — route written, reload it manually"
+      # unwind_first_time removes what THIS first-time branch has created so far — the route and the
+      # generated unit, both of which did not exist before this run (FIRST_TIME=1 was decided by
+      # systemd). Without it a failed route step would leave a unit behind, the next attempt would read
+      # as an UPDATE, skip the route step altogether, and report success over a service with no route.
+      # The system account and /var/lib/<repo> stay: creating them is idempotent and harmless.
+      unwind_first_time() { rm -f "$ROUTE_FILE" "$UNIT_FILE"; }
+      if command -v "$CADDY_BIN" >/dev/null 2>&1 && [ -f "$CADDY_MAIN" ]; then
+        if ! validate_out="$("$CADDY_BIN" validate --config "$CADDY_MAIN" 2>&1)"; then
+          unwind_first_time
+          die "the edge configuration does not validate with the new route — route and generated unit removed, edge untouched: $(printf '%s' "$validate_out" | tail -n 3)" 4
+        fi
+      else
+        unwind_first_time
+        die "cannot validate the shared edge configuration ($CADDY_BIN / $CADDY_MAIN) — refusing to write into a config directory serving every other service; provision the route by hand" 5
+      fi
+      "$SYSTEMCTL" reload caddy || {
+        unwind_first_time
+        die "caddy reload failed — route and generated unit removed so the edge keeps its last good configuration and the next attempt is a clean first-time setup" 4
+      }
     else
       log "no route dir at $CADDY_CONF — route NOT written"
     fi

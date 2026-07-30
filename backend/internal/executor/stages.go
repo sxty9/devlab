@@ -135,7 +135,9 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	}
 	defer func() { _ = cleanup() }()
 
-	prompt := AssemblePrompt(rc.Run.PromptSnapshot, rc.Finding, manifest)
+	// The examined stand of THIS repository (read per repo, never folded into the shared snapshot):
+	// without it every prompt falls back to "never examined ⇒ examine everything".
+	prompt := AssemblePrompt(rc.Run.PromptSnapshot, rc.Finding, deps.AxiomScope(ctx, rc.Repo, rc.Run), manifest)
 	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.resumeID)
 	if err != nil {
 		return fmt.Errorf("start agent: %w", err)
@@ -216,6 +218,14 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// after this line has already secured the work.
 	if err := wb.Publish(ctx); err != nil {
 		return fmt.Errorf("publish workbench: %w", err)
+	}
+
+	// The agent worked this repository through against the run's axioms and left rc.head behind, so
+	// THAT is the examined stand the next run measures from. Recorded only here, on the path where
+	// an examination actually happened: the rest path creates nothing and examines nothing, and a
+	// failed agent examined nothing it could vouch for.
+	if err := deps.RecordAxiomScope(rc.Repo, rc.Run, rc.head, deps.Now()); err != nil {
+		rc.logf("examined stand not recorded (the next run examines this repository in full): %s", firstLine(err.Error()))
 	}
 
 	rc.report = out.ResultText

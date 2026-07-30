@@ -423,6 +423,144 @@ identity_scan() {
   ' "$@"
 }
 
+# ── the token-exposure matchers (B-13 / B-43) ────────────────────────────────────────────────
+#
+# One secret, two languages — and each criterion had been written for only ONE of them. "No token on
+# a command line" searched shell files, so the Go path that spliced the credential into a remote URL
+# was invisible to it; "no token in a log line" searched Go files, so a shell that echoed the
+# variable was invisible to that one. The asymmetry was mutual, so both criteria are measured over
+# BOTH languages now, and the instrument section proves each half can see its own leak.
+#
+# The patterns stay PER LANGUAGE because the same letters mean opposite things in the two: the shell
+# reference `"$DEVLAB_GH_TOKEN"` inside a Go string is the inline credential HELPER — the tokenless
+# construction that keeps the secret OFF argv — while in a shell script it is the value itself.
+#
+# What puts a token on a command line is the CALL, not the letters. The credential travels in the
+# environment by design, so an env assignment (`"DEVLAB_GH_TOKEN="+token`), the Authorization header
+# an HTTP client sets, and the redaction of a value that leaked are admissible neighbours the matcher
+# must leave alone. It sees the three spellings that reach argv: an exec call carrying the value, an
+# argument slice carrying it, and a credential spliced into a URL.
+ARGV_TOKEN_GO='exec\.Command(Context)?\([^)]*[Tt]oken\b|append\((args|full|argv|cmdArgs)[[:space:]]*,[^)]*[Tt]oken\b|https?://[^"]*"[[:space:]]*\+[[:space:]]*[A-Za-z_.]*[Tt]oken\b'
+ARGV_TOKEN_SH='\$DEVLAB_GH_TOKEN|--token|-t[[:space:]]+"?\$[A-Z_]*TOKEN'
+LOG_TOKEN_GO='log\.[A-Za-z]+\([^)]*[Tt]oken|Printf\([^)]*[Tt]oken[^)]*\)'
+LOG_TOKEN_SH='(echo|printf|logger)[^|;&]*\$[A-Za-z_]*TOKEN'
+
+# two_absent <id> <desc> <pattern-a> <files-a…> :: <pattern-b> <files-b…> — ONE criterion measured
+# over two languages with the pattern each needs. A criterion that spans both may not become two
+# similar sibling checks: it would then be possible to pass one half and call the line green.
+two_absent() {
+  local id="$1" desc="$2"
+  shift 2
+  local -a a=() b=()
+  local seen=0
+  local arg
+  for arg in "$@"; do
+    if [[ $arg == "::" ]]; then
+      seen=1
+      continue
+    fi
+    if [[ $seen -eq 0 ]]; then a+=("$arg"); else b+=("$arg"); fi
+  done
+  if [[ $seen -eq 0 || ${#a[@]} -lt 2 || ${#b[@]} -lt 2 ]]; then
+    fail "$id" "$desc" "the check was given only one half — it would measure one language and report both"
+    return
+  fi
+  local pa="${a[0]}" pb="${b[0]}"
+  gate_files "$id" "$desc" "${a[@]:1}" || return 0
+  gate_files "$id" "$desc" "${b[@]:1}" || return 0
+  local out
+  out="$(
+    hits "$pa" "${a[@]:1}"
+    hits "$pb" "${b[@]:1}"
+  )"
+  if [[ -z $out ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "$out"; fi
+}
+
+# ── the env_keep allow-list (the pinned wrapper's boundary) ───────────────────────────────────
+#
+# devlab-exec confines every path to <state root>/workspaces/<user> and DERIVES that root from
+# DEVLAB_STATE_DIR / DEVLAB_WORKSPACES with the template's defaults. Those overrides exist for direct
+# invocation in tests and are harmless in production for exactly ONE reason: sudo's env_reset strips
+# them. A service that could set them would pick the boundary it is measured against — that is, hand
+# itself every user's files. The invariant was written down as PROSE in both files, so adding both
+# names to the env_keep line passed every check in this script.
+#
+# It is an ALLOW-LIST, not a deny-list of the two known names: "NOTHING ELSE MAY JOIN THIS LIST" is
+# what the sudoers file itself says, and a deny-list would have to be extended for every seam the
+# install wrapper grows. Prints one line per name that is on the list without being permitted.
+ENV_KEEP_ALLOWED='DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT'
+env_keep_strays() {
+  local f="$1" line names n
+  [[ -f $f && -r $f ]] || return 0
+  # sudoers continues a directive with a trailing backslash, so the file is folded before the
+  # directives are read; a commented example is prose, not a privilege.
+  while IFS= read -r line; do
+    names="$(sed -E 's/.*env_keep[[:space:]]*\+?=[[:space:]]*//; s/"//g' <<<"$line")"
+    for n in $names; do
+      [[ " $ENV_KEEP_ALLOWED " == *" $n "* ]] && continue
+      printf '%s\n' "$n"
+    done
+  done < <(sed -E ':a; /\\$/ { N; s/\\\n[[:space:]]*//; ba }' "$f" | grep -E '^[[:space:]]*[^#]*env_keep')
+}
+
+# ── the dead-shipped-function scan (REQ-040h) ─────────────────────────────────────────────────
+#
+# REQ-040c/d forbid a dead MODULE and an orphaned PACKAGE; the same rule holds one level down. An
+# unexported function that occurs exactly once in the shipped sources — its own declaration — is
+# reached from nowhere: whatever calls it is a test, so the shipped binary carries code whose only
+# purpose is to be asserted about. That is how a hand-rolled Basic-auth encoder survived the move to
+# the credential helper, kept alive by the very test that proved the credential no longer goes on argv.
+#
+# Unexported PLAIN functions only. A method may satisfy an interface and be called through it, and an
+# exported identifier may be used from another package — neither is decidable from one grep, and a
+# check that guesses is worse than no check. The scan reports the LEAF of a dead chain: a helper whose
+# only caller was the dead function surfaces on the next run, once the leaf is gone.
+dead_shipped_funcs() {
+  [[ $# -eq 0 ]] && return 0
+  local decls uses
+  decls="$(grep -hoE '^func [a-z][A-Za-z0-9_]*\(' "$@" 2>/dev/null | sed -E 's/^func //; s/\($//' | sort -u)"
+  [[ -n $decls ]] || return 0
+  uses="$(grep -hoE '\b[A-Za-z_][A-Za-z0-9_]*\b' "$@" 2>/dev/null | sort | uniq -c)"
+  awk 'NR == FNR { c[$2] = $1; next } (c[$0] + 0) <= 1 { print }' <(printf '%s\n' "$uses") <(printf '%s\n' "$decls")
+}
+
+# ── the contract-state fingerprint (contract-a) ───────────────────────────────────────────────
+#
+# A protocol entry must describe the change that is actually IN the tree, and naming the path proved
+# only that SOME change to it was described once. A second, undescribed change to a file an older
+# entry already named therefore passed unseen — appending an exported type to the frozen wire
+# contract was enough. So an entry carries the file's CONTENT fingerprint and the check compares it
+# against the file as it stands: describing a state is what records it, and a further change changes
+# the fingerprint.
+#
+# The fingerprint is git's own blob hash of the working-tree file, shortened — the identity git
+# itself uses, so it is recomputed with `git hash-object <path>` and needs no second tool.
+content_fingerprint() {
+  git hash-object -- "$1" 2>/dev/null | cut -c1-12
+}
+
+# contract_state_faults <body> <path…> — one fault line per path whose CURRENT state the protocol
+# body does not carry. Kept apart from the loop that collects the changed paths so the instrument
+# section can run it against a body whose answer is known.
+contract_state_faults() {
+  local body="$1"
+  shift
+  local p fp
+  for p in "$@"; do
+    if ! grep -qF -- "$p" <<<"$body"; then
+      printf '%s\n' "$p changed and no entry in the protocol names it (BAUPLAN §0.2: file, reason, diff hint)"
+      continue
+    fi
+    fp="$(content_fingerprint "$p")"
+    if [[ -z $fp ]]; then
+      printf '%s\n' "$p could not be fingerprinted — the protocol cannot be bound to a state nobody can read"
+      continue
+    fi
+    grep -qF -- "$p@$fp" <<<"$body" ||
+      printf '%s\n' "$p is named in the protocol, but no entry carries its CURRENT state \`$p@$fp\` — the protocol describes an older version of the file, so this change is undescribed"
+  done
+}
+
 # ── the audit's own instrument check ─────────────────────────────────────────────────────────
 #
 # Every criterion below reads one of these sets. An empty set makes each of its checks pass on
@@ -524,6 +662,135 @@ if [[ -z $id_faults ]]; then
   pass "harness-id" "the identity scanner sees a baked-in organisation, and only that"
 else
   fail "harness-id" "the identity scanner sees a baked-in organisation, and only that" "${id_faults%$'\n'}"
+fi
+
+# The token matchers, both halves, known answer. The caught samples are the leaks that were actually
+# possible: the credential spliced into a clone URL (Go), a token handed over as a flag (Go and
+# shell), and a variable echoed into a log (shell). The clean samples are the constructions this code
+# uses ON PURPOSE — the value in the ENVIRONMENT, the inline credential helper that only NAMES the
+# variable, the Authorization header, and the redaction of a value that leaked — and a matcher that
+# flagged one of them would be turned off within a week.
+tok_dir="$(mktemp -d)"
+trap 'rm -rf "$tok_dir"' EXIT
+cat >"$tok_dir/caught.go" <<'SAMPLE'
+func a(ctx context.Context, token, dir string) {
+	cmd := exec.CommandContext(ctx, "git", "clone", "https://x-access-token:"+token+"@github.com/o/r.git", dir)
+}
+func b(args []string, token string) []string { return append(args, "--token", token) }
+func c(token string) string { return "https://x-access-token:" + token + "@github.com/o/r.git" }
+SAMPLE
+cat >"$tok_dir/caught.sh" <<'SAMPLE'
+git clone "https://x-access-token:$DEVLAB_GH_TOKEN@github.com/o/r.git" "$dir"
+echo "using $DEVLAB_GH_TOKEN" >&2
+SAMPLE
+cat >"$tok_dir/clean.go" <<'SAMPLE'
+func a(cmd *exec.Cmd, token string) { cmd.Env = append(os.Environ(), "DEVLAB_GH_TOKEN="+token) }
+func b() []string {
+	return []string{"-c", `credential.helper=!f() { printf 'password=%s\n' "$DEVLAB_GH_TOKEN"; }; f`}
+}
+func c(req *http.Request, token string) { req.Header.Set("Authorization", "Bearer "+token) }
+func d(msg, token string) string { return strings.ReplaceAll(msg, token, "***") }
+func e(ctx context.Context, args []string) *exec.Cmd { return exec.CommandContext(ctx, "git", args...) }
+SAMPLE
+cat >"$tok_dir/clean.sh" <<'SAMPLE'
+Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT"
+exec git -c "safe.directory=*" "$@"
+echo "cloning $repo" >&2
+SAMPLE
+tok_faults=""
+tok_caught="$( {
+  hits "$ARGV_TOKEN_GO" "$tok_dir/caught.go"
+  hits "$ARGV_TOKEN_SH" "$tok_dir/caught.sh"
+  hits "$LOG_TOKEN_SH" "$tok_dir/caught.sh"
+} | grep -c . || true)"
+[[ $tok_caught -ge 5 ]] || tok_faults+="the token matchers caught $tok_caught of the 5 exposures (3 Go, 2 shell) — B-13/B-43 would pass on checks that cannot see their own leak"$'\n'
+tok_missed="$( {
+  hits "$ARGV_TOKEN_GO" "$tok_dir/clean.go"
+  hits "$LOG_TOKEN_GO" "$tok_dir/clean.go"
+  hits "$ARGV_TOKEN_SH" "$tok_dir/clean.sh"
+  hits "$LOG_TOKEN_SH" "$tok_dir/clean.sh"
+} || true)"
+[[ -z $tok_missed ]] || tok_faults+="a token matcher flagged an admissible construction:"$'\n'"$tok_missed"$'\n'
+rm -rf "$tok_dir"
+trap - EXIT
+if [[ -z $tok_faults ]]; then
+  pass "harness-token" "the token matchers see a leak in BOTH languages, and spare the env/header/redaction paths"
+else
+  fail "harness-token" "the token matchers see a leak in BOTH languages, and spare the env/header/redaction paths" "${tok_faults%$'\n'}"
+fi
+
+# The env_keep allow-list, known answer: the two boundary variables the wrapper's header forbids ARE
+# seen when they join the list, and the shipped list itself reads clean.
+keep_dir="$(mktemp -d)"
+trap 'rm -rf "$keep_dir"' EXIT
+cat >"$keep_dir/caught.sudoers" <<'SAMPLE'
+# DEVLAB_STATE_DIR must never be kept — this comment is prose, not a privilege.
+Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT DEVLAB_STATE_DIR DEVLAB_WORKSPACES"
+SAMPLE
+cat >"$keep_dir/clean.sudoers" <<'SAMPLE'
+# The boundary variables DEVLAB_STATE_DIR and DEVLAB_WORKSPACES are deliberately absent.
+Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT"
+SAMPLE
+keep_faults=""
+keep_caught="$(env_keep_strays "$keep_dir/caught.sudoers" | sort -u | tr '\n' ' ')"
+[[ $keep_caught == *DEVLAB_STATE_DIR* && $keep_caught == *DEVLAB_WORKSPACES* ]] ||
+  keep_faults+="the env_keep scan saw [$keep_caught] where both boundary variables were added — the invariant would stay prose"$'\n'
+keep_missed="$(env_keep_strays "$keep_dir/clean.sudoers")"
+[[ -z $keep_missed ]] || keep_faults+="the env_keep scan flagged a permitted name: $keep_missed"$'\n'
+rm -rf "$keep_dir"
+trap - EXIT
+if [[ -z $keep_faults ]]; then
+  pass "harness-keep" "the env_keep scan sees a boundary variable joining the list, and only that"
+else
+  fail "harness-keep" "the env_keep scan sees a boundary variable joining the list, and only that" "${keep_faults%$'\n'}"
+fi
+
+# The dead-function scan, known answer: an unexported function only a test names is FOUND, while a
+# called one, an exported one and a method are left alone.
+dead_dir="$(mktemp -d)"
+trap 'rm -rf "$dead_dir"' EXIT
+cat >"$dead_dir/sample.go" <<'SAMPLE'
+func basicAuth(token string) string { return base64Std("x-access-token:" + token) }
+func base64Std(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+func Exported() string { return caller() }
+func (s *Store) helper() string { return "" }
+func caller() string { return used() }
+func used() string { return "used" }
+SAMPLE
+dead_faults=""
+dead_found="$(dead_shipped_funcs "$dead_dir/sample.go" | sort | tr '\n' ' ')"
+[[ $dead_found == *basicAuth* ]] || dead_faults+="the dead-function scan did not see basicAuth, whose only caller is a test — it found [$dead_found]"$'\n'
+for alive in base64Std used caller Exported helper; do
+  [[ $dead_found == *"$alive"* ]] && dead_faults+="the dead-function scan reported $alive, which is reached: [$dead_found]"$'\n'
+done
+rm -rf "$dead_dir"
+trap - EXIT
+if [[ -z $dead_faults ]]; then
+  pass "harness-dead" "the dead-function scan sees a shipped function only a test reaches, and only that"
+else
+  fail "harness-dead" "the dead-function scan sees a shipped function only a test reaches, and only that" "${dead_faults%$'\n'}"
+fi
+
+# The contract-state matcher, known answer, measured against a REAL frozen file: a body that names the
+# path but carries a stale fingerprint must be reported (that is the exact hole — the path was named
+# by an older entry), a body that carries the current one must not, and an unnamed path must be.
+state_faults=""
+state_probe='deploy/migration/80-vertragsaenderungen.md'
+state_fp="$(content_fingerprint "$state_probe")"
+if [[ -z $state_fp ]]; then
+  state_faults+="no fingerprint could be taken of $state_probe — the contract check would compare against nothing"$'\n'
+else
+  [[ -n $(contract_state_faults "described once: $state_probe@0000deadbeef" "$state_probe") ]] ||
+    state_faults+="a stale fingerprint passed — a second, undescribed change to an already-named file would slip through"$'\n'
+  [[ -z $(contract_state_faults "described now: $state_probe@$state_fp" "$state_probe") ]] ||
+    state_faults+="the current fingerprint was rejected — every legitimate entry would fail"$'\n'
+  [[ -n $(contract_state_faults "names nothing at all" "$state_probe") ]] ||
+    state_faults+="an unnamed path passed — the original criterion would be lost"$'\n'
+fi
+if [[ -z $state_faults ]]; then
+  pass "harness-contract" "the contract-state matcher binds an entry to the file as it stands (a stale fingerprint fails)"
+else
+  fail "harness-contract" "the contract-state matcher binds an entry to the file as it stands" "${state_faults%$'\n'}"
 fi
 
 # ── §1 the six construction faults ───────────────────────────────────────────────────────────
@@ -691,8 +958,8 @@ unique_in "B-11" "every file pool writes through the ONE atomic write path" \
   '[:+]?=[[:space:]]*[A-Za-z_.]+[[:space:]]*\+[[:space:]]*"\.tmp"|CreateTemp' \
   '^backend/internal/fsatomic/' "${F_GO_SRC[@]}"
 
-absent "B-13" "no token ever reaches a log line" \
-  'log\.[A-Za-z]+\([^)]*[Tt]oken|Printf\([^)]*[Tt]oken[^)]*\)' "${F_GO_SRC[@]}"
+two_absent "B-13" "no token ever reaches a log line (Go AND shell)" \
+  "$LOG_TOKEN_GO" "${F_GO_SRC[@]}" :: "$LOG_TOKEN_SH" "${F_SH[@]}"
 
 absent "B-16" "no decomposition remnant" \
   '[Dd]ecompose' "${F_IMPL[@]}"
@@ -716,8 +983,8 @@ absent "B-35" "the client derives no stages — it renders the server stage arra
 
 no_file "B-41a" "the dead helper modules are gone" src/lib/mercury.ts src/lib/axioms.ts
 
-absent "B-43" "no token on a command line (env passthrough only)" \
-  '\$DEVLAB_GH_TOKEN|--token|-t[[:space:]]+"?\$[A-Z_]*TOKEN' "${F_SH[@]}"
+two_absent "B-43" "no token on a command line (env passthrough only, Go AND shell)" \
+  "$ARGV_TOKEN_GO" "${F_GO_SRC[@]}" :: "$ARGV_TOKEN_SH" "${F_SH[@]}"
 
 absent "B-44" "no PID busy marker and no idle-restart helper" \
   'restart-idle|pidfile|PIDFile|\.pid"' "${F_IMPL[@]}"
@@ -910,6 +1177,54 @@ else
   fail "REQ-040d" "no orphaned backend package" "$dead_pkgs"
 fi
 
+# REQ-040.5, one level below the package: no dead FUNCTION either. An unexported function the shipped
+# sources mention exactly once is called from nowhere — the caller is a test, so the binary carries
+# code that exists to be asserted about. A test may prove a construct ABSENT; it may not keep the
+# construct alive to do so.
+mapfile -t F_GO_TESTS < <(printf '%s\n' "${F_GO[@]}" | grep -E '_test\.go$')
+dead_funcs=""
+while IFS= read -r fn; do
+  [[ -z $fn ]] && continue
+  where="$(grep -lE "^func $fn\(" "${F_GO_SRC[@]}" 2>/dev/null | head -n1)"
+  by=""
+  [[ ${#F_GO_TESTS[@]} -gt 0 ]] &&
+    by="$(grep -lE "\b$fn\b" "${F_GO_TESTS[@]}" 2>/dev/null | head -n2 | tr '\n' ' ')"
+  dead_funcs+="$fn (${where:-?}) is reached from no shipped code${by:+ — only from $by}"$'\n'
+done < <(dead_shipped_funcs "${F_GO_SRC[@]}")
+if [[ -z $dead_funcs ]]; then
+  pass "REQ-040h" "no dead function in the shipped backend (a test may prove absence, not sustain it)"
+else
+  fail "REQ-040h" "no dead function in the shipped backend (a test may prove absence, not sustain it)" "${dead_funcs%$'\n'}"
+fi
+
+# The pinned per-user wrapper derives the boundary it confines to (<state root>/workspaces/<user>)
+# from DEVLAB_STATE_DIR / DEVLAB_WORKSPACES. sudo's env_reset is what makes those seams harmless, so
+# the env_keep allow-list IS the boundary: a service that could set them would choose the boundary it
+# is measured against. Both files say so in prose — this is the check that makes the sentence binding.
+sudoers_files=()
+for f in "${F_EVERY[@]}"; do
+  [[ $f == deploy/*.sudoers ]] && sudoers_files+=("$f")
+done
+keep_out=""
+if gate_files "sudo-a" "no boundary variable survives sudo (env_keep is an allow-list)" "${sudoers_files[@]}"; then
+  saw_keep=0
+  for f in "${sudoers_files[@]}"; do
+    grep -qE '^[[:space:]]*[^#]*env_keep' "$f" && saw_keep=1
+    while IFS= read -r stray; do
+      [[ -z $stray ]] && continue
+      keep_out+="$f keeps $stray across sudo — only [$ENV_KEEP_ALLOWED] may survive env_reset"$'\n'
+    done < <(env_keep_strays "$f")
+  done
+  if [[ $saw_keep -eq 0 ]]; then
+    keep_out+="no env_keep directive exists in any sudoers template — the check would pass on nothing"$'\n'
+  fi
+  if [[ -z $keep_out ]]; then
+    pass "sudo-a" "no boundary variable survives sudo (env_keep is an allow-list)"
+  else
+    fail "sudo-a" "no boundary variable survives sudo (env_keep is an allow-list)" "${keep_out%$'\n'}"
+  fi
+fi
+
 # B-03: every MUTATING route must be bound to a guard that enforces the CSRF double submit
 # (guardWrite or guardCSRF). A mutating route on the plain read guard is reachable cross-site with
 # the caller's cookies.
@@ -1013,8 +1328,10 @@ fi
 #
 # The frozen list AND the baseline commit are read out of the protocol's own header, so there is one
 # home for both and no second list to drift. An entry counts when the protocol's BODY (everything
-# below the header's rule) names the changed path — the header names every frozen path by definition,
-# which is why the search starts beneath it.
+# below the header's rule) names the changed path AND the file's current content fingerprint — the
+# header names every frozen path by definition, which is why the search starts beneath it, and the
+# fingerprint is what binds the entry to the change that is actually in the tree (contract_state_faults:
+# naming the path alone let a second, undescribed change to an already-named file pass unseen).
 section "contract discipline"
 
 protocol='deploy/migration/80-vertragsaenderungen.md'
@@ -1051,16 +1368,18 @@ if [[ -z $contract_faults ]]; then
   body="$(awk 'f; /^---$/ {f = 1}' "$protocol")"
   # Tracked changes since the baseline AND new files inside a frozen directory: adding a file to the
   # model or to the fixtures changes the contract exactly as editing one does.
-  while IFS= read -r changed; do
-    [[ -z $changed ]] && continue
-    grep -qF -- "$changed" <<<"$body" ||
-      contract_faults+="$changed changed since $baseline and no entry in $protocol names it (BAUPLAN §0.2: file, reason, diff hint)"$'\n'
-  done < <(
+  mapfile -t changed_frozen < <(
     {
       git diff --name-only "$baseline" -- "${targets[@]}" 2>/dev/null
       git ls-files --others --exclude-standard -- "${targets[@]}" 2>/dev/null
-    } | sort -u
+    } | sort -u | grep .
   )
+  if [[ ${#changed_frozen[@]} -gt 0 ]]; then
+    while IFS= read -r fault; do
+      [[ -z $fault ]] && continue
+      contract_faults+="${fault/changed and/changed since $baseline and}"$'\n'
+    done < <(contract_state_faults "$body" "${changed_frozen[@]}")
+  fi
 fi
 if [[ -z $contract_faults ]]; then
   pass "contract-a" "every frozen contract file changed since Welle 0 is recorded in the protocol"
@@ -1105,7 +1424,7 @@ if [[ ! -f $inspection ]]; then
 else
   # Every check id the document cites in "Grep green (…)" must be an id this script actually runs.
   script_ids="$(
-    grep -oE '^[[:space:]]*(pass|fail|absent|absent_raw|present|present_anywhere|unique_in|count_files|no_file|git_absent|note)[[:space:]]+"[^"]+"' \
+    grep -oE '^[[:space:]]*(pass|fail|absent|absent_raw|two_absent|present|present_anywhere|unique_in|count_files|no_file|git_absent|gate_files|note)[[:space:]]+"[^"]+"' \
       "${BASH_SOURCE[0]}" | grep -oE '"[^"]+"' | tr -d '"' | sort -u
   )"
   if [[ $(grep -c . <<<"$script_ids") -lt 20 ]]; then

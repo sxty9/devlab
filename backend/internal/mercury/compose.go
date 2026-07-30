@@ -179,7 +179,6 @@ func writeTask(b *strings.Builder, task string, atts []TodoAttachment) {
 // repository stood at, and when. Mirrors runs.AxiomCheck without importing it (the runs package
 // already depends on this one).
 type LastCheck struct {
-	Titel  string
 	Commit string
 	At     string // preformatted for the prompt; "" when unknown
 }
@@ -190,9 +189,21 @@ type LastCheck struct {
 //
 // Axioms with no entry are named explicitly rather than silently omitted — "not listed" would leave
 // the agent guessing, while "never examined here ⇒ full repository" is an instruction it can follow.
-func RepoScopeSection(axioms []RunAxiom, checked map[string]LastCheck) string {
+//
+// unread carries the NAMED reason the record could not be read at all ("" when it was read). The two
+// are never merged: "nothing is recorded" is an instruction the agent can carry out, while "the
+// record could not be read" is a gap — presenting it as "never examined" would be an assertion
+// nobody made, exactly as an unread corpus may never look like an empty constitution (REQ-001.3).
+func RepoScopeSection(axioms []RunAxiom, checked map[string]LastCheck, unread string) string {
 	if len(axioms) == 0 {
 		return ""
+	}
+	if strings.TrimSpace(unread) != "" {
+		return "\n## Zuletzt geprüfter Stand (für dieses Repository)\n\n" +
+			"Der Bestand der geprüften Stände konnte NICHT gelesen werden (" + strings.TrimSpace(unread) +
+			"). Das ist eine benannte Lücke und NICHT die Aussage, dass dieses Repository noch nie " +
+			"geprüft wurde: prüfe alle Axiome dieses Laufs gegen das GESAMTE Repository und nenne diese " +
+			"Lücke im Abschlussbericht.\n"
 	}
 	var known, fresh []string
 	for _, a := range axioms {

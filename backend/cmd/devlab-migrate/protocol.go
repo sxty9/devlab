@@ -77,6 +77,8 @@ func writeProtocol(w io.Writer, p *plan, dry bool) {
 		fmt.Fprintf(w, "  moved aside afterwards to %s (nothing is deleted; the tolerant read stops listing it twice)\n", p.arch.movedTo)
 	}
 
+	writeTakeover(w, p)
+
 	fmt.Fprintf(w, "migration protocol (%d items to record) — M1–M8 plus the activation gate\n", len(p.notices))
 	for _, o := range p.notices {
 		fmt.Fprintf(w, "  + %s\n", o.Label)
@@ -93,6 +95,61 @@ func writeProtocol(w io.Writer, p *plan, dry bool) {
 		len(p.presentRuns), len(p.presentHistory), p.presentNotices)
 	if p.empty() {
 		fmt.Fprintln(w, "nothing to do.")
+	}
+}
+
+// writeTakeover reports what the import CARRIES OVER rather than adds: which pool held how many
+// pre-rebuild records, where their verbatim copy went, and what the rebuild has no reader for. Every
+// set-aside artifact is printed with its find location — a copy whose whereabouts are not written
+// down is indistinguishable from a deletion.
+func writeTakeover(w io.Writer, p *plan) {
+	fmt.Fprintln(w, "pre-rebuild stock taken over")
+
+	switch {
+	case !p.pool.takenOver() && len(p.pool.newForm) == 0:
+		fmt.Fprintln(w, "  run pool             empty — nothing to carry over")
+	case !p.pool.takenOver():
+		fmt.Fprintf(w, "  run pool             %s — %d records, all in the rebuilt form; nothing to carry over\n",
+			p.pool.path, len(p.pool.newForm))
+	default:
+		fmt.Fprintf(w, "  run pool             %s\n", p.pool.path)
+		fmt.Fprintf(w, "    %d records in the PRE-REBUILD form, %d in the rebuilt form, %d undecidable\n",
+			len(p.pool.legacy), len(p.pool.newForm), len(p.pool.undecidable))
+		fmt.Fprintf(w, "    set aside verbatim to %s, then the pool is written with %d records in the rebuilt form\n",
+			p.pool.aside, len(p.poolAfter()))
+		fmt.Fprintln(w, "    the pre-rebuild records share their ids with the imported ones; they are told apart by SHAPE,")
+		fmt.Fprintln(w, "    which is why they neither count as already imported nor stay behind in the pool")
+		for _, u := range p.pool.undecidable {
+			fmt.Fprintf(w, "    ? %s — in neither shape; set aside with the rest, never interpreted\n", u)
+		}
+	}
+
+	if p.ledger.count() > 0 || len(p.ledger.undecidable) > 0 {
+		fmt.Fprintf(w, "  delivery ledger      %s\n", p.ledger.path)
+		fmt.Fprintf(w, "    %d records converted (%d merged · %d closed · %d open); set aside verbatim to %s first\n",
+			p.ledger.count(), p.ledger.merged, p.ledger.closed, p.ledger.open, p.ledger.aside)
+		fmt.Fprintln(w, "    the source recorded a status WORD; the rebuilt record expresses merged and closed as times,")
+		fmt.Fprintln(w, "    so an unconverted record reads as OPEN and the next pull request stacks onto it")
+		if p.ledger.merged+p.ledger.closed > 0 {
+			fmt.Fprintln(w, "    the outcome TIME is the delivery's own creation time: the source carried no second timestamp")
+		}
+		for _, u := range p.ledger.undecidable {
+			fmt.Fprintf(w, "    ? %s — in neither shape; left untouched and not converted\n", u)
+		}
+	}
+
+	switch {
+	case len(p.snaps.moved) > 0:
+		fmt.Fprintf(w, "  config snapshots     %s — %d of %d hold pre-rebuild run records\n",
+			p.snaps.dir, len(p.snaps.moved), len(p.snaps.moved)+p.snaps.kept)
+		fmt.Fprintf(w, "    moved to %s; a restore would write them back into the pool verbatim\n", p.snaps.to)
+	case p.snaps.kept > 0:
+		fmt.Fprintf(w, "  config snapshots     %s — %d, all in the rebuilt form; restorable\n", p.snaps.dir, p.snaps.kept)
+	}
+
+	for _, o := range p.orphans {
+		fmt.Fprintf(w, "  no reader            %s → %s\n", o.from, o.to)
+		fmt.Fprintf(w, "    %s\n", o.why)
 	}
 }
 
