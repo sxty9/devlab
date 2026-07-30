@@ -154,7 +154,23 @@ UMask=0027
 # to every other service, while the isolation this service actually relies on is the OS user
 # (devlab-exec), not the mount namespace. A drop-in that sets PrivateTmp=true silently takes that
 # decision back — the cutover removes it.
-ReadWritePaths=/var/lib/devlab /tmp
+#
+# The four install targets are writable for ONE reason: the mount namespace is inherited by every
+# child, the pinned root installer (devlab-install) is such a child, and a read-only /opt made EVERY
+# dev deploy of EVERY service fail with "chmod failed with error Read-only file system". Measured on
+# 2026-07-30: nine services in one execution, all with that one sentence.
+#
+# It gives the daemon itself nothing: it runs as the unprivileged `devlab` account, and all four
+# paths are root-owned, so file permissions still refuse it. What the namespace was blocking was the
+# root child alone — and the boundary this service actually relies on is the sudoers pin plus the OS
+# user (devlab-exec), as stated above, not the mount namespace. Exactly the paths the installer
+# writes are listed, nothing wider:
+#   /opt                  the service artifact (/opt/<id>/bin/<id>d)
+#   /usr/local/bin        the self repository's own binary
+#   /etc/systemd/system   the generated unit of a first-time setup
+#   /etc/caddy/conf.d     its generated route
+#   /var/lib              the state directory of a first-time setup (useradd creates /var/lib/<id>)
+ReadWritePaths=/var/lib /tmp /opt /usr/local/bin /etc/systemd/system /etc/caddy/conf.d
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=false
