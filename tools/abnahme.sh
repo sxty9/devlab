@@ -90,6 +90,10 @@ mapfile -t F_GO_SRC < <(sel '^backend/.*\.go$' '(_test\.go$)|/testdata/')
 # The Go files that make up the SHIPPED daemon: the integration suite may import a package without
 # the daemon wiring it, which is precisely what the orphan check must still see.
 mapfile -t F_GO_WIRED < <(sel '^backend/.*\.go$' '^backend/it/')
+# The WORKING-STATE path K-1 speaks of: the packages that hold a managed repository's working copy —
+# the fold-in state machine and the per-user worktrees. Scoped as a SET, not as a list of names, so a
+# new file in either package is audited the day it appears.
+mapfile -t F_WORKSTATE < <(sel '^backend/internal/(workbench|workspace)/.*\.go$' '(_test\.go$)|/testdata/')
 mapfile -t F_TS < <(sel '^src/.*\.tsx?$')
 mapfile -t F_TS_SRC < <(sel '^src/.*\.tsx?$' '\.test\.tsx?$')
 mapfile -t F_SH < <(sel '^(deploy/|service$|tools/)' '(\.md$)|(\.conf$)|(\.json$)')
@@ -293,6 +297,132 @@ note() {
 
 section() { printf '\n-- %s %s\n' "$1" "$(printf '%.0s-' $(seq 1 $((70 - ${#1}))))"; }
 
+# ── the git-call matcher (K-1) ───────────────────────────────────────────────────────────────
+#
+# This code writes git as an ARGUMENT LIST, never as one shell string: `b.gitUser(ctx, "reset",
+# "--hard", targetSHA)`. A pattern that expects contiguous shell text (`reset[[:space:]]+--hard`)
+# therefore matches NOTHING here — which is how the two K-1 checks came to pass on a code base in
+# which the construct they forbid could not be seen at all.
+#
+# So the source is NORMALISED first and matched afterwards: quotes and commas become spaces, and a
+# continued argument list is joined onto ONE logical line (gofmt breaks a long call after a comma).
+# A single pattern per forbidden construct then covers BOTH spellings — the shell string and the
+# argument list. The reported line number is where the logical line begins.
+git_calls() {
+  local f
+  for f in "$@"; do
+    [[ -f $f && -r $f ]] || continue
+    awk -v F="$f" '
+      function emit(n, s) { gsub(/["'"'"',]/, " ", s); print F ":" n ":" s }
+      {
+        line = $0
+        sub(/[[:space:]]+$/, "", line)
+        if (buf == "") { start = FNR; buf = line } else { buf = buf " " line }
+        # A trailing comma, backslash or open parenthesis means the argument list continues. The
+        # window is bounded, so a long composite literal cannot swallow half the file.
+        if (buf ~ /[,\\(]$/ && FNR - start < 5) next
+        emit(start, buf)
+        buf = ""
+      }
+      END { if (buf != "") emit(start, buf) }
+    ' "$f"
+  done
+}
+
+# The two constructs K-1 forbids, in normalised spelling. A reset is judged by its TARGET: onto a
+# resolved commit or HEAD it is the deliberate, actor-bound discard the architecture allows (behind
+# the UI's confirmation, with the previous tip sheltered); onto a REMOTE ref it throws away work the
+# remote never saw, which is the construction fault itself.
+FORCE_CHECKOUT='checkout([[:space:]]+-[a-zA-Z-]+)*[[:space:]]+-B([[:space:]]|$)'
+RESET_TO_REMOTE='reset([[:space:]]+-[a-zA-Z-]+)*[[:space:]]+--hard([[:space:]]+-[a-zA-Z-]+)*[[:space:]]+[^[:space:]]*(origin|remote|upstream)'
+
+# git_hits <pattern> <file...> — normalised git calls matching the pattern, comment lines dropped.
+git_hits() {
+  local pattern="$1"
+  shift
+  [[ $# -eq 0 ]] && return 0
+  git_calls "$@" | drop_comment_lines | grep -E -- "$pattern" || true
+}
+
+# git_absent <id> <description> <pattern> <file...>
+git_absent() {
+  local id="$1" desc="$2" pattern="$3"
+  shift 3
+  gate_files "$id" "$desc" "$@" || return 0
+  local out
+  out="$(git_hits "$pattern" "$@")"
+  if [[ -z $out ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "$out"; fi
+}
+
+# ── the identity-default scanner (B-45c) ─────────────────────────────────────────────────────
+#
+# Reads "path<TAB>line<TAB>literal" for every configuration lookup that names an IDENTITY and carries
+# a baked-in fallback. It is a function, not an inline program, so the instrument section can run it
+# against samples with a known answer — an absence check nobody has ever seen fire is a check whose
+# silence proves nothing.
+identity_scan() {
+  [[ $# -eq 0 ]] && return 0
+  awk '
+    # key is the WHOLE configuration key: an identity word anywhere inside an upper-case name.
+    function identity(k) { return k ~ /^[A-Z0-9_]*(OWNER|ORG|ACCOUNT|USER|EMAIL|TENANT)[A-Z0-9_]*$/ }
+    # A fallback that is DERIVED (a substitution, another variable) names no instance — only a
+    # baked-in literal does. Loopback stand-ins are technical constants, not identities.
+    function neutral(v) {
+      return v == "" || v == "localhost" || v == "127.0.0.1" || v == "::1" ||
+             v ~ /[$`]/ || v ~ /^[A-Z0-9]*_[A-Z0-9_]*$/
+    }
+    # A key that names WHERE the identity is read from (…_FILE, …_PATH, …_DIR) is not the identity:
+    # its value is a LOCATION. An organisation is never an absolute path, so a path default under
+    # such a key stays admissible — while the same key with a name-shaped default is still reported.
+    function location(k, v) { return k ~ /_(FILE|PATH|DIR)$/ && v ~ /^\// }
+    function report(k, v) {
+      if (neutral(v) || location(k, v)) return
+      print FILENAME "\t" FNR "\t" v
+    }
+    FNR == 1 { armed = 0 }
+    {
+      line = $0
+      sub(/[[:space:]]*\/\/.*$/, "", line)   # C-family line comment
+      sub(/^[[:space:]]*#.*$/, "", line)     # shell comment
+      if (line == "") { if (armed > 0) armed--; next }
+
+      # Shell: ${KEY:-default} carries key and fallback on one line.
+      rest = line
+      while (match(rest, /\$\{[A-Z0-9_]+:-[^}]*\}/)) {
+        frag = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        k = frag; sub(/^\$\{/, "", k); sub(/:-.*$/, "", k)
+        v = frag; sub(/^[^-]*:-/, "", v); sub(/\}$/, "", v)
+        if (identity(k)) report(k, v)
+      }
+
+      # Go / TypeScript: the lookup arms a short window; the fallback literal follows it.
+      hit = 0
+      if (match(line, /Getenv\("[A-Z0-9_]+"\)/) || match(line, /process\.env\.[A-Z0-9_]+/)) {
+        k = substr(line, RSTART, RLENGTH)
+        gsub(/^Getenv\("|"\)$|^process\.env\./, "", k)
+        if (identity(k)) { armed = 6; hit = 1 }
+        else { armed = 0 }
+      }
+
+      if (armed > 0) {
+        # A bare fallback: `return "x"`, `?? "x"`, `|| "x"`, `= "x"` — and on the lookup line
+        # itself only after the lookup, so the key inside Getenv("…") is never read as a value.
+        scan = line
+        if (hit) scan = substr(line, RSTART + RLENGTH)
+        while (match(scan, /(return|\?\?|\|\||=)[[:space:]]*("[^"]*"|'"'"'[^'"'"']*'"'"')/)) {
+          frag = substr(scan, RSTART, RLENGTH)
+          scan = substr(scan, RSTART + RLENGTH)
+          sub(/^[^"'"'"']*["'"'"']/, "", frag)
+          sub(/["'"'"']$/, "", frag)
+          report(k, frag)
+        }
+        armed--
+      }
+    }
+  ' "$@"
+}
+
 # ── the audit's own instrument check ─────────────────────────────────────────────────────────
 #
 # Every criterion below reads one of these sets. An empty set makes each of its checks pass on
@@ -301,7 +431,7 @@ section() { printf '\n-- %s %s\n' "$1" "$(printf '%.0s-' $(seq 1 $((70 - ${#1}))
 section "instrument"
 
 set_sizes=""
-for name in F_EVERY F_ALL F_GO F_GO_SRC F_GO_WIRED F_TS F_TS_SRC F_SH F_IMPL; do
+for name in F_EVERY F_ALL F_GO F_GO_SRC F_GO_WIRED F_WORKSTATE F_TS F_TS_SRC F_SH F_IMPL; do
   declare -n ref="$name"
   [[ ${#ref[@]} -eq 0 ]] && set_sizes+="$name is EMPTY — every check reading it would pass on nothing"$'\n'
   unset -n ref
@@ -312,15 +442,126 @@ else
   fail "harness" "every audited file set is non-empty" "${set_sizes%$'\n'}"
 fi
 
+# The K-1 matcher's own SENSITIVITY, measured before any criterion reads it. An absence check is
+# worth exactly as much as its ability to see the construct it forbids, and this one must see a git
+# call written as an argument list — the only spelling this code uses. So the matcher is run against
+# samples whose answer is known: four that MUST be caught (both constructs, in both spellings) and
+# five neighbours that must NOT be (a reset onto HEAD or onto a resolved sha, a plain `-b` checkout,
+# a tool-table row that merely names "checkout", and a comment that documents the removal).
+sample_dir="$(mktemp -d)"
+trap 'rm -rf "$sample_dir"' EXIT
+cat >"$sample_dir/caught.go" <<'SAMPLE'
+func a() { b.gitUser(ctx, "checkout", "-f", "-B", branch) }
+func b() { b.gitUser(ctx, "reset", "--hard", "origin/"+def) }
+func c() {
+	b.gitUser(ctx, "reset",
+		"--hard", remoteRef)
+}
+SAMPLE
+cat >"$sample_dir/caught.sh" <<'SAMPLE'
+git checkout -f -B "$branch"
+git reset --hard origin/main
+SAMPLE
+cat >"$sample_dir/clean.go" <<'SAMPLE'
+func a() { b.gitUser(ctx, "reset", "--hard", "HEAD") }
+func b() { b.gitUser(ctx, "reset", "--hard", targetSHA) }
+func c() { mustGit(t, wt, "checkout", "--quiet", "-b", Branch) }
+func d() { rows = append(rows, tool{Op: "checkout", Method: http.MethodPost, Path: "/api/repos/{id}/checkout"}) }
+// NEVER checkout -f -B, NEVER reset --hard origin/<branch> (REQ-023.1)
+SAMPLE
+matcher_faults=""
+caught="$(git_hits "$FORCE_CHECKOUT|$RESET_TO_REMOTE" "$sample_dir/caught.go" "$sample_dir/caught.sh" | grep -c . || true)"
+[[ $caught -eq 5 ]] || matcher_faults+="the matcher caught $caught of the 5 forbidden sample calls — it cannot see what K-1 forbids"$'\n'
+missed="$(git_hits "$FORCE_CHECKOUT|$RESET_TO_REMOTE" "$sample_dir/clean.go" || true)"
+[[ -z $missed ]] || matcher_faults+="the matcher flagged an admissible neighbour:"$'\n'"$missed"$'\n'
+rm -rf "$sample_dir"
+trap - EXIT
+if [[ -z $matcher_faults ]]; then
+  pass "harness-git" "the K-1 matcher sees a git call in both spellings (shell string AND argument list)"
+else
+  fail "harness-git" "the K-1 matcher sees a git call in both spellings (shell string AND argument list)" "${matcher_faults%$'\n'}"
+fi
+
+# The same measurement for the identity scanner behind B-45c: it must SEE a baked-in organisation in
+# both spellings, and must not read a technical constant as one. Two samples, known answer.
+id_dir="$(mktemp -d)"
+trap 'rm -rf "$id_dir"' EXIT
+cat >"$id_dir/caught.sh" <<'SAMPLE'
+OWNER="${DEVLAB_GH_OWNER:-an-org}"
+MAIL="${DEVLAB_ADMIN_EMAIL:-ops@an-org.example}"
+SAMPLE
+cat >"$id_dir/caught.go" <<'SAMPLE'
+func owner() string {
+	if o := os.Getenv("DEVLAB_GH_ORG"); o != "" {
+		return o
+	}
+	return "an-org"
+}
+SAMPLE
+cat >"$id_dir/clean.sh" <<'SAMPLE'
+OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
+OWNER="${DEVLAB_GH_OWNER:-}"
+PORT="${DEVLAB_PORT:-8080}"
+HOST="${DEVLAB_HOST:-localhost}"
+RUNNER="${DEVLAB_RUNS_USER:-$DEVLAB_USER}"
+SAMPLE
+cat >"$id_dir/clean.go" <<'SAMPLE'
+func topic() string {
+	if t := os.Getenv("DEVLAB_GH_TOPIC"); t != "" {
+		return t
+	}
+	return "holistic"
+}
+SAMPLE
+id_faults=""
+id_caught="$(identity_scan "$id_dir/caught.sh" "$id_dir/caught.go" 2>/dev/null | grep -c . || true)"
+[[ $id_caught -eq 3 ]] || id_faults+="the identity scanner found $id_caught of the 3 baked-in identities — B-45c would pass on a check that sees nothing"$'\n'
+id_missed="$(identity_scan "$id_dir/clean.sh" "$id_dir/clean.go" 2>/dev/null || true)"
+[[ -z $id_missed ]] || id_faults+="the identity scanner read a technical constant as an identity:"$'\n'"$id_missed"$'\n'
+rm -rf "$id_dir"
+trap - EXIT
+if [[ -z $id_faults ]]; then
+  pass "harness-id" "the identity scanner sees a baked-in organisation, and only that"
+else
+  fail "harness-id" "the identity scanner sees a baked-in organisation, and only that" "${id_faults%$'\n'}"
+fi
+
 # ── §1 the six construction faults ───────────────────────────────────────────────────────────
 
 section "§1  construction faults K-1 … K-6"
 
-absent "K-1a" "no force-checkout of the workbench branch (work is folded in, never re-pointed)" \
-  'checkout[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-B' "${F_GO_SRC[@]}" "${F_SH[@]}"
+# A force-checkout has no admissible use anywhere in the daemon, so this one is judged over the whole
+# shipped source: the old `EnsureDevBranch` re-pointed the working branch at the remote on every run
+# and dropped eighteen strands of committed work in a day.
+git_absent "K-1a" "no force-checkout of the workbench branch (work is folded in, never re-pointed)" \
+  "$FORCE_CHECKOUT" "${F_GO_SRC[@]}" "${F_SH[@]}"
 
-absent "K-1b" "no reset --hard onto origin anywhere in the working-state path" \
-  'reset[[:space:]].*--hard.*(origin|remote)|--hard[[:space:]]+origin' "${F_GO_SRC[@]}" "${F_SH[@]}"
+# K-1b is scoped the way the criterion is scoped — the WORKING-STATE path: the packages that hold a
+# managed repository's working copy, plus every shipped script (none of them has business resetting a
+# working copy). Outside that path K-1c decides.
+git_absent "K-1b" "no reset --hard onto a remote ref in the working-state path (fold in, never re-point)" \
+  "$RESET_TO_REMOTE" "${F_WORKSTATE[@]}" "${F_SH[@]}"
+
+# K-1c pins the ONE reset onto a remote that the tree legitimately contains: the constitution MIRROR.
+# That clone holds no local work by construction — every write commits and pushes, and a push that
+# loses the race is retried on the refreshed state — so refreshing it IS a reset to the remote.
+# Pinning it does double duty: the exception cannot spread to a second file, and the known occurrence
+# is the matcher's live WITNESS. If the normalisation above ever stopped seeing an argument-list git
+# call, this hit would disappear and the check fails — instead of K-1a/K-1b passing on an empty
+# result, which is exactly the way they used to pass.
+mirror_ok='^backend/internal/axiomrepo/'
+reset_hits="$(git_hits "$RESET_TO_REMOTE" "${F_GO_SRC[@]}" "${F_SH[@]}")"
+mirror_witness="$(awk -F: -v ok="$mirror_ok" '$1 ~ ok' <<<"$reset_hits" | grep -c . || true)"
+mirror_stray="$(awk -F: -v ok="$mirror_ok" '$1 !~ ok' <<<"$reset_hits" | grep . || true)"
+if [[ $mirror_witness -eq 0 ]]; then
+  fail "K-1c" "the ONLY reset onto a remote is the constitution mirror (and the matcher proves it sees one)" \
+    "the mirror's own reset onto origin/<branch> was NOT found — the matcher no longer sees an argument-list git call, so K-1a/K-1b would be passing on nothing"
+elif [[ -n $mirror_stray ]]; then
+  fail "K-1c" "the ONLY reset onto a remote is the constitution mirror (and the matcher proves it sees one)" \
+    "$mirror_stray"
+else
+  pass "K-1c" "the ONLY reset onto a remote is the constitution mirror (and the matcher proves it sees one)"
+fi
 
 absent "K-2" "no inline restart in the deploy path (handover only, via the root wrapper)" \
   'systemd-run|systemctl[[:space:]]+(restart|start)' "${F_GO_SRC[@]}"
@@ -513,63 +754,7 @@ fi
 # Stage two hunts every further occurrence of the literal the code itself revealed (prose included),
 # so fixing the fallback while leaving the name in a comment does not pass. The check therefore names
 # no instance of its own.
-identity_defaults="$(
-  awk '
-    # key is the WHOLE configuration key: an identity word anywhere inside an upper-case name.
-    function identity(k) { return k ~ /^[A-Z0-9_]*(OWNER|ORG|ACCOUNT|USER|EMAIL|TENANT)[A-Z0-9_]*$/ }
-    # A fallback that is DERIVED (a substitution, another variable) names no instance — only a
-    # baked-in literal does. Loopback stand-ins are technical constants, not identities.
-    function neutral(v) {
-      return v == "" || v == "localhost" || v == "127.0.0.1" || v == "::1" ||
-             v ~ /[$`]/ || v ~ /^[A-Z0-9]*_[A-Z0-9_]*$/
-    }
-    function report(v) {
-      if (neutral(v)) return
-      print FILENAME "\t" FNR "\t" v
-    }
-    FNR == 1 { armed = 0 }
-    {
-      line = $0
-      sub(/[[:space:]]*\/\/.*$/, "", line)   # C-family line comment
-      sub(/^[[:space:]]*#.*$/, "", line)     # shell comment
-      if (line == "") { if (armed > 0) armed--; next }
-
-      # Shell: ${KEY:-default} carries key and fallback on one line.
-      rest = line
-      while (match(rest, /\$\{[A-Z0-9_]+:-[^}]*\}/)) {
-        frag = substr(rest, RSTART, RLENGTH)
-        rest = substr(rest, RSTART + RLENGTH)
-        k = frag; sub(/^\$\{/, "", k); sub(/:-.*$/, "", k)
-        v = frag; sub(/^[^-]*:-/, "", v); sub(/\}$/, "", v)
-        if (identity(k)) report(v)
-      }
-
-      # Go / TypeScript: the lookup arms a short window; the fallback literal follows it.
-      hit = 0
-      if (match(line, /Getenv\("[A-Z0-9_]+"\)/) || match(line, /process\.env\.[A-Z0-9_]+/)) {
-        k = substr(line, RSTART, RLENGTH)
-        gsub(/^Getenv\("|"\)$|^process\.env\./, "", k)
-        if (identity(k)) { armed = 6; hit = 1 }
-        else { armed = 0 }
-      }
-
-      if (armed > 0) {
-        # A bare fallback: `return "x"`, `?? "x"`, `|| "x"`, `= "x"` — and on the lookup line
-        # itself only after the lookup, so the key inside Getenv("…") is never read as a value.
-        scan = line
-        if (hit) scan = substr(line, RSTART + RLENGTH)
-        while (match(scan, /(return|\?\?|\|\||=)[[:space:]]*("[^"]*"|'"'"'[^'"'"']*'"'"')/)) {
-          frag = substr(scan, RSTART, RLENGTH)
-          scan = substr(scan, RSTART + RLENGTH)
-          sub(/^[^"'"'"']*["'"'"']/, "", frag)
-          sub(/["'"'"']$/, "", frag)
-          report(frag)
-        }
-        armed--
-      }
-    }
-  ' "${F_IMPL[@]}" 2>/dev/null || true
-)"
+identity_defaults="$(identity_scan "${F_IMPL[@]}" 2>/dev/null || true)"
 # Stage two: every FURTHER occurrence of the literal the code revealed, prose included.
 identity_out=""
 while IFS=$'\t' read -r file line lit; do
@@ -816,6 +1001,155 @@ if [[ -z $missing_suites ]]; then
   pass "REQ-040e" "the list-shaped acceptance suites are present (routes, symmetry, vocabulary, parity, reload)"
 else
   fail "REQ-040e" "the list-shaped acceptance suites are present" "$missing_suites"
+fi
+
+# ── contract discipline (BAUPLAN §0.2 / §4) ──────────────────────────────────────────────────
+#
+# The contract files are frozen after Welle 0, and every later change to one of them must be recorded
+# in deploy/migration/80-vertragsaenderungen.md with its file, its reason and a diff hint. The rule
+# was written into that document and then broken five times in ONE commit — a new mutating route, the
+# wire types, the data seam, the MCP tool table and the parity artefact all moved unrecorded — so it
+# is measured here instead of trusted.
+#
+# The frozen list AND the baseline commit are read out of the protocol's own header, so there is one
+# home for both and no second list to drift. An entry counts when the protocol's BODY (everything
+# below the header's rule) names the changed path — the header names every frozen path by definition,
+# which is why the search starts beneath it.
+section "contract discipline"
+
+protocol='deploy/migration/80-vertragsaenderungen.md'
+contract_faults=""
+baseline=""
+frozen_list=()
+if [[ ! -f $protocol ]]; then
+  contract_faults="$protocol does not exist — the contract-change protocol cannot be read"$'\n'
+else
+  baseline="$(sed -nE 's/.*Welle 0 = `([0-9a-f]{7,40})`.*/\1/p' "$protocol" | head -n1)"
+  mapfile -t frozen_list < <(
+    awk '/Frozen were:/ {f = 1} f { if ($0 == "") exit; print }' "$protocol" |
+      grep -oE '`[^`]+`' | tr -d '`' | sort -u
+  )
+  if [[ -z $baseline ]] || ! git cat-file -e "${baseline}^{commit}" 2>/dev/null; then
+    contract_faults+="the protocol names no readable Welle-0 baseline commit — nothing to compare the contract against"$'\n'
+  fi
+  if [[ ${#frozen_list[@]} -lt 12 ]]; then
+    contract_faults+="the protocol's frozen list parsed to ${#frozen_list[@]} paths — BAUPLAN §0.2 names 13, so the list is unreadable or was shortened"$'\n'
+  fi
+fi
+
+if [[ -z $contract_faults ]]; then
+  # A trailing /* names the directory; a path that no longer exists cannot be audited at all.
+  targets=()
+  for p in "${frozen_list[@]}"; do
+    p="${p%/\*}"
+    if [[ ! -e $p ]]; then
+      contract_faults+="the frozen list names $p, which does not exist — a renamed contract file is an unauditable one"$'\n'
+      continue
+    fi
+    targets+=("$p")
+  done
+  body="$(awk 'f; /^---$/ {f = 1}' "$protocol")"
+  # Tracked changes since the baseline AND new files inside a frozen directory: adding a file to the
+  # model or to the fixtures changes the contract exactly as editing one does.
+  while IFS= read -r changed; do
+    [[ -z $changed ]] && continue
+    grep -qF -- "$changed" <<<"$body" ||
+      contract_faults+="$changed changed since $baseline and no entry in $protocol names it (BAUPLAN §0.2: file, reason, diff hint)"$'\n'
+  done < <(
+    {
+      git diff --name-only "$baseline" -- "${targets[@]}" 2>/dev/null
+      git ls-files --others --exclude-standard -- "${targets[@]}" 2>/dev/null
+    } | sort -u
+  )
+fi
+if [[ -z $contract_faults ]]; then
+  pass "contract-a" "every frozen contract file changed since Welle 0 is recorded in the protocol"
+else
+  fail "contract-a" "every frozen contract file changed since Welle 0 is recorded in the protocol" "${contract_faults%$'\n'}"
+fi
+
+# The live topics are frozen as CONSTANTS inside a file whose broker was meant to be filled, so the
+# constant set is what is compared — renaming or re-valuing a topic breaks every subscriber on the
+# other side of the wire and needs the same protocol entry as any other contract change.
+topic_faults=""
+topic_now="$(sed -nE 's/^[[:space:]]*(Topic[A-Za-z]+)[[:space:]]+Topic[[:space:]]*=[[:space:]]*"([^"]+)".*/\1=\2/p' \
+  backend/internal/live/live.go 2>/dev/null | sort)"
+topic_base=""
+if [[ -n $baseline ]]; then
+  topic_base="$(git show "$baseline:backend/internal/live/live.go" 2>/dev/null |
+    sed -nE 's/^[[:space:]]*(Topic[A-Za-z]+)[[:space:]]+Topic[[:space:]]*=[[:space:]]*"([^"]+)".*/\1=\2/p' | sort)"
+fi
+if [[ $(grep -c . <<<"$topic_now") -lt 5 ]]; then
+  topic_faults="the live topic constants could not be read from backend/internal/live/live.go — the comparison would pass on nothing"
+elif [[ $topic_now != "$topic_base" ]]; then
+  topic_faults="$(diff <(printf '%s\n' "$topic_base") <(printf '%s\n' "$topic_now") || true)"
+  grep -qF -- 'backend/internal/live/live.go' <<<"$(awk 'f; /^---$/ {f = 1}' "$protocol")" && topic_faults=""
+fi
+if [[ -z $topic_faults ]]; then
+  pass "contract-b" "the live topic constants are the ones Welle 0 fixed (or the change is recorded)"
+else
+  fail "contract-b" "the live topic constants are the ones Welle 0 fixed (or the change is recorded)" "$topic_faults"
+fi
+
+# ── the delivery's own statements about itself ───────────────────────────────────────────────
+#
+# deploy/migration/20-sichtpruefung.md carries the STATE of every acceptance line and the size of
+# every inspection section. Both are claims about this repository, and a claim in the delivery is
+# worth no more than a claim in the code: it gets measured. The document once cited a check id that
+# does not exist (`REQ-012`) and named section sizes that were three items short — a reader would
+# have inspected less than the matrix demands and called the line passed.
+inspection='deploy/migration/20-sichtpruefung.md'
+doc_faults=""
+if [[ ! -f $inspection ]]; then
+  doc_faults="$inspection does not exist — the inspection half of the acceptance cannot be audited"$'\n'
+else
+  # Every check id the document cites in "Grep green (…)" must be an id this script actually runs.
+  script_ids="$(
+    grep -oE '^[[:space:]]*(pass|fail|absent|absent_raw|present|present_anywhere|unique_in|count_files|no_file|git_absent|note)[[:space:]]+"[^"]+"' \
+      "${BASH_SOURCE[0]}" | grep -oE '"[^"]+"' | tr -d '"' | sort -u
+  )"
+  if [[ $(grep -c . <<<"$script_ids") -lt 20 ]]; then
+    doc_faults+="the script's own check ids could not be read — the comparison would pass on nothing"$'\n'
+  else
+    cited="$(grep -oE 'Grep green \([^)]*\)' "$inspection" | sed -E 's/Grep green \(|\)//g' | tr ',' '\n' | tr -d ' ' | sort -u | grep .)"
+    [[ -n $cited ]] || doc_faults+="the document cites no check id at all — its \"Grep green\" claims name nothing"$'\n'
+    while IFS= read -r id; do
+      [[ -z $id ]] && continue
+      grep -qxF -- "$id" <<<"$script_ids" ||
+        doc_faults+="$inspection cites check $id, which this script does not run — a status resting on a check nobody performs"$'\n'
+    done <<<"$cited"
+  fi
+
+  # Every section size the result table claims must be the number of items that section carries.
+  declare -A doc_items=()
+  sec=""
+  while IFS= read -r line; do
+    if [[ $line =~ ^##[[:space:]]+([0-9]+)\. ]]; then
+      sec="${BASH_REMATCH[1]}"
+      doc_items[$sec]=0
+      continue
+    fi
+    [[ -n $sec && $line == "- [ ]"* ]] && doc_items[$sec]=$((doc_items[$sec] + 1))
+  done <"$inspection"
+  if [[ ${#doc_items[@]} -lt 5 ]]; then
+    doc_faults+="the document's inspection sections could not be read — the size comparison would pass on nothing"$'\n'
+  fi
+  while IFS= read -r row; do
+    [[ $row =~ ^\|[[:space:]]*([0-9]+)[[:space:]][^|]*\|[[:space:]]*([0-9]+)[[:space:]]*\| ]] || continue
+    s="${BASH_REMATCH[1]}"
+    claimed="${BASH_REMATCH[2]}"
+    actual="${doc_items[$s]:-}"
+    if [[ -z $actual ]]; then
+      doc_faults+="the result table counts a section $s that the document does not contain"$'\n'
+    elif [[ $claimed != "$actual" ]]; then
+      doc_faults+="the result table claims $claimed items for section $s, which carries $actual — the inspection would be reported complete after doing less"$'\n'
+    fi
+  done <"$inspection"
+fi
+if [[ -z $doc_faults ]]; then
+  pass "doc-a" "the inspection document cites only checks that exist, and counts its own items correctly"
+else
+  fail "doc-a" "the inspection document cites only checks that exist, and counts its own items correctly" "${doc_faults%$'\n'}"
 fi
 
 # ── informational: prose that mentions a retired construct ──────────────────────────────────

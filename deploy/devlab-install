@@ -5,6 +5,17 @@
 #
 # Contract:
 #   * name grammar: <repo> must match ^[a-z][a-z0-9-]{2,30}$ — nothing else ever reaches a path
+#   * NAMESPACE (the grammar alone is not one — `root`, `caddy`, `sshd` and `postgres` all satisfy
+#     it, and the generated unit carries `User=<repo>`, so a repository called `root` would have
+#     run its own artifact as uid 0). A foreign repository must additionally
+#       – not be a reserved system or landscape identity (RESERVED_REPOS below),
+#       – be the checkout the artifact was built in AND belong to the configured organisation
+#         (the checkout's origin remote, read as text — git is never RUN on repo content as root),
+#       – own its service account: an existing account must be the nologin system account under
+#         /var/lib/<repo> that this wrapper creates, never a foreign identity we adopt,
+#       – be unknown to systemd or known ONLY through this wrapper's own unit file: existence is
+#         asked of `systemctl show -p FragmentPath`, not of a path, so a vendor unit under
+#         /lib|/usr/lib (or a masked one) is SEEN and refused instead of being shadowed
 #   * path canonicalization: <artifact-dir> resolves via `realpath -e` and MUST lie under the
 #     workspace root; a traversal (…/../../tmp/evil) dies before any effect
 #   * env is exactly `dev` or `prod` (prod is NOT armed in this phase — it dies)
@@ -20,11 +31,15 @@
 #
 # Instance values (state dir, workspace root, self unit) are env-overridable DEFAULTS of this
 # template; under the pinned sudoers grant sudo's env_reset strips the caller's env, so the
-# defaults stand in production and the overrides remain a direct-invocation test seam.
+# defaults stand in production and the overrides remain a direct-invocation test seam. The
+# organisation is NOT among them: it is read from a root-owned file, because the caller must not be
+# able to widen the namespace it is being measured against.
 #
 # Exit codes: 0 ok · 1 generic · 2 usage/validation · 4 external tool failed · 5 config-state
 set -euo pipefail
 
+# The ONE state-root derivation shared by every DevLab wrapper, mirroring statepath.Workspaces():
+# workspaces live at <state root>/workspaces. Keep this identical in devlab-exec.
 STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
 WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"
 SELF_REPO="${DEVLAB_SELF_REPO:-devlab}"
@@ -32,6 +47,23 @@ SELF_UNIT="${DEVLAB_UNIT:-devlabd}"
 CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
 RESTART_HELPER="/usr/local/sbin/devlab-restart-when-free"
+# systemd is the authority on which units exist — asked through this binary so the question is
+# answerable in a dry run without a bus (the seam is stripped by sudo's env_reset in production).
+SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
+# The unit directory this wrapper owns. A fragment ANYWHERE else belongs to somebody else.
+UNIT_DIR="/etc/systemd/system"
+# The configured organisation whose repositories may be installed: an instance value, so it lives
+# in root-owned runtime configuration and never as a literal in this template.
+OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
+
+# Reserved names. Every one of them satisfies the grammar, and for every one the generated unit and
+# service account would collide with an identity that already means something else — `root` most
+# sharply, because the unit template carries `User=<repo>`.
+RESERVED_REPOS="root daemon bin sys sync games man lp mail news uucp proxy backup list irc gnats
+nobody nogroup www-data adm admin operator halt shutdown reboot init systemd udev dbus messagebus
+polkitd syslog rsyslog sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
+caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod docker containerd
+kubelet etcd snapd holistic"
 
 log() { logger -t devlab-install -- "$*" 2>/dev/null || true; echo "devlab-install: $*"; }
 die() { printf 'devlab-install: error: %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -62,8 +94,12 @@ REPO="${POSITIONAL[0]}"
 ARTIFACT="${POSITIONAL[1]}"
 ENVN="${POSITIONAL[2]}"
 
-# 1) repo must satisfy the name grammar — nothing else ever reaches a path.
+# 1) repo must satisfy the name grammar — nothing else ever reaches a path. This is a SHAPE check;
+#    the namespace itself is narrowed in step 5 (the grammar admits `root`, `caddy`, `sshd`, …).
 [[ "$REPO" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || die "invalid repo name '$REPO' (want ^[a-z][a-z0-9-]{2,30}$)" 2
+case "$REPO" in
+  *--* | *-) die "invalid repo name '$REPO' (no doubled and no trailing dash)" 2 ;;
+esac
 
 # 2) env must be exactly dev or prod; prod is NOT armed in this phase.
 case "$ENVN" in
@@ -89,6 +125,100 @@ if [ "$HANDOVER" = 1 ] && [ "$REPO" != "$SELF_REPO" ]; then
 fi
 if [ "$PORT" != 0 ]; then
   [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "invalid --port '$PORT'" 2
+fi
+
+# 5) THE NAMESPACE (foreign repositories only — the self repo is this wrapper's own service and takes
+#    the branch below). Six independent narrowings, every one read-only and before any effect.
+UNIT_FILE="$UNIT_DIR/${REPO}.service"
+FIRST_TIME=0
+MANIFEST=""
+if [ "$REPO" != "$SELF_REPO" ]; then
+  # 5a) reserved identities: no repository may be named after a system or landscape component.
+  for r in $RESERVED_REPOS; do
+    if [ "$REPO" = "$r" ]; then
+      die "repo name '$REPO' is reserved (system or landscape identity) — a unit and a service account under this name would collide with an existing one" 2
+    fi
+  done
+  case "$REPO" in
+    systemd-*) die "repo name '$REPO' lies in systemd's own namespace" 2 ;;
+  esac
+
+  # 5b) the repository must BE the checkout the artifact was built in. The canonical artifact path
+  #     is <workspaces>/<user>/<repo>/.mercury-artifact, so the checkout carries the identity — the
+  #     <repo> argument is never a free-form string that only happens to look like a name.
+  CHECKOUT="$(dirname -- "$real")"
+  if [ "$(basename -- "$CHECKOUT")" != "$REPO" ]; then
+    die "repo '$REPO' does not name the checkout the artifact was built in ($CHECKOUT)" 2
+  fi
+
+  # 5c) …and it must belong to the CONFIGURED organisation. The owner comes from root-owned runtime
+  #     configuration (never from the caller, who would otherwise widen its own namespace), and the
+  #     checkout's origin remote is read as TEXT — git is never executed on repo content as root.
+  #     Every url of the origin section must match, so a decoy first entry buys nothing.
+  OWNER="${DEVLAB_GH_OWNER:-}"
+  if [ -z "$OWNER" ]; then
+    [ -r "$OWNER_FILE" ] || die "no managed organisation configured: $OWNER_FILE is missing (operator-provisioned instance value)" 5
+    OWNER="$(head -n1 -- "$OWNER_FILE" | tr -d '[:space:]')"
+  fi
+  [[ "$OWNER" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || die "invalid managed organisation '$OWNER' (from $OWNER_FILE)" 5
+
+  GITCONF="$CHECKOUT/.git/config"
+  { [ -f "$GITCONF" ] && [ ! -L "$GITCONF" ]; } || die "checkout '$CHECKOUT' carries no git config — its repository cannot be identified" 2
+  # Fed on stdin, never as an argument: a path containing '=' would otherwise read as an awk
+  # variable assignment rather than a file.
+  ORIGINS="$(awk '
+    /^[[:space:]]*\[/ { in_origin = ($0 ~ /^[[:space:]]*\[remote[[:space:]]*"origin"\]/); next }
+    in_origin && /^[[:space:]]*url[[:space:]]*=/ { sub(/^[[:space:]]*url[[:space:]]*=[[:space:]]*/, ""); print }
+  ' < "$GITCONF")"
+  [ -n "$ORIGINS" ] || die "checkout '$CHECKOUT' has no origin remote — its repository cannot be identified" 2
+  owner_lc="${OWNER,,}"
+  while IFS= read -r u; do
+    u="${u,,}"; u="${u%.git}"; u="${u%/}"
+    case "$u" in
+      "https://github.com/$owner_lc/$REPO" | "git@github.com:$owner_lc/$REPO" | "ssh://git@github.com/$owner_lc/$REPO") : ;;
+      *) die "checkout origin '$u' is not $OWNER/$REPO — only repositories of the configured organisation are installed" 2 ;;
+    esac
+  done <<<"$ORIGINS"
+
+  # 5d) the service account: an account that already exists must be the one THIS wrapper creates for
+  #     this service (system account, nologin, home /var/lib/<repo>). Anything else is a foreign
+  #     identity the generated `User=<repo>` would silently borrow.
+  if getent passwd "$REPO" >/dev/null 2>&1; then
+    IFS=: read -r _pname _ppw puid _pgid _pgecos phome pshell <<<"$(getent passwd "$REPO")"
+    [ "${puid:-0}" -gt 0 ] 2>/dev/null || die "account '$REPO' is uid 0 — refusing to install a service under it" 2
+    [ "${phome:-}" = "/var/lib/$REPO" ] || die "account '$REPO' already exists with home '${phome:-}' (expected /var/lib/$REPO) — refusing to adopt a foreign account" 2
+    case "${pshell:-}" in
+      */nologin | */false) : ;;
+      *) die "account '$REPO' already exists with an interactive shell '${pshell:-}' — refusing to adopt a foreign account" 2 ;;
+    esac
+  fi
+
+  # 5e) unit existence is asked of SYSTEMD, not of a path: a vendor unit lives under /lib or
+  #     /usr/lib and a path test in $UNIT_DIR does not see it, so "first time" would happily
+  #     generate a second unit that SHADOWS a running system service (and `systemctl restart` would
+  #     then start our artifact in its place). A fragment outside $UNIT_DIR — vendor, /run, or the
+  #     /dev/null of a masked unit — is refused; only our own fragment counts as "already set up".
+  frag="$("$SYSTEMCTL" show -p FragmentPath --value "${REPO}.service" 2>/dev/null)" \
+    || die "could not ask systemd about ${REPO}.service" 4
+  frag="$(printf '%s' "$frag" | tr -d '[:space:]')"
+  case "$frag" in
+    "$UNIT_FILE") FIRST_TIME=0 ;;
+    "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
+    *) die "unit ${REPO}.service already exists outside this wrapper's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
+  esac
+
+  # 5f) the rights manifest is a validated FILE COPY out of the checkout. It is resolved here so a
+  #     symlink pointing out of the checkout (…/permissions/<repo>.json -> /etc/shadow) cannot make
+  #     root publish a foreign file world-readable in $PERMS_DIR. Absent is fine; escaping is not.
+  cand="$CHECKOUT/permissions/$REPO.json"
+  if [ -e "$cand" ] || [ -L "$cand" ]; then
+    manreal="$(realpath -e -- "$cand" 2>/dev/null)" || die "rights manifest '$cand' does not resolve" 2
+    case "$manreal" in
+      "$CHECKOUT"/*) [ -f "$manreal" ] || die "rights manifest '$cand' is not a regular file" 2 ;;
+      *) die "rights manifest '$cand' resolves to '$manreal', outside the checkout — refusing to publish it" 2 ;;
+    esac
+    MANIFEST="$manreal"
+  fi
 fi
 
 # ── self repo: install NOW, restart only as a handover (K-2) ─────────────────────────────────────
@@ -120,10 +250,8 @@ fi
 BIN="$real/${REPO}d"    # go build ./cmd/... writes cmd/<repo>d into the artifact
 [ -f "$BIN" ] || die "staged binary missing: $BIN (expected <repo>d — prebuilt, never built here)" 5
 
-UNIT_FILE="/etc/systemd/system/${REPO}.service"
-FIRST_TIME=0
-[ -e "$UNIT_FILE" ] || FIRST_TIME=1
-
+# UNIT_FILE / FIRST_TIME / MANIFEST were decided in the validation cascade (step 5) — systemd was
+# asked, the account was judged and the manifest was resolved before any effect could happen.
 if [ "$FIRST_TIME" = 1 ]; then
   # First-time setup from root-owned INLINE templates (this root-owned script is their source):
   # unit + route + rights with VALIDATED values only. The port is the atlas proposal handed in
@@ -135,8 +263,12 @@ if [ "$FIRST_TIME" = 1 ]; then
     echo "PLAN: create system user '$REPO' (nologin) if missing"
     echo "PLAN: write $UNIT_FILE from the inline template (ExecStart /opt/$REPO/bin/${REPO}d --listen 127.0.0.1:$PORT)"
     echo "PLAN: write $CADDY_CONF/$REPO.caddy (route /api/services/$REPO/* -> 127.0.0.1:$PORT)"
-    echo "PLAN: install rights manifest from the artifact's repo checkout (validated copy) + groupadd its hp_* groups"
-    echo "PLAN: systemctl daemon-reload && systemctl enable $REPO"
+    if [ -n "$MANIFEST" ]; then
+      echo "PLAN: install rights manifest $MANIFEST (validated copy) + groupadd its hp_* groups"
+    else
+      echo "PLAN: no rights manifest in the checkout — install without declared rights"
+    fi
+    echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $REPO"
   else
     getent passwd "$REPO" >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$REPO" "$REPO"
     install -d -o "$REPO" -g "$REPO" -m 0755 "/var/lib/$REPO"
@@ -167,27 +299,26 @@ handle /api/services/${REPO}/* {
 	reverse_proxy 127.0.0.1:${PORT}
 }
 ROUTE
-      systemctl reload caddy 2>/dev/null || log "caddy reload unavailable — route written, reload it manually"
+      "$SYSTEMCTL" reload caddy 2>/dev/null || log "caddy reload unavailable — route written, reload it manually"
     else
       log "no route dir at $CADDY_CONF — route NOT written"
     fi
-    # Rights manifest: a validated FILE COPY out of the artifact's repo checkout (the artifact
-    # dir's parent — still canonicalized under the workspace root). Never executed.
-    MAN="$(dirname "$real")/permissions/$REPO.json"
-    if [ -f "$MAN" ]; then
+    # Rights manifest: the FILE COPY validated in step 5f (resolved inside the checkout, a regular
+    # file, never a symlink out of it). Never executed.
+    if [ -n "$MANIFEST" ]; then
       install -d -m 0755 "$PERMS_DIR"
-      install -m 0644 "$MAN" "$PERMS_DIR/$REPO.json"
-      grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$MAN" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
+      install -m 0644 "$MANIFEST" "$PERMS_DIR/$REPO.json"
+      grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$MANIFEST" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
         while read -r g; do groupadd -f "$g"; done
     else
-      log "no rights manifest at $MAN — service installs without declared rights (Uniformity gap, reported by detection)"
+      log "no rights manifest in the checkout — service installs without declared rights (Uniformity gap, reported by detection)"
     fi
-    systemctl daemon-reload
-    systemctl enable "$REPO" >/dev/null 2>&1 || true
+    "$SYSTEMCTL" daemon-reload
+    "$SYSTEMCTL" enable "$REPO" >/dev/null 2>&1 || true
   fi
 fi
 
 run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
 run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
-run systemctl restart "$REPO"
+run "$SYSTEMCTL" restart "$REPO"
 log "install-only deploy of '$REPO' done (running-proof is the caller's honest gate, F10)"

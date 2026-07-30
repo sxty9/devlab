@@ -6,6 +6,12 @@
 # install-only (validated artifact paths, inline root-owned templates) — it never executes
 # repo-provided code as root, and there is no arbitrary sudo here.
 #
+# The grant presupposes the wrapper's namespace configuration: /etc/devlab/gh-owner must name the
+# organisation whose repositories may be installed (the same value as the daemon's DEVLAB_GH_OWNER).
+# Without it devlab-install refuses every foreign repository (exit 5) — the grant is then harmless
+# but useless. It is deliberately a ROOT-OWNED FILE and not an environment variable: the caller of
+# this grant must not be able to widen the namespace it is measured against.
+#
 # The runner user `devlab-runs` gets NO sudo at all — deliberately. An unattended agent running with
 # `--permission-mode bypassPermissions` treats ANY sudo grant as arbitrary root: it can write a file
 # and reach for an allowed command creatively (a systemd unit runs ExecStart as root; `apt-get install`

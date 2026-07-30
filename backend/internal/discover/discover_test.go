@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -232,15 +233,16 @@ func TestOwnerIsMandatory(t *testing.T) {
 	t.Setenv(envOwner, "")
 	calls := serve(fixtureSet(), nil)
 
-	if _, err := owner(); !errors.Is(err, ErrOwnerUnset) {
-		t.Errorf("owner() error = %v, want ErrOwnerUnset", err)
-	}
-	if got := Owner(); got != "" {
-		t.Errorf("Owner() = %q — an unconfigured instance must not fall back to a namespace", got)
-	}
-	repos, err := ReposForUser(context.Background(), testUser, "tok")
+	own, err := Owner()
 	if !errors.Is(err, ErrOwnerUnset) {
-		t.Errorf("ReposForUser error = %v, want ErrOwnerUnset", err)
+		t.Errorf("Owner() error = %v, want ErrOwnerUnset", err)
+	}
+	if own != "" {
+		t.Errorf("Owner() = %q — an unconfigured instance must not fall back to a namespace", own)
+	}
+	repos, rerr := ReposForUser(context.Background(), testUser, "tok")
+	if !errors.Is(rerr, ErrOwnerUnset) {
+		t.Errorf("ReposForUser error = %v, want ErrOwnerUnset", rerr)
 	}
 	if repos != nil {
 		t.Errorf("ReposForUser repos = %v, want none", ids(repos))
@@ -314,8 +316,8 @@ func workingCopies(t *testing.T, names ...string) string {
 func TestOwnerAndTopicConfiguration(t *testing.T) {
 	reset(t)
 	t.Setenv(envOwner, "  "+testOwner+" ")
-	if got := Owner(); got != testOwner {
-		t.Errorf("Owner() = %q, want the trimmed value", got)
+	if got, err := Owner(); err != nil || got != testOwner {
+		t.Errorf("Owner() = %q,%v, want the trimmed value and no error", got, err)
 	}
 
 	t.Setenv(envTopic, "")
@@ -448,6 +450,67 @@ func TestPathRejectsForeignIDs(t *testing.T) {
 	}
 	if _, ok := Path(base, "not-cloned"); ok {
 		t.Error("a repo without a working copy must not resolve")
+	}
+}
+
+// ownerCallSite matches the ONE admissible shape of a call to Owner: both results are bound to
+// names. The error name may not be the blank identifier — and once it is a real name, Go's own
+// unused-variable rule forces the caller to read it, which is why binding is the whole assertion.
+var ownerCallSite = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.\[\]]*, *([A-Za-z_][A-Za-z0-9_]*) *:?= *discover\.Owner\(\)$`)
+
+// TestEveryOwnerCallSiteHandlesTheNamedError reads the SHIPPED backend sources and holds every
+// caller of Owner to the contract of the accessor, not to its own good intentions.
+//
+// The defect this test exists for: the accessor used to answer `string` alone, with a doc comment
+// asking callers to reject "" and report ErrOwnerUnset. Of its three callers two never looked —
+// one placed a repository under the empty owner (GitHub creates it under whatever account the
+// token holds) and one composed "/axioms", which the constitution store reads as a FILESYSTEM
+// remote. A comment cannot enforce a contract; the signature can, and this test proves that no
+// call site slipped back past it (a discarded error, or the call used inline as an operand).
+func TestEveryOwnerCallSiteHandlesTheNamedError(t *testing.T) {
+	backend := filepath.Join("..", "..")
+	sites := 0
+	err := filepath.Walk(backend, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		src, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(src), "\n") {
+			stmt := strings.TrimSpace(line)
+			if !strings.Contains(stmt, "discover.Owner(") || strings.HasPrefix(stmt, "//") {
+				continue // prose about the accessor is not a call to it
+			}
+			sites++
+			// An `if own, err := discover.Owner(); err != nil {` head is the same statement with
+			// decoration: drop the keyword and the condition, then judge the assignment itself.
+			stmt = strings.TrimPrefix(stmt, "if ")
+			if k := strings.Index(stmt, ";"); k >= 0 {
+				stmt = strings.TrimSpace(stmt[:k])
+			}
+			m := ownerCallSite.FindStringSubmatch(stmt)
+			if m == nil {
+				t.Errorf("%s:%d: %s\n\tOwner must be called as `x, err := discover.Owner()` — an unset namespace has to be REJECTED here, not turned into an empty owner", path, i+1, strings.TrimSpace(line))
+				continue
+			}
+			if m[1] == "_" {
+				t.Errorf("%s:%d: %s\n\tthe error is discarded — this is exactly how a repository ends up in a foreign namespace", path, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read the shipped sources: %v", err)
+	}
+	// The audit must have READ something: no call site found means the tree moved or the accessor
+	// was renamed, and the check would pass on nothing at all.
+	if sites < 3 {
+		t.Fatalf("found %d call sites of discover.Owner in the shipped backend, expected at least 3 — the audit read nothing meaningful", sites)
 	}
 }
 

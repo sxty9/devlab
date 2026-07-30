@@ -217,29 +217,64 @@ through it end to end. The bracketed id is the acceptance line the item belongs 
 
 ---
 
-## Status per acceptance line (Welle 3, integration)
+## Status per acceptance line
 
 The wording of every line lives in `spec/ABNAHME.md` — it is not repeated here. What this table adds
-is the STATE of each line after the integration wave, in exactly three kinds:
+is the STATE of each line, in exactly four kinds:
 
 - **Grep green** — the audit check(s) of `tools/abnahme.sh` that carry this line pass. The check ids
-  are named, so a failure points at the exact check.
+  are named, so a failure points at the exact check. Those ids are not decoration: check `doc-a` of
+  the same script asserts that every id named here EXISTS, so this table cannot cite a check nobody
+  runs.
 - **Test green** — the line's automated test(s) pass (`go test ./...` including `backend/it`,
   `node --test`). "via the referenced line" means the matrix itself points at another line's tests.
+- **E2E open** — the matrix names an END-TO-END walk-through as this line's own kind of proof: a
+  person clicking the whole path at the running instance. Nothing in this repository can discharge
+  it — no grep, no unit or integration test — so it stays open until it has been walked, and a line
+  that names E2E is never reported as finished on the strength of its unit tests alone.
 - **Visual inspection open** — the line additionally demands a look, a measurement or a review at
   the running instance. Those are the items of THIS document; a line marked "not itemised" is
   covered by a section here without naming the id, so read the section it belongs to.
 
-A line with several kinds needs all of them. Automated state as of the integration wave:
-`tools/abnahme.sh --tests` = 57 checks, 0 failing; `gofmt -l`, `go build ./...`, `go vet ./...` and
-`go test ./...` (including `backend/it`, also under `-race`) green; `npx tsc --noEmit`, `node --test`
-(163 tests) and `npm run build` green.
+A line with several kinds needs all of them.
+
+Fourteen lines name E2E in the matrix: REQ-007, REQ-012, REQ-035, REQ-036, B-25, B-27, B-28, B-31,
+B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open** below. Three of them (B-27,
+B-40, REQ-035) previously read "Test green" and nothing else — an acceptance claim wider than the
+evidence, which is the one thing this document may never make.
+
+### How the automated half is established
+
+The procedure, not a snapshot: a count ages with the next commit, so what stands here are the
+commands and the rule each must satisfy. Run them in the repository root.
+
+| # | Command | The rule |
+|---|---|---|
+| 1 | `bash tools/abnahme.sh --tests` | the last line reads `N passed, 0 failed`. N is however many checks the matrix currently carries — the count is not the criterion, the ZERO is |
+| 2 | `gofmt -l backend` | prints nothing |
+| 3 | `cd backend && go build ./... && go vet ./...` | both silent |
+| 4 | `cd backend && go test ./... -count=1`, once more with `-race` | every package `ok` |
+| 5 | `npx tsc -p tsconfig.json --noEmit` | prints nothing |
+| 6 | `npm test` | `fail 0`, and `pass` equals `tests` |
+| 7 | `npm run build` | exits 0 |
+
+Record the reading when an inspection is performed. The commit it was taken at is what makes a row
+re-checkable — and a row is a MEASUREMENT of that commit, never a promise about the working tree: if
+tree and row disagree, the tree is right and the row is stale.
+
+| Taken at | 1 acceptance | 4 go test | 6 node --test | 2 · 3 · 5 · 7 |
+|---|---|---|---|---|
+| repair wave 2, 2026-07-30 | 69 passed, 0 failed | whole suite ok (`go test ./... -count=1`) | 183 tests, 0 fail | 2 · 3 · 5 silent; 7 (`npm run build`) NOT run in this wave |
+
+The row states what was actually run, and nothing further: an unrun command is recorded as unrun,
+never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
+edits rather than the delivered state, so the closing row belongs to whoever closes the wave.
 
 ### §1 — the six construction faults (K-1 … K-6)
 
 | Line | Status |
 |---|---|
-| K-1 | Grep green (K-1a, K-1b) · Test green |
+| K-1 | Grep green (K-1a, K-1b, K-1c) · Test green |
 | K-2 | Grep green (K-2, K-2b) · Test green · Visual inspection open (measurement) |
 | K-3 | Test green |
 | K-4 | Test green · Visual inspection open (visual) |
@@ -256,12 +291,12 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | REQ-004 | Grep green (REQ-004) · Test green · Visual inspection open (visual) |
 | REQ-005 | Test green · Visual inspection open (visual) |
 | REQ-006 | Test green |
-| REQ-007 | Test green · Visual inspection open (visual) |
+| REQ-007 | Test green · E2E open (paste at every upload point) |
 | REQ-008 | Test green |
 | REQ-009 | Test green · Visual inspection open (visual) |
 | REQ-010 | Grep green (REQ-010) · Test green · Visual inspection open (visual) |
 | REQ-011 | Test green |
-| REQ-012 | Grep green (REQ-012) · Test green · Visual inspection open (visual) |
+| REQ-012 | Grep green (REQ-012a, REQ-012b, REQ-012c, REQ-012d) · Test green · E2E open (both directions, and the shared detail) |
 | REQ-013 | Grep green (REQ-013) · Test green |
 | REQ-014 | Test green |
 | REQ-015 | Grep green (REQ-015a, REQ-015b) · Test green · Visual inspection open (visual) |
@@ -284,8 +319,8 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | REQ-032 | Test green |
 | REQ-033 | Test green · Visual inspection open (visual) |
 | REQ-034 | Grep green (REQ-034a, REQ-034b) · Test green · Visual inspection open (visual/measurement) |
-| REQ-035 | Test green |
-| REQ-036 | Test green · Visual inspection open (visual) |
+| REQ-035 | Test green (the structural half: `src/reload.test.ts`) · E2E open (reload in every main view) |
+| REQ-036 | Test green · Visual inspection open (visual) · E2E open (live transcript during a real run) |
 | REQ-037 | Test green |
 | REQ-038 | Visual inspection open (visual) |
 | REQ-039 | Grep green (REQ-039a, REQ-039b) · Test green |
@@ -323,27 +358,27 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | B-22 | Grep green (B-22) · Test green |
 | B-23 | Test green · Visual inspection open (review) |
 | B-24 | Visual inspection open (visual/review) |
-| B-25 | Test green |
+| B-25 | Test green · E2E open (the boot gates, login → link → app) |
 | B-26 | Test green (via the referenced line) |
-| B-27 | Test green |
-| B-28 | Test green · Visual inspection open (visual/review) |
+| B-27 | Test green · E2E open (view change and back: drafts, terminal, AI session) |
+| B-28 | Test green · Visual inspection open (visual/review) · E2E open (the gates) |
 | B-29 | Test green · Visual inspection open (visual) |
 | B-30 | Visual inspection open (visual) |
-| B-31 | Test green · Visual inspection open (review) |
-| B-32 | Test green · Visual inspection open (review) |
-| B-33 | Test green |
-| B-34 | Test green |
-| B-35 | Grep green (B-35) |
+| B-31 | Test green · Visual inspection open (review) · E2E open (every tree operation) |
+| B-32 | Test green · Visual inspection open (review) · E2E open (per capability) |
+| B-33 | Test green · E2E open (per capability) |
+| B-34 | Test green · E2E open (both surfaces use the one kit; live follow during a real run) |
+| B-35 | Grep green (B-35, B-35b) |
 | B-36 | Visual inspection open (visual/measurement) |
-| B-37 | Test green · Visual inspection open (review) |
+| B-37 | Test green · Visual inspection open (review) · E2E open (proposal → application → visible change) |
 | B-38 | Visual inspection open (visual, not itemised) |
-| B-39 | Test green · Visual inspection open (review) |
-| B-40 | Test green |
+| B-39 | Test green · Visual inspection open (review) · E2E open (edit, save, diff, vision, comments) |
+| B-40 | Test green · E2E open (per panel) |
 | B-41 | Grep green (B-41a, B-41b) · Visual inspection open (review, not itemised) |
 | B-42 | Visual inspection open (visual) |
 | B-43 | Grep green (B-43) · Test green · Visual inspection open (visual) |
 | B-44 | Grep green (B-44) · Test green (via the referenced line) · Visual inspection open (review) |
-| B-45 | Grep green (B-45, B-45b) · Test green · Visual inspection open (visual) |
+| B-45 | Grep green (B-45, B-45b, B-45c) · Test green · Visual inspection open (visual) |
 
 ## 0. Before the first look
 
@@ -536,15 +571,15 @@ A line with several kinds needs all of them. Automated state as of the integrati
 |---|---|---|---|
 | 0 Before the first look | 3 | | |
 | 1 Boot, gates and shell | 6 | | |
-| 2 The IDE | 8 | | |
+| 2 The IDE | 9 | | |
 | 3 The constitution | 5 | | |
 | 4 Tasks and runs | 7 | | |
-| 5 Execution and delivery | 16 | | |
+| 5 Execution and delivery | 18 | | |
 | 6 The calendar | 3 | | |
 | 7 Live updates | 5 | | |
 | 8 Reporting and notices | 5 | | |
 | 9 Landscape and ports | 4 | | |
-| 10 Operation, deploy and restart | 8 | | |
+| 10 Operation, deploy and restart | 9 | | |
 | 11 Reload and state preservation | 3 | | |
 | 12 Consistency of the kit | 2 | | |
 
@@ -559,13 +594,24 @@ the rule the acceptance matrix applies to skipped steps applies to its own inspe
 # 80 — Contract changes (log)
 
 Every change to a file frozen after Welle 0 (BAUPLAN §0.2) is recorded here with its file, its
-reason and where to look in the diff. Frozen were: `go.mod`/`go.sum`, `package.json`,
-`backend/internal/model/*`, `backend/internal/statepath/*`, `backend/internal/live/topics`,
-`backend/internal/executor/chain.go`, `backend/internal/api/api.go`, `backend/cmd/devlabd/main.go`,
-`src/types.ts`, `src/data/source.ts`, `src/data/httpSource.ts`, `src/data/index.ts`,
-`contract/fixtures/*`.
+reason and where to look in the diff.
 
-Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`.
+Frozen were: `backend/go.mod`, `backend/go.sum`, `package.json`, `backend/internal/model/*`,
+`backend/internal/statepath/*`, `backend/internal/executor/chain.go`,
+`backend/internal/api/api.go`, `backend/cmd/devlabd/main.go`, `src/types.ts`, `src/data/source.ts`,
+`src/data/httpSource.ts`, `src/data/index.ts`, `contract/fixtures/*`.
+
+Of `backend/internal/live/live.go` only the TOPIC CONSTANTS are frozen; the broker beneath them was a
+Welle-0 stub and was deliberately filled in Welle 1.
+
+That list is not prose. `tools/abnahme.sh` READS it — checks `contract-a` (a frozen file changed
+since the baseline and no entry below names it) and `contract-b` (the live topic constants moved) —
+so the rule now fails an audit instead of relying on discipline: it was written down here first and
+then broken five times in one commit. The paths are therefore spelled exactly as the repository
+spells them, and the paragraph beginning "Frozen were:" is the one the check parses.
+
+Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`, Welle 3 = `3e2019b`,
+repair wave 1 = `0a9f8fe`.
 
 ---
 
@@ -722,6 +768,140 @@ These files are not on the frozen list; they are logged because they change a pu
   declaration (the one place a surface states its language, and the single attribute a language
   switch changes), with NEUTRAL as the fallback. The formatting API is unchanged — no caller passes
   a locale.
+
+---
+
+## Recorded after the fact — the contract changes of repair wave 1 (`3e2019b` → `0a9f8fe`)
+
+Repair wave 1 changed five contract artefacts and wrote none of them down. The entries below close
+that gap; each one names the file, the reason and where to look, exactly as it should have been
+written when the change was made. Since this wave the omission is no longer possible unnoticed:
+`tools/abnahme.sh` check `contract-a` compares the frozen list in this document's header against git
+and FAILS on a change no entry names.
+
+### 7. `backend/internal/api/api.go` — the report status access point gains its writing verb
+
+**Who:** repair wave 1.
+**Reason:** a report delivery that exhausted its retries ends as `blocked` and, by definition, never
+resumes itself (K-5). The resumption therefore needs an access point — and the READING one already
+existed (`GET /api/mercury/runs/report-status`), so the write joins it as the same access point's
+second verb instead of standing beside it as a second, similar sibling.
+**What changed:** one route registered — `mux.HandleFunc("POST /api/mercury/runs/report-status",
+s.guardCSRF(s.runsReportStatus))`. On the CSRF-enforcing guard, like every other mutating route; the
+handler branches on the method.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- backend/internal/api/api.go`.
+**Proof:** `tools/abnahme.sh` check `B-03` (no mutating route on a non-CSRF guard);
+`backend/it/guards_test.go` reads the tier out of the table itself; the behaviour is pinned by
+`backend/internal/api/handlers_mercury_report_test.go`
+(`TestReportStatusRouteAcceptsTheResume`, `TestRunsReportStatusResumeIsHonestAndIdempotent`).
+
+### 8. `src/types.ts` — `blocked` becomes a report state, and a delivery names its execution
+
+**Who:** repair wave 1.
+**Reason:** two honesty gaps in the wire vocabulary. A report delivery could only be `sent` or
+`failed`, so the END of the retries had no name of its own and a blocked send read as just another
+failure (K-5 wants reason, attempts and times, plus an explicit resumption). And a delivery record
+could not be attributed to the execution it arose from, so a surface had to GUESS which executions
+still carry an open delivery from a chain stage name — the derivation B-35 retires.
+**What changed:** `ReportDelivery.status` gains `'blocked'` and an optional `backoff: Backoff`;
+`Delivery` gains an optional `executionId`. Both are additive — no existing field changed shape, so
+no reader breaks.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- src/types.ts`.
+**Proof:** `backend/it/vocabulary_test.go` (one vocabulary across UI, API, store, log and report);
+`src/views/mercury/deliveries/deliveries.test.ts`; `src/views/mercury/exec/logic.test.ts`.
+
+### 9. `src/data/source.ts` (+ `src/data/httpSource.ts`, `src/data/stubSource.ts`) — the resumption enters through the seam
+
+**Who:** repair wave 1.
+**Reason:** the surface must be able to resume a blocked report, and the ONE place a surface may name
+an API path is the data seam (REQ-040a). A call from a view would have been a second data path to an
+entity that now has one.
+**What changed:** `DataSource` gains `mercuryResumeReportDelivery(day?): Promise<{ resumed: string[] }>`;
+`httpSource` posts it to the existing access point; `stubSource` answers `offline` — no pretended
+success where there is no server. The answer is the list of days actually resumed, never a bare `ok`.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- src/data/`.
+**Proof:** `src/parity.test.ts` (every seam operation is mirrored by an MCP tool or declared omitted);
+`backend/internal/api/handlers_mcp_test.go` (`TestToolTableMirrorsTheDataSource`).
+
+### 10. `contract/mcp-tools.json` + `backend/internal/api/mcp_tools.go` — the tool beside the new operation
+
+**Who:** repair wave 1.
+**Reason:** the parity artefact is generated from the tool table and read by the parity test, so a new
+seam operation without a tool (or without a stated omission) fails that test by design — an agent
+would otherwise be unable to do what a person can (REQ-043).
+**What changed:** one tool `report_resume` (`mercuryResumeReportDelivery`, POST, tier `csrf`, one
+optional `day` argument) added on both sides in identical wording.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- contract/mcp-tools.json backend/internal/api/mcp_tools.go`.
+**Proof:** `src/parity.test.ts`; `backend/internal/api/handlers_mcp_test.go`
+(`TestParityArtifactInStep`).
+
+---
+
+## Repair wave 2
+
+### 11. `backend/internal/api/api.go` — no configured namespace, no constitution repository
+
+**Who:** repair wave 2 (S4). Touched outside its own ownership because the file only has to PASS THE
+ERROR THROUGH; recorded here for exactly that reason.
+**Reason:** `axiomsRepo()` composed the constitution's repository name as `discover.Owner() +
+"/axioms"`. The accessor answered `string` alone, so an instance that had configured no owner got the
+name `"/axioms"` — and a LEADING SLASH is what `axiomrepo` reads as a filesystem remote. The store
+would then have cloned whatever directory of that name exists on the host and served it as this
+instance's constitution: a foreign namespace admitted by an unset configuration, reported as either
+"unreachable" or, worse, as a perfectly readable set of axioms belonging to somebody else. REQ-001
+requires the opposite — one store, no second data path, and a read error that is never "no axioms".
+**What changed:** `axiomsRepo()` now answers `(string, error)`; `api.New` builds the store only when a
+namespace exists and logs the named reason otherwise. `*axiomrepo.Store` is nil-safe by construction,
+so every constitution operation then answers `ErrNoStore` ("constitution store not configured") —
+distinguishable from "no axioms" and from "unreachable".
+**Diff hint:** `git diff 0a9f8fe -- backend/internal/api/api.go backend/internal/api/axioms_config.go`.
+**Proof:** `backend/internal/api/owner_scope_test.go`
+(`TestAxiomsRepoRefusesWithoutANamespace`, `TestServerWithoutANamespaceHasNoConstitutionStore`), plus
+`backend/internal/discover/discover_test.go`
+(`TestEveryOwnerCallSiteHandlesTheNamedError`), which reads the shipped sources and holds every caller
+of `discover.Owner` to the two-answer contract.
+
+### 12. `deploy/devlab-install`, `deploy/devlabd.service` — a new operator-provisioned file, and two unit modes
+
+**Who:** repair wave 2 (S1). Neither file is on the §0.2 freeze list, so this entry is not owed as a
+frozen-contract change — it is recorded here because it adds a REQUIREMENT the cutover must satisfy,
+and a cutover that misses it makes every foreign dev-delivery fail closed.
+**Reason:** the install wrapper's name grammar `^[a-z][a-z0-9-]{2,30}$` is a shape, not a namespace:
+`root`, `caddy`, `sshd` and `postgres` all satisfy it, the generated unit carries `User=<repo>` and
+`ExecStart=/opt/<repo>/bin/<repo>d`, and "first time" was decided by the ABSENCE of
+`/etc/systemd/system/<repo>.service` — which cannot see a vendor unit under `/lib`. A repository
+named `root` therefore had root install that repository's own binary as a unit running as uid 0, and
+a repository named after any packaged service could shadow it.
+**What changed (namespace):** a foreign repository must now (a) not be a reserved system or
+landscape name (`RESERVED_REPOS` in the wrapper, plus the `systemd-*` prefix), (b) BE the checkout
+the artifact was built in and belong to the configured organisation — read from the checkout's origin
+remote as text, never by running git as root, (c) own its service account: an existing account must
+be the nologin system account under `/var/lib/<repo>` this wrapper creates, and (d) be unknown to
+systemd or known only through `/etc/systemd/system/<repo>.service` — existence is asked of
+`systemctl show -p FragmentPath`, so a vendor, `/run` or masked fragment is seen and refused. The
+rights manifest is resolved inside the checkout, so a symlink out of it can no longer make root
+publish a foreign file in `/etc/holistic/permissions.d`.
+**Consequence for operation — the new file:** the configured organisation is an instance value, so it
+lives in root-owned runtime configuration and not in the template:
+
+```bash
+printf '%s\n' '<github-owner>' | sudo tee /etc/devlab/gh-owner >/dev/null   # same value as DEVLAB_GH_OWNER
+sudo chmod 0644 /etc/devlab/gh-owner
+```
+
+Without it the wrapper fails closed (exit 5, "no managed organisation configured"). It must hold the
+same owner as the daemon's `DEVLAB_GH_OWNER`; the wrapper may not read the caller's environment for
+it, because a caller that chooses its own namespace is not measured against one.
+**What changed (unit):** `devlabd.service` gains `StateDirectoryMode=0711` (systemd's default 0755
+let every local account LIST the state root, which holds the link store and the transcripts; 0711
+keeps the traverse bit the per-user workspaces need, which 0750 would cut) and `UMask=0027`, matching
+devlab-exec. Security-relevant modes stay explicit at their site — the readiness socket now sets
+`api.SocketMode` itself rather than inheriting the umask.
+**Diff hint:** `git diff 0a9f8fe -- deploy/devlab-install deploy/devlab-exec deploy/devlab.sudoers deploy/devlabd.service backend/internal/api/ready.go`.
+**Proof:** `backend/internal/deploy/wrapper_namespace_test.go` (one dry run per attack path:
+reserved names, foreign checkout name, foreign organisation, decoy origin, unconfigured owner,
+vendor/masked unit, unaskable systemd, escaping rights manifest, and the derived workspace root),
+`backend/internal/api/ready_test.go` (`TestReadySocketModeIsOwnerAndGroupOnly`).
 
 
 ---

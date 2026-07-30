@@ -2,7 +2,7 @@
 # devlab-exec — pinned per-user executor for DevLab. Invoked ONLY by the devlab service via:
 #     sudo -n -u <targetuser> /usr/local/sbin/devlab-exec <verb> <args...>
 # It runs AS the target user (sudo -u) and CONFINES every path to that user's workspace root
-# (/var/lib/devlab/workspaces/<self>), so a compromised devlab service cannot reach another user's
+# (<state root>/workspaces/<self>), so a compromised devlab service cannot reach another user's
 # files, /home, or the token store. Must be root-owned and non-writable (see devlab.sudoers).
 #
 # Verbs:
@@ -17,9 +17,23 @@ set -euo pipefail
 umask 0027
 
 SELF="$(id -un)"
-ROOT="/var/lib/devlab/workspaces/$SELF"
+# The ONE state-root derivation every DevLab wrapper shares, mirroring statepath.Workspaces():
+# workspaces live at <state root>/workspaces. Keep it identical in devlab-install.
+#
+# These are env-overridable DEFAULTS and the override is a DIRECT-INVOCATION test seam only:
+# devlab-exec is invoked BY the devlab service through sudo, whose env_reset strips the caller's
+# environment. DEVLAB_STATE_DIR and DEVLAB_WORKSPACES must therefore NEVER be added to the env_keep
+# list in devlab.sudoers — a service that could set them could move the very boundary this wrapper
+# exists to hold. The check below is the belt to that brace.
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"
+ROOT="$WORKSPACES_ROOT/$SELF"
 
 die() { echo "devlab-exec: $*" >&2; exit 64; }
+
+# A workspace root is a directory owned by the user we run as. Anything else is not this user's
+# workspace, so there is nothing to confine against — refuse before any verb runs.
+{ [ -d "$ROOT" ] && [ -O "$ROOT" ]; } || die "no workspace root owned by $SELF at $ROOT"
 
 # require_under_root <path> — resolve the deepest existing ancestor (defeating symlink escapes) and
 # require the result stays within $ROOT.

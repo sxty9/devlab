@@ -10,7 +10,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 )
+
+// SocketMode is the readiness socket's EXPLICIT mode: the service user and its operating group,
+// nobody else. A Unix socket is created with 0777&~umask, so without this the free signal would be
+// world-readable and world-connectable — and it is not a harmless status line: it is the restart
+// gate (any local user could read whether an execution is running, and a "busy" answer defers the
+// daemon's own restart). Neither the unit's UMask nor the state directory's mode is something this
+// file may rely on, so the mode is set here and proven by test.
+const SocketMode = 0o660
 
 // ServeReadySocket runs the readiness endpoint until ctx ends. It must never be mounted on
 // the TCP mux.
@@ -23,10 +32,32 @@ func (s *Server) ServeReadySocket(ctx context.Context) error {
 	if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	l, err := net.Listen("unix", sock)
+	// Bind inside a PRIVATE staging directory (0700) and publish the socket only once its mode is
+	// fixed. Binding straight at the contract path and chmod'ing afterwards leaves a window in
+	// which the socket already accepts connections at the umask's mode; inside the staging
+	// directory no foreign process can even traverse to it, so that window does not exist.
+	stage, err := os.MkdirTemp(filepath.Dir(sock), ".ready-")
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(stage) // a no-op once the rename below succeeded and the dir was removed
+	staged := filepath.Join(stage, "s")
+	l, err := net.Listen("unix", staged)
+	if err != nil {
+		return err
+	}
+	if err := os.Chmod(staged, SocketMode); err != nil {
+		l.Close()
+		return err
+	}
+	// The rename publishes the socket under its contract path. The listener still believes it owns
+	// the staged path, so its own Close no longer unlinks the published socket — the explicit
+	// removal on shutdown below is what cleans up.
+	if err := os.Rename(staged, sock); err != nil {
+		l.Close()
+		return err
+	}
+	_ = os.Remove(stage)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, _ *http.Request) {

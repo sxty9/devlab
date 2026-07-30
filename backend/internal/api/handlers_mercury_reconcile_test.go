@@ -10,11 +10,11 @@ import (
 	"devlab/backend/internal/runs"
 )
 
-// A constitution write recomposes exactly the runs whose composed inputs changed — and,
-// because the input hash folds in record titles, a pure RENAME counts as a change (REQ-003).
-// Unaffected runs (and todos, which fold in no axioms) are left untouched, so recomposition
-// neither loses a rename nor churns runs it did not affect.
-func TestRecomposeAffectedRunsOnlyTouchesChanged(t *testing.T) {
+// A constitution write recomposes exactly the runs whose composed inputs changed — and, because the
+// input hash folds in record titles, a pure RENAME counts as a change (REQ-003). Every prompt now
+// carries the whole constitution (REQ-002.1), automatic runs and ToDos alike, so a rename reaches
+// BOTH kinds; a write that changes nothing composed still churns nothing.
+func TestRecomposeAffectedRunsReachesBothKinds(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_RUNS", filepath.Join(dir, "runs.json"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
@@ -39,11 +39,38 @@ func TestRecomposeAffectedRunsOnlyTouchesChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Rename ax_1 (title only, body unchanged). run_1 references it → must recompose; run_2
-	// must not.
+	// A write that changes nothing composed must rewrite nothing at all.
+	s.recomposeAffectedRuns(cat)
+	unchanged := listByID(t, store)
+	for _, before := range []runs.Run{r1, r2, todo} {
+		if got := unchanged[before.ID]; got.PromptSnapshot != before.PromptSnapshot || got.PromptInputHash != before.PromptInputHash {
+			t.Errorf("%s was rewritten although nothing changed", before.ID)
+		}
+	}
+
+	// Rename ax_1 (title only, body unchanged). Every prompt carries the whole constitution, so
+	// every run — both automatic ones and the todo — must pick the new title up.
 	cat.ByID["ax_1"] = mercury.RunAxiom{ID: "ax_1", Titel: "Minimalismus-Maxim", Body: "Sei minimal."}
 	s.recomposeAffectedRuns(cat)
 
+	by := listByID(t, store)
+	for _, before := range []runs.Run{r1, r2, todo} {
+		got := by[before.ID]
+		if got.PromptInputHash == before.PromptInputHash {
+			t.Errorf("%s: the renamed axiom must move the input hash", before.ID)
+		}
+		if !strings.Contains(got.PromptSnapshot, "Minimalismus-Maxim") {
+			t.Errorf("%s not recomposed with the new title:\n%s", before.ID, got.PromptSnapshot)
+		}
+	}
+	// The todo carries the wording, not just the title legend (REQ-002.1).
+	if !strings.Contains(by["run_t"].PromptSnapshot, "Sei symmetrisch.") {
+		t.Errorf("the todo prompt must carry every axiom in full wording:\n%s", by["run_t"].PromptSnapshot)
+	}
+}
+
+func listByID(t *testing.T, store *runs.Store) map[string]runs.Run {
+	t.Helper()
 	got, err := store.List()
 	if err != nil {
 		t.Fatal(err)
@@ -52,20 +79,5 @@ func TestRecomposeAffectedRunsOnlyTouchesChanged(t *testing.T) {
 	for _, r := range got {
 		by[r.ID] = r
 	}
-
-	if by["run_1"].PromptInputHash == r1.PromptInputHash {
-		t.Error("run_1 references the renamed axiom — its snapshot hash must change")
-	}
-	if !strings.Contains(by["run_1"].PromptSnapshot, "Minimalismus-Maxim") {
-		t.Errorf("run_1 prompt not recomposed with the new title:\n%s", by["run_1"].PromptSnapshot)
-	}
-
-	if by["run_2"].PromptInputHash != r2.PromptInputHash {
-		t.Error("run_2 does not reference the renamed axiom — its snapshot must be untouched")
-	}
-
-	// A todo folds in no axioms, so a constitution write never recomposes it.
-	if by["run_t"].PromptInputHash != "" || by["run_t"].PromptSnapshot != todo.PromptSnapshot {
-		t.Errorf("todo must be skipped: got hash=%q", by["run_t"].PromptInputHash)
-	}
+	return by
 }

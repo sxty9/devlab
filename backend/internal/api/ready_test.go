@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,58 @@ func TestReadySocketAnswers204FreeAnd423Busy(t *testing.T) {
 	}
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Fatalf("socket file must be removed on shutdown: %v", err)
+	}
+}
+
+// The free signal is the restart gate, so it must not be readable or drivable by every local
+// user: the socket carries an EXPLICIT mode (owner + operating group). Before that was set it
+// inherited 0777&~umask — 0755 under the service's default umask, i.e. any local account could
+// probe the execution state and see the handover window, while the unit sets no UMask and the
+// state directory stays traversable. The private bind directory must leave no residue either.
+func TestReadySocketModeIsOwnerAndGroupOnly(t *testing.T) {
+	dir := t.TempDir()
+	paths := &statepath.Paths{Root: dir}
+	s := &Server{paths: paths}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- s.ServeReadySocket(ctx) }()
+
+	sock := paths.ReadySocket()
+	if got := readyGet(t, sock); got != http.StatusNoContent {
+		t.Fatalf("the ready socket must answer before its mode is judged, got %d", got)
+	}
+	fi, err := os.Lstat(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("%s is not a socket: %v", sock, fi.Mode())
+	}
+	if perm := fi.Mode().Perm(); perm != SocketMode {
+		t.Errorf("socket mode = %#o, want %#o (owner + operating group, never world)", perm, SocketMode)
+	}
+	if fi.Mode().Perm()&0o007 != 0 {
+		t.Errorf("socket mode %#o admits every local user — the restart gate must not be public", fi.Mode().Perm())
+	}
+
+	// The private bind directory is transient: nothing named .ready-* survives publication.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".ready-") {
+			t.Errorf("the staging directory %q was left behind in the state root", e.Name())
+		}
+	}
+
+	cancel()
+	if err := <-errc; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Errorf("the socket file must be removed on shutdown: %v", err)
 	}
 }
 

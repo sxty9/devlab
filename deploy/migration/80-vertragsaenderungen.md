@@ -1,13 +1,24 @@
 # 80 — Contract changes (log)
 
 Every change to a file frozen after Welle 0 (BAUPLAN §0.2) is recorded here with its file, its
-reason and where to look in the diff. Frozen were: `go.mod`/`go.sum`, `package.json`,
-`backend/internal/model/*`, `backend/internal/statepath/*`, `backend/internal/live/topics`,
-`backend/internal/executor/chain.go`, `backend/internal/api/api.go`, `backend/cmd/devlabd/main.go`,
-`src/types.ts`, `src/data/source.ts`, `src/data/httpSource.ts`, `src/data/index.ts`,
-`contract/fixtures/*`.
+reason and where to look in the diff.
 
-Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`.
+Frozen were: `backend/go.mod`, `backend/go.sum`, `package.json`, `backend/internal/model/*`,
+`backend/internal/statepath/*`, `backend/internal/executor/chain.go`,
+`backend/internal/api/api.go`, `backend/cmd/devlabd/main.go`, `src/types.ts`, `src/data/source.ts`,
+`src/data/httpSource.ts`, `src/data/index.ts`, `contract/fixtures/*`.
+
+Of `backend/internal/live/live.go` only the TOPIC CONSTANTS are frozen; the broker beneath them was a
+Welle-0 stub and was deliberately filled in Welle 1.
+
+That list is not prose. `tools/abnahme.sh` READS it — checks `contract-a` (a frozen file changed
+since the baseline and no entry below names it) and `contract-b` (the live topic constants moved) —
+so the rule now fails an audit instead of relying on discipline: it was written down here first and
+then broken five times in one commit. The paths are therefore spelled exactly as the repository
+spells them, and the paragraph beginning "Frozen were:" is the one the check parses.
+
+Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`, Welle 3 = `3e2019b`,
+repair wave 1 = `0a9f8fe`.
 
 ---
 
@@ -164,3 +175,137 @@ These files are not on the frozen list; they are logged because they change a pu
   declaration (the one place a surface states its language, and the single attribute a language
   switch changes), with NEUTRAL as the fallback. The formatting API is unchanged — no caller passes
   a locale.
+
+---
+
+## Recorded after the fact — the contract changes of repair wave 1 (`3e2019b` → `0a9f8fe`)
+
+Repair wave 1 changed five contract artefacts and wrote none of them down. The entries below close
+that gap; each one names the file, the reason and where to look, exactly as it should have been
+written when the change was made. Since this wave the omission is no longer possible unnoticed:
+`tools/abnahme.sh` check `contract-a` compares the frozen list in this document's header against git
+and FAILS on a change no entry names.
+
+### 7. `backend/internal/api/api.go` — the report status access point gains its writing verb
+
+**Who:** repair wave 1.
+**Reason:** a report delivery that exhausted its retries ends as `blocked` and, by definition, never
+resumes itself (K-5). The resumption therefore needs an access point — and the READING one already
+existed (`GET /api/mercury/runs/report-status`), so the write joins it as the same access point's
+second verb instead of standing beside it as a second, similar sibling.
+**What changed:** one route registered — `mux.HandleFunc("POST /api/mercury/runs/report-status",
+s.guardCSRF(s.runsReportStatus))`. On the CSRF-enforcing guard, like every other mutating route; the
+handler branches on the method.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- backend/internal/api/api.go`.
+**Proof:** `tools/abnahme.sh` check `B-03` (no mutating route on a non-CSRF guard);
+`backend/it/guards_test.go` reads the tier out of the table itself; the behaviour is pinned by
+`backend/internal/api/handlers_mercury_report_test.go`
+(`TestReportStatusRouteAcceptsTheResume`, `TestRunsReportStatusResumeIsHonestAndIdempotent`).
+
+### 8. `src/types.ts` — `blocked` becomes a report state, and a delivery names its execution
+
+**Who:** repair wave 1.
+**Reason:** two honesty gaps in the wire vocabulary. A report delivery could only be `sent` or
+`failed`, so the END of the retries had no name of its own and a blocked send read as just another
+failure (K-5 wants reason, attempts and times, plus an explicit resumption). And a delivery record
+could not be attributed to the execution it arose from, so a surface had to GUESS which executions
+still carry an open delivery from a chain stage name — the derivation B-35 retires.
+**What changed:** `ReportDelivery.status` gains `'blocked'` and an optional `backoff: Backoff`;
+`Delivery` gains an optional `executionId`. Both are additive — no existing field changed shape, so
+no reader breaks.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- src/types.ts`.
+**Proof:** `backend/it/vocabulary_test.go` (one vocabulary across UI, API, store, log and report);
+`src/views/mercury/deliveries/deliveries.test.ts`; `src/views/mercury/exec/logic.test.ts`.
+
+### 9. `src/data/source.ts` (+ `src/data/httpSource.ts`, `src/data/stubSource.ts`) — the resumption enters through the seam
+
+**Who:** repair wave 1.
+**Reason:** the surface must be able to resume a blocked report, and the ONE place a surface may name
+an API path is the data seam (REQ-040a). A call from a view would have been a second data path to an
+entity that now has one.
+**What changed:** `DataSource` gains `mercuryResumeReportDelivery(day?): Promise<{ resumed: string[] }>`;
+`httpSource` posts it to the existing access point; `stubSource` answers `offline` — no pretended
+success where there is no server. The answer is the list of days actually resumed, never a bare `ok`.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- src/data/`.
+**Proof:** `src/parity.test.ts` (every seam operation is mirrored by an MCP tool or declared omitted);
+`backend/internal/api/handlers_mcp_test.go` (`TestToolTableMirrorsTheDataSource`).
+
+### 10. `contract/mcp-tools.json` + `backend/internal/api/mcp_tools.go` — the tool beside the new operation
+
+**Who:** repair wave 1.
+**Reason:** the parity artefact is generated from the tool table and read by the parity test, so a new
+seam operation without a tool (or without a stated omission) fails that test by design — an agent
+would otherwise be unable to do what a person can (REQ-043).
+**What changed:** one tool `report_resume` (`mercuryResumeReportDelivery`, POST, tier `csrf`, one
+optional `day` argument) added on both sides in identical wording.
+**Diff hint:** `git diff 3e2019b 0a9f8fe -- contract/mcp-tools.json backend/internal/api/mcp_tools.go`.
+**Proof:** `src/parity.test.ts`; `backend/internal/api/handlers_mcp_test.go`
+(`TestParityArtifactInStep`).
+
+---
+
+## Repair wave 2
+
+### 11. `backend/internal/api/api.go` — no configured namespace, no constitution repository
+
+**Who:** repair wave 2 (S4). Touched outside its own ownership because the file only has to PASS THE
+ERROR THROUGH; recorded here for exactly that reason.
+**Reason:** `axiomsRepo()` composed the constitution's repository name as `discover.Owner() +
+"/axioms"`. The accessor answered `string` alone, so an instance that had configured no owner got the
+name `"/axioms"` — and a LEADING SLASH is what `axiomrepo` reads as a filesystem remote. The store
+would then have cloned whatever directory of that name exists on the host and served it as this
+instance's constitution: a foreign namespace admitted by an unset configuration, reported as either
+"unreachable" or, worse, as a perfectly readable set of axioms belonging to somebody else. REQ-001
+requires the opposite — one store, no second data path, and a read error that is never "no axioms".
+**What changed:** `axiomsRepo()` now answers `(string, error)`; `api.New` builds the store only when a
+namespace exists and logs the named reason otherwise. `*axiomrepo.Store` is nil-safe by construction,
+so every constitution operation then answers `ErrNoStore` ("constitution store not configured") —
+distinguishable from "no axioms" and from "unreachable".
+**Diff hint:** `git diff 0a9f8fe -- backend/internal/api/api.go backend/internal/api/axioms_config.go`.
+**Proof:** `backend/internal/api/owner_scope_test.go`
+(`TestAxiomsRepoRefusesWithoutANamespace`, `TestServerWithoutANamespaceHasNoConstitutionStore`), plus
+`backend/internal/discover/discover_test.go`
+(`TestEveryOwnerCallSiteHandlesTheNamedError`), which reads the shipped sources and holds every caller
+of `discover.Owner` to the two-answer contract.
+
+### 12. `deploy/devlab-install`, `deploy/devlabd.service` — a new operator-provisioned file, and two unit modes
+
+**Who:** repair wave 2 (S1). Neither file is on the §0.2 freeze list, so this entry is not owed as a
+frozen-contract change — it is recorded here because it adds a REQUIREMENT the cutover must satisfy,
+and a cutover that misses it makes every foreign dev-delivery fail closed.
+**Reason:** the install wrapper's name grammar `^[a-z][a-z0-9-]{2,30}$` is a shape, not a namespace:
+`root`, `caddy`, `sshd` and `postgres` all satisfy it, the generated unit carries `User=<repo>` and
+`ExecStart=/opt/<repo>/bin/<repo>d`, and "first time" was decided by the ABSENCE of
+`/etc/systemd/system/<repo>.service` — which cannot see a vendor unit under `/lib`. A repository
+named `root` therefore had root install that repository's own binary as a unit running as uid 0, and
+a repository named after any packaged service could shadow it.
+**What changed (namespace):** a foreign repository must now (a) not be a reserved system or
+landscape name (`RESERVED_REPOS` in the wrapper, plus the `systemd-*` prefix), (b) BE the checkout
+the artifact was built in and belong to the configured organisation — read from the checkout's origin
+remote as text, never by running git as root, (c) own its service account: an existing account must
+be the nologin system account under `/var/lib/<repo>` this wrapper creates, and (d) be unknown to
+systemd or known only through `/etc/systemd/system/<repo>.service` — existence is asked of
+`systemctl show -p FragmentPath`, so a vendor, `/run` or masked fragment is seen and refused. The
+rights manifest is resolved inside the checkout, so a symlink out of it can no longer make root
+publish a foreign file in `/etc/holistic/permissions.d`.
+**Consequence for operation — the new file:** the configured organisation is an instance value, so it
+lives in root-owned runtime configuration and not in the template:
+
+```bash
+printf '%s\n' '<github-owner>' | sudo tee /etc/devlab/gh-owner >/dev/null   # same value as DEVLAB_GH_OWNER
+sudo chmod 0644 /etc/devlab/gh-owner
+```
+
+Without it the wrapper fails closed (exit 5, "no managed organisation configured"). It must hold the
+same owner as the daemon's `DEVLAB_GH_OWNER`; the wrapper may not read the caller's environment for
+it, because a caller that chooses its own namespace is not measured against one.
+**What changed (unit):** `devlabd.service` gains `StateDirectoryMode=0711` (systemd's default 0755
+let every local account LIST the state root, which holds the link store and the transcripts; 0711
+keeps the traverse bit the per-user workspaces need, which 0750 would cut) and `UMask=0027`, matching
+devlab-exec. Security-relevant modes stay explicit at their site — the readiness socket now sets
+`api.SocketMode` itself rather than inheriting the umask.
+**Diff hint:** `git diff 0a9f8fe -- deploy/devlab-install deploy/devlab-exec deploy/devlab.sudoers deploy/devlabd.service backend/internal/api/ready.go`.
+**Proof:** `backend/internal/deploy/wrapper_namespace_test.go` (one dry run per attack path:
+reserved names, foreign checkout name, foreign organisation, decoy origin, unconfigured owner,
+vendor/masked unit, unaskable systemd, escaping rights manifest, and the derived workspace root),
+`backend/internal/api/ready_test.go` (`TestReadySocketModeIsOwnerAndGroupOnly`).

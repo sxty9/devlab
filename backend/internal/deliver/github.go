@@ -79,9 +79,18 @@ func (g liveGitHub) DeleteBranch(ctx context.Context, repo, branch string) error
 // the runtime configuration — never a literal) and reports the resulting full name. An
 // already-existing repo is returned as-is (Satisfied, REQ-033.6). The `private` flag is
 // accepted for the interface's sake; the client creates repositories private.
+//
+// Without a configured namespace the creation is REFUSED with discover.ErrOwnerUnset, before any
+// GitHub call. This is the one place the chain PLACES a repository, so an unset owner must not
+// become an empty owner: GitHub then creates it under whatever account the token belongs to — a
+// foreign namespace, and one nobody named.
 func (g liveGitHub) CreateRepo(ctx context.Context, name string, private bool) (string, error) {
 	_ = private
-	return github.CreateRepo(ctx, g.token, discover.Owner(), name,
+	owner, err := discover.Owner()
+	if err != nil {
+		return "", err
+	}
+	return github.CreateRepo(ctx, g.token, owner, name,
 		"Holistic service repository, created by the delivery chain", discover.Topic())
 }
 

@@ -82,6 +82,16 @@ Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
 # wrappers to run ops as the end user); ProtectHome false so per-user git/claude configs
 # resolve. Isolation is at the sudo/OS-user layer (devlab-exec), not the mount namespace.
 StateDirectory=devlab
+# 0711, not systemd's default 0755: the state root holds the link store, the transcripts and the
+# restart-ready socket, so no local account may LIST it — but the per-user workspaces below it are
+# entered by devlab-exec running AS the end user, which needs the traverse bit (x). 0750 would cut
+# that path and break every per-user git op. The workspaces root keeps the same shape (0711).
+StateDirectoryMode=0711
+# 0027: what the daemon creates is readable by itself and the operating group only, never by every
+# local user. It matches devlab-exec's umask, so a file's mode does not depend on who created it.
+# Security-relevant modes are still set explicitly at the site (e.g. api.SocketMode) — this is the
+# floor, never the guarantee.
+UMask=0027
 ReadWritePaths=/var/lib/devlab
 NoNewPrivileges=false
 ProtectSystem=strict

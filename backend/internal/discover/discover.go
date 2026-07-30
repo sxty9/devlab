@@ -36,36 +36,33 @@ var idRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // Resolution fails closed with this error rather than falling back to a hard-coded namespace.
 var ErrOwnerUnset = errors.New("discover: no GitHub owner configured for the holistic set (DEVLAB_GH_OWNER)")
 
-// owner reads the MANDATORY owner scoping of the holistic set from the runtime configuration. The
-// variable is named at the lookup, not behind a constant, so the instance-neutrality audit (B-45c)
-// keeps watching this exact spot for a re-introduced fallback.
-func owner() (string, error) {
+// Owner reads the MANDATORY owner scoping of the holistic set from the runtime configuration — one
+// definition for the whole daemon, so a newly created service repository lands in the same namespace
+// this package scans and no drifting sibling can name a second one. The variable is named at the
+// lookup, not behind a constant, so the instance-neutrality audit (B-45c) keeps watching this exact
+// spot for a re-introduced fallback.
+//
+// There are exactly TWO answers: a configured owner, or ErrOwnerUnset. There is no third answer and
+// no usable default, and the SIGNATURE is what enforces that a caller notices — the accessor used to
+// hand out "" beside a comment asking callers to reject it, and two of its three callers did not.
+// "" is never a namespace: it makes `Owner() + "/axioms"` read "/axioms" (a filesystem remote, not a
+// repository) and would place a created repository in whatever account the token happens to hold.
+func Owner() (string, error) {
 	if o := strings.TrimSpace(os.Getenv("DEVLAB_GH_OWNER")); o != "" {
 		return o, nil
 	}
 	return "", ErrOwnerUnset
 }
 
-// topic marks a repo as part of the holistic set (override with DEVLAB_GH_TOPIC). Unlike the owner
-// this DOES default: "holistic" is the landscape-wide membership marker, not an instance value.
-func topic() string {
+// Topic is the marker that makes a repo part of the holistic set (override with DEVLAB_GH_TOPIC).
+// Unlike the owner this DOES default: "holistic" is the landscape-wide membership marker, not an
+// instance value, so it needs no error channel.
+func Topic() string {
 	if t := strings.TrimSpace(os.Getenv("DEVLAB_GH_TOPIC")); t != "" {
 		return t
 	}
 	return "holistic"
 }
-
-// Owner is the GitHub owner the holistic set lives under — exported so a newly created service repo
-// lands in the same namespace this package scans (one definition, no drifting sibling). It is ""
-// when the instance configured none, and "" is never a usable namespace: a caller that places a
-// repository must reject it and report ErrOwnerUnset instead of falling back to another namespace.
-func Owner() string {
-	o, _ := owner()
-	return o
-}
-
-// Topic is the marker that makes a repo part of the holistic set (same rationale as Owner).
-func Topic() string { return topic() }
 
 // ─── Per-user GitHub visibility (production) ────────────────────────────────
 
@@ -92,7 +89,7 @@ var listRepos = github.ListRepos
 // closed with ErrOwnerUnset — before any GitHub call and without serving a cached set, because
 // there is no namespace the set could legitimately be scoped to.
 func ReposForUser(ctx context.Context, user, token string) ([]model.Repo, error) {
-	own, err := owner()
+	own, err := Owner()
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +114,7 @@ func ReposForUser(ctx context.Context, user, token string) ([]model.Repo, error)
 		return nil, err
 	}
 
-	repos := projectRepos(ghs, own, topic())
+	repos := projectRepos(ghs, own, Topic())
 	userMu.Lock()
 	userCache[user] = userEntry{repos: repos, at: time.Now()}
 	userMu.Unlock()
@@ -250,7 +247,7 @@ func Repos(base string) []model.Repo {
 }
 
 func query(base string) []model.Repo {
-	own, err := owner()
+	own, err := Owner()
 	if err != nil {
 		// Fail closed like the per-user path: without an owner there is no namespace to search
 		// and no full name to mint, so the sandbox offers nothing rather than something foreign.
@@ -293,7 +290,7 @@ func query(base string) []model.Repo {
 }
 
 func ghSearch(own string) []ghRepo {
-	cmd := exec.Command("gh", "search", "repos", "--owner", own, "--topic", topic(),
+	cmd := exec.Command("gh", "search", "repos", "--owner", own, "--topic", Topic(),
 		"--limit", "100", "--json", "name,description,language")
 	out, err := cmd.Output()
 	if err != nil {

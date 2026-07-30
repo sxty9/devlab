@@ -22,8 +22,11 @@ import (
 // Execution belongs to sched/executor (handlers_slots.go); results are read here, written
 // there.
 
-// runCatalog scans the constitution store once: every axiom by its stable id (as the RunAxiom
-// composition shape), the id→path index (coverage badges) and all global run rules.
+// runCatalog scans the constitution store once — the ONE scan behind every composition: every axiom
+// by its stable id (as the RunAxiom composition shape), the id→path index (coverage badges), every
+// Implementierungsregel and every global Laufregel. The Implementierungsregeln are part of the
+// binding wording every execution prompt carries (REQ-002.1), so they are read here, not somewhere
+// else.
 func (s *Server) runCatalog(ctx context.Context, cookie string) (cat runs.Catalog, idPath map[string]string, err error) {
 	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
@@ -32,15 +35,26 @@ func (s *Server) runCatalog(ctx context.Context, cookie string) (cat runs.Catalo
 	cat.ByID = map[string]mercury.RunAxiom{}
 	idPath = map[string]string{}
 	for _, p := range paths {
+		if !strings.HasSuffix(p, ".md") {
+			continue
+		}
+		rule := func() (mercury.RunAxiom, bool) {
+			rec, ok := s.fetchRecord(ctx, cookie, p)
+			return mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}, ok
+		}
 		switch {
-		case strings.HasPrefix(p, mercury.NsAxiome+"/") && strings.HasSuffix(p, ".md"):
+		case strings.HasPrefix(p, mercury.NsAxiome+"/"):
 			if rec, ok := s.fetchRecord(ctx, cookie, p); ok && rec.Axiom.ID != "" {
 				cat.ByID[rec.Axiom.ID] = mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}
 				idPath[rec.Axiom.ID] = p
 			}
-		case strings.HasPrefix(p, mercury.NsLaeufe+"/") && strings.HasSuffix(p, ".md"):
-			if rec, ok := s.fetchRecord(ctx, cookie, p); ok {
-				cat.Laufregeln = append(cat.Laufregeln, mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body})
+		case strings.HasPrefix(p, mercury.NsRegeln+"/"):
+			if r, ok := rule(); ok {
+				cat.Regeln = append(cat.Regeln, r)
+			}
+		case strings.HasPrefix(p, mercury.NsLaeufe+"/"):
+			if r, ok := rule(); ok {
+				cat.Laufregeln = append(cat.Laufregeln, r)
 			}
 		}
 	}

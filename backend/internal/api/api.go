@@ -113,12 +113,22 @@ func New(v *auth.Verifier, paths *statepath.Paths) *Server {
 	// The constitution lives in its own repository. Pushing uses the runner's linked account —
 	// the same identity the autonomous chain commits with — so an edit works whether or not the
 	// person making it has linked GitHub themselves.
-	s.axioms = axiomrepo.New(axiomsDir(paths), axiomsRepo(), func() (string, error) {
-		if s.links == nil {
-			return "", errors.New("no GitHub link store configured")
-		}
-		return s.links.Token(axiomsTokenUser())
-	})
+	//
+	// Without a configured namespace there IS no constitution repository (discover.ErrOwnerUnset):
+	// the store stays nil, every operation on it answers axiomrepo.ErrNoStore ("constitution store
+	// not configured") — distinguishable from "no axioms" and from "unreachable" (REQ-001) — and the
+	// named reason is logged once here. Naming one anyway would clone whatever "/axioms" resolves to
+	// on this host.
+	if axiomsFull, err := axiomsRepo(); err != nil {
+		log.Printf("devlabd: no constitution repository configured: %v", err)
+	} else {
+		s.axioms = axiomrepo.New(axiomsDir(paths), axiomsFull, func() (string, error) {
+			if s.links == nil {
+				return "", errors.New("no GitHub link store configured")
+			}
+			return s.links.Token(axiomsTokenUser())
+		})
+	}
 	// The auto-assigner runs on a caller's forwarded session (like the AI-fill button).
 	s.assigner = newAutoAssigner(s)
 	// The constitution repository documents itself: seed its README best-effort, create-only.

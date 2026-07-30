@@ -52,7 +52,14 @@ func runWrapper(t *testing.T, script string, env map[string]string, args ...stri
 	return res
 }
 
-// installEnv prepares a fake workspace root with a valid artifact and returns the env + paths.
+// testOwner is the organisation the fixtures below pretend to belong to. The wrapper takes the
+// managed owner from root-owned configuration; DEVLAB_GH_OWNER is the direct-invocation test seam
+// (sudo's env_reset strips it in production).
+const testOwner = "example-org"
+
+// installEnv prepares a fake workspace root with a valid artifact and returns the env + paths. The
+// checkout carries an origin remote under testOwner, because the wrapper only installs repositories
+// of the configured organisation.
 func installEnv(t *testing.T) (env map[string]string, workRoot, artifact string) {
 	t.Helper()
 	state := t.TempDir()
@@ -64,7 +71,22 @@ func installEnv(t *testing.T) (env map[string]string, workRoot, artifact string)
 	if err := os.WriteFile(filepath.Join(artifact, "svc-ad"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return map[string]string{"DEVLAB_STATE_DIR": state}, workRoot, artifact
+	writeOrigin(t, filepath.Dir(artifact), testOwner, "svc-a")
+	return map[string]string{"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner}, workRoot, artifact
+}
+
+// writeOrigin gives a checkout the git config of a clone of <owner>/<repo> — the fact the wrapper
+// reads (as text, never by running git) to decide whose repository it is being handed.
+func writeOrigin(t *testing.T, checkout, owner, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	conf := "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/" +
+		owner + "/" + repo + ".git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+	if err := os.WriteFile(filepath.Join(checkout, ".git", "config"), []byte(conf), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ─── devlab-install --check: the validation cascade without root ─────────────

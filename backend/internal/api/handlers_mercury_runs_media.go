@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
 	"mime"
 	"net/http"
 	"path"
@@ -81,11 +83,22 @@ func resolveMIME(name string, data []byte) string {
 	return http.DetectContentType(data)
 }
 
-// recomposeTodoPrompt refreshes a todo's stored prompt snapshot from its task + current
-// attachments so the prompt preview stays truthful after an attachment change (REQ-003:
-// every write path recomposes; the todo branch of the ONE composition path).
-func recomposeTodoPrompt(run *runs.Run) {
-	runs.ComposeInto(run, runs.Catalog{})
+// composeCatalog reads the constitution for a recompose that is NOT itself a constitution write:
+// an attachment change refreshes the todo's prompt through the ONE composition path (REQ-003), and
+// that prompt carries the constitution in full wording (REQ-002.1).
+//
+// A read failure does not fail the media write — attaching a file may not hinge on the axiom store.
+// Reads are served from the local clone and survive a network blip, so a failure here means the
+// store is genuinely unavailable (unconfigured, or no clone): the unscanned catalog then makes the
+// composed prompt NAME the missing wording instead of presenting an empty constitution, the reason
+// is logged, and the next constitution write recomposes in full (runs.RecomposeDrifted).
+func (s *Server) composeCatalog(ctx context.Context, cookie string) runs.Catalog {
+	cat, _, err := s.runCatalog(ctx, cookie)
+	if err != nil {
+		log.Printf("devlabd: prompt recomposed without the constitution (the gap is named in the prompt): %v", err)
+		return runs.Catalog{}
+	}
+	return cat
 }
 
 // runAttachmentUpload attaches one uploaded medium (base64 in the JSON body) to a ToDo: it stores the
@@ -121,6 +134,10 @@ func (s *Server) runAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "File too large (max. 25 MiB)")
 		return
 	}
+
+	// Read the constitution BEFORE any byte is written: the recompose below folds it into the
+	// todo's prompt (REQ-002.1).
+	cat := s.composeCatalog(r.Context(), r.Header.Get("Cookie"))
 
 	att := runs.AttachmentRef{
 		ID:         runs.NewAttachmentID(),
@@ -175,7 +192,7 @@ func (s *Server) runAttachmentUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		cur[idx].Attachments = append(cur[idx].Attachments, att)
 		cur[idx].Authorship.UpdatedAt = now
-		recomposeTodoPrompt(&cur[idx])
+		runs.ComposeInto(&cur[idx], cat)
 		updated = cur[idx]
 		return cur, nil
 	}); perr != nil {
@@ -256,6 +273,7 @@ func (s *Server) runAttachmentDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, aid := r.PathValue("id"), r.PathValue("aid")
+	cat := s.composeCatalog(r.Context(), r.Header.Get("Cookie")) // as in the upload: the prompt carries the wording
 	now := time.Now().UTC()
 	var updated runs.Run
 	if _, perr := s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) {
@@ -277,7 +295,7 @@ func (s *Server) runAttachmentDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		cur[idx].Attachments = next
 		cur[idx].Authorship.UpdatedAt = now
-		recomposeTodoPrompt(&cur[idx])
+		runs.ComposeInto(&cur[idx], cat)
 		updated = cur[idx]
 		return cur, nil
 	}); perr != nil {

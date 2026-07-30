@@ -141,9 +141,11 @@ func (d *ChainDeps) fullName(ctx context.Context, repo string) (string, error) {
 	}
 	full, ok := d.s.resolveRunnerRepo(ctx, d.token, repo)
 	if !ok {
-		owner := discover.Owner()
-		if owner == "" {
-			return "", fmt.Errorf("repository %q is unknown and no instance owner is configured", repo)
+		owner, err := discover.Owner()
+		if err != nil {
+			// The NAMED error, wrapped: a caller — and a test — tells "no namespace configured"
+			// apart from "this repository does not exist" without matching on message text.
+			return "", fmt.Errorf("repository %q is unknown and no instance owner is configured: %w", repo, err)
 		}
 		full = owner + "/" + repo
 	}

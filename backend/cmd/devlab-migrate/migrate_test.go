@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/executor"
+	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/preflight"
 	"devlab/backend/internal/runs"
@@ -496,13 +497,29 @@ func TestOpenTaskCarriesTheComposedPromptTheAgentReceives(t *testing.T) {
 	if strings.TrimSpace(todo.PromptSnapshot) == "" {
 		t.Fatal("the imported task carries no prompt snapshot — its execution would run the bare preamble")
 	}
-	if todo.PromptInputHash != "" {
-		t.Errorf("a task's snapshot has no axiom inputs, so it carries no input hash: %q", todo.PromptInputHash)
+	if todo.PromptInputHash == "" {
+		t.Error("the snapshot must carry its input fingerprint, or no constitution write could tell it drifted")
 	}
 	for _, want := range []string{todo.Title, "Switch the imports and prove the check passes."} {
 		if !strings.Contains(todo.PromptSnapshot, want) {
 			t.Errorf("the composed snapshot does not carry %q:\n%s", want, todo.PromptSnapshot)
 		}
+	}
+	// The import runs OFFLINE, so the constitution wording cannot be read here. That gap is NAMED in
+	// the prompt rather than presented as an empty constitution (REQ-002.1 honesty), and the
+	// fingerprint records "not read" — so the first constitution write recomposes the task in full.
+	if !strings.Contains(todo.PromptSnapshot, "nicht gelesen") {
+		t.Errorf("an offline import must name the missing constitution wording:\n%s", todo.PromptSnapshot)
+	}
+	withWording := todo
+	runs.ComposeInto(&withWording, runs.Catalog{ByID: map[string]mercury.RunAxiom{
+		"ax_1": {ID: "ax_1", Titel: "Minimalism", Body: "Keep it small."},
+	}})
+	if withWording.PromptInputHash == todo.PromptInputHash {
+		t.Error("the fingerprint must tell 'constitution not read' apart from 'constitution read'")
+	}
+	if !strings.Contains(withWording.PromptSnapshot, "Keep it small.") {
+		t.Errorf("recomposing with the constitution must fold in the wording:\n%s", withWording.PromptSnapshot)
 	}
 	full := executor.AssemblePrompt(todo.PromptSnapshot, preflight.Finding{State: model.TaskNotImplemented}, "")
 	if !strings.Contains(full, "Switch the imports and prove the check passes.") {

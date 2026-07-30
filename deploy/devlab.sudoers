@@ -7,6 +7,13 @@
 #    can never become root or an unrelated account. The GitHub token is passed via
 #    DEVLAB_GH_TOKEN (never argv) — env_keep lets it (and GIT_TERMINAL_PROMPT) survive sudo's
 #    env reset.
+#    NOTHING ELSE MAY JOIN THIS LIST. devlab-exec confines every path to
+#    <state root>/workspaces/<user> and resolves that root from DEVLAB_STATE_DIR /
+#    DEVLAB_WORKSPACES with the template's defaults. Keeping either variable would let the calling
+#    service pick the boundary it is measured against — that is, hand it every user's files. The
+#    same holds for the install wrapper's seams (DEVLAB_SYSTEMCTL, DEVLAB_GH_OWNER,
+#    DEVLAB_GH_OWNER_FILE): they exist for direct invocation in tests, and it is sudo's env_reset
+#    that makes them harmless in production.
 Defaults!/usr/local/sbin/devlab-exec env_keep += "DEVLAB_GH_TOKEN GIT_TERMINAL_PROMPT"
 devlab ALL=(%hp_devlab_access) NOPASSWD: /usr/local/sbin/devlab-exec
 

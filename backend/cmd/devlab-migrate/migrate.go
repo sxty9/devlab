@@ -326,8 +326,11 @@ func (m *migrator) planOpenTodo(p *plan, e exportRun, haveID map[string]bool) {
 		Attachments: e.attachments(),
 		Authorship:  auth,
 	}
-	// The todo branch of the one composition path needs no catalog: a task's snapshot is its own
-	// task base — the constitution reaches the agent through the repository's own CLAUDE.md.
+	// Composed through the ONE path with an UNSCANNED catalog: this import runs offline, without the
+	// constitution store (no session, no token, possibly no clone). A prompt carries the constitution
+	// in full wording (REQ-002.1), so the snapshot composed here NAMES the missing wording instead of
+	// pretending the constitution is empty — and because its input fingerprint records "corpus not
+	// read", the first constitution write recomposes the task in full (runs.RecomposeDrifted).
 	runs.ComposeInto(&todo, runs.Catalog{})
 	p.openTodos = append(p.openTodos, todo)
 	haveID[e.ID] = true

@@ -45,6 +45,16 @@ var (
 	ErrNotAService   = errors.New("deploy: not a service — nothing to deliver")
 	ErrTemplateRepo  = errors.New("deploy: the pristine service template is never delivered")
 	ErrNonconforming = errors.New("deploy: repo does not conform to the shared service structure (Code-Struktur violation) — no special path exists")
+
+	// ErrIDMismatch names the split the install wrapper itself cannot see. The wrapper derives the
+	// unit, the service account, the route and the binary name from the repository name it is handed,
+	// while the port ledger and the running gate key on the DETECTED service id. When the two
+	// disagree, ONE setup call would create a unit under one name and prove it under another: the
+	// port is reserved for the id, the unit and the route are built for the repository name, and the
+	// gate then probes a foreign or absent unit — a green delivery over a service that is not there,
+	// or a second unit shadowing an existing one. There is nothing to guess between two keys, so the
+	// divergence is refused BEFORE any install.
+	ErrIDMismatch = errors.New("deploy: repository name and detected service id disagree — the install takes ONE key")
 )
 
 // DeliverDev delivers a FOREIGN repo to dev: ONE generic install-only path through the pinned
@@ -68,26 +78,36 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 		return Outcome{}, fmt.Errorf("deploy: unknown detection kind %q", d.Kind)
 	}
 
+	// ONE key for the whole setup: port reservation, wrapper install and running proof must all
+	// name the same service, so a divergence between the repository name and the detected id is a
+	// named refusal before any effect (ErrIDMismatch). What follows uses `key` exclusively.
+	if d.ID != repo {
+		return Outcome{Detail: fmt.Sprintf("repository %q, detected service id %q (%s)", repo, d.ID, d.Evidence)},
+			fmt.Errorf("%w: repository %q vs service id %q — rename the repository or its rights manifest so both name the service",
+				ErrIDMismatch, repo, d.ID)
+	}
+	key := d.ID
+
 	desired := 0
 	if d.Decl != nil {
 		desired = d.Decl.Port
 	}
-	port, _, err := ports.PortFor(ctx, d.ID, desired)
+	port, _, err := ports.PortFor(ctx, key, desired)
 	if err != nil {
 		// An occupied desired port is REJECTED before any install: the error names the holder
 		// and proposes a free port (REQ-044.2). No wrapper call happens.
 		return Outcome{Detail: err.Error()}, err
 	}
 
-	if err := ri.Install(ctx, repo, artifactDir, "dev", port, false); err != nil {
-		return Outcome{Port: port, Detail: err.Error()}, fmt.Errorf("deploy: install of %s failed: %w", repo, err)
+	if err := ri.Install(ctx, key, artifactDir, "dev", port, false); err != nil {
+		return Outcome{Port: port, Detail: err.Error()}, fmt.Errorf("deploy: install of %s failed: %w", key, err)
 	}
 
 	// The honest gate (F10): "installed and started" only when the unit is ACTIVE and the port
 	// is HELD — otherwise the setup FAILED, never green by default (REQ-044.3, K-4).
-	if err := gate.VerifyRunning(ctx, d.ID, port); err != nil {
+	if err := gate.VerifyRunning(ctx, key, port); err != nil {
 		return Outcome{Installed: true, Port: port,
-			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", repo, err)
+			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", key, err)
 	}
 	return Outcome{Installed: true, Running: true, Port: port,
 		Detail: "installed and started (active, holding :" + strconv.Itoa(port) + ")"}, nil

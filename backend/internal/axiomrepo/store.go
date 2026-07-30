@@ -105,6 +105,33 @@ func (s *Store) Dir() string { return s.dir }
 // FullName is the owner/repo this store is backed by.
 func (s *Store) FullName() string { return s.fullName }
 
+// tokenEnvVar carries the credential to git IN THE PROCESS ENVIRONMENT. /proc/<pid>/cmdline is
+// world-readable — a token on argv is visible to every local account through a plain `ps auxww` for
+// as long as the command runs — while /proc/<pid>/environ is readable by its owner alone. The
+// variable and the helper below are the SAME ones the per-user git primitives use
+// (workspace.credHelperArgs), so a token reaches git in exactly one way across the service.
+const tokenEnvVar = "DEVLAB_GH_TOKEN"
+
+// credentialArgs are the TOKENLESS arguments that point git at our inline credential helper; the
+// helper reads the secret out of the environment, so nothing secret is ever an argument. The empty
+// first assignment resets any inherited system/global helper, so no foreign helper can answer.
+func credentialArgs() []string {
+	return []string{
+		"-c", "credential.helper=",
+		"-c", `credential.helper=!f() { printf 'username=x-access-token\npassword=%s\n' "$` + tokenEnvVar + `"; }; f`,
+	}
+}
+
+// gitEnv is the environment of one git invocation: the terminal prompt is off (a missing credential
+// must fail, never block) and the token — when there is one — travels here, never on argv.
+func gitEnv(token string) []string {
+	env := append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	if token != "" {
+		env = append(env, tokenEnvVar+"="+token)
+	}
+	return env
+}
+
 // git runs one git command in the clone, with credentials injected per invocation rather than written
 // into the remote URL — a token must never end up in .git/config, where every later log would leak it.
 func (s *Store) git(ctx context.Context, args ...string) (string, error) {
@@ -116,11 +143,10 @@ func (s *Store) git(ctx context.Context, args ...string) (string, error) {
 			return "", err
 		}
 		token = t
-		full = append(full, "-c", "credential.helper=",
-			"-c", "http.https://github.com/.extraheader=Authorization: Basic "+basicAuth(token))
+		full = append(full, credentialArgs()...)
 	}
 	cmd := exec.CommandContext(ctx, "git", append(full, args...)...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = gitEnv(token)
 	var out, errb strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
@@ -176,13 +202,12 @@ func (s *Store) clone(ctx context.Context) error {
 			return err
 		}
 		token = t
-		args = append(args, "-c", "credential.helper=",
-			"-c", "http.https://github.com/.extraheader=Authorization: Basic "+basicAuth(token))
+		args = append(args, credentialArgs()...)
 		url = "https://github.com/" + s.fullName + ".git"
 	}
 	args = append(args, "clone", "--quiet", url, s.dir)
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = gitEnv(token)
 	var errb strings.Builder
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
@@ -257,7 +282,11 @@ func (s *Store) Get(ctx context.Context, path string) ([]byte, bool, error) {
 	if err := s.ensure(ctx, false); err != nil {
 		return nil, false, err
 	}
-	b, err := os.ReadFile(filepath.Join(s.dir, filepath.FromSlash(path)))
+	abs, err := s.resolveInClone(path)
+	if err != nil {
+		return nil, false, err
+	}
+	b, err := os.ReadFile(abs)
 	if os.IsNotExist(err) {
 		return nil, false, nil
 	}
@@ -277,7 +306,10 @@ func (s *Store) Put(ctx context.Context, path, content, message, actor string, o
 		return err
 	}
 	return s.write(ctx, message, actor, func() error {
-		abs := filepath.Join(s.dir, filepath.FromSlash(path))
+		abs, err := s.resolveInClone(path)
+		if err != nil {
+			return err
+		}
 		if !overwrite {
 			if _, err := os.Stat(abs); err == nil {
 				return ErrExists
@@ -299,7 +331,10 @@ func (s *Store) Delete(ctx context.Context, path, message, actor string) error {
 		return err
 	}
 	return s.write(ctx, message, actor, func() error {
-		abs := filepath.Join(s.dir, filepath.FromSlash(path))
+		abs, err := s.resolveInClone(path)
+		if err != nil {
+			return err
+		}
 		if _, err := os.Stat(abs); os.IsNotExist(err) {
 			return ErrNotFound
 		}
@@ -320,8 +355,14 @@ func (s *Store) Move(ctx context.Context, from, to, message, actor string) error
 		return err
 	}
 	return s.write(ctx, message, actor, func() error {
-		src := filepath.Join(s.dir, filepath.FromSlash(from))
-		dst := filepath.Join(s.dir, filepath.FromSlash(to))
+		src, err := s.resolveInClone(from)
+		if err != nil {
+			return err
+		}
+		dst, err := s.resolveInClone(to)
+		if err != nil {
+			return err
+		}
 		if _, err := os.Stat(src); os.IsNotExist(err) {
 			return ErrNotFound
 		}
@@ -380,12 +421,58 @@ func (s *Store) write(ctx context.Context, message, actor string, apply func() e
 	return fmt.Errorf("push rejected after %d attempts (constitution repository under heavy contention)", maxWriteAttempts)
 }
 
-// safePath rejects anything that could escape the repository or hit its git directory.
+// safePath rejects anything that could escape the repository or hit its git directory. It is a pure
+// STRING check and therefore only the first half of the confinement: it cannot see a symlink, so
+// every access resolves the path as well (resolveInClone).
 func safePath(p string) error {
 	if p == "" || strings.HasPrefix(p, "/") || strings.Contains(p, "..") || strings.HasPrefix(p, ".git") {
 		return fmt.Errorf("invalid path %q", p)
 	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".git" {
+			return fmt.Errorf("invalid path %q", p)
+		}
+	}
 	return nil
+}
+
+// resolveInClone turns a record path into the absolute path to operate on, and confines it under the
+// clone by RESOLVING it — the string check above cannot: the repository's own content may carry a
+// symlink (`axiome/x -> /etc`), and reading or writing through it leaves the constitution entirely.
+// Like the root wrappers, the deepest EXISTING ancestor is resolved (so a record that does not exist
+// yet is confined through its parent) and required to stay inside the clone. Callers hold the lock
+// and call this AFTER the refresh, because a refresh can re-materialise such a link.
+func (s *Store) resolveInClone(rel string) (string, error) {
+	if err := safePath(rel); err != nil {
+		return "", err
+	}
+	root, err := filepath.EvalSymlinks(s.dir)
+	if err != nil {
+		return "", fmt.Errorf("constitution clone unusable: %w", err)
+	}
+	abs := filepath.Join(s.dir, filepath.FromSlash(rel))
+	for probe := abs; ; {
+		real, err := filepath.EvalSymlinks(probe)
+		if err == nil {
+			if real != root && !strings.HasPrefix(real, root+string(os.PathSeparator)) {
+				return "", fmt.Errorf("invalid path %q: it resolves to %q, outside the constitution repository", rel, real)
+			}
+			return abs, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		// A DANGLING symlink fails to resolve too. Walking past it would let the access land at the
+		// link's target the moment that target appears, so it is refused rather than followed.
+		if fi, lerr := os.Lstat(probe); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("invalid path %q: %q is a symlink that does not resolve inside the constitution repository", rel, probe)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe || len(parent) < len(s.dir) {
+			return "", fmt.Errorf("invalid path %q: no existing ancestor inside the constitution repository", rel)
+		}
+		probe = parent
+	}
 }
 
 func basicAuth(token string) string {

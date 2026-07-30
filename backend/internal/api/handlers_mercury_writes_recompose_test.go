@@ -95,6 +95,73 @@ func postJSON(t *testing.T, h http.HandlerFunc, method, target, body string) *ht
 	return w
 }
 
+// REQ-002.1 end-to-end over the REAL store: the prompt of BOTH kinds carries the constitution in
+// full wording — the axioms AND the Implementierungsregeln. This is the path the blocker ran
+// through: the store scan has to read regeln/ at all, and a ToDo has to be recomposed by a
+// constitution write just like an automatic run, because a repository's CLAUDE.md carries only the
+// reference text now.
+func TestBothPromptKindsCarryAxiomsAndImplementationRules(t *testing.T) {
+	f := newWritesFixture(t)
+	s := f.s
+
+	// A ToDo joins the pool, composed against the same seeded store the fixture used.
+	cat, _, err := s.runCatalog(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	todo := runs.Run{ID: "run_t", Kind: model.KindTodo, Title: "Fix login", Task: "Repair the reload bug."}
+	runs.ComposeInto(&todo, cat)
+	if _, err := s.runs.Patch(func(cur []runs.Run) ([]runs.Run, error) { return append(cur, todo), nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(todo.PromptSnapshot, "Stay minimal.") {
+		t.Fatalf("a todo prompt must carry the axiom wording:\n%s", todo.PromptSnapshot)
+	}
+	if strings.Contains(todo.PromptSnapshot, "CLAUDE.md") {
+		t.Errorf("a todo prompt must not defer the wording to a repository file:\n%s", todo.PromptSnapshot)
+	}
+
+	// Write an Implementierungsregel through the real handler; the same request must recompose both.
+	postJSON(t, s.addAxiom, http.MethodPost, "/api/mercury/axiom",
+		`{"titel":"Ask first","body":"Ask before you guess.","section":"regeln"}`)
+
+	all, err := s.runs.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("both runs must still be in the pool, got %d", len(all))
+	}
+	for _, r := range all {
+		if !strings.Contains(r.PromptSnapshot, "Stay minimal.") {
+			t.Errorf("%s (%s) lost the axiom wording:\n%s", r.ID, r.Kind, r.PromptSnapshot)
+		}
+		if sec := sectionAt(r.PromptSnapshot, "Ask before you guess."); sec != "Verfassung — Implementierungsregeln" {
+			t.Errorf("%s (%s) does not carry the implementation rule in its own section (got %q):\n%s",
+				r.ID, r.Kind, sec, r.PromptSnapshot)
+		}
+	}
+}
+
+// sectionAt names the "## " heading a piece of prompt text sits under. Presence alone no longer
+// tells a move apart from a no-op: every prompt carries the whole constitution, so a re-filed record
+// moves between sections instead of appearing or disappearing.
+func sectionAt(prompt, needle string) string {
+	i := strings.Index(prompt, needle)
+	if i < 0 {
+		return "(absent)"
+	}
+	j := strings.LastIndex(prompt[:i], "\n## ")
+	if j < 0 {
+		return "(no heading)"
+	}
+	head := prompt[j+len("\n## "):]
+	if k := strings.IndexByte(head, '\n'); k >= 0 {
+		head = head[:k]
+	}
+	return head
+}
+
 func TestEveryWriteKindRecomposesAndOpensNoPR(t *testing.T) {
 	f := newWritesFixture(t)
 	s := f.s
@@ -140,20 +207,25 @@ func TestEveryWriteKindRecomposesAndOpensNoPR(t *testing.T) {
 		t.Error("a pure rename must change the composed input hash")
 	}
 
-	// (4) MOVE — re-filing the parked rule OUT of laeufe/ removes it from every composition.
+	// (4) MOVE — re-filing the parked rule OUT of laeufe/ recomposes. The wording does NOT vanish:
+	// every prompt carries the whole constitution (REQ-002.1), so a re-filed record changes SECTION,
+	// from the run rules into the axioms. The section is what proves the move reached composition.
 	postJSON(t, s.moveAxiom, http.MethodPost, "/api/mercury/move",
 		`{"from":"laeufe/unsortiert/honest-delivery.md","to":"axiome/imported/honest-delivery.md"}`)
 	afterMove := f.run1(t)
-	if strings.Contains(afterMove.PromptSnapshot, "Ship honestly.") {
-		t.Errorf("move must recompose — the re-filed record no longer folds in:\n%s", afterMove.PromptSnapshot)
+	if got := sectionAt(afterMove.PromptSnapshot, "Ship honestly."); got != "Verfassung — Axiome" {
+		t.Errorf("move must recompose — the re-filed record sits under %q:\n%s", got, afterMove.PromptSnapshot)
+	}
+	if afterMove.PromptInputHash == afterRename.PromptInputHash {
+		t.Error("a move must change the composed input hash")
 	}
 
-	// (5) MOVE CATEGORY — the whole category returns under laeufe/, so the rule folds in again.
+	// (5) MOVE CATEGORY — the whole category returns under laeufe/, so the record is a run rule again.
 	postJSON(t, s.moveCategory, http.MethodPost, "/api/mercury/move-category",
 		`{"from":"axiome/imported","to":"laeufe/imported"}`)
 	afterMoveCat := f.run1(t)
-	if !strings.Contains(afterMoveCat.PromptSnapshot, "Ship honestly.") {
-		t.Errorf("move-category must recompose:\n%s", afterMoveCat.PromptSnapshot)
+	if got := sectionAt(afterMoveCat.PromptSnapshot, "Ship honestly."); got != "Laufregeln (gelten für den gesamten Lauf)" {
+		t.Errorf("move-category must recompose — the record sits under %q:\n%s", got, afterMoveCat.PromptSnapshot)
 	}
 
 	// (6) DELETE — removing the rule recomposes it away.

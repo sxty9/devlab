@@ -12,29 +12,64 @@ through it end to end. The bracketed id is the acceptance line the item belongs 
 
 ---
 
-## Status per acceptance line (Welle 3, integration)
+## Status per acceptance line
 
 The wording of every line lives in `spec/ABNAHME.md` — it is not repeated here. What this table adds
-is the STATE of each line after the integration wave, in exactly three kinds:
+is the STATE of each line, in exactly four kinds:
 
 - **Grep green** — the audit check(s) of `tools/abnahme.sh` that carry this line pass. The check ids
-  are named, so a failure points at the exact check.
+  are named, so a failure points at the exact check. Those ids are not decoration: check `doc-a` of
+  the same script asserts that every id named here EXISTS, so this table cannot cite a check nobody
+  runs.
 - **Test green** — the line's automated test(s) pass (`go test ./...` including `backend/it`,
   `node --test`). "via the referenced line" means the matrix itself points at another line's tests.
+- **E2E open** — the matrix names an END-TO-END walk-through as this line's own kind of proof: a
+  person clicking the whole path at the running instance. Nothing in this repository can discharge
+  it — no grep, no unit or integration test — so it stays open until it has been walked, and a line
+  that names E2E is never reported as finished on the strength of its unit tests alone.
 - **Visual inspection open** — the line additionally demands a look, a measurement or a review at
   the running instance. Those are the items of THIS document; a line marked "not itemised" is
   covered by a section here without naming the id, so read the section it belongs to.
 
-A line with several kinds needs all of them. Automated state as of the integration wave:
-`tools/abnahme.sh --tests` = 57 checks, 0 failing; `gofmt -l`, `go build ./...`, `go vet ./...` and
-`go test ./...` (including `backend/it`, also under `-race`) green; `npx tsc --noEmit`, `node --test`
-(163 tests) and `npm run build` green.
+A line with several kinds needs all of them.
+
+Fourteen lines name E2E in the matrix: REQ-007, REQ-012, REQ-035, REQ-036, B-25, B-27, B-28, B-31,
+B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open** below. Three of them (B-27,
+B-40, REQ-035) previously read "Test green" and nothing else — an acceptance claim wider than the
+evidence, which is the one thing this document may never make.
+
+### How the automated half is established
+
+The procedure, not a snapshot: a count ages with the next commit, so what stands here are the
+commands and the rule each must satisfy. Run them in the repository root.
+
+| # | Command | The rule |
+|---|---|---|
+| 1 | `bash tools/abnahme.sh --tests` | the last line reads `N passed, 0 failed`. N is however many checks the matrix currently carries — the count is not the criterion, the ZERO is |
+| 2 | `gofmt -l backend` | prints nothing |
+| 3 | `cd backend && go build ./... && go vet ./...` | both silent |
+| 4 | `cd backend && go test ./... -count=1`, once more with `-race` | every package `ok` |
+| 5 | `npx tsc -p tsconfig.json --noEmit` | prints nothing |
+| 6 | `npm test` | `fail 0`, and `pass` equals `tests` |
+| 7 | `npm run build` | exits 0 |
+
+Record the reading when an inspection is performed. The commit it was taken at is what makes a row
+re-checkable — and a row is a MEASUREMENT of that commit, never a promise about the working tree: if
+tree and row disagree, the tree is right and the row is stale.
+
+| Taken at | 1 acceptance | 4 go test | 6 node --test | 2 · 3 · 5 · 7 |
+|---|---|---|---|---|
+| repair wave 2, 2026-07-30 | 69 passed, 0 failed | whole suite ok (`go test ./... -count=1`) | 183 tests, 0 fail | 2 · 3 · 5 silent; 7 (`npm run build`) NOT run in this wave |
+
+The row states what was actually run, and nothing further: an unrun command is recorded as unrun,
+never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
+edits rather than the delivered state, so the closing row belongs to whoever closes the wave.
 
 ### §1 — the six construction faults (K-1 … K-6)
 
 | Line | Status |
 |---|---|
-| K-1 | Grep green (K-1a, K-1b) · Test green |
+| K-1 | Grep green (K-1a, K-1b, K-1c) · Test green |
 | K-2 | Grep green (K-2, K-2b) · Test green · Visual inspection open (measurement) |
 | K-3 | Test green |
 | K-4 | Test green · Visual inspection open (visual) |
@@ -51,12 +86,12 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | REQ-004 | Grep green (REQ-004) · Test green · Visual inspection open (visual) |
 | REQ-005 | Test green · Visual inspection open (visual) |
 | REQ-006 | Test green |
-| REQ-007 | Test green · Visual inspection open (visual) |
+| REQ-007 | Test green · E2E open (paste at every upload point) |
 | REQ-008 | Test green |
 | REQ-009 | Test green · Visual inspection open (visual) |
 | REQ-010 | Grep green (REQ-010) · Test green · Visual inspection open (visual) |
 | REQ-011 | Test green |
-| REQ-012 | Grep green (REQ-012) · Test green · Visual inspection open (visual) |
+| REQ-012 | Grep green (REQ-012a, REQ-012b, REQ-012c, REQ-012d) · Test green · E2E open (both directions, and the shared detail) |
 | REQ-013 | Grep green (REQ-013) · Test green |
 | REQ-014 | Test green |
 | REQ-015 | Grep green (REQ-015a, REQ-015b) · Test green · Visual inspection open (visual) |
@@ -79,8 +114,8 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | REQ-032 | Test green |
 | REQ-033 | Test green · Visual inspection open (visual) |
 | REQ-034 | Grep green (REQ-034a, REQ-034b) · Test green · Visual inspection open (visual/measurement) |
-| REQ-035 | Test green |
-| REQ-036 | Test green · Visual inspection open (visual) |
+| REQ-035 | Test green (the structural half: `src/reload.test.ts`) · E2E open (reload in every main view) |
+| REQ-036 | Test green · Visual inspection open (visual) · E2E open (live transcript during a real run) |
 | REQ-037 | Test green |
 | REQ-038 | Visual inspection open (visual) |
 | REQ-039 | Grep green (REQ-039a, REQ-039b) · Test green |
@@ -118,27 +153,27 @@ A line with several kinds needs all of them. Automated state as of the integrati
 | B-22 | Grep green (B-22) · Test green |
 | B-23 | Test green · Visual inspection open (review) |
 | B-24 | Visual inspection open (visual/review) |
-| B-25 | Test green |
+| B-25 | Test green · E2E open (the boot gates, login → link → app) |
 | B-26 | Test green (via the referenced line) |
-| B-27 | Test green |
-| B-28 | Test green · Visual inspection open (visual/review) |
+| B-27 | Test green · E2E open (view change and back: drafts, terminal, AI session) |
+| B-28 | Test green · Visual inspection open (visual/review) · E2E open (the gates) |
 | B-29 | Test green · Visual inspection open (visual) |
 | B-30 | Visual inspection open (visual) |
-| B-31 | Test green · Visual inspection open (review) |
-| B-32 | Test green · Visual inspection open (review) |
-| B-33 | Test green |
-| B-34 | Test green |
-| B-35 | Grep green (B-35) |
+| B-31 | Test green · Visual inspection open (review) · E2E open (every tree operation) |
+| B-32 | Test green · Visual inspection open (review) · E2E open (per capability) |
+| B-33 | Test green · E2E open (per capability) |
+| B-34 | Test green · E2E open (both surfaces use the one kit; live follow during a real run) |
+| B-35 | Grep green (B-35, B-35b) |
 | B-36 | Visual inspection open (visual/measurement) |
-| B-37 | Test green · Visual inspection open (review) |
+| B-37 | Test green · Visual inspection open (review) · E2E open (proposal → application → visible change) |
 | B-38 | Visual inspection open (visual, not itemised) |
-| B-39 | Test green · Visual inspection open (review) |
-| B-40 | Test green |
+| B-39 | Test green · Visual inspection open (review) · E2E open (edit, save, diff, vision, comments) |
+| B-40 | Test green · E2E open (per panel) |
 | B-41 | Grep green (B-41a, B-41b) · Visual inspection open (review, not itemised) |
 | B-42 | Visual inspection open (visual) |
 | B-43 | Grep green (B-43) · Test green · Visual inspection open (visual) |
 | B-44 | Grep green (B-44) · Test green (via the referenced line) · Visual inspection open (review) |
-| B-45 | Grep green (B-45, B-45b) · Test green · Visual inspection open (visual) |
+| B-45 | Grep green (B-45, B-45b, B-45c) · Test green · Visual inspection open (visual) |
 
 ## 0. Before the first look
 
@@ -331,15 +366,15 @@ A line with several kinds needs all of them. Automated state as of the integrati
 |---|---|---|---|
 | 0 Before the first look | 3 | | |
 | 1 Boot, gates and shell | 6 | | |
-| 2 The IDE | 8 | | |
+| 2 The IDE | 9 | | |
 | 3 The constitution | 5 | | |
 | 4 Tasks and runs | 7 | | |
-| 5 Execution and delivery | 16 | | |
+| 5 Execution and delivery | 18 | | |
 | 6 The calendar | 3 | | |
 | 7 Live updates | 5 | | |
 | 8 Reporting and notices | 5 | | |
 | 9 Landscape and ports | 4 | | |
-| 10 Operation, deploy and restart | 8 | | |
+| 10 Operation, deploy and restart | 9 | | |
 | 11 Reload and state preservation | 3 | | |
 | 12 Consistency of the kit | 2 | | |
 
