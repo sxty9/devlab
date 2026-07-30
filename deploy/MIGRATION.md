@@ -737,6 +737,7 @@ if tree and row disagree, the tree is right and the row is stale.
 | Commit (`git rev-parse --short HEAD`) | 1 acceptance | 4 go test | 6 node --test | 2 · 3 · 5 · 7 |
 |---|---|---|---|---|
 | c98d4a9 | 67 passed, 0 failed | whole suite ok (`go test ./... -count=1`) | 183 tests, 0 fail | 2 · 3 · 5 silent; 7 (`npm run build`) NOT run |
+| 74057f1 | 74 passed, 0 failed (76 with `--tests`) | whole suite ok incl. `-race` (`go test ./... -count=1`, 32 packages) | 185 tests, 0 fail | 2 · 3 · 5 · 7 all green (`tsc --noEmit`, `npm test`, `npm run build`, `assemble-migration --check`) |
 
 The row states what was actually run, and nothing further: an unrun command is recorded as unrun,
 never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
