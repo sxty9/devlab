@@ -1,8 +1,10 @@
 // Tests of the delivery ledger's presentation logic (F12, REQ-024/025/040.2): grouping, ordering
 // (including records without a usable time), the server-stated lifecycle badge, what may still be
-// rolled back, and the three sentences a dangerous action owes its caller.
+// rolled back, and the three sentences a dangerous action owes its caller. Plus the two rules of the
+// view that are decided by its source: which repositories get a section, and what it may claim.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   DELIVERY_STAGE,
   canRollback,
@@ -10,6 +12,8 @@ import {
   deliveryAt,
   deliveryBadge,
   groupDeliveriesByRepo,
+  isOpenDelivery,
+  openDeliveryExecutionIds,
   resetConfirmation,
   rollbackConfirmation,
   shortSha,
@@ -68,21 +72,58 @@ test('the ledger groups per repository, repos led by their most recent delivery'
   assert.deepEqual(groups.find((g) => g.repo === 'o/one')!.deliveries.map((d) => d.id), ['c', 'a']);
 });
 
-test('devServes names the newest OPEN delivery — what dev carries beyond the default branch', () => {
+test('latestOpen names the newest delivery the LEDGER still holds open', () => {
   const [g] = groupDeliveriesByRepo([
     dlv({ id: 'a', repo: 'o/one', stage: 'open', createdAt: '2026-07-01T00:00:00Z' }),
     dlv({ id: 'b', repo: 'o/one', stage: 'open', createdAt: '2026-07-02T00:00:00Z' }),
     dlv({ id: 'c', repo: 'o/one', stage: 'merged', createdAt: '2026-07-03T00:00:00Z' }),
   ]);
-  assert.equal(g.devServes?.id, 'b'); // the newest OPEN one, not the newer merged one
+  assert.equal(g.latestOpen?.id, 'b'); // the newest OPEN one, not the newer merged one
   assert.equal(g.openCount, 2);
 
   const [settled] = groupDeliveriesByRepo([
     dlv({ id: 'a', repo: 'o/one', stage: 'merged', createdAt: '2026-07-01T00:00:00Z' }),
     dlv({ id: 'b', repo: 'o/one', stage: 'reverted', createdAt: '2026-07-02T00:00:00Z' }),
   ]);
-  assert.equal(settled.devServes, null); // dev equals the default branch
+  // Nothing is open — which says the LEDGER is settled, never what the dev branch happens to carry.
+  assert.equal(settled.latestOpen, null);
   assert.equal(settled.openCount, 0);
+});
+
+test('EVERY managed repository gets a section, delivered to or not (its dev reset lives there)', () => {
+  const groups = groupDeliveriesByRepo(
+    [dlv({ id: 'a', repo: 'o/one', stage: 'open', createdAt: '2026-07-01T00:00:00Z' })],
+    ['o/one', 'o/untouched', 'o/also-untouched'],
+  );
+  // A repository the ledger never named must still be present — committed but undelivered work
+  // leaves no row, and that is exactly the repository whose dev state may need the reset.
+  assert.deepEqual(groups.map((g) => g.repo), ['o/one', 'o/also-untouched', 'o/untouched']);
+  const untouched = groups.find((g) => g.repo === 'o/untouched')!;
+  assert.deepEqual(untouched.deliveries, []);
+  assert.equal(untouched.latestOpen, null);
+  assert.equal(untouched.openCount, 0);
+  assert.equal(untouched.latestAt, 0);
+  // The ledger's own repositories are never lost, even when they are not in the handed-in set.
+  const onlyLedger = groupDeliveriesByRepo([dlv({ id: 'a', repo: 'o/gone', createdAt: '2026-07-01T00:00:00Z' })], ['o/one']);
+  assert.deepEqual(onlyLedger.map((g) => g.repo).sort(), ['o/gone', 'o/one']);
+  // A nameless entry yields no section — there would be nothing to act on.
+  assert.deepEqual(groupDeliveriesByRepo([], ['', 'o/one']).map((g) => g.repo), ['o/one']);
+});
+
+test('openness is the SERVER-stated stage, and it names the executions still holding one (B-8)', () => {
+  assert.equal(isOpenDelivery({ stage: 'open' }), true);
+  for (const stage of ['merged', 'closed', 'reverted', '', undefined]) {
+    assert.equal(isOpenDelivery({ stage }), false, `stage ${String(stage)} is settled`);
+  }
+  const ids = openDeliveryExecutionIds([
+    dlv({ id: 'a', repo: 'o/one', stage: 'open', createdAt: '2026-07-01T00:00:00Z', executionId: 'exec_open' }),
+    dlv({ id: 'b', repo: 'o/one', stage: 'merged', createdAt: '2026-07-02T00:00:00Z', executionId: 'exec_merged' }),
+    dlv({ id: 'c', repo: 'o/one', stage: 'closed', createdAt: '2026-07-03T00:00:00Z', executionId: 'exec_closed' }),
+    dlv({ id: 'd', repo: 'o/one', stage: 'reverted', createdAt: '2026-07-04T00:00:00Z', executionId: 'exec_reverted' }),
+    // A row the ledger cannot attribute holds nothing open.
+    dlv({ id: 'e', repo: 'o/one', stage: 'open', createdAt: '2026-07-05T00:00:00Z' }),
+  ]);
+  assert.deepEqual([...ids], ['exec_open']);
 });
 
 test('only an open or merged delivery offers a rollback — no button into the void (REQ-040.3)', () => {
@@ -118,9 +159,26 @@ test('a rollback states effect, resulting state and the way back (REQ-040.6)', (
   }
 });
 
-test('the dev reset states what it discards (REQ-022.4/040.6)', () => {
+test('the dev reset states what it discards and the way back the server really provides', () => {
   const c = resetConfirmation('o/one');
   assert.match(c.effect, /dev branch of o\/one back to its default branch/);
   assert.match(c.result, /Delivered work stays/);
-  assert.match(c.undo, /never published are lost/);
+  // workbench.ResetToDefault shelters the discarded tip under a rescue ref before the branch moves,
+  // so the sentence must not claim the work is simply lost.
+  assert.match(c.undo, /rescue ref/);
+  assert.doesNotMatch(c.undo, /are lost;/);
+});
+
+test('the view gives EVERY managed repository a section and claims nothing about its branches', () => {
+  const src = readFileSync(new URL('./DeliveriesView.tsx', import.meta.url), 'utf8');
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
+  // The managed set comes through the ONE repo access point and decides the sections, so a
+  // repository with committed-but-undelivered work still has its dev reset.
+  assert.match(code, /source\.repos\(/);
+  assert.match(code, /groupDeliveriesByRepo\(list, repos\.map\(\(r\) => r\.fullName\)\)/);
+  // What is stated is what the LEDGER holds. The dev branch's own content is not on this wire, so
+  // the view must not put a sentence about it on screen.
+  assert.doesNotMatch(src, /dev equals the default branch/);
+  assert.doesNotMatch(src, /dev serves/);
+  assert.doesNotMatch(code, /devServes/);
 });

@@ -35,7 +35,7 @@ func writeProtocol(w io.Writer, p *plan, dry bool) {
 		fmt.Fprintln(w)
 	}
 
-	fmt.Fprintf(w, "automatic runs (%d) — created WITHOUT axiom assignment; uncovered stays visible\n", len(p.autoRuns))
+	fmt.Fprintf(w, "automatic runs (%d) — created INACTIVE and WITHOUT axiom assignment; uncovered stays visible\n", len(p.autoRuns))
 	for _, r := range p.autoRuns {
 		state := "inactive"
 		if r.Active {
@@ -43,15 +43,24 @@ func writeProtocol(w io.Writer, p *plan, dry bool) {
 		}
 		fmt.Fprintf(w, "  + %-22s %-20s %-8s %s\n", r.ID, scheduleLine(r.Schedule), state, clip(r.Title))
 	}
+	if len(p.heldInactive) > 0 {
+		fmt.Fprintf(w, "  activation gate (%d) — these were switched ON in the export and are imported OFF:\n",
+			len(p.heldInactive))
+		fmt.Fprintln(w, "  without axioms there is no prompt, and a run without a prompt would execute the bare preamble.")
+		for _, h := range p.heldInactive {
+			fmt.Fprintf(w, "  ~ %s\n", h)
+		}
+		fmt.Fprintln(w, "  assign the axioms first (a constitution write triggers it), then switch each run on.")
+	}
 
-	fmt.Fprintf(w, "open tasks (%d) — foreign repositories; fed in, not started\n", len(p.openTodos))
+	fmt.Fprintf(w, "open tasks (%d) — foreign repositories, prompt composed; fed in, not started\n", len(p.openTodos))
 	for _, r := range p.openTodos {
 		fmt.Fprintf(w, "  + %-22s %-29s %s\n", r.ID, targetLine(r.Targets), clip(r.Title))
 	}
 
 	fmt.Fprintf(w, "history entries (%d) — completed foreign tasks, original metadata, no run definition\n", len(p.history))
 	for _, res := range p.history {
-		fmt.Fprintf(w, "  + %-32s %-19s %s\n", res.ID, repoLine(res.Repos), clip(res.RunTitle))
+		fmt.Fprintf(w, "  + %-32s %-9s %-19s %s\n", res.ID, outcomeLine(res.Repos), repoLine(res.Repos), clip(res.RunTitle))
 	}
 
 	fmt.Fprintf(w, "own-repository records skipped (%d) — their substance is the acceptance matrix\n", p.skippedOwn)
@@ -68,7 +77,7 @@ func writeProtocol(w io.Writer, p *plan, dry bool) {
 		fmt.Fprintf(w, "  moved aside afterwards to %s (nothing is deleted; the tolerant read stops listing it twice)\n", p.arch.movedTo)
 	}
 
-	fmt.Fprintf(w, "migration protocol M1–M8 (%d items to record)\n", len(p.notices))
+	fmt.Fprintf(w, "migration protocol (%d items to record) — M1–M8 plus the activation gate\n", len(p.notices))
 	for _, o := range p.notices {
 		fmt.Fprintf(w, "  + %s\n", o.Label)
 	}
@@ -117,6 +126,24 @@ func targetLine(ts []runs.Target) string {
 		return "-"
 	}
 	return strings.Join(out, ",")
+}
+
+// outcomeLine states the recorded outcome of a history entry the way the entry itself carries it —
+// read off the one derivation, never re-decided here.
+func outcomeLine(rs []model.RepoPipeline) string {
+	if len(rs) == 0 {
+		return "no repos"
+	}
+	for _, r := range rs {
+		done, ok := model.PipelineSucceeded(r.Stages)
+		if !done {
+			return "open"
+		}
+		if !ok {
+			return "failed"
+		}
+	}
+	return "succeeded"
 }
 
 func repoLine(rs []model.RepoPipeline) string {

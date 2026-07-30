@@ -14,10 +14,18 @@
 #   * Code checks IGNORE comment-only lines: the matrix asks whether a construct EXISTS, and
 #     prose that documents its removal ("there is no rollout") must not read as a violation.
 #     Checks that must see prose too use the *_raw variants.
+#     The comment syntax is decided PER FILE (drop_comment_lines): // and /* … */ for the C-family
+#     sources, # for shell/unit/sudoers, and NOTHING for Markdown, JSON and HTML — a Markdown
+#     bullet, heading or `--flag` is content, and a filter that swallowed it would make every
+#     absence check over documentation blind.
 #   * deploy/migration/ is excluded from code checks by design: those documents describe the
-#     cutover and therefore NAME the retired artefacts they remove.
+#     cutover and therefore NAME the retired artefacts they remove. The universality checks
+#     (B-45/B-45b) see it anyway: documenting a cutover never justifies a user's home path.
+#   * A check that NAMES its files fails when one of them is missing (gate_files): a renamed file
+#     would otherwise make grep answer "no match" and the criterion pass on nothing at all.
 #   * This script carries no instance literals of its own — the "no instance domain" check works
-#     off an allow-list of generic hosts, never off a concrete one.
+#     off an allow-list of generic hosts, and the "no instance identity" check DERIVES the
+#     offending literal from the code it audits.
 #
 # Usage: tools/abnahme.sh [--tests] [--verbose]
 #   --tests    additionally run the acceptance TESTS (go test ./it/..., node --test)
@@ -73,8 +81,10 @@ sel() {
 }
 
 MIGRATION='^deploy/migration/'
+# F_EVERY is the WHOLE audited inventory, migration documents included: the universality criteria
+# (no instance path, no instance domain) hold for every artefact in the repository without exception.
+mapfile -t F_EVERY < <(sel '.')
 mapfile -t F_ALL < <(sel '.' "$MIGRATION")
-mapfile -t F_CODE < <(sel '.' "(\.md$)|$MIGRATION|^contract/fixtures/|^\.sxgate/")
 mapfile -t F_GO < <(sel '^backend/.*\.go$')
 mapfile -t F_GO_SRC < <(sel '^backend/.*\.go$' '(_test\.go$)|/testdata/')
 # The Go files that make up the SHIPPED daemon: the integration suite may import a package without
@@ -117,13 +127,43 @@ fail() {
   fi
 }
 
-# hits <pattern> <file...> — matching "path:line:text", comment-only lines removed.
+# drop_comment_lines reads grep's "path:line:text" on stdin and drops the matches that are
+# COMMENT-ONLY in the comment syntax OF THAT FILE. Binding the syntax to the file is what keeps the
+# filter from lying: the old single filter dropped every line starting with `#`, `*`, `--` or
+# `<!--`, which in Markdown is a heading, a bullet, a CLI flag and an HTML comment — so every
+# absence check over documentation silently matched nothing.
+drop_comment_lines() {
+  awk '
+    {
+      i = index($0, ":")
+      if (i == 0) { print; next }
+      path = substr($0, 1, i - 1)
+      rest = substr($0, i + 1)
+      j = index(rest, ":")
+      if (j == 0) { print; next }
+      text = substr(rest, j + 1)
+      sub(/^[[:space:]]+/, "", text)
+      if (path ~ /\.(go|ts|tsx|js|jsx|mjs|cjs|css)$/) {
+        if (text ~ /^\/\//) next                  # line comment
+        if (text ~ /^\/\*/) next                  # block comment opener
+        if (text ~ /^\*([[:space:]]|\/|$)/) next  # block comment continuation ("* …", "*/")
+      } else if (path ~ /\.(md|markdown|json|html|htm|mod|sum)$/) {
+        # No comment-only line here: the whole line is content.
+      } else {
+        if (text ~ /^#/) next                     # shell, unit, sudoers, conf
+      }
+      print
+    }
+  '
+}
+
+# hits <pattern> <file...> — matching "path:line:text", comment-only lines removed. /dev/null keeps
+# grep in multi-file mode so the path prefix is present even for a single named file.
 hits() {
   local pattern="$1"
   shift
   [[ $# -eq 0 ]] && return 0
-  grep -nIE -- "$pattern" "$@" 2>/dev/null |
-    grep -vE ':[0-9]+:[[:space:]]*(//|#|\*|<!--|--|;)' || true
+  grep -nIE -- "$pattern" "$@" /dev/null 2>/dev/null | drop_comment_lines || true
 }
 
 # hits_raw <pattern> <file...> — matching lines INCLUDING comments.
@@ -131,13 +171,36 @@ hits_raw() {
   local pattern="$1"
   shift
   [[ $# -eq 0 ]] && return 0
-  grep -nIE -- "$pattern" "$@" 2>/dev/null || true
+  grep -nIE -- "$pattern" "$@" /dev/null 2>/dev/null || true
+}
+
+# gate_files <id> <description> <file...> — refuses a check whose file set cannot carry it: no file
+# at all, or a named file that does not exist (renamed, moved, deleted). Both would make grep answer
+# "nothing" and the criterion pass on air. Returns 1 after FAILing.
+gate_files() {
+  local id="$1" desc="$2"
+  shift 2
+  if [[ $# -eq 0 ]]; then
+    fail "$id" "$desc" "the check names no file at all — it would pass on an empty inventory"
+    return 1
+  fi
+  local p missing=""
+  for p in "$@"; do
+    [[ -f $p && -r $p ]] && continue
+    missing+="$p does not exist or is unreadable — renamed? the check can prove nothing about it"$'\n'
+  done
+  if [[ -n $missing ]]; then
+    fail "$id" "$desc" "${missing%$'\n'}"
+    return 1
+  fi
+  return 0
 }
 
 # absent <id> <description> <pattern> <file...>
 absent() {
   local id="$1" desc="$2" pattern="$3"
   shift 3
+  gate_files "$id" "$desc" "$@" || return 0
   local out
   out="$(hits "$pattern" "$@")"
   if [[ -z $out ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "$out"; fi
@@ -147,15 +210,31 @@ absent() {
 absent_raw() {
   local id="$1" desc="$2" pattern="$3"
   shift 3
+  gate_files "$id" "$desc" "$@" || return 0
   local out
   out="$(hits_raw "$pattern" "$@")"
   if [[ -z $out ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "$out"; fi
 }
 
-# present <id> <description> <pattern> <file...>
+# present <id> <description> <pattern> <file...> — EVERY named file must carry the pattern; a
+# union would let one file cover for another that does not contain it at all.
 present() {
   local id="$1" desc="$2" pattern="$3"
   shift 3
+  gate_files "$id" "$desc" "$@" || return 0
+  local f without=""
+  for f in "$@"; do
+    grep -qIE -- "$pattern" "$f" 2>/dev/null || without+="$f carries no occurrence of /$pattern/"$'\n'
+  done
+  if [[ -z $without ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "${without%$'\n'}"; fi
+}
+
+# present_anywhere <id> <description> <pattern> <file...> — the pattern exists SOMEWHERE in the
+# named set (used where the criterion is "the rule is written down", not "every file states it").
+present_anywhere() {
+  local id="$1" desc="$2" pattern="$3"
+  shift 3
+  gate_files "$id" "$desc" "$@" || return 0
   local out
   out="$(hits_raw "$pattern" "$@")"
   if [[ -n $out ]]; then pass "$id" "$desc"; else fail "$id" "$desc" "expected at least one occurrence of /$pattern/"; fi
@@ -166,6 +245,7 @@ present() {
 unique_in() {
   local id="$1" desc="$2" pattern="$3" allowed="$4"
   shift 4
+  gate_files "$id" "$desc" "$@" || return 0
   local out stray
   out="$(hits "$pattern" "$@")"
   if [[ -z $out ]]; then
@@ -180,6 +260,7 @@ unique_in() {
 count_files() {
   local id="$1" desc="$2" want="$3" pattern="$4"
   shift 4
+  gate_files "$id" "$desc" "$@" || return 0
   local out got
   out="$(hits "$pattern" "$@")"
   got="$(cut -d: -f1 <<<"$out" | sort -u | grep -c . || true)"
@@ -211,6 +292,25 @@ note() {
 }
 
 section() { printf '\n-- %s %s\n' "$1" "$(printf '%.0s-' $(seq 1 $((70 - ${#1}))))"; }
+
+# ── the audit's own instrument check ─────────────────────────────────────────────────────────
+#
+# Every criterion below reads one of these sets. An empty set makes each of its checks pass on
+# nothing, so the sets are asserted BEFORE the first criterion is judged: the audit states what it
+# measured, or it fails.
+section "instrument"
+
+set_sizes=""
+for name in F_EVERY F_ALL F_GO F_GO_SRC F_GO_WIRED F_TS F_TS_SRC F_SH F_IMPL; do
+  declare -n ref="$name"
+  [[ ${#ref[@]} -eq 0 ]] && set_sizes+="$name is EMPTY — every check reading it would pass on nothing"$'\n'
+  unset -n ref
+done
+if [[ -z $set_sizes ]]; then
+  pass "harness" "every audited file set is non-empty (${#F_EVERY[@]} files, ${#F_GO[@]} Go, ${#F_TS[@]} TS)"
+else
+  fail "harness" "every audited file set is non-empty" "${set_sizes%$'\n'}"
+fi
 
 # ── §1 the six construction faults ───────────────────────────────────────────────────────────
 
@@ -261,8 +361,20 @@ count_files "REQ-004" "exactly ONE planning path folds axioms into runs" \
 count_files "REQ-010" "exactly ONE maintenance place for the run tunables (model/effort/budget)" \
   1 'EFFORT_LADDER|EFFORTS[[:space:]]*[:=]|effortLadder' "${F_TS_SRC[@]}"
 
-present "REQ-012" "both calendars read through the ONE calendar access point" \
-  'mercuryRunCalendar' src/views/mercury/calendar/MercuryCalendar.tsx src/views/GlobalCalendarView.tsx
+# REQ-012 is a THREE-part statement about the calendar, and each part is checked at the file that
+# has to satisfy it — a union over both files would let the fetching view cover for the rendering
+# one, which is exactly how "no second data path" went unmeasured.
+present "REQ-012a" "the calendar surface reads through the ONE calendar access point" \
+  'source\.mercuryRunCalendar\(' src/views/GlobalCalendarView.tsx
+
+count_files "REQ-012d" "exactly ONE calendar endpoint is addressed (no second calendar data path)" \
+  1 '/api/mercury/runs/calendar' "${F_TS_SRC[@]}"
+
+absent "REQ-012b" "the calendar view owns no data path of its own (it renders what it is handed)" \
+  'source\.[a-zA-Z]+\(|fetch\(|EventSource' src/views/mercury/calendar/MercuryCalendar.tsx
+
+present "REQ-012c" "a past occurrence opens the SAME detail the history opens (no second detail path)" \
+  'ExecutionDetail' src/views/mercury/calendar/MercuryCalendar.tsx src/views/mercury/exec/ExecutionsView.tsx
 
 absent "REQ-013" "no singular \"the active run\" assumption (active work is a list)" \
   '\b(activeRun|currentRun|theActiveRun|ActiveRun|activeExecutionID)\b' "${F_IMPL[@]}"
@@ -278,7 +390,7 @@ absent "REQ-017" "no cost cap and no remaining-budget display anywhere" \
   '[Mm]axCost|costCap|CostCap|costLimit|CostLimit|budgetUSD|BudgetUSD|remainingCost|costRemaining' \
   "${F_IMPL[@]}"
 
-present "REQ-022a" "the working branch is recorded as never becoming a pull request" \
+present_anywhere "REQ-022a" "the working branch is recorded as never becoming a pull request" \
   'never itself turned into a pull request' "${F_GO_SRC[@]}"
 
 absent "REQ-022b" "the production path never ships the working branch" \
@@ -370,7 +482,7 @@ absent "B-44" "no PID busy marker and no idle-restart helper" \
   'restart-idle|pidfile|PIDFile|\.pid"' "${F_IMPL[@]}"
 
 absent "B-45" "no machine- or user-specific paths in the repository" \
-  '/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/' "${F_ALL[@]}"
+  '/home/[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/' "${F_EVERY[@]}"
 
 # ── cross-cutting audits (no single matrix cell, but named by several) ───────────────────────
 
@@ -382,13 +494,120 @@ section "cross-cutting audits"
 # domain. Everything dotted must be a vendor-neutral or documentation host.
 host_allow='^([^.]+|127\.0\.0\.1|github\.com|api\.github\.com|www\.w3\.org|([a-z0-9-]+\.)*example(\.(com|org|net|invalid))?|([a-z0-9-]+\.)*invalid)$'
 stray_hosts="$(
-  grep -ohIE 'https?://[A-Za-z0-9._~-]+' "${F_ALL[@]}" 2>/dev/null |
+  grep -ohIE 'https?://[A-Za-z0-9._~-]+' "${F_EVERY[@]}" 2>/dev/null |
     sed -E 's#https?://##' | sort -u | grep -vE "$host_allow" || true
 )"
 if [[ -z $stray_hosts ]]; then
   pass "B-45b" "no concrete instance domain in the repository"
 else
   fail "B-45b" "no concrete instance domain in the repository" "$stray_hosts"
+fi
+
+# B-45 / universality: an instance's ORGANISATION or ACCOUNT name is an instance literal exactly
+# like its domain and its home directory — "Instanz-Spezifika leben ausschließlich in der
+# Laufzeit-Konfiguration". A name cannot be recognised by its spelling, so the check reads the SHAPE
+# that produces one: an identity-shaped configuration key (owner, org, account, user, email, tenant)
+# whose lookup carries a baked-in non-empty fallback. Such a fallback IS the instance. Only a
+# loopback stand-in is exempt — that is a technical constant, not an identity.
+#
+# Stage two hunts every further occurrence of the literal the code itself revealed (prose included),
+# so fixing the fallback while leaving the name in a comment does not pass. The check therefore names
+# no instance of its own.
+identity_defaults="$(
+  awk '
+    # key is the WHOLE configuration key: an identity word anywhere inside an upper-case name.
+    function identity(k) { return k ~ /^[A-Z0-9_]*(OWNER|ORG|ACCOUNT|USER|EMAIL|TENANT)[A-Z0-9_]*$/ }
+    # A fallback that is DERIVED (a substitution, another variable) names no instance — only a
+    # baked-in literal does. Loopback stand-ins are technical constants, not identities.
+    function neutral(v) {
+      return v == "" || v == "localhost" || v == "127.0.0.1" || v == "::1" ||
+             v ~ /[$`]/ || v ~ /^[A-Z0-9]*_[A-Z0-9_]*$/
+    }
+    function report(v) {
+      if (neutral(v)) return
+      print FILENAME "\t" FNR "\t" v
+    }
+    FNR == 1 { armed = 0 }
+    {
+      line = $0
+      sub(/[[:space:]]*\/\/.*$/, "", line)   # C-family line comment
+      sub(/^[[:space:]]*#.*$/, "", line)     # shell comment
+      if (line == "") { if (armed > 0) armed--; next }
+
+      # Shell: ${KEY:-default} carries key and fallback on one line.
+      rest = line
+      while (match(rest, /\$\{[A-Z0-9_]+:-[^}]*\}/)) {
+        frag = substr(rest, RSTART, RLENGTH)
+        rest = substr(rest, RSTART + RLENGTH)
+        k = frag; sub(/^\$\{/, "", k); sub(/:-.*$/, "", k)
+        v = frag; sub(/^[^-]*:-/, "", v); sub(/\}$/, "", v)
+        if (identity(k)) report(v)
+      }
+
+      # Go / TypeScript: the lookup arms a short window; the fallback literal follows it.
+      hit = 0
+      if (match(line, /Getenv\("[A-Z0-9_]+"\)/) || match(line, /process\.env\.[A-Z0-9_]+/)) {
+        k = substr(line, RSTART, RLENGTH)
+        gsub(/^Getenv\("|"\)$|^process\.env\./, "", k)
+        if (identity(k)) { armed = 6; hit = 1 }
+        else { armed = 0 }
+      }
+
+      if (armed > 0) {
+        # A bare fallback: `return "x"`, `?? "x"`, `|| "x"`, `= "x"` — and on the lookup line
+        # itself only after the lookup, so the key inside Getenv("…") is never read as a value.
+        scan = line
+        if (hit) scan = substr(line, RSTART + RLENGTH)
+        while (match(scan, /(return|\?\?|\|\||=)[[:space:]]*("[^"]*"|'"'"'[^'"'"']*'"'"')/)) {
+          frag = substr(scan, RSTART, RLENGTH)
+          scan = substr(scan, RSTART + RLENGTH)
+          sub(/^[^"'"'"']*["'"'"']/, "", frag)
+          sub(/["'"'"']$/, "", frag)
+          report(frag)
+        }
+        armed--
+      }
+    }
+  ' "${F_IMPL[@]}" 2>/dev/null || true
+)"
+# Stage two: every FURTHER occurrence of the literal the code revealed, prose included.
+identity_out=""
+while IFS=$'\t' read -r file line lit; do
+  [[ -z ${lit:-} ]] && continue
+  identity_out+="$file:$line: identity default \"$lit\" is baked in — it belongs in the runtime configuration"$'\n'
+  [[ ${#lit} -lt 4 ]] && continue
+  identity_out+="$(grep -nIEw -- "$(sed -E 's/[][\.*^$(){}?+|/]/\\&/g' <<<"$lit")" "${F_EVERY[@]}" 2>/dev/null || true)"$'\n'
+done <<<"$identity_defaults"
+identity_out="$(grep . <<<"$identity_out" | sort -u || true)"
+if [[ -z $identity_out ]]; then
+  pass "B-45c" "no instance organisation or account literal (identity comes from the runtime configuration)"
+else
+  fail "B-45c" "no instance organisation or account literal (identity comes from the runtime configuration)" "$identity_out"
+fi
+
+# B-35: the client renders the server's stage array and derives NO stage. A stage NAME in client
+# code is the step-name heuristic the criterion retires — the client would be deciding what a stage
+# means instead of reading the state the server stated. The forbidden set is DERIVED from the wire
+# contract (the Go stage constants), so it cannot drift when a stage is renamed; the type mirror in
+# src/types.ts is the one place allowed to spell them.
+stage_names="$(
+  sed -nE 's/^[[:space:]]*Stage[A-Za-z]+[[:space:]]+Stage[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+    backend/internal/model/model.go 2>/dev/null | sort -u
+)"
+stage_literals=""
+while IFS= read -r st; do
+  [[ -z ${st:-} ]] && continue
+  hit="$(grep -nIE "['\"]${st}['\"]" "${F_TS_SRC[@]}" 2>/dev/null | grep -vE '^src/types\.ts:' || true)"
+  [[ -n $hit ]] && stage_literals+="$hit"$'\n'
+done <<<"$stage_names"
+if [[ $(grep -c . <<<"$stage_names") -lt 5 ]]; then
+  fail "B-35b" "no stage-name literal in the client" \
+    "the stage contract could not be read from backend/internal/model/model.go — the forbidden set would be unknown"
+elif [[ -z $stage_literals ]]; then
+  pass "B-35b" "no stage-name literal in the client (the server's stage array is rendered, not interpreted)"
+else
+  fail "B-35b" "no stage-name literal in the client (the server's stage array is rendered, not interpreted)" \
+    "$(sort -u <<<"$stage_literals" | grep .)"
 fi
 
 # REQ-030.5 / brand integrity: Tailwind's /opacity modifier only works on a token whose value is a
@@ -448,6 +667,11 @@ fi
 # REQ-007.2 / B-41: every upload point offers the clipboard as an equal input path.
 upload_files="$(grep -lIE 'uploadVision\(|mercuryUploadAttachment\(' "${F_TS_SRC[@]}" 2>/dev/null | grep -v '^src/data/' || true)"
 missing_paste=""
+if [[ -z $upload_files ]]; then
+  # No upload point found at all: either the two upload operations were renamed or the surface lost
+  # them. Either way the criterion is unproven, so it must not read as satisfied.
+  missing_paste="no upload point found at all — the check found nothing to verify (renamed operation?)"$'\n'
+fi
 while IFS= read -r f; do
   [[ -z $f ]] && continue
   grep -qE 'usePasteFiles|onPaste|filesFromClipboard' "$f" || missing_paste+="$f has no clipboard path"$'\n'
@@ -455,7 +679,7 @@ done <<<"$upload_files"
 if [[ -z $missing_paste ]]; then
   pass "B-41b" "every upload point accepts the clipboard as an equal input path"
 else
-  fail "B-41b" "every upload point accepts the clipboard as an equal input path" "$missing_paste"
+  fail "B-41b" "every upload point accepts the clipboard as an equal input path" "${missing_paste%$'\n'}"
 fi
 
 # REQ-040.5: no dead inventory — every module under src/ has at least one importer.
@@ -504,10 +728,19 @@ fi
 # B-03: every MUTATING route must be bound to a guard that enforces the CSRF double submit
 # (guardWrite or guardCSRF). A mutating route on the plain read guard is reachable cross-site with
 # the caller's cookies.
-csrf_holes="$(
-  grep -nE 'mux\.HandleFunc\("(POST|PUT|DELETE) [^"]+",[[:space:]]*s\.guard\(' \
-    backend/internal/api/api.go 2>/dev/null || true
-)"
+# The route table must be READ for the check to mean anything: a renamed file would answer "no
+# holes" on a table nobody looked at, so its presence and its mutating routes are asserted first.
+csrf_holes=""
+if [[ ! -f backend/internal/api/api.go ]]; then
+  csrf_holes="backend/internal/api/api.go does not exist — the route table cannot be audited"
+elif ! grep -qE 'mux\.HandleFunc\("(POST|PUT|DELETE) ' backend/internal/api/api.go; then
+  csrf_holes="backend/internal/api/api.go registers no mutating route at all — the check would pass on nothing"
+else
+  csrf_holes="$(
+    grep -nE 'mux\.HandleFunc\("(POST|PUT|DELETE) [^"]+",[[:space:]]*s\.guard\(' \
+      backend/internal/api/api.go || true
+  )"
+fi
 if [[ -z $csrf_holes ]]; then
   pass "B-03" "every mutating route is bound to a CSRF-enforcing guard"
 else
@@ -516,11 +749,20 @@ fi
 
 # K-2 / REQ-039.1 / REQ-013: the boot sequence is only real if the daemon CONSTRUCTS it. An
 # unwired daemon makes every downstream criterion unreachable in production, so the calls the
-# documented boot order needs are checked one by one.
+# documented boot order needs are checked one by one — against the CODE, comments stripped. The
+# documented boot order sits as prose at the top of main.go and NAMES every one of these calls, so
+# a comment-blind check would be satisfied by the documentation of a daemon that wires nothing.
 boot_gaps=""
+boot_code=""
+if [[ -f backend/cmd/devlabd/main.go ]]; then
+  boot_code="$(sed -E 's#//.*$##' backend/cmd/devlabd/main.go | grep -vE '^[[:space:]]*(/\*|\*)' || true)"
+else
+  boot_gaps="backend/cmd/devlabd/main.go does not exist — the daemon's boot cannot be audited"$'\n'
+fi
 while IFS='|' read -r call why; do
   [[ -z $call ]] && continue
-  grep -qF -- "$call" backend/cmd/devlabd/main.go 2>/dev/null ||
+  [[ -z $boot_code ]] && continue
+  grep -qF -- "$call" <<<"$boot_code" ||
     boot_gaps+="cmd/devlabd/main.go never calls ${call} — ${why}"$'\n'
 done <<'BOOT'
 execstate.Open|boot step 2 opens the execution documents
@@ -539,16 +781,24 @@ else
   fail "K-2b" "the daemon constructs the documented boot sequence" "$boot_gaps"
 fi
 
-# REQ-040.5: no build artefact in the inventory. A compiled binary that is neither ignored nor
-# tracked lands in the repository the moment somebody commits everything.
+# REQ-040.5: no build artefact in the inventory. The WHOLE inventory is inspected, tracked files
+# included — a committed binary is not a smaller problem than an unignored one, it is the larger:
+# it is already in the repository. (Scanning only the untracked half is how a tracked 9-MB daemon
+# stays invisible.)
 stray_binaries=""
-while IFS= read -r f; do
-  [[ -z $f ]] && continue
-  [[ -f $f ]] || continue
-  if file -b --mime-type "$f" 2>/dev/null | grep -q 'application/x-\(executable\|sharedlib\|pie-executable\)'; then
-    stray_binaries+="$f is a compiled artefact that git neither tracks nor ignores"$'\n'
-  fi
-done < <(git ls-files --others --exclude-standard)
+while IFS= read -r line; do
+  [[ -z $line ]] && continue
+  f="${line%%:*}"
+  case "${line##*:}" in
+    *application/x-executable* | *application/x-sharedlib* | *application/x-pie-executable* | *application/x-archive*)
+      if git ls-files --error-unmatch -- "$f" >/dev/null 2>&1; then
+        stray_binaries+="$f is a compiled artefact and git TRACKS it — it is committed into the repository"$'\n'
+      else
+        stray_binaries+="$f is a compiled artefact that git neither tracks nor ignores"$'\n'
+      fi
+      ;;
+  esac
+done < <(file --mime-type -- "${F_EVERY[@]}" 2>/dev/null)
 if [[ -z $stray_binaries ]]; then
   pass "REQ-040g" "no build artefact loose in the inventory"
 else

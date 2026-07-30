@@ -1,7 +1,13 @@
 // Package discover resolves DevLab's managed repository set. The single source of truth is
-// GitHub: the holistic set is "owner sxty9, topic holistic", resolved PER USER with that user's
-// own OAuth token (ReposForUser) so visibility and permissions come straight from GitHub. A short
-// per-user TTL cache avoids an API round-trip on every request.
+// GitHub: the holistic set is every repository of the CONFIGURED owner that carries the holistic
+// topic, resolved PER USER with that user's own OAuth token (ReposForUser) so visibility and
+// permissions come straight from GitHub. A short per-user TTL cache avoids an API round-trip on
+// every request.
+//
+// The owner is mandatory runtime configuration (DEVLAB_GH_OWNER). It deliberately has NO default: a
+// default would scope both the managed set and every repository the delivery chain creates to
+// another organisation's namespace. Without it every resolution fails closed with ErrOwnerUnset —
+// an empty set is served, never a foreign one.
 //
 // The legacy local path (Repos/Path) — discovery of local working copies via the gh CLI — is
 // retained for the dev-bypass/preview sandbox, which has no per-user GitHub link.
@@ -10,6 +16,7 @@ package discover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,25 +32,37 @@ import (
 
 var idRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
-// owner scoping for the holistic set (override with DEVLAB_GH_OWNER).
-func owner() string {
-	if o := os.Getenv("DEVLAB_GH_OWNER"); o != "" {
-		return o
+// ErrOwnerUnset reports that the instance has not configured the GitHub owner of the holistic set.
+// Resolution fails closed with this error rather than falling back to a hard-coded namespace.
+var ErrOwnerUnset = errors.New("discover: no GitHub owner configured for the holistic set (DEVLAB_GH_OWNER)")
+
+// owner reads the MANDATORY owner scoping of the holistic set from the runtime configuration. The
+// variable is named at the lookup, not behind a constant, so the instance-neutrality audit (B-45c)
+// keeps watching this exact spot for a re-introduced fallback.
+func owner() (string, error) {
+	if o := strings.TrimSpace(os.Getenv("DEVLAB_GH_OWNER")); o != "" {
+		return o, nil
 	}
-	return "sxty9"
+	return "", ErrOwnerUnset
 }
 
-// topic marks a repo as part of the holistic set (override with DEVLAB_GH_TOPIC).
+// topic marks a repo as part of the holistic set (override with DEVLAB_GH_TOPIC). Unlike the owner
+// this DOES default: "holistic" is the landscape-wide membership marker, not an instance value.
 func topic() string {
-	if t := os.Getenv("DEVLAB_GH_TOPIC"); t != "" {
+	if t := strings.TrimSpace(os.Getenv("DEVLAB_GH_TOPIC")); t != "" {
 		return t
 	}
 	return "holistic"
 }
 
 // Owner is the GitHub owner the holistic set lives under — exported so a newly created service repo
-// lands in the same namespace this package scans (one definition, no drifting sibling).
-func Owner() string { return owner() }
+// lands in the same namespace this package scans (one definition, no drifting sibling). It is ""
+// when the instance configured none, and "" is never a usable namespace: a caller that places a
+// repository must reject it and report ErrOwnerUnset instead of falling back to another namespace.
+func Owner() string {
+	o, _ := owner()
+	return o
+}
 
 // Topic is the marker that makes a repo part of the holistic set (same rationale as Owner).
 func Topic() string { return topic() }
@@ -62,10 +81,21 @@ var (
 
 const userTTL = 45 * time.Second
 
+// listRepos is the GitHub read the set is resolved from — a package variable so the resolution can
+// be driven from a fixture repo list in tests, mirroring the fixture seam the github package uses
+// for its own client tests. Production never reassigns it.
+var listRepos = github.ListRepos
+
 // ReposForUser returns the holistic-set repos the user can see on GitHub, with that user's
 // effective per-repo permission. Cached per user for userTTL. A GitHub error returns the error
-// (and any still-fresh cached value is preferred over erroring).
+// (and any still-fresh cached value is preferred over erroring). An unconfigured owner fails
+// closed with ErrOwnerUnset — before any GitHub call and without serving a cached set, because
+// there is no namespace the set could legitimately be scoped to.
 func ReposForUser(ctx context.Context, user, token string) ([]model.Repo, error) {
+	own, err := owner()
+	if err != nil {
+		return nil, err
+	}
 	userMu.Lock()
 	if e, ok := userCache[user]; ok && time.Since(e.at) < userTTL {
 		repos := e.repos
@@ -74,7 +104,7 @@ func ReposForUser(ctx context.Context, user, token string) ([]model.Repo, error)
 	}
 	userMu.Unlock()
 
-	ghs, err := github.ListRepos(ctx, token)
+	ghs, err := listRepos(ctx, token)
 	if err != nil {
 		// Serve a stale cache entry rather than blanking the UI on a transient GitHub blip.
 		userMu.Lock()
@@ -87,7 +117,7 @@ func ReposForUser(ctx context.Context, user, token string) ([]model.Repo, error)
 		return nil, err
 	}
 
-	repos := projectRepos(ghs)
+	repos := projectRepos(ghs, own, topic())
 	userMu.Lock()
 	userCache[user] = userEntry{repos: repos, at: time.Now()}
 	userMu.Unlock()
@@ -102,12 +132,12 @@ func InvalidateUser(user string) {
 	userMu.Unlock()
 }
 
-// projectRepos filters GitHub repos to the holistic set and maps them onto model.Repo.
-func projectRepos(ghs []github.Repo) []model.Repo {
-	want := topic()
+// projectRepos filters GitHub repos to the holistic set (own + want, both resolved by the caller)
+// and maps them onto model.Repo.
+func projectRepos(ghs []github.Repo, own, want string) []model.Repo {
 	var repos []model.Repo
 	for _, g := range ghs {
-		if !inHolisticSet(g, want) {
+		if !inHolisticSet(g, own, want) {
 			continue
 		}
 		if !idRe.MatchString(g.Name) {
@@ -141,10 +171,14 @@ func projectRepos(ghs []github.Repo) []model.Repo {
 	return repos
 }
 
-// inHolisticSet matches the existing `gh search --owner sxty9 --topic holistic` semantics:
-// the repo must be owned by the configured owner AND carry the holistic topic.
-func inHolisticSet(g github.Repo, want string) bool {
-	if !strings.EqualFold(g.Owner, owner()) {
+// inHolisticSet matches the `gh search --owner <owner> --topic <topic>` semantics: the repo must be
+// owned by the configured owner AND carry the set marker. An unset scope matches NOTHING — without
+// that guard an empty owner would admit every repo whose owner GitHub left blank.
+func inHolisticSet(g github.Repo, own, want string) bool {
+	if own == "" || want == "" {
+		return false
+	}
+	if !strings.EqualFold(g.Owner, own) {
 		return false
 	}
 	for _, t := range g.Topics {
@@ -202,7 +236,8 @@ var (
 )
 
 // Repos returns the locally-cloned repos tagged `holistic` (30s cached). Used only in the
-// dev-bypass/preview sandbox, which has no per-user GitHub token.
+// dev-bypass/preview sandbox, which has no per-user GitHub token. Without a configured owner the
+// set is empty (query fails closed); this path has no error channel of its own.
 func Repos(base string) []model.Repo {
 	mu.Lock()
 	defer mu.Unlock()
@@ -215,7 +250,13 @@ func Repos(base string) []model.Repo {
 }
 
 func query(base string) []model.Repo {
-	ghs := ghSearch()
+	own, err := owner()
+	if err != nil {
+		// Fail closed like the per-user path: without an owner there is no namespace to search
+		// and no full name to mint, so the sandbox offers nothing rather than something foreign.
+		return []model.Repo{}
+	}
+	ghs := ghSearch(own)
 	if len(ghs) == 0 {
 		ghs = allowlist()
 	}
@@ -235,7 +276,7 @@ func query(base string) []model.Repo {
 		repos = append(repos, model.Repo{
 			ID:          g.Name,
 			Name:        g.Name,
-			FullName:    owner() + "/" + g.Name,
+			FullName:    own + "/" + g.Name,
 			Kind:        k,
 			Description: desc,
 			Language:    languageLabel(g.Language),
@@ -251,8 +292,8 @@ func query(base string) []model.Repo {
 	return repos
 }
 
-func ghSearch() []ghRepo {
-	cmd := exec.Command("gh", "search", "repos", "--owner", owner(), "--topic", topic(),
+func ghSearch(own string) []ghRepo {
+	cmd := exec.Command("gh", "search", "repos", "--owner", own, "--topic", topic(),
 		"--limit", "100", "--json", "name,description,language")
 	out, err := cmd.Output()
 	if err != nil {

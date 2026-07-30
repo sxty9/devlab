@@ -3,11 +3,16 @@
 // the ready socket, B-9), and it is idempotent: a second run changes nothing.
 //
 // Input: the raw legacy run set (--input mercury-runs-roh.json — instance data, never in the
-// repository). It imports the foreign todos (1 open, 6 as completed history entries with their
-// original metadata), creates the 7 automatic runs WITHOUT axiom assignment (uncovered stays
-// visible; the auto-assignment plans on the first constitution write, B-10), imports the
-// legacy execution history tolerantly into executions/ (legacy states stay viewable, are
-// never produced anew), and prepares the M1–M8 migration notices with their outcome column.
+// repository). It feeds in the foreign todos — the open one with its prompt composed through the
+// one composition path, the completed ones as history entries carrying the outcome the export
+// recorded — creates the 7 automatic runs INACTIVE and WITHOUT axiom assignment (uncovered stays
+// visible; the auto-assignment plans on the first constitution write, B-10, and the activation
+// gate item names what has to happen before any of them may run), imports the legacy execution
+// history tolerantly into executions/ (legacy states stay viewable, are never produced anew), and
+// prepares the migration notices with their outcome column.
+//
+// Nothing it writes can be started without a prompt that names its subject: a record that would
+// enter the pool ready to fire without one is refused by name and no byte is written.
 //
 // Exit codes follow the uniform Holistic CLI convention (the `service` verbs use the same set):
 // 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined.

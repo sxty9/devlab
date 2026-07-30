@@ -1,12 +1,18 @@
 # DevLab backend (devlabd) — systemd unit TEMPLATE.
 #
-# Instance values (domain, cookie domain, ports, run user) belong in a local drop-in
-# (/etc/systemd/system/devlabd.service.d/*.conf), NEVER in this repo. The values below are
-# overridable defaults. There is NO operating-mode variable — modes do not exist
+# Instance values (domain, cookie domain, ports, run user, GitHub owner) belong in a local
+# drop-in (/etc/systemd/system/devlabd.service.d/*.conf), NEVER in this repo. The values below
+# are overridable defaults. There is NO operating-mode variable — modes do not exist
 # (REQ-027.1); DEVLAB_RUNS_MAX_CONCURRENCY, when set, is only the FIRST-start seed of the
 # runtime settings pool (REQ-013.2).
 #
 # Environment-contract migration (B-45 — one note per changed variable):
+#   DEVLAB_GH_OWNER           now MANDATORY, previously optional. The GitHub owner the managed
+#                             repository set lives under has NO default any more: a default would
+#                             scope both the set and every repository the delivery chain creates
+#                             to another organisation. Unset, every resolution fails closed with
+#                             an empty set and the named ErrOwnerUnset. Set it in the drop-in —
+#                             it is an instance value and therefore not in this template.
 #   DEVLAB_RUNS_MODE          REMOVED. Operating modes do not exist; the one chain always runs
 #                             preflight → implement → deliver-dev → publish → pull-request.
 #   DEVLAB_RUNS_MAX_COST*     REMOVED. There is no cost cap (REQ-017): consumption is counted
@@ -62,6 +68,12 @@ Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json
 # Per-user GitHub link store key + OAuth app config (operator-provisioned files).
 Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
 Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
+# MANDATORY, no default: the GitHub owner whose topic-marked repositories form the managed set.
+# It is an instance value, so it is set in the drop-in and stays out of this template:
+#   Environment=DEVLAB_GH_OWNER=<github-owner>
+# The set marker itself does have a default ("holistic", the landscape-wide topic); override it
+# only where the instance marks membership differently:
+#   Environment=DEVLAB_GH_TOPIC=<topic>
 # Drain/resume knobs (runtime settings win over env where a settings value exists).
 Environment=DEVLAB_RUNS_DRAIN_GRACE=60s
 Environment=DEVLAB_RUNS_RESUME_WINDOW=240h

@@ -110,22 +110,35 @@ export function sortNotices(list: readonly NoticeRecord[]): NoticeRecord[] {
 }
 
 /** What to say about the daily report's delivery (REQ-042.5): a failed send must be visible, with
- *  its reason and its attempts, instead of vanishing silently. `at`, when set, is the moment the
- *  component renders through the shared formatter. null when no report has run yet. */
+ *  its reason and its attempts, instead of vanishing silently — and a BLOCKED one must read as
+ *  blocked (K-5), never as delivered. `at`, when set, is the moment the component renders through the
+ *  shared formatter. null when no report has run yet. */
 export interface ReportStatusLine {
   text: string;
   tone: NoticeTone;
   at?: string;
+  /** The day whose delivery stands BLOCKED — set only then, and what the resume acts on. */
+  blockedDay?: string;
 }
+
+const attemptsPhrase = (n: number): string => (n === 1 ? '1 attempt' : `${n} attempts`);
 
 export function reportStatusLine(records: readonly ReportDelivery[]): ReportStatusLine | null {
   if (records.length === 0) return null;
   const latest = [...records].sort((a, b) => b.day.localeCompare(a.day))[0];
-  if (latest.status === 'failed') {
-    const attempts = latest.attempts === 1 ? '1 attempt' : `${latest.attempts} attempts`;
-    const why = latest.lastError ? `: ${latest.lastError}` : '';
+  const why = latest.lastError ? `: ${latest.lastError}` : '';
+  // Blocked: the retries have ended and nothing happens until somebody resumes it.
+  if (latest.status === 'blocked') {
     return {
-      text: `Daily report for ${latest.day} could not be delivered after ${attempts}${why}`,
+      text: `Daily report for ${latest.day} is blocked after ${attemptsPhrase(latest.attempts)}${why}`,
+      tone: 'alarm',
+      at: latest.lastAttempt,
+      blockedDay: latest.day,
+    };
+  }
+  if (latest.status === 'failed') {
+    return {
+      text: `Daily report for ${latest.day} could not be delivered after ${attemptsPhrase(latest.attempts)}${why}`,
       tone: 'alarm',
       at: latest.lastAttempt,
     };

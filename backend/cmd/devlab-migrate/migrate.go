@@ -75,7 +75,11 @@ type plan struct {
 	presentHistory []string
 	presentNotices int
 	lapsedDue      []string
-	refusals       []string
+	// heldInactive names the recurring runs the export had switched ON and the import creates
+	// switched OFF, because they carry no axioms yet and therefore no prompt. It is the
+	// protocol's counterpart to the activation gate item.
+	heldInactive []string
+	refusals     []string
 }
 
 // empty reports whether applying the plan would write nothing.
@@ -185,16 +189,82 @@ func (m *migrator) plan(inputPath string) (*plan, error) {
 	if err := m.planNotices(p); err != nil {
 		return nil, err
 	}
+	// The bar comes LAST, over everything the import would create: nothing may enter the pool
+	// able to fire without a prompt that names its subject.
+	barUnsubstantiated(p)
 	sort.Strings(p.presentRuns)
 	sort.Strings(p.presentHistory)
 	return p, nil
 }
 
-// planAutoRun prepares one recurring run. It is created WITHOUT an axiom assignment: an
-// uncovered run is visible as uncovered, and the one planning path assigns axioms on the first
-// constitution write with a session behind it (B-10). Its authorship is the import itself at
-// import time — the schedule anchors on it, so a back-dated creation would make all seven runs
-// due at once on the first tick.
+// wouldFire answers "would the scheduler start this freshly imported record?" by the SAME two
+// conditions sched.IsDue applies — the one place "due" is decided — for a record with no
+// execution behind it yet: a recurring run fires while it is active and carries a recurrence, a
+// task fires once it carries a due date. The conditions are mirrored deliberately: the import has
+// to judge admission by the rule that will actually admit the record.
+func wouldFire(r runs.Run) bool {
+	if r.Kind == model.KindTodo {
+		return r.DueAt != nil
+	}
+	return r.Active && r.Schedule != nil
+}
+
+// unsubstantiated names why a record must not be imported ready to fire, or "" when it is sound.
+//
+// An execution takes the run's prompt snapshot VERBATIM and prepends only the division-of-labor
+// preamble. A record that can fire without a prompt that names its subject therefore sends an
+// unattended agent into every one of its target repositories with "you implement the task", no
+// task named, and the standing order never to end with a question and never to shrink the task.
+// That is not a half-finished import — it is an autonomous sweep without a subject, and an empty
+// axiom list produces exactly the same thing one step later (the composer writes its heading and
+// lists nothing beneath it). Both are refused by name.
+func unsubstantiated(r runs.Run) string {
+	if !wouldFire(r) {
+		return ""
+	}
+	if strings.TrimSpace(r.PromptSnapshot) == "" {
+		return "carries no prompt snapshot"
+	}
+	if r.Kind == model.KindAuto && len(r.AxiomIDs) == 0 {
+		return "carries no axioms, so its prompt names no subject"
+	}
+	if r.Kind == model.KindTodo && strings.TrimSpace(r.Task) == "" {
+		return "carries no task text, so its prompt names no subject"
+	}
+	return ""
+}
+
+// barUnsubstantiated is the import's own bar: it turns every unsound record into a named refusal,
+// which aborts the whole import before the first write. It is a structural tripwire, not a
+// repair — the planning above is what keeps records sound, and this states out loud what "sound"
+// means so a later change cannot quietly drop it.
+func barUnsubstantiated(p *plan) {
+	for _, r := range append(append([]runs.Run{}, p.autoRuns...), p.openTodos...) {
+		why := unsubstantiated(r)
+		if why == "" {
+			continue
+		}
+		p.refusals = append(p.refusals, fmt.Sprintf(
+			"record %s (%s) would be imported ready to fire and %s — its execution would run the bare preamble",
+			r.ID, r.Title, why))
+	}
+}
+
+// planAutoRun prepares one recurring run. Two properties belong together and are both deliberate:
+//
+//   - WITHOUT an axiom assignment: an uncovered run is visible as uncovered, and the one planning
+//     path assigns axioms on the first constitution write with a session behind it (B-10). No
+//     prompt is composed here either — an empty snapshot is the honest "not composed yet", while a
+//     composition over zero axioms would look complete and name nothing.
+//   - INACTIVE, whatever the export's switch said: an active run with no axioms and no prompt is
+//     due on its next window and would execute the bare preamble across every repository of the
+//     instance. The export's switch is not lost — it is protocolled per run and the activation
+//     gate item states what has to happen first (deploy/migration/10-daten.md). Activation is the
+//     operator's step AFTER the assignment, and the bar above refuses any record that would slip
+//     in ready to fire without a subject.
+//
+// Its authorship is the import itself at import time — the schedule anchors on it, so a
+// back-dated creation would make all seven runs due at once on the first tick.
 func (m *migrator) planAutoRun(p *plan, e exportRun, haveID, haveTitle map[string]bool) {
 	title := strings.TrimSpace(e.Name)
 	if haveID[e.ID] || haveTitle[strings.ToLower(title)] {
@@ -212,11 +282,15 @@ func (m *migrator) planAutoRun(p *plan, e exportRun, haveID, haveTitle map[strin
 		Kind:     model.KindAuto,
 		Title:    title,
 		Schedule: spec,
-		Active:   e.Enabled,
+		// Active is false for every imported run, see above.
+		Active: false,
 		// AxiomIDs, PromptSnapshot and PromptInputHash stay empty on purpose: the ONE
 		// composition path fills them when the assignment happens.
 		Authorship: model.Authorship{Created: by, CreatedAt: m.now, Updated: by, UpdatedAt: m.now},
 	})
+	if e.Enabled {
+		p.heldInactive = append(p.heldInactive, e.ID+" "+title)
+	}
 	haveID[e.ID] = true
 	haveTitle[strings.ToLower(title)] = true
 }
@@ -224,6 +298,12 @@ func (m *migrator) planAutoRun(p *plan, e exportRun, haveID, haveTitle map[strin
 // planOpenTodo prepares the one open foreign task as an executable task with its original
 // metadata. A due date that has already lapsed is NOT carried: it would fire the task on the
 // first tick, and this phase feeds the foreign tasks in without running them.
+//
+// The prompt snapshot is COMPOSED here, through runs.ComposeInto — the one composition path
+// (REQ-003). It is not copied from the export: the old composition is a foreign string of unknown
+// age, while the snapshot is what an execution hands the agent verbatim. Composing it at import
+// time is what makes the task executable at all; leaving it empty would make the task startable
+// and subjectless at once.
 func (m *migrator) planOpenTodo(p *plan, e exportRun, haveID map[string]bool) {
 	if haveID[e.ID] {
 		p.presentRuns = append(p.presentRuns, e.ID+" "+e.Name)
@@ -236,7 +316,7 @@ func (m *migrator) planOpenTodo(p *plan, e exportRun, haveID map[string]bool) {
 	}
 	// The actors are unknown: the export records no author, and unknown is never back-filled.
 	auth := model.Authorship{CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt}
-	p.openTodos = append(p.openTodos, runs.Run{
+	todo := runs.Run{
 		ID:          e.ID,
 		Kind:        model.KindTodo,
 		Title:       strings.TrimSpace(e.Name),
@@ -245,9 +325,22 @@ func (m *migrator) planOpenTodo(p *plan, e exportRun, haveID map[string]bool) {
 		DueAt:       due,
 		Attachments: e.attachments(),
 		Authorship:  auth,
-	})
+	}
+	// The todo branch of the one composition path needs no catalog: a task's snapshot is its own
+	// task base — the constitution reaches the agent through the repository's own CLAUDE.md.
+	runs.ComposeInto(&todo, runs.Catalog{})
+	p.openTodos = append(p.openTodos, todo)
 	haveID[e.ID] = true
 }
+
+// stageArchivedOutcome is the ONE stage an imported history entry carries, and it is deliberately
+// NOT a chain stage. The export recorded a single outcome flag and a single timestamp for the
+// whole record, so claiming preflight, implement, delivery or pull-request states would be exactly
+// the false green the rebuild exists to remove (K-4). This entry claims one thing and states it as
+// its own name: the outcome the source recorded. The surface renders the server's stage name
+// verbatim (B-35), the way it already renders the archive's historical stage names, so the entry
+// labels itself as an archive state and needs no case of its own.
+const stageArchivedOutcome = model.Stage("archived-outcome")
 
 // planHistoryEntry prepares one completed foreign task as a history entry: an execution document
 // with the original metadata and NO run definition, so it shows up in the history and never as an
@@ -273,9 +366,11 @@ func (m *migrator) planHistoryEntry(p *plan, e exportRun, haveResult map[string]
 	at := lr.At
 	repos := make([]model.RepoPipeline, 0, len(e.repoNames()))
 	for _, name := range e.repoNames() {
-		// No stages: the export carries no per-stage detail, and a claimed stage state is
-		// exactly the false green the rebuild exists to remove (K-4).
-		repos = append(repos, model.RepoPipeline{Repo: name, Stages: []model.StageView{}})
+		rp := model.RepoPipeline{Repo: name, Stages: []model.StageView{archivedOutcomeStage(lr)}}
+		// Derived, never invented: the same one derivation the store applies on every read, so
+		// the written document and the read document say the same thing.
+		rp.Done, rp.Succeeded = model.PipelineSucceeded(rp.Stages)
+		repos = append(repos, rp)
 	}
 	p.history = append(p.history, runs.Result{
 		ID:        id,
@@ -294,6 +389,24 @@ func (m *migrator) planHistoryEntry(p *plan, e exportRun, haveResult map[string]
 		Legacy:    true,
 	})
 	haveResult[id] = true
+}
+
+// archivedOutcomeStage carries the recorded outcome as a terminal state, so the entry is DONE and
+// its success is the one the source recorded — an entry left without stages is neither done nor
+// successful and the surface would have to call a recorded success "incomplete". The provenance
+// note sits in the field the contract designates for the state at hand: the reason is mandatory
+// for a failure, the log carries the note otherwise.
+func archivedOutcomeStage(lr *exportResultSummary) model.StageView {
+	at := lr.At
+	sv := model.StageView{Stage: stageArchivedOutcome, State: model.StepExecuted, EndedAt: &at}
+	note := "outcome recorded by the pre-rebuild export for the record as a whole — one flag, one " +
+		"timestamp, no per-stage detail"
+	if !lr.OK {
+		sv.State, sv.Reason = model.StepFailed, note
+		return sv
+	}
+	sv.Log = note
+	return sv
 }
 
 // historyReport states WHERE this entry comes from and WHAT the source did not carry, so the
@@ -321,7 +434,11 @@ func historyReport(e exportRun, lr *exportResultSummary) string {
 		b.WriteString("- attachments (metadata only; the files stay in the attachment pool): " +
 			strings.Join(files, ", ") + "\n")
 	}
-	b.WriteString("\nThe export carried no per-stage detail, so this entry claims none.\n")
+	b.WriteString("\nThe export carried no per-stage detail. This entry therefore records the outcome " +
+		"above as its one stage (`" + string(stageArchivedOutcome) + "`) and claims no stage of the " +
+		"delivery chain.\n")
+	b.WriteString("\nNo run definition stands behind this entry: the record was completed before the " +
+		"rebuild and exists as history only, so it cannot be started again from here.\n")
 	return b.String()
 }
 
@@ -390,7 +507,7 @@ func archiveFiles(dir string) ([]string, error) {
 	return out, nil
 }
 
-// planNotices prepares the M1–M8 protocol, skipping the items already recorded.
+// planNotices prepares the migration protocol, skipping the items already recorded.
 func (m *migrator) planNotices(p *plan) error {
 	have, err := m.notices.List()
 	if err != nil {
@@ -400,7 +517,7 @@ func (m *migrator) planNotices(p *plan) error {
 	for _, n := range have {
 		known[n.ID] = true
 	}
-	for _, o := range oneOffs() {
+	for _, o := range protocolItems() {
 		if known[noticeIDPrefix+o.Key] {
 			p.presentNotices++
 			continue

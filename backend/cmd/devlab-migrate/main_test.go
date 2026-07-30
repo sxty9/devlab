@@ -84,10 +84,12 @@ func TestDryRunWritesNothing(t *testing.T) {
 	for _, want := range []string{
 		"dry run — nothing is written",
 		"automatic runs (2)",
+		"created INACTIVE",
+		"activation gate (2)",
 		"open tasks (1)",
 		"history entries (3)",
 		"own-repository records skipped (2)",
-		"migration protocol M1–M8 (8 items to record)",
+		"migration protocol (9 items to record) — M1–M8 plus the activation gate",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("the protocol is missing %q:\n%s", want, text)

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -70,10 +71,13 @@ func (s *Server) StartReporter(ctx context.Context) {
 		// The pause lives on the state documents, so an unfinished execution is named as
 		// "paused" only when a document says so (nil-safe: without the machinery the report
 		// claims no pause).
-		Paused:   s.pausedExecutions(),
-		Notices:  s.runNotices, // the day's alarms, overrides and deviations (REQ-042.6)
+		Paused: s.pausedExecutions(),
+		// The day's alarms, overrides and deviations (REQ-042.6) — and where a blocked delivery
+		// raises its one bundled hint (K-5).
+		Notices:  s.noticePool(),
 		Ledger:   s.reportLedger,
 		Sender:   mailSender{},
+		Pub:      s.publisher(),
 		Lookback: lookback,
 		LinkBase: strings.TrimSpace(os.Getenv("DEVLAB_PUBLIC_URL")),
 	})
@@ -109,6 +113,15 @@ func (s *Server) pausedExecutions() report.PausedExecutions {
 		return nil
 	}
 	return s.docs
+}
+
+// noticePool hands out the notice pool as the Reporter's read+write seam, or nil while none is wired
+// (a typed nil would read as "present" through the interface and panic on first use).
+func (s *Server) noticePool() report.NoticePool {
+	if s.runNotices == nil {
+		return nil
+	}
+	return s.runNotices
 }
 
 // publisher hands out the SSE broker as a live.Publisher, or nil when none is wired — so a
@@ -159,7 +172,11 @@ type mailSender struct{}
 func (mailSender) Send(ctx context.Context, recipient string, c report.Content) error {
 	cl, err := mailer.New()
 	if err != nil {
-		return err
+		// An unreadable internal secret is a MISCONFIGURATION, not a hiccup: no number of retries
+		// makes the secret readable. The seam that knows this names the fault permanent (K-5), so the
+		// day gets one attempt and a blocked record awaiting a human — instead of a send per pass for
+		// ever. The named cause stays in the chain: callers still recognise mailer.ErrNoSecret.
+		return fmt.Errorf("%w: %w", report.ErrPermanent, err)
 	}
 	return cl.Send(ctx, mailer.Message{
 		Username: recipient,
@@ -169,9 +186,18 @@ func (mailSender) Send(ctx context.Context, recipient string, c report.Content) 
 	})
 }
 
-// runsReportStatus returns the recent delivery records of the daily run report (newest day first), so
-// the UI can surface a failed send instead of it vanishing silently. Read-only.
-func (s *Server) runsReportStatus(w http.ResponseWriter, _ *http.Request) {
+// runsReportStatus is the ONE access point to the daily report's delivery state, in both directions:
+//
+//	GET   the recent delivery records (newest day first), so a failed — or BLOCKED — send is visible
+//	      with its reason, its time and its attempts instead of vanishing silently (REQ-042.5).
+//	POST  the EXPLICIT resumption K-5 requires: it lifts the block on a blocked day ({"day": "…"}) or
+//	      on every blocked day when none is named, and hands them back to the retry path. Nothing
+//	      resumes itself, so a permanent fault stays blocked until a person says otherwise.
+func (s *Server) runsReportStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.resumeReportDelivery(w, r)
+		return
+	}
 	recs := []report.Record{}
 	if s.reportLedger != nil {
 		all, err := s.reportLedger.List()
@@ -188,4 +214,37 @@ func (s *Server) runsReportStatus(w http.ResponseWriter, _ *http.Request) {
 		recs = recs[:30]
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"records": recs})
+}
+
+// resumeReportDelivery performs the explicit resumption behind the access point above. It answers with
+// the days it actually lifted the block on — an empty list when nothing stood blocked, which is the
+// honest answer rather than a claimed success — and ticks the live stream so the surface shows the
+// resumed state without a reload.
+func (s *Server) resumeReportDelivery(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Day string `json:"day"`
+	}
+	// A body is optional — no body means "every blocked day" — but anything sent is read through the
+	// ONE decoder, so a malformed request is named rather than silently taken as "resume everything".
+	if r.Body != nil && r.ContentLength != 0 && !decodeJSON(w, r, &body) {
+		return
+	}
+	if s.reportLedger == nil {
+		writeErr(w, http.StatusServiceUnavailable, "The report ledger is unavailable")
+		return
+	}
+	resumed, err := report.Resume(s.reportLedger, strings.TrimSpace(body.Day))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not resume the report delivery")
+		return
+	}
+	days := make([]string, 0, len(resumed))
+	for _, rec := range resumed {
+		days = append(days, rec.Day)
+		log.Printf("devlabd: daily report %s for %s resumed — the next pass tries again", rec.Day, rec.Recipient)
+	}
+	if len(days) > 0 {
+		s.publish(live.TopicNotices)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"resumed": days})
 }

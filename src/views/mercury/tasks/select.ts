@@ -1,11 +1,15 @@
 // Open/history selectors — the client mirror of the backend derivation (runs/derive.go): pure
 // functions over the passive pools, nothing stored (REQ-011.2, REQ-037.1, B-8). Consumed by
 // the task lists here and by the execution history surface.
+//
+// The one thing this module never does is decide a CHAIN stage. Which executions still hold an open
+// delivery is read off the delivery ledger, where the server states it (deliveries.ts:
+// openDeliveryExecutionIds) — never guessed from a stage name (B-35).
 import type { Run, RunResult } from '../../../types';
 
 /** Whether an execution is history-ready: it ENDED and none of its deliveries is still open
  *  (open = neither merged nor closed with a reason). `openDeliveryExecutionIds` is the set of
- *  execution ids that still hold an open delivery, derived from the delivery ledger by the
+ *  execution ids that still hold an open delivery, read from the delivery ledger by the
  *  caller — an execution the ledger never names historizes on ending (a failed run delivered
  *  nothing). */
 export function executionCompleted(res: RunResult, openDeliveryExecutionIds?: ReadonlySet<string>): boolean {
@@ -33,21 +37,6 @@ export function runCompleted(run: Run, results: RunResult[], openDeliveryExecuti
   return results.some(
     (res) => res.runId === run.id && executionCompleted(res, openDeliveryExecutionIds) && executionCoversTargets(res, run),
   );
-}
-
-/** Derive which executions still hold an open delivery FROM the server's own stamps: an ended
- *  execution that delivered (a server-stated executed pull-request stage) but is not yet
- *  stamped merged (`mergedAt` is the B-8 completion stamp — set once every delivery is merged,
- *  rolled back, or closed with a reason). Legacy archive entries predate the ledger and are
- *  never open. No stage is DERIVED here (B-35) — only server-provided state is read. */
-export function openDeliveryExecutionIds(results: RunResult[]): ReadonlySet<string> {
-  const out = new Set<string>();
-  for (const res of results) {
-    if (res.legacy || !res.endedAt || res.mergedAt) continue;
-    const delivered = res.repos.some((rp) => rp.stages.some((s) => s.stage === 'pull-request' && s.state === 'executed'));
-    if (delivered) out.add(res.id);
-  }
-  return out;
 }
 
 /** Split runs and executions into the open list and the history so that open ∩ history = ∅

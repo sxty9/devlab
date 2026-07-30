@@ -607,6 +607,14 @@ func mcpToolRows() []mcpTool {
 			Op: "mercuryReportStatus", Method: http.MethodGet, Path: "/api/mercury/runs/report-status", Tier: tierRead,
 			Handler: (*Server).runsReportStatus,
 		},
+		{
+			Name: "report_resume", Desc: "Resume a blocked daily report so it is attempted again. A blocked report waits for this: it never resumes itself.",
+			Op: "mercuryResumeReportDelivery", Method: http.MethodPost, Path: "/api/mercury/runs/report-status", Tier: tierCSRF,
+			Handler: (*Server).runsReportStatus,
+			Params: []mcpParam{
+				bodyArg("day", mcp.KindString, false, "The day (YYYY-MM-DD) to resume; omit to resume every blocked day."),
+			},
+		},
 
 		// ── execution & slots ─────────────────────────────────────────────────────────────
 		{

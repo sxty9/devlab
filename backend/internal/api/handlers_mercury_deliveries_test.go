@@ -3,8 +3,9 @@ package api
 // Delivery-surface tests (S10). These adopt the coverage of the pre-rebuild
 // handlers_mercury_runs_rollback_test.go: the counter-booking DECISION logic itself now lives
 // (and is tested) in package deliver — here the API surface is pinned: ledger stages, the
-// rollback endpoint's outcomes (conflict → todo, open → closed PR), the reversal-PR tracking
-// for the auto-merge window, and the guards.
+// execution link the surface reads openness from, the rollback endpoint's outcomes (conflict →
+// todo, open → closed PR), the reversal-PR tracking for the auto-merge window, the deliberate dev
+// reset over the repository name the LEDGER states, and the guards.
 
 import (
 	"bytes"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +26,8 @@ import (
 	"devlab/backend/internal/links"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
+	"devlab/backend/internal/workbench"
+	"devlab/backend/internal/workspace"
 )
 
 // fakeDeliverOps is the fixture GitHubOps + GitSide the handler seam injects.
@@ -341,5 +345,197 @@ func TestMaintainDeliveriesComposition(t *testing.T) {
 	}
 	if r, _, _ := s.results.Get("exec_1"); r.MergedAt == nil {
 		t.Errorf("B-8: the execution result must settle, got %+v", r)
+	}
+}
+
+// ── The deliberate dev reset over the name the LEDGER states ─────────────────────────────
+
+// benchFixture is a hermetic workbench: a bare origin, a working tree cloned from it, and a
+// workbench branch one commit ahead of the default branch. It records what the handler passed
+// down, so the repository name that travels through the reset is provable.
+type benchFixture struct {
+	origin string
+	wt     string
+	repoID string
+	full   string
+	calls  int
+}
+
+// newBenchFixture builds the local repositories and substitutes the workbench seam with a bench
+// over the working tree — no GitHub, no sudo, real git.
+func newBenchFixture(t *testing.T) *benchFixture {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	// Hermetic git: the operator's own config must not decide what this test observes.
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
+	root := t.TempDir()
+	f := &benchFixture{origin: filepath.Join(root, "origin.git"), wt: filepath.Join(root, "work")}
+	gitCmd(t, "", "init", "--quiet", "--bare", "--initial-branch=main", f.origin)
+
+	seed := filepath.Join(root, "seed")
+	gitCmd(t, "", "clone", "--quiet", f.origin, seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, seed, "add", "-A")
+	gitCmd(t, seed, "commit", "-m", "seed")
+	gitCmd(t, seed, "push", "--quiet", "origin", "main")
+	// The workbench, one commit ahead — the state a reset must discard.
+	gitCmd(t, seed, "checkout", "--quiet", "-b", workbench.Branch)
+	if err := os.WriteFile(filepath.Join(seed, "undelivered.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, seed, "add", "-A")
+	gitCmd(t, seed, "commit", "-m", "undelivered work")
+	gitCmd(t, seed, "push", "--quiet", "origin", workbench.Branch)
+
+	gitCmd(t, "", "clone", "--quiet", "--branch", workbench.Branch, f.origin, f.wt)
+
+	old := openRunnerBench
+	openRunnerBench = func(_ *Server, _ context.Context, _, _, repoID, full string) (*workbench.Bench, string, func(), error) {
+		f.calls++
+		f.repoID, f.full = repoID, full
+		// The hermetic executor form: no user identity, so git runs directly instead of through
+		// the per-user sudo wrapper (workbench.New documents this form).
+		b, err := workbench.New(&workspace.Executor{}, f.wt)
+		return b, f.wt, func() {}, err
+	}
+	t.Cleanup(func() { openRunnerBench = old })
+	return f
+}
+
+// tip resolves a ref in one of the fixture's repositories.
+func (f *benchFixture) tip(t *testing.T, dir, ref string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", ref).Output()
+	if err != nil {
+		t.Fatalf("rev-parse %s in %s: %v", ref, dir, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// fixtureRepoSet substitutes the instance repo set with what GitHub would report: the id and the
+// short name are one path segment, the full name carries the owner.
+func fixtureRepoSet(t *testing.T, repos ...model.Repo) {
+	t.Helper()
+	old := runnerRepoSet
+	runnerRepoSet = func(context.Context, string, string) ([]model.Repo, error) { return repos, nil }
+	t.Cleanup(func() { runnerRepoSet = old })
+}
+
+// TestRepoResetOverLedgerRepoName is the reset the surface actually triggers: the button hands over
+// the repository string the DELIVERY LEDGER carries — the GitHub full name "owner/repo" — because
+// that is what a delivery record stores and what the deliveries view groups by. Before, that name
+// reached a lookup keyed by id/short name only and every reset answered 404; and the same string
+// would have become a workspace directory name. The reset must resolve and actually move the
+// workbench back onto the default branch.
+func TestRepoResetOverLedgerRepoName(t *testing.T) {
+	s := deliveriesServer(t)
+	fixtureRepoSet(t, model.Repo{ID: "a", Name: "a", FullName: "o/a", Permission: "push"})
+	f := newBenchFixture(t)
+	// The ledger states the full name (exec_deps writes it that way), and so does the surface.
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_1", Repo: "o/a", Branch: "fix/a-1", CreatedAt: tD})
+
+	mainTip := f.tip(t, f.wt, "refs/remotes/origin/main")
+	if f.tip(t, f.wt, "refs/heads/"+workbench.Branch) == mainTip {
+		t.Fatal("precondition: the workbench must be ahead of the default branch")
+	}
+
+	rec := httptest.NewRecorder()
+	s.runRepoReset(rec, authedReq(http.MethodPost, "/api/mercury/runs/reset", map[string]string{"repo": "o/a"}, "alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset over the ledger name: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if f.calls != 1 {
+		t.Fatalf("the workbench must be opened exactly once, got %d", f.calls)
+	}
+	// The workspace is addressed by the repo ID (one path segment); the clone by the full name.
+	if f.repoID != "a" || f.full != "o/a" {
+		t.Errorf("workbench opened for repoID=%q full=%q, want \"a\" / \"o/a\"", f.repoID, f.full)
+	}
+	if got := f.tip(t, f.wt, "refs/heads/"+workbench.Branch); got != mainTip {
+		t.Errorf("workbench tip = %s, want the default tip %s — the reset did not happen", got, mainTip)
+	}
+	if got := f.tip(t, f.origin, "refs/heads/"+workbench.Branch); got != mainTip {
+		t.Errorf("origin workbench = %s, want %s — the reset was not published", got, mainTip)
+	}
+	var out struct {
+		Reset bool   `json:"reset"`
+		Repo  string `json:"repo"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if !out.Reset || out.Repo != "o/a" {
+		t.Errorf("the answer must name the repository that was reset, got %+v", out)
+	}
+}
+
+// TestRepoResetShortNameAndUnknown: the short name resolves just as well (one lookup, three
+// accepted forms), and a repository outside the instance set is refused instead of guessed.
+func TestRepoResetShortNameAndUnknown(t *testing.T) {
+	s := deliveriesServer(t)
+	fixtureRepoSet(t, model.Repo{ID: "a", Name: "a", FullName: "o/a", Permission: "push"})
+	f := newBenchFixture(t)
+
+	rec := httptest.NewRecorder()
+	s.runRepoReset(rec, authedReq(http.MethodPost, "/api/mercury/runs/reset", map[string]string{"repo": "a"}, "alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reset over the short name: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	s.runRepoReset(rec, authedReq(http.MethodPost, "/api/mercury/runs/reset", map[string]string{"repo": "o/elsewhere"}, "alice"))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown repository: status = %d, want 404", rec.Code)
+	}
+	// A FOREIGN owner's repository of the same short name is not this instance's: resolving happens
+	// before the name is reduced, so it is refused rather than quietly redirected.
+	rec = httptest.NewRecorder()
+	s.runRepoReset(rec, authedReq(http.MethodPost, "/api/mercury/runs/reset", map[string]string{"repo": "other-owner/a"}, "alice"))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("foreign owner: status = %d, want 404", rec.Code)
+	}
+	if f.calls != 1 {
+		t.Errorf("an unresolved repository must never open a workbench, opened %d times", f.calls)
+	}
+}
+
+// TestDeliveriesListCarriesExecutionLink: the ledger's wire view names the execution a delivery
+// arose from. That link is what lets a surface state which executions still hold an OPEN delivery
+// by reading the two pools — the same B-8 rule runs.ExecutionCompleted applies — instead of
+// re-deriving a chain stage from its name (B-35).
+func TestDeliveriesListCarriesExecutionLink(t *testing.T) {
+	s := deliveriesServer(t)
+	m := tD.Add(time.Hour)
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_open", Repo: "o/a", Branch: "fix/a-1", CreatedAt: tD, ExecutionID: "exec_open"})
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_done", Repo: "o/a", Branch: "fix/a-2", CreatedAt: tD, MergedAt: &m, ExecutionID: "exec_done"})
+
+	rec := httptest.NewRecorder()
+	s.runDeliveriesList(rec, authedReq(http.MethodGet, "/api/mercury/runs/deliveries", nil, "alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Deliveries []struct {
+			ID          string `json:"id"`
+			Stage       string `json:"stage"`
+			ExecutionID string `json:"executionId"`
+		} `json:"deliveries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]string{}
+	for _, d := range out.Deliveries {
+		got[d.ID] = [2]string{d.Stage, d.ExecutionID}
+	}
+	if got["dlv_open"] != [2]string{"open", "exec_open"} {
+		t.Errorf("open delivery = %v, want stage open of exec_open", got["dlv_open"])
+	}
+	if got["dlv_done"] != [2]string{"merged", "exec_done"} {
+		t.Errorf("settled delivery = %v, want stage merged of exec_done", got["dlv_done"])
 	}
 }

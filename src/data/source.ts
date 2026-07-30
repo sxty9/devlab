@@ -200,6 +200,9 @@ export interface DataSource {
   /** Stored executions (history), newest first; `kind` narrows per surface. */
   mercuryRunExecutions(kind?: RunKind): Promise<{ executions: RunResult[] }>;
   mercuryReportStatus(): Promise<{ records: ReportDelivery[] }>;
+  /** Resume a BLOCKED daily report (K-5) — `day` names one, omitted resumes every blocked day.
+   *  Answers with the days it actually resumed, never with a claimed success. */
+  mercuryResumeReportDelivery(day?: string): Promise<{ resumed: string[] }>;
   mercuryChat(messages: RunChatMessage[]): Promise<RunChatReply>;
 
   // ── Mercury: execution & slots (S7/S13) ────────────────────────────────────

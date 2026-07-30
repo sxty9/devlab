@@ -6,6 +6,12 @@
 //
 // Both are dangerous actions, so both state their effect, the state they leave behind and the way
 // back before they run (REQ-040.6). The view refreshes on the `deliveries` topic — no polling.
+//
+// EVERY managed repository has a section here, not only the ones the ledger has already named: work
+// that was committed but never delivered leaves no ledger row, and that is precisely the repository
+// whose dev state may need the reset. A section without rows therefore says what the ledger holds
+// (nothing) — and no section claims what the dev branch of a repository carries: that is a property
+// only the repository itself can attest, and it is not on this wire.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { cn } from '@/lib/cn';
@@ -15,7 +21,7 @@ import { Modal } from '@/ui/Modal';
 import { useToast } from '@/ui/Toast';
 import { badgeTone } from '@/ui/tint';
 import { useLiveTopic } from '@/state/live';
-import type { Delivery } from '@/types';
+import type { Delivery, Repo } from '@/types';
 import {
   canRollback,
   commitRange,
@@ -38,6 +44,7 @@ export function DeliveriesView() {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [list, setList] = useState<Delivery[] | null>(null);
+  const [repos, setRepos] = useState<Repo[]>([]);
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
@@ -55,9 +62,21 @@ export function DeliveriesView() {
     }
   }, [source]);
 
+  // The managed repositories, through the ONE repo access point: they decide which sections exist,
+  // so a repository the ledger never named still has its reset. A failed read leaves the ledger's
+  // own repositories as the sections — fewer sections, never a wrong one.
+  const loadRepos = useCallback(async () => {
+    try {
+      setRepos(await source.repos());
+    } catch {
+      /* keep what is known */
+    }
+  }, [source]);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadRepos();
+  }, [load, loadRepos]);
   useLiveTopic('deliveries', load);
 
   const confirm = useCallback(async () => {
@@ -101,7 +120,9 @@ export function DeliveriesView() {
     );
   }
 
-  const groups = groupDeliveriesByRepo(list);
+  // A repository is named the way the ledger names it — its GitHub full name — so the ledger's rows
+  // and the managed set land in ONE section per repository instead of two under two spellings.
+  const groups = groupDeliveriesByRepo(list, repos.map((r) => r.fullName));
 
   return (
     <div className="dl-scroll min-h-0 w-full flex-1 overflow-y-auto bg-bg-base">
@@ -109,17 +130,20 @@ export function DeliveriesView() {
         <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Deliveries</h1>
 
         {groups.length === 0 ? (
-          <p className="mt-4 text-footnote text-text-tertiary">Nothing has been delivered yet.</p>
+          <p className="mt-4 text-footnote text-text-tertiary">No repository to deliver to yet.</p>
         ) : (
           <div className="mt-5 flex flex-col gap-5">
             {groups.map((g) => (
               <section key={g.repo}>
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <h2 className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
+                  {/* What the LEDGER states — never a claim about the repository's own branches. */}
                   <span className="text-caption text-text-tertiary">
-                    {g.devServes
-                      ? `dev serves ${shortSha(g.devServes.toCommit)} · ${g.openCount} open`
-                      : 'dev equals the default branch'}
+                    {g.deliveries.length === 0
+                      ? 'nothing delivered yet'
+                      : g.latestOpen
+                        ? `${g.openCount} open · last delivered ${shortSha(g.latestOpen.toCommit)}`
+                        : 'every delivery settled'}
                   </span>
                   <Button
                     variant="ghost"
@@ -130,15 +154,17 @@ export function DeliveriesView() {
                     Reset dev state
                   </Button>
                 </div>
-                <ul className="flex flex-col gap-1.5">
-                  {g.deliveries.map((d) => (
-                    <DeliveryRow
-                      key={d.id}
-                      delivery={d}
-                      onRollback={() => setPending({ kind: 'rollback', delivery: d, consequence: rollbackConfirmation(d) })}
-                    />
-                  ))}
-                </ul>
+                {g.deliveries.length > 0 && (
+                  <ul className="flex flex-col gap-1.5">
+                    {g.deliveries.map((d) => (
+                      <DeliveryRow
+                        key={d.id}
+                        delivery={d}
+                        onRollback={() => setPending({ kind: 'rollback', delivery: d, consequence: rollbackConfirmation(d) })}
+                      />
+                    ))}
+                  </ul>
+                )}
               </section>
             ))}
           </div>

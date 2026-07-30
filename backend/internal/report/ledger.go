@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
 
 	"devlab/backend/internal/statepath"
 )
@@ -26,9 +27,17 @@ const (
 	// a later-finishing run cannot produce a second email for the same day.
 	StatusSent Status = "sent"
 	// StatusFailed means a send was attempted and rejected/errored. It is deliberately visible (it
-	// carries the error and the attempt count) and is retried on the next pass — without duplicating,
-	// because success flips it to StatusSent and a sealed day is never retried.
+	// carries the error and the attempt count) and is retried once the record's backoff interval has
+	// passed — without duplicating, because success flips it to StatusSent and a sealed day is never
+	// retried.
 	StatusFailed Status = "failed"
+	// StatusBlocked means the sending stopped honestly (K-5): either the fault was PERMANENT — a
+	// misconfiguration or a rejection no repetition can change, which earns exactly one named
+	// attempt — or the transient attempts reached their cap. A blocked day states its reason, its
+	// time and its attempts and is never attempted again on its own: it waits for the explicit
+	// resumption (Resume), which is what keeps a broken mail path from producing one send per pass
+	// for ever.
+	StatusBlocked Status = "blocked"
 )
 
 // Record is the ledger entry for one (Recipient, Day). Day is a calendar date "YYYY-MM-DD" in the
@@ -42,6 +51,12 @@ type Record struct {
 	SentAt      *time.Time `json:"sentAt,omitempty"`      // set once StatusSent
 	LastAttempt *time.Time `json:"lastAttempt,omitempty"` // when the most recent attempt ran
 	LastError   string     `json:"lastError,omitempty"`   // the most recent failure reason (cleared on success)
+	// Backoff is the CURRENT retry episode of this day (K-5): the class of the last fault, how many
+	// attempts the episode has made, and the earliest moment the next one may run. It is the same
+	// record every other blocked thing in the system carries, so class, attempts and times read the
+	// same way everywhere. nil while nothing has failed — and nil again after an explicit
+	// resumption, which is what earns the resumed day a fresh set of attempts.
+	Backoff *model.Backoff `json:"backoff,omitempty"`
 }
 
 // key is the ledger's primary key. A recipient username never contains NUL, so it is a safe joiner.
@@ -137,6 +152,28 @@ func (l *Ledger) Put(rec Record) error {
 		recs = append(recs, rec)
 	}
 	return l.save(recs)
+}
+
+// Update applies mutate to the record for one (recipient, day) atomically — load, change and store
+// under the same lock — and returns the stored record plus whether it existed at all. It is what the
+// explicit resumption needs: a change coming from a request and a pass of the Reporter can never
+// overwrite each other's decision, because neither reads a state it does not also write. The pool
+// stays passive — WHAT changes is decided by the caller's mutate, never here.
+func (l *Ledger) Update(recipient, day string, mutate func(*Record)) (Record, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	recs, err := l.load()
+	if err != nil {
+		return Record{}, false, err
+	}
+	want := key(recipient, day)
+	for i := range recs {
+		if key(recs[i].Recipient, recs[i].Day) == want {
+			mutate(&recs[i])
+			return recs[i], true, l.save(recs)
+		}
+	}
+	return Record{}, false, nil
 }
 
 func (l *Ledger) save(recs []Record) error {

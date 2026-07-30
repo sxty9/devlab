@@ -310,6 +310,9 @@ export const httpSource: DataSource = {
   async mercuryReportStatus() {
     return json(await request('/api/mercury/runs/report-status'));
   },
+  async mercuryResumeReportDelivery(day) {
+    return json(await post('/api/mercury/runs/report-status', { day: day ?? '' }));
+  },
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },

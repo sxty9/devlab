@@ -1,18 +1,7 @@
 import { CodeIcon } from '@/ui/icons';
 import { Button } from '@/ui/Button';
+import { holisticOrigin } from '@/lib/constants';
 import type { User } from '@/types';
-
-/** Resolve the Holistic dashboard origin from DevLab's own host: devlab.<zone> → holistic.<zone>.
- *  Falls back to a bare path in dev/unknown hosts. */
-function holisticOrigin(): string {
-  if (typeof window === 'undefined') return '/';
-  const { protocol, hostname, host } = window.location;
-  const parts = hostname.split('.');
-  if (parts.length >= 2) {
-    return `${protocol}//holistic.${parts.slice(1).join('.')}`;
-  }
-  return `${protocol}//${host}`;
-}
 
 /** The Holistic sign-in URL carrying a `return` param, so Holistic sends the user straight back to
  *  where they were in DevLab after signing in (Holistic validates it stays on the same zone). */
@@ -45,7 +34,7 @@ export function SignInGate() {
   return (
     <GateShell>
       <p className="mt-1 max-w-xs text-footnote text-text-secondary">
-        Bitte über Holistic anmelden. Deine Sitzung gilt dann auch hier.
+        Sign in through Holistic — your session then carries over to here.
       </p>
       <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
         <Button
@@ -56,10 +45,10 @@ export function SignInGate() {
             window.location.href = holisticLoginUrl();
           }}
         >
-          Bei Holistic anmelden
+          Sign in with Holistic
         </Button>
         <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
-          Erneut prüfen
+          Check again
         </Button>
       </div>
     </GateShell>
@@ -73,16 +62,16 @@ export function AccessDenied({ user }: { user: User }) {
       <p className="mt-1 max-w-sm text-footnote text-text-secondary">
         {user.displayName || user.username ? (
           <>
-            Angemeldet als <span className="font-medium text-text-primary">{user.displayName || user.username}</span>.{' '}
+            Signed in as <span className="font-medium text-text-primary">{user.displayName || user.username}</span>.{' '}
           </>
         ) : null}
-        Für DevLab fehlt dir die Berechtigung. Ein Administrator kann dir das Recht{' '}
+        You do not have access to DevLab. An administrator grants the right{' '}
         <code className="rounded bg-fill/10 px-1 py-0.5 text-caption text-text-primary">hp_devlab_access</code>{' '}
-        über privleg erteilen.
+        in the central rights management.
       </p>
       <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
         <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
-          Erneut prüfen
+          Check again
         </Button>
       </div>
     </GateShell>

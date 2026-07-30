@@ -142,3 +142,45 @@ test('the report status line is honest about a failed send', () => {
 
   assert.equal(reportStatusLine([]), null);
 });
+
+// K-5: a BLOCKED delivery reads as blocked — with its reason, its attempts and the day that waits.
+// Rendering it as a delivered day (or as a failure still being retried) would state something that is
+// not happening: nothing is attempted again until it is resumed.
+test('the report status line names a blocked delivery and the day it waits on', () => {
+  const blocked: ReportDelivery[] = [
+    { recipient: 'ada', day: '2026-07-25', status: 'sent', executions: 2, attempts: 1, sentAt: '2026-07-26T02:00:00Z' },
+    {
+      recipient: 'ada',
+      day: '2026-07-26',
+      status: 'blocked',
+      executions: 1,
+      attempts: 1,
+      lastAttempt: '2026-07-27T00:05:00Z',
+      lastError: 'mailer: no internal secret configured',
+      backoff: {
+        reason: 'mailer: no internal secret configured',
+        class: 'permanent',
+        attempts: 1,
+        firstAt: '2026-07-27T00:05:00Z',
+        lastAt: '2026-07-27T00:05:00Z',
+        nextAt: '0001-01-01T00:00:00Z',
+      },
+    },
+  ];
+  const line = reportStatusLine(blocked);
+  assert.ok(line);
+  assert.equal(line!.tone, 'alarm');
+  assert.equal(line!.blockedDay, '2026-07-26', 'the blocked day must be named so it can be resumed');
+  assert.ok(line!.text.includes('2026-07-26'), line!.text);
+  assert.ok(line!.text.includes('blocked'), line!.text);
+  assert.ok(line!.text.includes('1 attempt'), line!.text);
+  assert.ok(line!.text.includes('no internal secret'), line!.text);
+  assert.equal(line!.at, '2026-07-27T00:05:00Z');
+  assert.ok(!line!.text.includes('delivered'), line!.text);
+
+  // A merely failed day is still being retried on its own: it does not read as blocked and offers
+  // nothing to resume.
+  const retrying = reportStatusLine([{ ...blocked[1], status: 'failed' }]);
+  assert.ok(!retrying!.text.includes('blocked'), retrying!.text);
+  assert.equal(retrying!.blockedDay, undefined);
+});

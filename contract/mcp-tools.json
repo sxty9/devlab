@@ -1276,6 +1276,25 @@
       }
     },
     {
+      "name": "report_resume",
+      "description": "Resume a blocked daily report so it is attempted again. A blocked report waits for this: it never resumes itself.",
+      "dataSourceOp": "mercuryResumeReportDelivery",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/report-status",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "day": {
+            "description": "The day (YYYY-MM-DD) to resume; omit to resume every blocked day.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
       "name": "report_status_get",
       "description": "Read which daily reports were sent, to whom, and what failed.",
       "dataSourceOp": "mercuryReportStatus",

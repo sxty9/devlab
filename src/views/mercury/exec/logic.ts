@@ -143,24 +143,48 @@ export function phaseBadge(phase: ExecutionView['phase']): { label: string; tone
   return PHASE_BADGE[phase] ?? { label: String(phase || 'unknown'), tone: 'neutral' };
 }
 
+/** Whether a record carries no step detail at all: it names repositories, but every one of them has
+ *  an EMPTY stage array. Such a record cannot be judged — there is nothing that ran, failed or was
+ *  skipped to read. */
+export function withoutStageDetail(res: RunResult): boolean {
+  return res.repos.length > 0 && res.repos.every((rp) => rp.stages.length === 0);
+}
+
 /** A recorded execution's outcome, derived ONLY from server-stated fields: still running while it
  *  has no end stamp; otherwise succeeded ⇔ every repo is done and succeeded. An execution without
- *  repositories is honestly "nothing to do", never a green success. */
+ *  repositories is honestly "nothing to do", never a green success.
+ *
+ *  A record without any step detail gets its OWN state instead of the derived "incomplete": that
+ *  label claims the work stopped half-way, which is a statement about steps nobody recorded. An
+ *  imported record whose source knew a single outcome for the whole run is the everyday case, and
+ *  the honest answer is to name the gap rather than to paint it red. */
 export function executionOutcome(res: RunResult): { label: string; tone: BadgeTone; pulse: boolean } {
   if (!res.endedAt) return { label: 'running', tone: 'warning', pulse: true };
   if (res.repos.length === 0) return { label: 'no repositories', tone: 'neutral', pulse: false };
   if (res.repos.some((rp) => rp.block)) return { label: 'blocked', tone: 'danger', pulse: false };
   const done = res.repos.every((rp) => rp.done);
-  if (!done) return { label: 'incomplete', tone: 'danger', pulse: false };
+  if (!done) {
+    return withoutStageDetail(res)
+      ? { label: 'no step detail', tone: 'neutral', pulse: false }
+      : { label: 'incomplete', tone: 'danger', pulse: false };
+  }
   return res.repos.every((rp) => rp.succeeded)
     ? { label: 'succeeded', tone: 'success', pulse: false }
     : { label: 'failed', tone: 'danger', pulse: false };
 }
 
-/** A recorded execution that ended without every repo succeeding can be triggered again — no
- *  corpses (REQ-037.2). A still-running one is not re-triggered from the history. */
-export function retriable(res: RunResult): boolean {
+/** Whether a recorded execution can be triggered again from the history — no corpses (REQ-037.2),
+ *  and no control into the void either (REQ-040.3). Two conditions, both necessary:
+ *
+ *   1. it ended without every repository succeeding — a running one is not re-triggered from the
+ *      history, a fully succeeded one has nothing to repeat; and
+ *   2. its RUN still exists. Results outlive the run they came from by contract, so a deleted run —
+ *      and an imported record that never had a definition — leaves a result with nothing left to
+ *      start. The caller states which run ids the pool still holds; without that answer nothing is
+ *      offered, because a missing answer is never taken for a yes. */
+export function retriable(res: RunResult, existingRunIds: ReadonlySet<string>): boolean {
   if (!res.endedAt) return false;
+  if (!existingRunIds.has(res.runId)) return false;
   return res.repos.length === 0 || !res.repos.every((rp) => rp.done && rp.succeeded);
 }
 

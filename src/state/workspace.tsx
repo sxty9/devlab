@@ -151,7 +151,7 @@ export function WorkspaceProvider({ repoId, children }: { repoId: string; childr
       .catch(() => {
         if (cancelled) return;
         // Without this the provider would sit on its splash forever, taking the whole shell with it.
-        toast({ title: `${repoId} konnte nicht geladen werden`, variant: 'danger' });
+        toast({ title: `${repoId} could not be loaded`, variant: 'danger' });
         closeRepo();
       });
     return () => {

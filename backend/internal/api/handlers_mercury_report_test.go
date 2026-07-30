@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"devlab/backend/internal/auth"
 	"devlab/backend/internal/mailer"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/report"
@@ -78,8 +80,10 @@ func TestRunsReportStatusEmptyIsAList(t *testing.T) {
 }
 
 // B-15 fail-soft: without a readable internal secret the mail seam returns a NAMED error — it
-// never panics and never invents a delivery. The reporter then records a visible failure and
-// retries, so a mail misconfiguration costs a mail, never the daemon.
+// never panics and never invents a delivery. K-5 sharpens it: an unreadable secret is a
+// MISCONFIGURATION, so the seam names the fault PERMANENT. Without that name the reporter would
+// treat a broken mail path as a passing hiccup and compose a send on every pass, for every
+// undelivered day, for ever.
 func TestMailSenderFailsSoftWithoutSecret(t *testing.T) {
 	t.Setenv("DEVLAB_MAIL_INTERNAL_SECRET", "")
 	t.Setenv("DEVLAB_MAIL_INTERNAL_SECRET_FILE", filepath.Join(t.TempDir(), "absent"))
@@ -90,6 +94,173 @@ func TestMailSenderFailsSoftWithoutSecret(t *testing.T) {
 	}
 	if !errors.Is(err, mailer.ErrNoSecret) {
 		t.Errorf("the failure must be the named one, got %v", err)
+	}
+	if !errors.Is(err, report.ErrPermanent) {
+		t.Errorf("a misconfigured mail path must be named permanent, got %v", err)
+	}
+}
+
+// K-5 — the ONE access point resumes a blocked delivery EXPLICITLY: POST lifts the block on the named
+// day, answers with what it actually resumed, and hands the day back to the retry path. Nothing else
+// unblocks it, so a permanently broken mail path waits for a person.
+func TestRunsReportStatusResumesABlockedDay(t *testing.T) {
+	s := reportFixture(t)
+	failed := time.Date(2026, 7, 27, 0, 5, 0, 0, time.UTC)
+	blocked := report.Record{
+		Recipient: "ada", Day: "2026-07-26", Status: report.StatusBlocked, Executions: 2, Attempts: 1,
+		LastAttempt: &failed, LastError: "mailer: no internal secret configured",
+		Backoff: &model.Backoff{
+			Class: "permanent", Attempts: 1, Reason: "mailer: no internal secret configured",
+			FirstAt: failed, LastAt: failed,
+		},
+	}
+	if err := s.reportLedger.Put(blocked); err != nil {
+		t.Fatal(err)
+	}
+	// A second, untouched day proves the resumption stays with the day it was asked for.
+	if err := s.reportLedger.Put(report.Record{
+		Recipient: "ada", Day: "2026-07-25", Status: report.StatusBlocked, Attempts: 5,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The blocked state is visible first — with its reason, its time and its attempts.
+	w := httptest.NewRecorder()
+	s.runsReportStatus(w, httptest.NewRequest("GET", "/api/mercury/runs/report-status", nil))
+	var status struct{ Records []report.Record }
+	if err := json.Unmarshal(w.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Records) != 2 || status.Records[0].Status != report.StatusBlocked ||
+		status.Records[0].Backoff == nil || status.Records[0].Backoff.Class != "permanent" {
+		t.Fatalf("a blocked delivery must be recognisable: %+v", status.Records)
+	}
+
+	// Then it is resumed by name.
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/mercury/runs/report-status", strings.NewReader(`{"day":"2026-07-26"}`))
+	s.runsReportStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct{ Resumed []string }
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Resumed) != 1 || body.Resumed[0] != "2026-07-26" {
+		t.Fatalf("resumed = %+v, want the one named day", body.Resumed)
+	}
+	rec, _, _ := s.reportLedger.Get("ada", "2026-07-26")
+	if rec.Status != report.StatusFailed || rec.Backoff != nil || rec.Attempts != 1 {
+		t.Errorf("the resumed day must be back in the retry path, keeping its history: %+v", rec)
+	}
+	if other, _, _ := s.reportLedger.Get("ada", "2026-07-25"); other.Status != report.StatusBlocked {
+		t.Errorf("the day nobody named must stay blocked: %+v", other)
+	}
+}
+
+// A resumption with no body lifts every blocked day; one that finds nothing blocked says so instead of
+// claiming a success.
+func TestRunsReportStatusResumeIsHonestAndIdempotent(t *testing.T) {
+	s := reportFixture(t)
+	for _, day := range []string{"2026-07-25", "2026-07-26"} {
+		if err := s.reportLedger.Put(report.Record{
+			Recipient: "ada", Day: day, Status: report.StatusBlocked, Attempts: 5, LastError: "mail service down",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resumed := func() []string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.runsReportStatus(w, httptest.NewRequest("POST", "/api/mercury/runs/report-status", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+		}
+		var body struct{ Resumed []string }
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Resumed
+	}
+
+	// A malformed body is NAMED, never silently taken as "resume everything".
+	w := httptest.NewRecorder()
+	s.runsReportStatus(w, httptest.NewRequest("POST", "/api/mercury/runs/report-status", strings.NewReader("{day")))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("a malformed body = %d, want 400: %s", w.Code, w.Body.String())
+	}
+	if rec, _, _ := s.reportLedger.Get("ada", "2026-07-26"); rec.Status != report.StatusBlocked {
+		t.Fatalf("a refused request must change nothing: %+v", rec)
+	}
+
+	if got := resumed(); len(got) != 2 {
+		t.Fatalf("resumed = %+v, want both blocked days", got)
+	}
+	if got := resumed(); len(got) != 0 {
+		t.Errorf("a second resumption must claim nothing, got %+v", got)
+	}
+}
+
+// REQ-043 — an agent performs the SAME resumption as the surface: the tool's argument becomes the
+// access point's body, and behind it stands the one handler the UI calls. No second path exists.
+func TestReportResumeToolReachesTheSameResumption(t *testing.T) {
+	s := reportFixture(t)
+	if err := s.reportLedger.Put(report.Record{
+		Recipient: "ada", Day: "2026-07-26", Status: report.StatusBlocked, Attempts: 1,
+		LastError: "mailer: no internal secret configured",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var row mcpTool
+	for _, r := range mcpToolRows() {
+		if r.Name == "report_resume" {
+			row = r
+		}
+	}
+	if row.Name == "" {
+		t.Fatal("the resume capability is missing from the MCP tool table")
+	}
+	u := withRight()
+	req, err := mcpRequest(context.Background(), row, &u, mcpCallInfo{}, json.RawMessage(`{"day":"2026-07-26"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	s.runsReportStatus(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body.String())
+	}
+	var body struct{ Resumed []string }
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Resumed) != 1 || body.Resumed[0] != "2026-07-26" {
+		t.Fatalf("resumed = %+v", body.Resumed)
+	}
+	if rec, _, _ := s.reportLedger.Get("ada", "2026-07-26"); rec.Status != report.StatusFailed {
+		t.Errorf("the agent path did not resume the day: %+v", rec)
+	}
+}
+
+// REQ-040.3 — the resumption is REACHABLE: the ONE route table binds POST beside GET on the access
+// point. Unauthenticated here, so the honest answer is 401 in both directions; an unbound method would
+// fall through the table and answer 404 — a handler nobody can call.
+func TestReportStatusRouteAcceptsTheResume(t *testing.T) {
+	h := (&Server{v: auth.New()}).Handler()
+	for _, method := range []string{"GET", "POST"} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(method, "/api/mercury/runs/report-status", nil))
+		if w.Code == http.StatusNotFound || w.Code == http.StatusMethodNotAllowed {
+			t.Errorf("%s report-status is not routed (%d) — the access exists but nothing can reach it", method, w.Code)
+			continue
+		}
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s report-status = %d, want the guard's 401", method, w.Code)
+		}
 	}
 }
 

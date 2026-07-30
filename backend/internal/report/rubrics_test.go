@@ -184,9 +184,13 @@ func TestReportSurvivesAnUnreadableNoticePool(t *testing.T) {
 	}
 }
 
+// brokenNotices is a pool that can neither be read nor written — the worst case for the report:
+// neither its rubrics nor a block hint can pass through it, and neither may cost the report itself.
 type brokenNotices struct{}
 
 func (brokenNotices) List() ([]runs.Notice, error) { return nil, errBroken }
+
+func (brokenNotices) Coalesce(runs.Notice) (runs.Notice, error) { return runs.Notice{}, errBroken }
 
 var errBroken = errNotice("notice pool unreadable")
 

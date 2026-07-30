@@ -61,11 +61,11 @@ export function Dashboard() {
             <div className="flex flex-col items-start gap-3 rounded-card border border-separator bg-surface px-4 py-4 shadow-elev-1">
               <p className="max-w-lg text-footnote text-text-secondary">
                 {reposError
-                  ? 'Die Repository-Liste konnte nicht geladen werden. GitHub ist gerade nicht erreichbar.'
-                  : 'Keine Repositories sichtbar. DevLab zeigt die Holistic-Repos, auf die dein verknüpftes GitHub-Konto Zugriff hat.'}
+                  ? 'The repository list could not be read. GitHub is unreachable right now.'
+                  : 'No repositories visible. DevLab shows the Holistic repositories your linked GitHub account has access to.'}
               </p>
               <Button variant="secondary" size="sm" onClick={reloadRepos}>
-                Erneut prüfen
+                Check again
               </Button>
             </div>
           )}

@@ -30,9 +30,11 @@ import {
   stageHasDetail,
   stageLabel,
   usageParts,
+  withoutStageDetail,
 } from './logic.ts';
-import { executionCompleted, openDeliveryExecutionIds } from '../tasks/select.ts';
-import type { ExecutionView, RepoPipeline, RunResult, SlotOverview, StageView, StepState } from '../../../types';
+import { executionCompleted } from '../tasks/select.ts';
+import { openDeliveryExecutionIds } from '../deliveries/deliveries.ts';
+import type { Delivery, ExecutionView, RepoPipeline, RunResult, SlotOverview, StageView, StepState } from '../../../types';
 
 const AUTH = { created: { user: 'alice' }, createdAt: '2026-07-26T09:00:00Z', updated: { user: 'alice' }, updatedAt: '2026-07-26T09:00:00Z' };
 const NO_USAGE = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
@@ -238,9 +240,38 @@ test('an outcome is read off server stamps only: running, succeeded, failed, blo
   assert.deepEqual(by('e-block'), { label: 'blocked', tone: 'danger', pulse: false });
   assert.deepEqual(by('e-empty'), { label: 'no repositories', tone: 'neutral', pulse: false });
   assert.deepEqual(by('e-dead'), { label: 'running', tone: 'warning', pulse: true });
-  // An execution that ended with a repo still not done is incomplete — never a silent success.
-  const half = result({ id: 'h', runId: 'r', endedAt: '2026-07-26T15:00:00Z', repos: [pipeline({ repo: 'a' })] });
+  // An execution that ended with a repo still not done is incomplete — never a silent success. The
+  // record must carry step detail for that verdict: "incomplete" is a statement about steps.
+  const half = result({
+    id: 'h',
+    runId: 'r',
+    endedAt: '2026-07-26T15:00:00Z',
+    repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'x', state: 'executed' })] })],
+  });
   assert.equal(executionOutcome(half).label, 'incomplete');
+});
+
+test('a record without ANY step detail gets its own honest state, never a red "incomplete"', () => {
+  // Exactly the shape an imported entry has whose source knew one outcome for the whole run: it
+  // names repositories and carries no stages at all. Calling that "incomplete" claims the work
+  // stopped half-way — a statement about steps nobody ever recorded.
+  const imported = result({ id: 'i', runId: 'gone', legacy: true, endedAt: '2026-05-01T10:00:00Z', repos: [pipeline({ repo: 'a' })] });
+  assert.equal(withoutStageDetail(imported), true);
+  const outcome = executionOutcome(imported);
+  assert.notEqual(outcome.label, 'incomplete');
+  assert.equal(outcome.tone, 'neutral', 'an unrecorded pipeline is not an alarm');
+  assert.ok(outcome.label.length > 0);
+  // As soon as the server states a finished pipeline, its own verdict wins again.
+  const stated = result({
+    id: 'j',
+    runId: 'r',
+    endedAt: '2026-05-01T10:00:00Z',
+    repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'archived-outcome', state: 'executed' })], done: true, succeeded: true })],
+  });
+  assert.equal(withoutStageDetail(stated), false);
+  assert.equal(executionOutcome(stated).label, 'succeeded');
+  // A record with no repositories at all keeps its own older answer.
+  assert.equal(withoutStageDetail(result({ id: 'k', runId: 'r', endedAt: '2026-05-01T10:00:00Z' })), false);
 });
 
 test('archive and reconciliation are stated, not disguised', () => {
@@ -250,12 +281,26 @@ test('archive and reconciliation are stated, not disguised', () => {
 });
 
 test('anything that ended without full success is triggerable again — no corpses (REQ-037.2)', () => {
-  const by = (id: string) => retriable(HISTORY_FIXTURE.find((r) => r.id === id)!);
+  // Every run of the fixture still exists in this pool.
+  const runs = new Set(HISTORY_FIXTURE.map((r) => r.runId));
+  const by = (id: string) => retriable(HISTORY_FIXTURE.find((r) => r.id === id)!, runs);
   assert.equal(by('e-fail'), true);
   assert.equal(by('e-block'), true);
   assert.equal(by('e-empty'), true);
   assert.equal(by('e-ok'), false); // nothing to redo
   assert.equal(by('e-dead'), false); // still alive — the Active surface owns it
+});
+
+test('a record whose RUN is gone is never offered again — no control into the void (REQ-040.3)', () => {
+  // Results outlive their run by contract: a deleted run, and an imported entry that never had a
+  // definition, both leave a result there is nothing left to start.
+  const failed = HISTORY_FIXTURE.find((r) => r.id === 'e-fail')!;
+  assert.equal(retriable(failed, new Set([failed.runId])), true);
+  assert.equal(retriable(failed, new Set(['some-other-run'])), false, 'a deleted run offers no restart');
+  assert.equal(retriable(failed, new Set()), false, 'an unread run pool offers nothing');
+  const imported = result({ id: 'i', runId: 'foreign-task', legacy: true, endedAt: '2026-05-01T10:00:00Z', repos: [pipeline({ repo: 'a' })] });
+  assert.equal(retriable(imported, new Set()), false);
+  assert.equal(retriable(imported, new Set(['foreign-task'])), true, 'once a run exists again, the record may run');
 });
 
 // ── Ordering (REQ-037.3) ──────────────────────────────────────────────────────
@@ -289,22 +334,28 @@ test('sorting is stable for equal instants (the server order survives)', () => {
 // ── History membership: the SAME selector the task surfaces use (B-8) ────────
 
 test('the history admits an execution only once every delivery is settled (REQ-037.1, selector)', () => {
-  const delivered = (id: string, over: Partial<RunResult> = {}) =>
+  const shipped = (id: string, over: Partial<RunResult> = {}) =>
     result({
       id,
       runId: 'r',
       endedAt: '2026-07-26T11:00:00Z',
-      repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'pull-request', state: 'executed' })], done: true, succeeded: true })],
+      repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'x', state: 'executed' })], done: true, succeeded: true })],
       ...over,
     });
   const all = [
-    delivered('unmerged'), // delivered, no merge stamp yet → stays OPEN
-    delivered('merged', { mergedAt: '2026-07-26T12:00:00Z' }),
+    shipped('unmerged'),
+    shipped('merged'),
     result({ id: 'running', runId: 'r' }), // no end stamp → not history
-    result({ id: 'nodelivery', runId: 'r', endedAt: '2026-07-26T09:00:00Z', repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'implement', state: 'failed' })], done: true })] }),
+    result({ id: 'nodelivery', runId: 'r', endedAt: '2026-07-26T09:00:00Z', repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'y', state: 'failed' })], done: true })] }),
   ];
-  // Exactly the composition ExecutionsView performs — no second membership rule exists.
-  const open = openDeliveryExecutionIds(all);
+  // Openness comes from the LEDGER, where the server states it — the client never reconstructs it
+  // from a stage name (B-35). This is exactly the composition ExecutionsView performs; no second
+  // membership rule exists.
+  const ledger: Delivery[] = [
+    { id: 'dlv_1', repo: 'o/a', branch: 'b1', fromCommit: 'c0', toCommit: 'c1', createdAt: '2026-07-26T11:30:00Z', stage: 'open', executionId: 'unmerged' },
+    { id: 'dlv_2', repo: 'o/a', branch: 'b2', fromCommit: 'c1', toCommit: 'c2', createdAt: '2026-07-26T11:30:00Z', stage: 'merged', executionId: 'merged' },
+  ];
+  const open = openDeliveryExecutionIds(ledger);
   const history = sortExecutions(all.filter((res) => executionCompleted(res, open)));
   assert.deepEqual(history.map((r) => r.id), ['merged', 'nodelivery']);
   assert.ok(open.has('unmerged'));
@@ -407,18 +458,53 @@ function codeOnly(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
 }
 
+/** The five chain stages. They are decided on the server; a client-side literal is the first step
+ *  back towards the deleted step-name heuristic (B-35). */
+const CHAIN_STAGES = ['preflight', 'implement', 'deliver-dev', 'publish', 'pull-request'];
+
 test('no chain stage is derived, named or ordered in the client (B-35)', () => {
-  // The five chain stages exist ONLY on the server. A client-side literal would be the first step
-  // back towards the deleted step-name heuristic.
-  const chain = ['preflight', 'implement', 'deliver-dev', 'publish', 'pull-request'];
   for (const { name, src } of surfaceFiles()) {
     const code = codeOnly(src);
-    for (const s of chain) {
+    for (const s of CHAIN_STAGES) {
       assert.ok(!code.includes(`'${s}'`) && !code.includes(`"${s}"`), `${name} must not carry the stage literal ${s}`);
     }
     assert.ok(!/PIPELINE_STAGES|REPORT_STAGES|deriveJobs|isReportExecution/.test(code), `${name} must not resurrect the client-side stage derivation`);
   }
 });
+
+test('and no chain stage literal exists ANYWHERE in the client — the whole tree (B-35)', () => {
+  // The per-surface guard above only reads the surfaces it lists. That is how a stage-name test in a
+  // sibling directory survived once; the rule is tree-wide, so the guard is too. The single
+  // exception is types.ts, which MIRRORS the frozen wire vocabulary (it declares the names, it
+  // decides nothing).
+  const root = join(HERE, '..', '..', '..');
+  const allowed = join(root, 'types.ts');
+  for (const path of walkClient(root)) {
+    if (path === allowed) continue;
+    const code = codeOnly(readFileSync(path, 'utf8'));
+    for (const s of CHAIN_STAGES) {
+      assert.ok(
+        !code.includes(`'${s}'`) && !code.includes(`"${s}"`),
+        `${path.slice(root.length + 1)} must not carry the chain stage literal ${s}`,
+      );
+    }
+  }
+});
+
+/** Every implementation file of the client (tests excluded — a test names a construct to prove its
+ *  absence, and a guard that read the guards would report the proof as the offence). */
+function walkClient(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...walkClient(path));
+    } else if (/\.(ts|tsx)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)) {
+      out.push(path);
+    }
+  }
+  return out;
+}
 
 test('every rendered report goes through the sanitizing markdown renderer (REQ-038)', () => {
   for (const { name, src } of surfaceFiles()) {
@@ -464,7 +550,23 @@ test('the calendar reads through the SAME access points as the history (REQ-012)
 
 test('the history states no membership rule of its own — it consumes the shared selector (B-8)', () => {
   const src = surfaceFiles().find((f) => f.name === 'ExecutionsView.tsx')!.src;
-  assert.match(src, /import \{ executionCompleted, openDeliveryExecutionIds \} from '\.\.\/tasks\/select'/);
+  assert.match(src, /import \{ executionCompleted \} from '\.\.\/tasks\/select'/);
+  // Openness is READ from the ledger through the one delivery access point, not derived here.
+  assert.match(src, /import \{ openDeliveryExecutionIds \} from '\.\.\/deliveries\/deliveries'/);
   const code = codeOnly(src);
+  assert.match(code, /source\.mercuryDeliveries\(/, 'the ledger the membership rule needs must be read');
   assert.ok(!/mergedAt/.test(code), 'the completion stamp is the selector\'s business, not the view\'s');
+});
+
+test('the history offers a restart only while the RUN exists — and states it otherwise (REQ-040.3)', () => {
+  const src = surfaceFiles().find((f) => f.name === 'ExecutionsView.tsx')!.src;
+  const code = codeOnly(src);
+  // The set of existing runs is READ (results outlive their run), and every run-bound control of the
+  // pane — restart, the one-grip delivery and the resume — is gated on it.
+  assert.match(code, /source\.mercuryRuns\(/);
+  assert.match(code, /retriable\(selected, knownRunIds\)/);
+  assert.match(code, /onDeliver=\{runGone === false \?/);
+  assert.match(code, /onResume=\{runGone === false \?/);
+  // And the pane says WHY nothing is offered instead of leaving the user guessing.
+  assert.match(src, /no longer exists/);
 });

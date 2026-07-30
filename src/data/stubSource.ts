@@ -122,6 +122,7 @@ export const stubSource: DataSource = {
   async mercuryReportStatus() {
     return { records: [] };
   },
+  mercuryResumeReportDelivery: offline,
   mercuryChat: offline,
   mercuryRunNow: offline,
   async mercuryRunActive() {

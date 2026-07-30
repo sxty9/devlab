@@ -18,8 +18,9 @@ import { TaskForm } from './TaskForm';
 import { TaskList } from './TaskList';
 import { TaskDetail } from './TaskDetail';
 import { errMsg } from './logic';
-import { openDeliveryExecutionIds, splitOpenHistory } from './select';
-import type { Repo, RunCoverage, RunKind, RunList, RunResult } from '@/types';
+import { splitOpenHistory } from './select';
+import { openDeliveryExecutionIds } from '../deliveries/deliveries';
+import type { Delivery, Repo, RunCoverage, RunKind, RunList, RunResult } from '@/types';
 
 export interface SurfaceProps {
   kind: RunKind;
@@ -38,6 +39,7 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   const [coverage, setCoverage] = useState<RunCoverage | null>(null);
   const [repos, setRepos] = useState<Repo[]>([]);
   const [executions, setExecutions] = useState<RunResult[]>([]);
+  const [deliveries, setDeliveries] = useState<Delivery[]>([]);
   const [liveRunIds, setLiveRunIds] = useState<ReadonlySet<string>>(() => new Set());
   const [nextDue, setNextDue] = useState<Record<string, string>>({});
   const [failed, setFailed] = useState<string | null>(null);
@@ -76,6 +78,16 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
     }
   }, [source, kind]);
 
+  // The ledger states which deliveries are still open, and an open one keeps its execution — and so
+  // its task — in this list (B-8). Read through the ONE delivery access point.
+  const reloadDeliveries = useCallback(async () => {
+    try {
+      setDeliveries(await source.mercuryDeliveries());
+    } catch {
+      /* keep the last good ledger */
+    }
+  }, [source]);
+
   const reloadActive = useCallback(async () => {
     try {
       const { active } = await source.mercuryRunActive();
@@ -88,6 +100,7 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   useEffect(() => {
     void reload();
     void reloadExecutions();
+    void reloadDeliveries();
     void reloadActive();
     if (isTodo) {
       source
@@ -95,14 +108,17 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
         .then(setRepos)
         .catch((e) => toast({ title: 'Could not load the repositories', description: errMsg(e), variant: 'danger' }));
     }
-  }, [source, isTodo, reload, reloadExecutions, reloadActive, toast]);
+  }, [source, isTodo, reload, reloadExecutions, reloadDeliveries, reloadActive, toast]);
 
   // The one live mechanism keeps every dataset fresh — foreign sessions, autonomous runs and
   // merges appear on their own (REQ-034); a resting view causes no periodic requests. A merge
   // stamps results (B-8), so the deliveries topic refreshes the executions too.
   useLiveTopic('runs', reload);
   useLiveTopic('progress', reloadExecutions);
-  useLiveTopic('deliveries', reloadExecutions);
+  useLiveTopic('deliveries', () => {
+    void reloadExecutions();
+    void reloadDeliveries();
+  });
   useLiveTopic('active', reloadActive);
 
   // The ONE start flow of this surface (the very flow the execution surface uses): resume-vs-fresh,
@@ -144,7 +160,7 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   const ofKind = list.runs.filter((r) => r.kind === kind);
   // Open ∩ history = ∅ (REQ-011.2): a done todo leaves this list; its executions live in the
   // History section. An open delivery keeps its execution — and so its todo — open (B-8).
-  const { open } = splitOpenHistory(ofKind, executions, openDeliveryExecutionIds(executions));
+  const { open } = splitOpenHistory(ofKind, executions, openDeliveryExecutionIds(deliveries));
   const shownBase = isTodo ? open : ofKind;
 
   const lastStarted: Record<string, string> = {};

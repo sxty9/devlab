@@ -2,8 +2,10 @@
 
 _Owner: B5. The command sequence below is the binding cutover (BAUPLAN §5): backup, wrappers +
 sudoers, unit + drop-in, marker removal, build as an unprivileged user, install-only, migrate
-BEFORE the first start, start + honest probes. Instance values appear ONLY here and in the
-drop-in — never in the repository's code._
+BEFORE the first start, start + honest probes. Instance values live in the drop-in and in the
+operator's shell — never in the repository. What this document cannot know is written as a
+placeholder (`<export-dir>`, `<github-owner>`, same convention as `10-daten.md`); substitute it
+before running the line._
 
 ```sh
 # 0) Sicherung (Alt-Datenpfad + Binary + Unit)
@@ -23,11 +25,14 @@ sudo visudo -c
 sudo rm -f /usr/local/sbin/devlab-restart-idle /usr/local/sbin/devlab-deploy /usr/local/sbin/devlab-preview
 sudo mv /etc/devlab/deploy.d /root/deploy.d.bak    # per-Repo-Skriptmechanik außer Betrieb (B-44)
 
-# 2) Unit + Drop-in (Instanz-Werte bleiben NUR hier)
+# 2) Unit + Drop-in (Instanz-Werte bleiben NUR im Drop-in)
 sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
 sudo $EDITOR /etc/systemd/system/devlabd.service.d/runs.conf
 #   ENTFERNEN: Environment=DEVLAB_RUNS_MODE=full          (existiert im Neubau nicht, REQ-027.1)
 #   SETZEN:    Environment=DEVLAB_STATE_DIR=/var/lib/devlab
+#              Environment=DEVLAB_GH_OWNER=<github-owner>  (PFLICHT: der GitHub-Owner der
+#                        Instanz; es gibt keinen Default mehr — ohne diesen Wert löst devlabd
+#                        KEIN Repository auf und liefert eine leere Menge, nie eine fremde)
 #              Environment=DEVLAB_RUNS_DRAIN_GRACE=60s
 #              Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
 #   (DEVLAB_RUNS_MAX_CONCURRENCY bleibt als STARTWERT; Laufzeit gewinnt, REQ-013.2)
@@ -37,17 +42,20 @@ sudo systemctl daemon-reload
 sudo rm -f /var/lib/devlab/mercury/run-active /var/lib/devlab/mercury/runs-active
 
 # 4) Bauen als UNPRIVILEGIERTER User (root baut nie), dann install-only
-(cd backend && go build -o /tmp/neubau/devlabd ./cmd/devlabd && go build -o /tmp/neubau/devlab-migrate ./cmd/devlab-migrate)
+(cd backend && go build -o /tmp/devlab-build/devlabd ./cmd/devlabd && go build -o /tmp/devlab-build/devlab-migrate ./cmd/devlab-migrate)
 npm ci && npm run build
-sudo install -o root -g root -m0755 /tmp/neubau/devlabd /usr/local/bin/devlabd
+sudo install -o root -g root -m0755 /tmp/devlab-build/devlabd /usr/local/bin/devlabd
 sudo rsync -a --delete dist/ /var/lib/devlab/www/
 
 # 5) Datenmigration VOR dem ersten Start (B-9; migrate verweigert bei laufendem Dienst)
-sudo -u devlab env DEVLAB_STATE_DIR=/var/lib/devlab /tmp/neubau/devlab-migrate \
-    --input /home/nanu/devlab-neubau/mercury-runs-roh.json
+#    <export-dir> = Ablage des Roh-Exports (Instanzdaten, nie im Repo — siehe 10-daten.md)
+sudo -u devlab env DEVLAB_STATE_DIR=/var/lib/devlab /tmp/devlab-build/devlab-migrate \
+    --input <export-dir>/mercury-runs-roh.json
 
 # 6) Start + ehrliche Prüfung
 sudo systemctl start devlabd && systemctl status devlabd --no-pager
+systemctl show -p Environment devlabd | grep -q 'DEVLAB_GH_OWNER=[^[:space:]]' \
+    || echo 'FEHLT: DEVLAB_GH_OWNER — die Repo-Menge bleibt leer (Schritt 2)'
 ss -tlnp | grep 8781 && curl -fsS http://127.0.0.1:8781/api/health
 curl -fsS --unix-socket /var/lib/devlab/restart-ready.sock http://x/ready -o /dev/null -w '%{http_code}\n'   # 204 erwartet
 ```

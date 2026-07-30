@@ -426,6 +426,10 @@ export interface Delivery {
   mergedAt?: string;
   reversalOf?: string;
   stage?: string;
+  /** The execution this delivery arose from. Reading it against `stage` is how a surface knows
+   *  which executions still hold an open delivery — the server's own B-8 rule — instead of guessing
+   *  it from a chain stage name (B-35). Absent on a record the ledger cannot attribute. */
+  executionId?: string;
 }
 
 export interface PRRef {
@@ -697,12 +701,15 @@ export interface RunCalendar {
 export interface ReportDelivery {
   recipient: string;
   day: string;
-  status: 'sent' | 'failed';
+  /** `blocked` is the honest end of the retries (K-5): the send is not attempted again until it is
+   *  resumed explicitly. `backoff` then carries the class, the attempts and the times. */
+  status: 'sent' | 'failed' | 'blocked';
   executions: number;
   attempts: number;
   sentAt?: string;
   lastAttempt?: string;
   lastError?: string;
+  backoff?: Backoff;
 }
 
 // ── Mercury chat (reviewable single-action proposals) ─────────────────────────

@@ -14,6 +14,7 @@ import (
 	"devlab/backend/internal/live"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/sched"
+	"devlab/backend/internal/workbench"
 )
 
 // The whole chain, end to end, over the real motor and the real route table: a todo starts
@@ -55,13 +56,19 @@ func TestBootChainEndToEnd(t *testing.T) {
 	}
 
 	// The agent's committed work was published (K-1: publish after commit) and a PR exists on
-	// the ONE PR path.
-	r := e.deps.repo("alpha")
-	if len(r.published) == 0 {
-		t.Error("nothing was published — committed work must be secured the moment it exists")
+	// the ONE PR path. "Published" is asked of the REMOTE: the origin's working branch must carry
+	// exactly the local tip.
+	gr := e.deps.git("alpha")
+	localTip, err := gr.bench.Head(ctx)
+	if err != nil {
+		t.Fatalf("workbench head: %v", err)
 	}
-	if len(e.deps.prs) != 1 {
-		t.Errorf("pull requests opened: %d, want exactly 1", len(e.deps.prs))
+	if published := gr.originHead("refs/heads/" + workbench.Branch); published != localTip {
+		t.Errorf("origin/%s is %q but the workbench is at %q — committed work was not secured",
+			workbench.Branch, published, localTip)
+	}
+	if open := e.deps.openPRs(); len(open) != 1 {
+		t.Errorf("pull requests opened: %d, want exactly 1", len(open))
 	}
 	dels, err := e.deliveries.All()
 	if err != nil {

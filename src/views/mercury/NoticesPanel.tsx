@@ -71,6 +71,20 @@ export function NoticesPanel() {
     }
   };
 
+  // K-5: a BLOCKED report delivery is resumed EXPLICITLY — it never retries on its own.
+  const resumeReport = async (day: string) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await source.mercuryResumeReportDelivery(day);
+      await reload();
+    } catch (e) {
+      toast({ title: 'Could not resume the report delivery', description: errMsg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const clearAll = async () => {
     if (busy) return;
     setBusy(true);
@@ -117,10 +131,23 @@ export function NoticesPanel() {
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
         {status && (
-          <p className={cn('mb-3 rounded-md px-3 py-2 text-caption', toneBox(status.tone))}>
-            {status.text}
-            {status.at ? ` · ${fmtDateTime(status.at)}` : ''}
-          </p>
+          <div className={cn('mb-3 flex flex-wrap items-center gap-2 rounded-md px-3 py-2 text-caption', toneBox(status.tone))}>
+            <span>
+              {status.text}
+              {status.at ? ` · ${fmtDateTime(status.at)}` : ''}
+            </span>
+            {status.blockedDay && (
+              <Button
+                variant="secondary"
+                size="sm"
+                className="ml-auto"
+                disabled={busy}
+                onClick={() => void resumeReport(status.blockedDay!)}
+              >
+                Resume
+              </Button>
+            )}
+          </div>
         )}
 
         {notices === null ? (

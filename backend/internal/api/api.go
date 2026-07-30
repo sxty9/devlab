@@ -259,6 +259,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/executions", s.guard(s.runsExecutions))
 	mux.HandleFunc("GET /api/mercury/runs/notices", s.guard(s.runsNoticesList))
 	mux.HandleFunc("GET /api/mercury/runs/report-status", s.guard(s.runsReportStatus))
+	// The same access point in the writing direction: the explicit resumption of a BLOCKED report
+	// delivery (K-5). One access, two verbs — not a second, similar sibling.
+	mux.HandleFunc("POST /api/mercury/runs/report-status", s.guardCSRF(s.runsReportStatus))
 	// Δ Executions & slots (S7/S13).
 	mux.HandleFunc("GET /api/mercury/runs/active", s.guard(s.runActive))
 	mux.HandleFunc("GET /api/mercury/runs/slots", s.guard(s.runSlots))

@@ -32,6 +32,30 @@ type OneOff struct {
 	NextStep string
 }
 
+// protocolItems returns everything the import records as protocol: the eight one-off items M1–M8
+// of the old data set, plus the activation gate the import itself creates. One list, so the
+// notice pool, the printed protocol and the section file cannot disagree about what is open.
+func protocolItems() []OneOff {
+	return append(oneOffs(), activationGate())
+}
+
+// activationGate is the protocol item the IMPORT produces rather than inherits: the recurring runs
+// arrive switched off, and this states what has to happen before any of them may run. It is a
+// checked cutover step, not a hint — the corresponding section of
+// deploy/migration/10-daten.md carries the same wording with its verification.
+func activationGate() OneOff {
+	return OneOff{
+		Key:   "activation",
+		Label: "Activation gate — the imported recurring runs",
+		Text: "The recurring runs were imported switched OFF although the old system had them on. " +
+			"They carry no axioms yet, so they carry no composed prompt; an active run without one " +
+			"would send an unattended agent into every target repository with no task named.",
+		NextStep: "Assign the axioms (a constitution write triggers the assignment, B-10), confirm in " +
+			"the coverage view that every run carries axioms and a prompt, then switch each run on " +
+			"and check its next firing in the calendar.",
+	}
+}
+
 // oneOffs returns M1–M8 in order. The wording mirrors deploy/migration/10-daten.md; both are
 // this module's ownership, so the protocol in the surface and the protocol in the section file
 // cannot drift apart.

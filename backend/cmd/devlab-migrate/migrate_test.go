@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"devlab/backend/internal/executor"
 	"devlab/backend/internal/model"
+	"devlab/backend/internal/preflight"
 	"devlab/backend/internal/runs"
+	"devlab/backend/internal/sched"
 	"devlab/backend/internal/statepath"
 )
 
@@ -159,8 +162,8 @@ func TestForeignRecordsOpenTaskAndHistoryEntries(t *testing.T) {
 		t.Fatalf("both target repositories must be named: %+v", res.Repos)
 	}
 	for _, rp := range res.Repos {
-		if len(rp.Stages) != 0 {
-			t.Errorf("the export carries no stage detail — none may be claimed: %+v", rp)
+		if len(rp.Stages) != 1 || rp.Stages[0].Stage != stageArchivedOutcome {
+			t.Errorf("the entry must carry exactly the recorded outcome and no chain stage: %+v", rp)
 		}
 	}
 	if !strings.Contains(res.Report, "no per-stage detail") {
@@ -176,6 +179,81 @@ func TestForeignRecordsOpenTaskAndHistoryEntries(t *testing.T) {
 	}
 	if !strings.Contains(failed.Report, "failed") {
 		t.Errorf("a failed original outcome must stay failed:\n%s", failed.Report)
+	}
+}
+
+// An imported history entry is an ARCHIVE state, not a corpse: it carries the outcome the export
+// recorded in a stage of its own — `archived-outcome`, terminal, never a chain stage — so the one
+// derivation makes the entry done and its success the recorded one.
+//
+// Without it every entry stays "neither done nor successful", which the surface can only label
+// "incomplete" in red although the source recorded a success, and which makes it offer a re-run
+// for an execution that has no run definition to re-run.
+func TestImportedHistoryEntryCarriesTheRecordedOutcome(t *testing.T) {
+	p := stateRoot(t)
+	migrate(t, p)
+	results, err := runs.NewResultStore(p).List()
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	chain := map[model.Stage]bool{}
+	for _, s := range model.ChainStages() {
+		chain[s] = true
+	}
+	for _, c := range []struct {
+		id        string
+		state     model.StepState
+		succeeded bool
+	}{
+		{"2026-07-12T11-49-52.236015668Z", model.StepExecuted, true},
+		{"2026-07-14T14-52-28.048904010Z", model.StepExecuted, true},
+		{"2026-07-16T18-00-12.382259604Z", model.StepFailed, false},
+	} {
+		res, found := findResult(results, c.id)
+		if !found {
+			t.Errorf("history entry %s is missing", c.id)
+			continue
+		}
+		if len(res.Repos) == 0 {
+			t.Errorf("%s names no repository", c.id)
+			continue
+		}
+		for _, rp := range res.Repos {
+			if len(rp.Stages) != 1 {
+				t.Errorf("%s/%s: expected exactly the recorded outcome, got %+v", c.id, rp.Repo, rp.Stages)
+				continue
+			}
+			sv := rp.Stages[0]
+			if sv.Stage != stageArchivedOutcome || chain[sv.Stage] {
+				t.Errorf("%s/%s: the archive state must be its own name, not a chain stage: %q", c.id, rp.Repo, sv.Stage)
+			}
+			if sv.State != c.state {
+				t.Errorf("%s/%s: recorded outcome %q, want %q", c.id, rp.Repo, sv.State, c.state)
+			}
+			if !sv.State.Terminal() {
+				t.Errorf("%s/%s: an archived entry must END somewhere: %q", c.id, rp.Repo, sv.State)
+			}
+			if sv.EndedAt == nil || !sv.EndedAt.Equal(res.StartedAt) {
+				t.Errorf("%s/%s: the recorded instant must be carried: %+v", c.id, rp.Repo, sv)
+			}
+			// The contract: a failure states its reason; the note sits in the log otherwise.
+			if c.state == model.StepFailed && strings.TrimSpace(sv.Reason) == "" {
+				t.Errorf("%s/%s: a failed stage must carry its reason", c.id, rp.Repo)
+			}
+			if c.state == model.StepExecuted && strings.TrimSpace(sv.Log) == "" {
+				t.Errorf("%s/%s: the entry must say where its outcome comes from", c.id, rp.Repo)
+			}
+			if !rp.Done {
+				t.Errorf("%s/%s: a completed archive entry is done — otherwise it reads as incomplete", c.id, rp.Repo)
+			}
+			if rp.Succeeded != c.succeeded {
+				t.Errorf("%s/%s: succeeded=%v, want %v (the recorded outcome, neither prettied up nor sunk)",
+					c.id, rp.Repo, rp.Succeeded, c.succeeded)
+			}
+		}
+		if !strings.Contains(res.Report, "No run definition stands behind this entry") {
+			t.Errorf("%s: the entry must state that nothing can be started from it:\n%s", c.id, res.Report)
+		}
 	}
 }
 
@@ -285,8 +363,8 @@ func TestAutomaticRunsAreCreatedUncovered(t *testing.T) {
 		if err := r.Schedule.Valid(); err != nil {
 			t.Errorf("run %s got an unusable schedule: %v", r.ID, err)
 		}
-		if !r.Active {
-			t.Errorf("run %s was active in the export and must stay active", r.ID)
+		if r.Active {
+			t.Errorf("run %s is active while it carries neither axioms nor a prompt", r.ID)
 		}
 		if !r.Authorship.Created.Autonomous {
 			t.Errorf("run %s: a record the import creates is not a person's act: %+v", r.ID, r.Authorship.Created)
@@ -295,6 +373,173 @@ func TestAutomaticRunsAreCreatedUncovered(t *testing.T) {
 	if seen != 2 {
 		t.Fatalf("expected 2 automatic runs in the pool, got %d", seen)
 	}
+}
+
+// THE decisive property of the import: nothing it creates can be started by the scheduler while
+// it carries no prompt that names a subject. The check runs against sched.IsDue — the one place
+// "due" is decided — a week and a day after the import, so every weekly window has passed.
+//
+// Without this, the imported recurring runs are due with a 0-byte snapshot, and an execution
+// hands the agent the division-of-labor preamble alone: "YOU implement the task", no task,
+// "never end with a question", "do not shrink the task" — an autonomous sweep over every target
+// repository with no subject at all.
+func TestNothingImportedIsDueWithoutAPromptThatNamesItsSubject(t *testing.T) {
+	p := stateRoot(t)
+	migrate(t, p)
+	defs, err := runs.NewStore(p).List()
+	if err != nil {
+		t.Fatalf("run pool: %v", err)
+	}
+	if len(defs) == 0 {
+		t.Fatal("nothing was imported at all")
+	}
+	later := migrateNow.Add(8 * 24 * time.Hour)
+	for _, r := range defs {
+		subject := strings.TrimSpace(r.PromptSnapshot) != "" &&
+			(r.Kind == model.KindTodo || len(r.AxiomIDs) > 0)
+		if sched.IsDue(r, nil, later) && !subject {
+			t.Errorf("%s run %s is due %s after the import with %d axioms and a %d-byte prompt",
+				r.Kind, r.ID, later.Sub(migrateNow), len(r.AxiomIDs), len(r.PromptSnapshot))
+		}
+	}
+}
+
+// The bar itself, over the exact record shapes the import must never write. It is stated as a
+// table so a future change to the planning that reintroduces one of them fails here, in one line,
+// instead of on the instance.
+func TestARecordReadyToFireWithoutASubjectIsRefused(t *testing.T) {
+	weekly := &runs.ScheduleSpec{Kind: runs.Weekly, TimeOfDay: "07:00", Weekdays: []time.Weekday{time.Monday}}
+	due := migrateNow.Add(24 * time.Hour)
+	for _, c := range []struct {
+		name   string
+		run    runs.Run
+		refuse bool
+	}{
+		{"active recurring run without axioms or prompt", runs.Run{
+			ID: "r1", Kind: model.KindAuto, Title: "sweep", Schedule: weekly, Active: true}, true},
+		{"active recurring run with a prompt but no axioms", runs.Run{
+			ID: "r2", Kind: model.KindAuto, Title: "sweep", Schedule: weekly, Active: true,
+			PromptSnapshot: "# run\n\nno axioms beneath the heading"}, true},
+		{"inactive recurring run without either", runs.Run{
+			ID: "r3", Kind: model.KindAuto, Title: "sweep", Schedule: weekly}, false},
+		{"active recurring run with axioms and a prompt", runs.Run{
+			ID: "r4", Kind: model.KindAuto, Title: "sweep", Schedule: weekly, Active: true,
+			AxiomIDs: []string{"ax_reuse"}, PromptSnapshot: "# run\n\n### Reuse\nbody"}, false},
+		{"task with a due date and no prompt", runs.Run{
+			ID: "r5", Kind: model.KindTodo, Title: "task", Task: "do it", DueAt: &due}, true},
+		{"task with a due date and a prompt over an empty task", runs.Run{
+			ID: "r6", Kind: model.KindTodo, Title: "task", DueAt: &due,
+			PromptSnapshot: "# Konkretes ToDo: task\n\n## Aufgabe\n\n"}, true},
+		{"task without a due date and without a prompt", runs.Run{
+			ID: "r7", Kind: model.KindTodo, Title: "task", Task: "do it"}, false},
+		{"task with a due date, a task text and a prompt", runs.Run{
+			ID: "r8", Kind: model.KindTodo, Title: "task", Task: "do it", DueAt: &due,
+			PromptSnapshot: "# Konkretes ToDo: task\n\n## Aufgabe\n\ndo it"}, false},
+	} {
+		why := unsubstantiated(c.run)
+		if c.refuse && why == "" {
+			t.Errorf("%s: must be refused, was accepted", c.name)
+		}
+		if !c.refuse && why != "" {
+			t.Errorf("%s: must be accepted, was refused (%s)", c.name, why)
+		}
+	}
+}
+
+// And the bar end to end: a record the export delivers ready to fire without a subject aborts the
+// whole import by name — nothing at all is written.
+func TestATaskThatWouldFireWithoutATaskTextRefusesTheWholeImport(t *testing.T) {
+	p := stateRoot(t)
+	in := filepath.Join(t.TempDir(), "export.json")
+	if err := os.WriteFile(in, []byte(`{"runs":[
+	  {"id":"run_empty","name":"a task with no task text","type":"todo",
+	   "targets":[{"repo":"alpha"}],"dueAt":"2026-08-30T08:00:00Z",
+	   "createdAt":"2026-07-01T08:00:00Z","updatedAt":"2026-07-01T08:00:00Z"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := newMigrator(p, ownRepo, migrateNow)
+	pl, err := m.plan(in)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if len(pl.refusals) != 1 || !strings.Contains(pl.refusals[0], "run_empty") ||
+		!strings.Contains(pl.refusals[0], "no task text") {
+		t.Fatalf("expected one named refusal, got %v", pl.refusals)
+	}
+	if err := m.apply(pl); err == nil {
+		t.Fatal("apply must refuse a record that would fire without a subject")
+	}
+	if _, err := os.Stat(p.Runs()); !os.IsNotExist(err) {
+		t.Error("a refused import must not have written the run pool")
+	}
+}
+
+// The imported task carries the prompt an execution actually hands the agent: composed HERE
+// through the one composition path, from the task's own text. Assembled with the runtime addenda
+// it must NAME the task — the preamble alone is an order to implement nothing.
+func TestOpenTaskCarriesTheComposedPromptTheAgentReceives(t *testing.T) {
+	p := stateRoot(t)
+	migrate(t, p)
+	defs, err := runs.NewStore(p).List()
+	if err != nil {
+		t.Fatalf("run pool: %v", err)
+	}
+	var todo runs.Run
+	for _, r := range defs {
+		if r.ID == "run_foreign_open" {
+			todo = r
+		}
+	}
+	if todo.ID == "" {
+		t.Fatal("the open foreign task was not imported")
+	}
+	if strings.TrimSpace(todo.PromptSnapshot) == "" {
+		t.Fatal("the imported task carries no prompt snapshot — its execution would run the bare preamble")
+	}
+	if todo.PromptInputHash != "" {
+		t.Errorf("a task's snapshot has no axiom inputs, so it carries no input hash: %q", todo.PromptInputHash)
+	}
+	for _, want := range []string{todo.Title, "Switch the imports and prove the check passes."} {
+		if !strings.Contains(todo.PromptSnapshot, want) {
+			t.Errorf("the composed snapshot does not carry %q:\n%s", want, todo.PromptSnapshot)
+		}
+	}
+	full := executor.AssemblePrompt(todo.PromptSnapshot, preflight.Finding{State: model.TaskNotImplemented}, "")
+	if !strings.Contains(full, "Switch the imports and prove the check passes.") {
+		t.Errorf("the assembled execution prompt names no task:\n%s", full)
+	}
+}
+
+// The activation gate is recorded as a protocol item AND printed, so the operator cannot miss why
+// seven switched-on runs arrived switched off.
+func TestActivationGateIsRecordedAndProtocolled(t *testing.T) {
+	p := stateRoot(t)
+	pl := migrate(t, p)
+	if len(pl.heldInactive) != 2 {
+		t.Fatalf("both runs that were switched on in the export must be named, got %v", pl.heldInactive)
+	}
+	var buf bytes.Buffer
+	writeProtocol(&buf, pl, false)
+	for _, want := range []string{"activation gate (2)", "assign the axioms first"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("the protocol is missing %q:\n%s", want, buf.String())
+		}
+	}
+	list, err := runs.NewNoticeStore(p).List()
+	if err != nil {
+		t.Fatalf("notice pool: %v", err)
+	}
+	gate := activationGate()
+	for _, n := range list {
+		if n.ID != noticeIDPrefix+gate.Key {
+			continue
+		}
+		if !strings.Contains(n.Message(), "switched OFF") || !strings.Contains(n.NextStep, "Assign the axioms") {
+			t.Errorf("the gate record must name the required unlock: %+v", n)
+		}
+		return
+	}
+	t.Error("the activation gate was not recorded in the notice pool")
 }
 
 // Weekday and time-of-day survive the import — the recurrence is data, not a default.
@@ -501,16 +746,29 @@ func TestNoSkippedStateIsEverProducedAnew(t *testing.T) {
 	installArchive(t, p)
 	pl := migrate(t, p)
 
+	chain := map[model.Stage]bool{}
+	for _, s := range model.ChainStages() {
+		chain[s] = true
+	}
 	for _, res := range pl.history {
 		for _, rp := range res.Repos {
-			if len(rp.Stages) != 0 {
-				t.Errorf("history entry %s claims stage states: %+v", res.ID, rp.Stages)
+			for _, sv := range rp.Stages {
+				if chain[sv.Stage] {
+					t.Errorf("history entry %s claims the chain stage %q: %+v", res.ID, sv.Stage, sv)
+				}
 			}
 		}
 	}
-	for _, r := range append(append([]runs.Run{}, pl.autoRuns...), pl.openTodos...) {
-		if r.PromptSnapshot != "" {
-			t.Errorf("run %s was imported with a stale composition", r.ID)
+	for _, r := range pl.autoRuns {
+		if r.PromptSnapshot != "" || r.PromptInputHash != "" {
+			t.Errorf("recurring run %s was imported with a composition it has no axioms for", r.ID)
+		}
+	}
+	for _, r := range pl.openTodos {
+		// A task's snapshot is composed HERE, but from its own task text — never copied from the
+		// export's aged string.
+		if strings.Contains(r.PromptSnapshot, "old composed task prompt") {
+			t.Errorf("task %s carries the export's stale composition instead of a fresh one", r.ID)
 		}
 	}
 	// Across the whole imported history, every skip state traces back to the archive.
@@ -561,9 +819,12 @@ func TestOneOffItemsArePreparedAsNotices(t *testing.T) {
 	for _, n := range list {
 		byID[n.ID] = n
 	}
-	items := oneOffs()
-	if len(items) != 8 {
-		t.Fatalf("M1–M8 are eight items, got %d", len(items))
+	if len(oneOffs()) != 8 {
+		t.Fatalf("M1–M8 are eight items, got %d", len(oneOffs()))
+	}
+	items := protocolItems()
+	if len(items) != 9 {
+		t.Fatalf("the protocol is M1–M8 plus the activation gate, got %d items", len(items))
 	}
 	for _, o := range items {
 		n, ok := byID[noticeIDPrefix+o.Key]
@@ -617,7 +878,7 @@ func TestSecondRunChangesNothing(t *testing.T) {
 			t.Errorf("the second run rewrote %s", path)
 		}
 	}
-	if len(pl.presentRuns) != 3 || len(pl.presentHistory) != 3 || pl.presentNotices != 8 {
+	if len(pl.presentRuns) != 3 || len(pl.presentHistory) != 3 || pl.presentNotices != 9 {
 		t.Errorf("the second protocol must report what is already there, got runs=%v history=%v notices=%d",
 			pl.presentRuns, pl.presentHistory, pl.presentNotices)
 	}

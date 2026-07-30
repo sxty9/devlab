@@ -7,6 +7,7 @@ import { ClaudeIcon, PlusIcon, SendIcon } from '@/ui/icons';
 import { renderMarkdown } from '@/lib/markdown';
 import { basename } from '@/lib/lang';
 import { cn } from '@/lib/cn';
+import { aigenticUrl } from '@/lib/constants';
 import type { AiAsk, AiMessage, AiModelCatalog } from '@/types';
 import { NATIVE_EFFORTS } from '@/ui/RunTuning';
 import {
@@ -19,15 +20,6 @@ import {
   modelLabel,
   modelsForEngine,
 } from './aiChat';
-
-/** Resolve the Holistic dashboard origin so we can deep-link to the aigentic settings. */
-function aigenticUrl(): string {
-  if (typeof window === 'undefined') return '#';
-  const { protocol, hostname } = window.location;
-  const parts = hostname.split('.');
-  const origin = parts.length >= 2 ? `${protocol}//holistic.${parts.slice(1).join('.')}` : window.location.origin;
-  return `${origin}/app/aigentic`;
-}
 
 // AskOptions renders a structured question the AI posed — a header, the question, and clickable
 // options — so the user answers by clicking inside the chat rather than typing (à la Claude Code).

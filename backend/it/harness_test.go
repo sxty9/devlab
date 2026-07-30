@@ -20,6 +20,7 @@ import (
 
 	"devlab/backend/internal/api"
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/execstate"
 	"devlab/backend/internal/executor"
 	"devlab/backend/internal/live"
@@ -46,18 +47,27 @@ type env struct {
 	deliveries *runs.DeliveryStore
 	settings   *runs.SettingsStore
 	usage      *telemetry.UsageLedger
+	// prs is the auto-merge window pool. api.New opens its own handle over the SAME pool file (it
+	// owns every passive pool); this handle is the one the fixture delivery path writes through and
+	// the one the maintenance tick reads, so the tick under test sees what the chain recorded.
+	prs *runs.PRStore
 
 	broker *live.Broker
 	sch    *sched.Scheduler
 	srv    *api.Server
 	ts     *httptest.Server
 
-	deps    *fixtureDeps
+	deps *fixtureDeps
+	// world is the git reality of the fixture repositories. It lives NEXT TO the state root, not
+	// inside the process, so a reboot reopens the same repositories with the same commits.
+	world   *gitWorld
 	gate    func(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error)
 	secret  string
 	user    string
 	csrf    string
 	adminGr string
+	// mergeWindow is the auto-merge window the fixture delivery path stamps (default: at once).
+	mergeWindow time.Duration
 
 	// ctx is the daemon's root context: cancelled on cleanup, which drains the scheduler so no
 	// execution goroutine outlives its test (and its temporary state root).
@@ -123,12 +133,29 @@ func gitRun(t *testing.T, dir string, args ...string) {
 }
 
 // reboot stops this process and starts a NEW one over the SAME state root — the integration
-// suite's process death. Everything the next daemon knows it must read off the documents.
+// suite's process death. Everything the next daemon knows it must read off the documents; the git
+// repositories it finds on disk are the ones the killed process left behind.
 func (e *env) reboot(cfg sched.Config) *env {
 	e.t.Helper()
 	e.stop()
 	e.ts.Close()
 	return newEnvAt(e.t, cfg, e.paths.Root)
+}
+
+// automergeWindow is the window the fixture delivery path stamps onto a tracked pull request. Zero
+// means "mergeable at once", which is what a test that drives the maintenance tick wants; a test
+// that must observe the WAITING state raises it.
+func (e *env) automergeWindow() time.Duration { return e.mergeWindow }
+
+// mergeNow makes every delivery from here on mergeable at once, so the next maintenance tick really
+// merges it (the window is a runtime value, REQ-013.2-style, not a compile-time constant).
+func (e *env) mergeNow() { e.mergeWindow = 0 }
+
+// maintain is the scheduler's MaintainFunc: the SHIPPED delivery maintenance (deliver.Maintain) over
+// the fixture GitHub. Wiring it is what puts auto-merge, branch pruning, the origin status and the
+// K-5 blockade of a failing pull request under test at all.
+func (e *env) maintain(ctx context.Context) error {
+	return deliver.Maintain(ctx, fixtureGH{d: e.deps}, e.prs, e.deliveries, e.results, e.notices, e.broker)
 }
 
 // newEnvAt composes the system over an EXISTING state root (a fresh one on the first call).
@@ -146,7 +173,10 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 	if err != nil {
 		t.Skipf("no resolvable OS account: %v", err)
 	}
-	e := &env{t: t, paths: paths, secret: "integration-suite-secret", user: cur.Username, csrf: "csrf-token"}
+	// The auto-merge window defaults to an hour so no test is silently raced by the maintenance
+	// tick; a test that wants the merge to happen calls mergeNow().
+	e := &env{t: t, paths: paths, secret: "integration-suite-secret", user: cur.Username,
+		csrf: "csrf-token", mergeWindow: time.Hour}
 	e.adminGr = firstGroupOf(t, cur)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	t.Cleanup(e.stop)
@@ -178,6 +208,15 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 		t.Fatal("the verifier read no secret — SSO would fail closed and the suite prove nothing")
 	}
 
+	// The fixture repositories are REAL git repositories driven by the shipped workbench, so the
+	// suite must be immune to the developer's own git configuration (signing, merge defaults,
+	// identity) — including inside the bench's subprocesses, which inherit this environment.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available — the fixture repositories are real repositories")
+	}
+
 	e.docs, err = execstate.Open(paths) // boot step 2
 	if err != nil {
 		t.Fatal(err)
@@ -188,8 +227,11 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 	e.deliveries = runs.NewDeliveryStore(paths)
 	e.settings = runs.NewSettingsStore(paths, runs.Settings{MaxConcurrency: 2, DefaultTimeBudget: 3 * time.Hour})
 	e.usage = telemetry.OpenUsage(paths)
+	e.prs = runs.NewPRStore(paths)
 	e.broker = live.NewBroker()
-	e.deps = newFixtureDeps(e)
+	// The git world sits beside the state root, so reboot() (same root) reopens it.
+	e.world = openGitWorld(filepath.Join(filepath.Dir(root), "git-world"))
+	e.deps = newFixtureDeps(e, e.world)
 
 	e.gate = func(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 		return e.deps.Preflight(ctx, repo, run)
@@ -198,7 +240,7 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 		func(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 			return e.gate(ctx, repo, run)
 		},
-		e.execute, nil, e.broker)
+		e.execute, e.maintain, e.broker)
 	e.sch.SetNoticeFunc(func(kind, text string) {
 		_ = e.notices.Add(runs.Notice{Kind: kind, Reason: text})
 	})
@@ -423,6 +465,26 @@ func (e *env) waitPhase(execID string, want model.ExecPhase) execstate.Doc {
 	d, _, _ := e.docs.Get(execID)
 	e.t.Fatalf("execution %s never reached %s (is %q, reason %q)", execID, want, d.Phase, d.Reason)
 	return execstate.Doc{}
+}
+
+// waitEnded blocks until the execution reached an END state, whichever it is — so a test whose point
+// is WHICH end it reached names the difference itself instead of timing out on the expected one.
+func (e *env) waitEnded(execID string) execstate.Doc {
+	e.t.Helper()
+	var last execstate.Doc
+	e.waitFor("execution "+execID+" to end", func() bool {
+		d, ok, err := e.docs.Get(execID)
+		if err != nil || !ok {
+			return false
+		}
+		last = d
+		switch d.Phase {
+		case model.PhaseCompleted, model.PhaseFailed, model.PhaseDiscarded, model.PhaseBlocked:
+			return true
+		}
+		return false
+	})
+	return last
 }
 
 // waitFor polls cond until it holds.

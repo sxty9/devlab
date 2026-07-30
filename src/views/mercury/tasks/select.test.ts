@@ -1,21 +1,37 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { executionCompleted, openDeliveryExecutionIds, runCompleted, splitOpenHistory } from './select.ts';
-import type { Run, RunResult } from '../../../types';
+import { readFileSync } from 'node:fs';
+import { executionCompleted, runCompleted, splitOpenHistory } from './select.ts';
+// Which executions still hold an open delivery is READ off the ledger, where the server states it —
+// these selectors never derive it, so the set comes from the delivery module (B-35).
+import { openDeliveryExecutionIds } from '../deliveries/deliveries.ts';
+import type { Delivery, Run, RunResult } from '../../../types';
 
 const AUTH = { created: { user: 'alice' }, createdAt: '2026-07-26T09:00:00Z', updated: { user: 'alice' }, updatedAt: '2026-07-26T09:00:00Z' };
 
 const okRepo = (repo: string) => ({
   repo,
-  stages: [{ stage: 'implement', state: 'executed' as const }],
+  stages: [{ stage: 'done-something', state: 'executed' as const }],
   done: true,
   succeeded: true,
 });
 const failedRepo = (repo: string) => ({
   repo,
-  stages: [{ stage: 'implement', state: 'failed' as const, reason: 'boom' }],
+  stages: [{ stage: 'did-not-work', state: 'failed' as const, reason: 'boom' }],
   done: true,
   succeeded: false,
+});
+
+/** One ledger row, as the server states it (stage + the execution it arose from). */
+const dlv = (id: string, executionId: string, stage: string): Delivery => ({
+  id,
+  repo: 'o/svc',
+  branch: `mercury-delivery/${id}`,
+  fromCommit: 'c0',
+  toCommit: 'c1',
+  createdAt: '2026-07-26T11:30:00Z',
+  stage,
+  executionId,
 });
 
 const result = (id: string, runId: string, overrides: Partial<RunResult> = {}): RunResult => ({
@@ -63,27 +79,29 @@ test('a todo is done only when one completed execution covered ALL targets', () 
   assert.equal(runCompleted(auto, [result('exec_4', 'run_auto')]), false, 'an auto run recurs — never done');
 });
 
-test('open deliveries are read off server stamps, never derived stages (B-35)', () => {
-  const prStage = { stage: 'pull-request', state: 'executed' as const };
-  const delivered = result('exec_open', 'run_a', { repos: [{ repo: 'svc', stages: [prStage], done: true, succeeded: true }] });
-  const merged = result('exec_merged', 'run_a', {
-    repos: [{ repo: 'svc', stages: [prStage], done: true, succeeded: true }],
-    mergedAt: '2026-07-26T12:00:00Z',
-  });
+test('open deliveries come from the LEDGER, never from a stage name (B-35)', () => {
+  const delivered = result('exec_open', 'run_a');
+  const merged = result('exec_merged', 'run_a');
   const undelivered = result('exec_failed', 'run_a', { repos: [failedRepo('svc')] });
-  const legacy = result('exec_legacy', 'run_a', {
-    legacy: true,
-    repos: [{ repo: 'svc', stages: [{ stage: 'pr', state: 'executed' as const }], done: true, succeeded: true }],
-  });
+  const legacy = result('exec_legacy', 'run_a', { legacy: true });
 
-  const open = openDeliveryExecutionIds([delivered, merged, undelivered, legacy]);
-  assert.deepEqual([...open], ['exec_open'], 'only the delivered-but-unmerged execution is open');
+  // The ledger is the answer: one row still open, one settled, and nothing at all for the two
+  // executions that never delivered.
+  const open = openDeliveryExecutionIds([dlv('dlv_1', 'exec_open', 'open'), dlv('dlv_2', 'exec_merged', 'merged')]);
+  assert.deepEqual([...open], ['exec_open'], 'only the execution with an unsettled delivery is open');
 
-  // The open one stays in the list; the merged one historizes (REQ-037.1: history after merge).
+  // The open one stays in the list; the settled one historizes (REQ-037.1: history after merge).
   assert.equal(executionCompleted(delivered, open), false);
   assert.equal(executionCompleted(merged, open), true);
   assert.equal(executionCompleted(undelivered, open), true, 'nothing delivered ⇒ history-ready on end');
-  assert.equal(executionCompleted(legacy, open), true, 'legacy archive entries are never held open');
+  assert.equal(executionCompleted(legacy, open), true, 'archive entries the ledger never names are never held open');
+
+  // These selectors read stage names nowhere — the module carries no chain-stage literal at all.
+  const src = readFileSync(new URL('./select.ts', import.meta.url), 'utf8');
+  for (const s of ['preflight', 'implement', 'deliver-dev', 'publish', 'pull-request']) {
+    assert.ok(!src.includes(`'${s}'`), `select.ts must not carry the stage literal ${s}`);
+  }
+  assert.ok(!/\.stage\b/.test(src), 'select.ts must not read a chain stage at all');
 });
 
 test('open ∩ history = ∅ (REQ-011.2)', () => {

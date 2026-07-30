@@ -55,10 +55,31 @@ var deliverOps = func(s *Server, token string) deliver.GitHubOps {
 	return runnerGitSide{GitHubOps: deliver.NewGitHub(token), s: s, token: token}
 }
 
+// runnerRepoSet reads the instance repo set as GitHub reports it for the runner's account. A
+// package variable so the resolution below can be driven from a fixture set in a test while the
+// resolution itself — which ids it accepts — stays under test. Production never reassigns it.
+var runnerRepoSet = discover.ReposForUser
+
+// openRunnerBench is the workbench seam of this surface. Production opens the runner's real
+// per-user workspace, whose git runs AS that Linux user through the pinned sudo wrapper; a test
+// substitutes a hermetic local bench, so what a handler passes down (repo id and full name) is
+// provable without crossing a sudo boundary.
+var openRunnerBench = (*Server).runnerBench
+
+// deliveryWire is the ledger's wire view: the shared delivery contract PLUS the execution the
+// delivery arose from. The link is what lets a surface state which executions still hold an open
+// delivery by READING the two pools — the very rule the server applies (runs.ExecutionCompleted,
+// B-8) — instead of re-deriving a chain stage from its name (B-35). Its proper home is
+// model.Delivery; until the shared contract carries it, this projection does.
+type deliveryWire struct {
+	model.Delivery
+	ExecutionID string `json:"executionId,omitempty"`
+}
+
 // runDeliveriesList returns the delivery ledger as the wire view (REQ-024/F12).
 func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 	if s.deliveries == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"deliveries": []model.Delivery{}})
+		writeJSON(w, http.StatusOK, map[string]any{"deliveries": []deliveryWire{}})
 		return
 	}
 	all, err := s.deliveries.All()
@@ -72,14 +93,17 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 			reversed[d.ReversalOf] = true
 		}
 	}
-	out := make([]model.Delivery, 0, len(all))
+	out := make([]deliveryWire, 0, len(all))
 	for _, d := range all {
-		out = append(out, model.Delivery{
-			ID: d.ID, Repo: d.Repo, Branch: d.Branch,
-			FromCommit: d.FromCommit, ToCommit: d.ToCommit,
-			PRNumber: d.PRNumber, PRURL: d.PRURL,
-			CreatedAt: d.CreatedAt, MergedAt: d.MergedAt, ReversalOf: d.ReversalOf,
-			Stage: deliveryStage(d, reversed[d.ID]),
+		out = append(out, deliveryWire{
+			Delivery: model.Delivery{
+				ID: d.ID, Repo: d.Repo, Branch: d.Branch,
+				FromCommit: d.FromCommit, ToCommit: d.ToCommit,
+				PRNumber: d.PRNumber, PRURL: d.PRURL,
+				CreatedAt: d.CreatedAt, MergedAt: d.MergedAt, ReversalOf: d.ReversalOf,
+				Stage: deliveryStage(d, reversed[d.ID]),
+			},
+			ExecutionID: d.ExecutionID,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deliveries": out})
@@ -189,8 +213,15 @@ func (s *Server) runRepoReset(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	repoID := strings.TrimSpace(body.Repo)
-	if repoID == "" {
+	// The caller names the repository the way the ledger states it — the GitHub FULL name
+	// ("owner/repo"), because that is what a delivery record carries and what the surface shows.
+	// That name is RESOLVED against the instance set first (which accepts the full name, the short
+	// name and the id); only the RESOLVED repository is then reduced to its id, which is what
+	// everything below the API works with: the workspace directory name is a single path segment.
+	// Resolving before reducing is what keeps a foreign "other-owner/name" a 404 instead of silently
+	// becoming this instance's repository of the same short name.
+	named := strings.TrimSpace(body.Repo)
+	if named == "" {
 		writeErr(w, http.StatusBadRequest, "Which repository should be reset?")
 		return
 	}
@@ -204,13 +235,14 @@ func (s *Server) runRepoReset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "No runner account configured")
 		return
 	}
-	full, ok := s.resolveRunnerRepo(r.Context(), token, repoID)
+	full, ok := s.resolveRunnerRepo(r.Context(), token, named)
 	if !ok {
 		writeErr(w, http.StatusNotFound, errRepoNotFound)
 		return
 	}
+	repoID := repoShort(full)
 	actor := model.Actor{User: userFrom(r).Username}
-	bench, _, unlock, err := s.runnerBench(r.Context(), user, token, repoID, full)
+	bench, _, unlock, err := openRunnerBench(s, r.Context(), user, token, repoID, full)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "Could not prepare the runner workspace: "+err.Error())
 		return
@@ -221,17 +253,22 @@ func (s *Server) runRepoReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.publish(live.TopicDeliveries)
-	writeJSON(w, http.StatusOK, map[string]any{"reset": true, "repo": repoID})
+	// The answer names the repository the way the ledger and the surface do — fully — so the caller
+	// reads back the repository it meant, not an id it never sent.
+	writeJSON(w, http.StatusOK, map[string]any{"reset": true, "repo": full})
 }
 
-// resolveRunnerRepo maps a repo id onto its full name within the instance's repo set.
+// resolveRunnerRepo maps a repo id onto its full name within the instance's repo set. All three
+// names a repository is addressed by resolve: its id, its short name and its full name — a caller
+// holding a ledger record (which stores the full name) resolves without having to know which form
+// this lookup happens to be keyed by.
 func (s *Server) resolveRunnerRepo(ctx context.Context, token, repoID string) (string, bool) {
-	repos, err := discover.ReposForUser(ctx, runsTokenUser(), token)
+	repos, err := runnerRepoSet(ctx, runsTokenUser(), token)
 	if err != nil {
 		return "", false
 	}
 	for _, r := range repos {
-		if r.ID == repoID || r.Name == repoID {
+		if r.ID == repoID || r.Name == repoID || r.FullName == repoID {
 			return r.FullName, true
 		}
 	}

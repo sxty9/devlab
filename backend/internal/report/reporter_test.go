@@ -3,11 +3,13 @@ package report
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"devlab/backend/internal/github"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
@@ -26,18 +28,49 @@ type sentMail struct {
 }
 
 type fakeSender struct {
-	failFirst int // fail the first N Send calls, then succeed
+	failFirst int   // fail the first N Send calls, then succeed
+	failAll   bool  // fail EVERY call — the fault that does not mend itself
+	failWith  error // the fault a failing call reports (nil ⇒ a plain transient outage)
 	attempts  int
 	sent      []sentMail
 }
 
 func (f *fakeSender) Send(_ context.Context, recipient string, c Content) error {
 	f.attempts++
-	if f.attempts <= f.failFirst {
+	if f.failAll || f.attempts <= f.failFirst {
+		if f.failWith != nil {
+			return f.failWith
+		}
 		return errors.New("mail service down")
 	}
 	f.sent = append(f.sent, sentMail{recipient, c})
 	return nil
+}
+
+// clock is a movable test clock. Passes are driven by advancing it, which is the only way a growing
+// backoff interval becomes observable at all — a fixed clock cannot tell "retried too early" from
+// "retried on time".
+type clock struct{ t time.Time }
+
+func (c *clock) now() time.Time      { return c.t }
+func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
+
+// logSpy captures every line the Reporter logs, so the volume over simulated hours can be measured
+// (K-5: one bundled message instead of dozens of identical repetitions).
+type logSpy struct{ lines []string }
+
+func (l *logSpy) logf(format string, args ...any) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logSpy) containing(sub string) []string {
+	var out []string
+	for _, ln := range l.lines {
+		if strings.Contains(ln, sub) {
+			out = append(out, ln)
+		}
+	}
+	return out
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -67,6 +100,79 @@ func newReporter(t *testing.T, execs Executions, sender Sender, ledger *Ledger, 
 		Now: func() time.Time { return now }, Loc: time.UTC, Lookback: 3,
 		Logf: func(string, ...any) {},
 	})
+}
+
+// harness is the K-5 measuring rig: a Reporter over a movable clock, a real notice pool and a captured
+// log — the three places the retry policy has to be honest in (record, hint, log).
+type harness struct {
+	clk    *clock
+	ledger *Ledger
+	sender *fakeSender
+	pool   *runs.NoticeStore
+	logs   *logSpy
+	rp     *Reporter
+}
+
+func newHarness(t *testing.T, sender *fakeSender, start time.Time, work ...runs.Result) *harness {
+	t.Helper()
+	h := &harness{
+		clk:    &clock{t: start},
+		ledger: NewLedgerAt(filepath.Join(t.TempDir(), "l.json")),
+		sender: sender,
+		pool:   noticePool(t),
+		logs:   &logSpy{},
+	}
+	h.rp = NewReporter(Config{
+		Recipient: "owner",
+		Execs:     &fakeExecs{summaries: work},
+		Notices:   h.pool,
+		Ledger:    h.ledger,
+		Sender:    sender,
+		Now:       h.clk.now,
+		Loc:       time.UTC, Lookback: 3, Logf: h.logs.logf,
+	})
+	return h
+}
+
+// pass performs one Reporter pass at the current clock.
+func (h *harness) pass() { h.rp.tick(context.Background()) }
+
+// hours drives the loop the way the daemon does: one pass every `every` over `span` of simulated
+// time. This is the measurement K-5 asks for — a fault that holds must not produce a pass-by-pass
+// repetition over hours.
+func (h *harness) hours(span, every time.Duration) {
+	for elapsed := time.Duration(0); elapsed < span; elapsed += every {
+		h.pass()
+		h.clk.add(every)
+	}
+}
+
+func (h *harness) record(t *testing.T, day string) Record {
+	t.Helper()
+	rec, ok, err := h.ledger.Get("owner", day)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("no delivery record for %s", day)
+	}
+	return rec
+}
+
+// blockHints returns the pool's blocked-delivery records — the hint a blocked report raises.
+func (h *harness) blockHints(t *testing.T) []runs.Notice {
+	t.Helper()
+	all, err := h.pool.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []runs.Notice
+	for _, n := range all {
+		if n.Kind == runs.NoticeDeliveryBlocked {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // --- the required behaviours ----------------------------------------------
@@ -138,38 +244,310 @@ func TestRestartSameDayNoSecondEmail(t *testing.T) {
 	}
 }
 
-// A failed send is recorded visibly and retried on the next pass — and once it goes through the day is
-// sealed, so it is never duplicated.
+// A failed send is recorded visibly and retried once its backoff interval has passed — and once it
+// goes through the day is sealed, so it is never duplicated.
 func TestFailedSendIsVisibleAndRetriedWithoutDuplicate(t *testing.T) {
-	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
-	sender := &fakeSender{failFirst: 1} // first attempt fails, then the mail service recovers
-	execs := &fakeExecs{summaries: []runs.Result{summary("a", "Nightly", at(26, 20))}}
-	rp := newReporter(t, execs, sender, ledger, at(27, 0))
+	// The first attempt fails, then the mail service recovers.
+	h := newHarness(t, &fakeSender{failFirst: 1}, at(27, 0), summary("a", "Nightly", at(26, 20)))
 
 	// Pass 1: the send fails. It is visible in the ledger as a failure with the reason, not silent.
-	rp.tick(context.Background())
-	rec, ok, _ := ledger.Get("owner", "2026-07-26")
-	if !ok || rec.Status != StatusFailed || rec.LastError == "" || rec.Attempts != 1 {
-		t.Fatalf("failure not visible in ledger: %+v ok=%v", rec, ok)
+	h.pass()
+	rec := h.record(t, "2026-07-26")
+	if rec.Status != StatusFailed || rec.LastError == "" || rec.Attempts != 1 {
+		t.Fatalf("failure not visible in ledger: %+v", rec)
 	}
-	if len(sender.sent) != 0 {
+	if len(h.sender.sent) != 0 {
 		t.Fatalf("nothing should have been delivered yet")
 	}
+	if rec.Backoff == nil || !rec.Backoff.NextAt.After(h.clk.now()) {
+		t.Fatalf("a failed send must name WHEN it may be retried: %+v", rec.Backoff)
+	}
 
-	// Pass 2: retried, now succeeds and is sealed.
-	rp.tick(context.Background())
-	rec, _, _ = ledger.Get("owner", "2026-07-26")
-	if rec.Status != StatusSent || rec.Attempts != 2 || rec.LastError != "" {
+	// A pass inside the interval does not attempt again — that is the growing distance, not a skip.
+	h.pass()
+	if h.sender.attempts != 1 {
+		t.Fatalf("a pass inside the backoff interval must not attempt again, attempts=%d", h.sender.attempts)
+	}
+
+	// Once the named moment has come the retry runs, succeeds and seals the day.
+	h.clk.t = rec.Backoff.NextAt
+	h.pass()
+	rec = h.record(t, "2026-07-26")
+	if rec.Status != StatusSent || rec.Attempts != 2 || rec.LastError != "" || rec.Backoff != nil {
 		t.Fatalf("retry did not seal cleanly: %+v", rec)
 	}
-	if len(sender.sent) != 1 {
-		t.Fatalf("want exactly one delivery after retry, got %d", len(sender.sent))
+	if len(h.sender.sent) != 1 {
+		t.Fatalf("want exactly one delivery after retry, got %d", len(h.sender.sent))
 	}
 
-	// Pass 3: sealed — no duplicate however many more passes run.
-	rp.tick(context.Background())
+	// Sealed — no duplicate however many more passes run, over however many hours.
+	h.hours(24*time.Hour, 10*time.Minute)
+	if len(h.sender.sent) != 1 {
+		t.Fatalf("sealed day must never duplicate, got %d", len(h.sender.sent))
+	}
+}
+
+// K-5/REQ-032.1 — a PERMANENT fault gets exactly ONE attempt with a named end. The production case is
+// the unreadable internal mail secret: a misconfiguration, wrapped as permanent by the mail seam. The
+// old reporter re-sent it on every pass for every undelivered day, for ever.
+func TestPermanentFaultGetsOneAttemptAndBlocks(t *testing.T) {
+	cause := fmt.Errorf("%w: %w", ErrPermanent, errors.New("mailer: no internal secret configured"))
+	h := newHarness(t, &fakeSender{failAll: true, failWith: cause}, at(27, 0), summary("a", "Nightly", at(26, 20)))
+
+	// A full day of passes at the daemon's rhythm: 144 opportunities to repeat the mistake.
+	h.hours(24*time.Hour, 10*time.Minute)
+
+	if h.sender.attempts != 1 {
+		t.Fatalf("a permanent fault must be attempted exactly once, got %d attempts", h.sender.attempts)
+	}
+	rec := h.record(t, "2026-07-26")
+	if rec.Status != StatusBlocked {
+		t.Fatalf("status = %q, want %q", rec.Status, StatusBlocked)
+	}
+	if rec.Backoff == nil || rec.Backoff.Class != "permanent" || rec.Backoff.Attempts != 1 {
+		t.Fatalf("the block must name its class and attempts: %+v", rec.Backoff)
+	}
+	if !rec.Backoff.NextAt.IsZero() {
+		t.Errorf("a blocked day must not claim a next attempt: %v", rec.Backoff.NextAt)
+	}
+	if rec.LastError == "" || rec.LastAttempt == nil || rec.Attempts != 1 {
+		t.Errorf("the block must state reason, time and attempts: %+v", rec)
+	}
+
+	// The log names the end ONCE — not 144 times.
+	blocked := h.logs.containing("BLOCKED")
+	if len(blocked) != 1 {
+		t.Fatalf("want exactly one named end in the log, got %d:\n%s", len(blocked), strings.Join(h.logs.lines, "\n"))
+	}
+	if len(h.logs.lines) != 1 {
+		t.Errorf("a blocked day must stay silent afterwards, got %d log lines:\n%s",
+			len(h.logs.lines), strings.Join(h.logs.lines, "\n"))
+	}
+	// And exactly ONE hint the user can act on.
+	if hints := h.blockHints(t); len(hints) != 1 || hints[0].NextStep == "" {
+		t.Fatalf("want one actionable blocked hint, got %+v", hints)
+	}
+}
+
+// K-5 — the fault classes faultclass itself names (404/403/422) reach the same named end through the
+// same path: no repetition, a blocked record, one hint.
+func TestRejectedSendIsPermanentByItsStatus(t *testing.T) {
+	h := newHarness(t, &fakeSender{failAll: true, failWith: &github.StatusError{Status: 422, Msg: "recipient rejected"}},
+		at(27, 0), summary("a", "Nightly", at(26, 20)))
+
+	h.hours(6*time.Hour, 10*time.Minute)
+
+	if h.sender.attempts != 1 {
+		t.Fatalf("a 422 must be attempted exactly once, got %d", h.sender.attempts)
+	}
+	if rec := h.record(t, "2026-07-26"); rec.Status != StatusBlocked || rec.Backoff.Class != "permanent" {
+		t.Fatalf("record = %+v / %+v", rec, rec.Backoff)
+	}
+}
+
+// K-5/REQ-032.3 — a TRANSIENT fault backs off with provably growing intervals and ends in `blocked`
+// after the attempt cap, with reason, time and attempts. It never keeps trying for ever.
+func TestTransientFaultBacksOffThenBlocks(t *testing.T) {
+	h := newHarness(t, &fakeSender{failAll: true}, at(27, 0), summary("a", "Nightly", at(26, 20)))
+
+	var gaps []time.Duration
+	for attempt := 1; attempt <= maxSendAttempts; attempt++ {
+		h.pass()
+		rec := h.record(t, "2026-07-26")
+		if h.sender.attempts != attempt {
+			t.Fatalf("attempt %d: sender saw %d attempts", attempt, h.sender.attempts)
+		}
+		if rec.Backoff == nil || rec.Backoff.Attempts != attempt || rec.Backoff.Class != "transient" {
+			t.Fatalf("attempt %d: backoff = %+v", attempt, rec.Backoff)
+		}
+		if attempt == maxSendAttempts {
+			break
+		}
+		if rec.Status != StatusFailed {
+			t.Fatalf("attempt %d of %d must not block yet: %+v", attempt, maxSendAttempts, rec)
+		}
+		gap := rec.Backoff.NextAt.Sub(rec.Backoff.LastAt)
+		gaps = append(gaps, gap)
+		h.clk.t = rec.Backoff.NextAt // wait exactly as long as the record asks
+	}
+
+	// The distances grow — that is what makes the retry a backoff and not a hammer.
+	for i := 1; i < len(gaps); i++ {
+		if gaps[i] <= gaps[i-1] {
+			t.Fatalf("the retry intervals do not grow: %v", gaps)
+		}
+	}
+	rec := h.record(t, "2026-07-26")
+	if rec.Status != StatusBlocked || rec.Attempts != maxSendAttempts {
+		t.Fatalf("the exhausted day must be blocked with its attempts: %+v", rec)
+	}
+	if rec.LastError == "" || rec.LastAttempt == nil || !rec.Backoff.NextAt.IsZero() {
+		t.Fatalf("the block must state reason and time and claim no next attempt: %+v / %+v", rec, rec.Backoff)
+	}
+
+	// And it stays put: hours of further passes add nothing.
+	before := h.sender.attempts
+	h.hours(24*time.Hour, 10*time.Minute)
+	if h.sender.attempts != before {
+		t.Fatalf("a blocked day must not be retried, attempts %d → %d", before, h.sender.attempts)
+	}
+	if hints := h.blockHints(t); len(hints) != 1 {
+		t.Fatalf("want exactly one blocked hint, got %d", len(hints))
+	}
+}
+
+// K-5 measurement — the same fault over SEVERAL undelivered days and hours of passes produces ONE
+// bundled hint with a count and a period, not a row (or a log line) per day and pass. The old reporter
+// wrote ~144 identical FAILED lines per day AND per undelivered day.
+func TestABrokenMailPathIsReportedOnceNotPerPass(t *testing.T) {
+	cause := fmt.Errorf("%w: %w", ErrPermanent, errors.New("mailer: no internal secret configured"))
+	h := newHarness(t, &fakeSender{failAll: true, failWith: cause}, at(27, 0),
+		summary("a", "Nightly", at(24, 20)),
+		summary("b", "Nightly", at(25, 20)),
+		summary("c", "Nightly", at(26, 20)))
+
+	h.hours(24*time.Hour, 10*time.Minute) // 144 passes over three undelivered days
+
+	if h.sender.attempts != 3 {
+		t.Fatalf("three undelivered days must cost three attempts in total, got %d", h.sender.attempts)
+	}
+	for _, day := range []string{"2026-07-24", "2026-07-25", "2026-07-26"} {
+		if rec := h.record(t, day); rec.Status != StatusBlocked {
+			t.Errorf("%s: status = %q, want blocked", day, rec.Status)
+		}
+	}
+	hints := h.blockHints(t)
+	if len(hints) != 1 {
+		t.Fatalf("want ONE bundled hint, got %d: %+v", len(hints), hints)
+	}
+	if hints[0].Count != 3 {
+		t.Errorf("the hint must count the occurrences, got %d", hints[0].Count)
+	}
+	if len(h.logs.lines) != 3 {
+		t.Errorf("want one log line per blocked day, got %d:\n%s", len(h.logs.lines), strings.Join(h.logs.lines, "\n"))
+	}
+
+	// A day later the operator resumes, the fault still holds — and the SAME record grows its count
+	// and stretches its period instead of a second row appearing (REQ-032.5).
+	if _, err := Resume(h.ledger, ""); err != nil {
+		t.Fatal(err)
+	}
+	h.hours(24*time.Hour, 10*time.Minute)
+
+	hints = h.blockHints(t)
+	if len(hints) != 1 {
+		t.Fatalf("the recurring fault must stay ONE record, got %d", len(hints))
+	}
+	if hints[0].Count != 6 || !hints[0].LastAt.After(hints[0].FirstAt) {
+		t.Errorf("the hint must carry the count AND the period: count=%d %s..%s",
+			hints[0].Count, hints[0].FirstAt, hints[0].LastAt)
+	}
+}
+
+// K-5/REQ-032.3 — a blocked delivery is resumed EXPLICITLY, and only then does it try again. The
+// resumed day keeps its history and earns a fresh set of attempts.
+func TestBlockedDeliveryResumesOnlyWhenAsked(t *testing.T) {
+	sender := &fakeSender{failAll: true}
+	h := newHarness(t, sender, at(27, 0), summary("a", "Nightly", at(26, 20)))
+	h.hours(2*time.Hour, time.Minute) // fails, backs off, blocks
+	if rec := h.record(t, "2026-07-26"); rec.Status != StatusBlocked {
+		t.Fatalf("precondition: the day must be blocked, got %+v", rec)
+	}
+	spent := sender.attempts
+
+	// Resuming a day that is NOT blocked changes nothing and claims nothing.
+	if resumed, err := Resume(h.ledger, "2026-07-25"); err != nil || len(resumed) != 0 {
+		t.Fatalf("resume of an unblocked day = %+v, %v", resumed, err)
+	}
+
+	// The explicit resumption hands the day back to the retry path.
+	resumed, err := Resume(h.ledger, "2026-07-26")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed) != 1 || resumed[0].Status != StatusFailed || resumed[0].Backoff != nil {
+		t.Fatalf("resumed = %+v", resumed)
+	}
+	if resumed[0].Attempts != spent || resumed[0].LastError == "" {
+		t.Errorf("a resumed day keeps its history: %+v", resumed[0])
+	}
+
+	// It now tries again — and, the mail path being repaired, gets through.
+	sender.failAll = false
+	h.pass()
 	if len(sender.sent) != 1 {
-		t.Fatalf("sealed day must never duplicate, got %d", len(sender.sent))
+		t.Fatalf("the resumed day must be attempted again, deliveries = %d", len(sender.sent))
+	}
+	rec := h.record(t, "2026-07-26")
+	if rec.Status != StatusSent || rec.Attempts != spent+1 {
+		t.Fatalf("the resumed day did not seal: %+v", rec)
+	}
+}
+
+// A resumption without a named day lifts EVERY blocked day — the one gesture the surface needs when a
+// mail path was broken for a while.
+func TestResumeWithoutADayLiftsEveryBlockedDay(t *testing.T) {
+	cause := fmt.Errorf("%w: %w", ErrPermanent, errors.New("mailer: no internal secret configured"))
+	h := newHarness(t, &fakeSender{failAll: true, failWith: cause}, at(27, 0),
+		summary("a", "Nightly", at(25, 20)), summary("b", "Nightly", at(26, 20)))
+	h.pass()
+
+	resumed, err := Resume(h.ledger, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resumed) != 2 {
+		t.Fatalf("want both blocked days resumed, got %+v", resumed)
+	}
+	for _, day := range []string{"2026-07-25", "2026-07-26"} {
+		if rec := h.record(t, day); rec.Status != StatusFailed || rec.Backoff != nil {
+			t.Errorf("%s: %+v", day, rec)
+		}
+	}
+	// Idempotent: nothing is blocked any more, so a second resumption claims nothing.
+	if again, err := Resume(h.ledger, ""); err != nil || len(again) != 0 {
+		t.Fatalf("second resume = %+v, %v", again, err)
+	}
+}
+
+// A day the ledger reports as sent is never resumable — the seal outlives every gesture.
+func TestResumeNeverReopensADeliveredDay(t *testing.T) {
+	h := newHarness(t, &fakeSender{}, at(27, 0), summary("a", "Nightly", at(26, 20)))
+	h.pass()
+	if rec := h.record(t, "2026-07-26"); rec.Status != StatusSent {
+		t.Fatalf("precondition: %+v", rec)
+	}
+	if resumed, err := Resume(h.ledger, ""); err != nil || len(resumed) != 0 {
+		t.Fatalf("a delivered day must not be resumable: %+v %v", resumed, err)
+	}
+	h.hours(24*time.Hour, 10*time.Minute)
+	if len(h.sender.sent) != 1 {
+		t.Fatalf("deliveries = %d, want 1", len(h.sender.sent))
+	}
+}
+
+// An unwritable notice pool costs the block its hint, never the honest record: the blocked state and
+// its reason stay in the ledger, and the pass does not fall over.
+func TestBlockSurvivesAnUnwritableNoticePool(t *testing.T) {
+	cause := fmt.Errorf("%w: %w", ErrPermanent, errors.New("mailer: no internal secret configured"))
+	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
+	logs := &logSpy{}
+	rp := NewReporter(Config{
+		Recipient: "owner",
+		Execs:     &fakeExecs{summaries: []runs.Result{summary("a", "Nightly", at(26, 20))}},
+		Notices:   brokenNotices{},
+		Ledger:    ledger, Sender: &fakeSender{failAll: true, failWith: cause},
+		Now: func() time.Time { return at(27, 0) },
+		Loc: time.UTC, Lookback: 3, Logf: logs.logf,
+	})
+	rp.tick(context.Background())
+
+	rec, ok, err := ledger.Get("owner", "2026-07-26")
+	if err != nil || !ok || rec.Status != StatusBlocked || rec.LastError == "" {
+		t.Fatalf("the block must be recorded regardless of the pool: %+v ok=%v err=%v", rec, ok, err)
+	}
+	if len(logs.containing("hint not recorded")) != 1 {
+		t.Errorf("the unwritable pool must be named once: %s", strings.Join(logs.lines, "\n"))
 	}
 }
 

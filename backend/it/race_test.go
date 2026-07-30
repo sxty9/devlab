@@ -207,10 +207,44 @@ func TestRepositoryExclusivityQueuesInsteadOfSkipping(t *testing.T) {
 	e.deps.release("shared")
 	e.waitPhase(first.ExecutionID, model.PhaseCompleted)
 	e.waitPhase(second.ExecutionID, model.PhaseCompleted)
-	if e.deps.repo("shared").agentRuns != 2 {
-		t.Errorf("the shared repository was worked %d times, want 2 (both runs, one after the other)",
-			e.deps.repo("shared").agentRuns)
+
+	// "Never skipped" is asked of the second execution's own pipeline: it VISITED the repository
+	// and recorded every stage terminally. What it then found there is the repo truth — the first
+	// run's work is committed and undelivered, so the second observes exactly that and creates
+	// nothing new (K-3/REQ-020.3); it does NOT invoke the agent a second time on the same work.
+	// (That is why this test counts visits, not agent invocations: a repeated agent run over
+	// already-implemented work would itself be the defect.)
+	stages := e.stagesOf(second.ExecutionID, "shared")
+	assertAllTerminal(t, "shared (second execution)", stages)
+	if stages[0].State != model.StepExecuted {
+		t.Errorf("the queued execution never reached the repository: preflight = %s (%s)",
+			stages[0].State, stageNames(stages))
 	}
+	if got := taskStateOf(t, e, second.ExecutionID, "shared"); got != model.TaskImplementedUndelivered {
+		t.Errorf("the second run observed %q at the shared repository, want implemented-undelivered "+
+			"(the first run's work is committed and not yet merged)", got)
+	}
+	if runs := e.deps.repo("shared").agentRuns; runs != 1 {
+		t.Errorf("the agent ran %d times at the shared repository, want exactly 1 — the second run "+
+			"must not re-implement work that is already there", runs)
+	}
+}
+
+// taskStateOf reads the observation the chain recorded for one repository of one execution — from
+// the result document, which is where the derived task state is kept (never a stored flag, K-3).
+func taskStateOf(t *testing.T, e *env, execID, repo string) model.TaskState {
+	t.Helper()
+	res, ok, err := e.results.Get(execID)
+	if err != nil || !ok {
+		t.Fatalf("result %s: ok=%v err=%v", execID, ok, err)
+	}
+	for _, rp := range res.Repos {
+		if rp.Repo == repo {
+			return rp.TaskState
+		}
+	}
+	t.Fatalf("result %s carries no observation for %s", execID, repo)
+	return ""
 }
 
 func (e *env) runningCount() int {

@@ -2,14 +2,15 @@
 //
 // Membership is not decided here. An execution enters the history exactly when the task surfaces
 // consider it closed — ended AND every delivery of it settled (merged, rolled back, or closed with
-// a reason) — so this view applies the very selector those surfaces apply (tasks/select.ts) instead
-// of restating the rule. Until then the execution stays in the open list: list ∩ history = ∅
-// (REQ-011.2, B-8).
+// a reason) — so this view applies the very selector those surfaces apply (tasks/select.ts) over the
+// very ledger the server decides it from. Until then the execution stays in the open list:
+// list ∩ history = ∅ (REQ-011.2, B-8).
 //
 // Nothing here derives a stage or a shape: every entry renders the server's stage array through the
 // shared execution kit, so a failed, a killed and an archive record all render a DEFINED state and
 // no click ends in a black screen (REQ-037.5). A record that did not fully succeed can be triggered
-// again from here — there are no corpses (REQ-037.2).
+// again from here — there are no corpses (REQ-037.2) — but only while the RUN behind it still
+// exists: results outlive their run by contract, and a control that cannot act is not offered.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getDataSource } from '@/data';
 import { cn } from '@/lib/cn';
@@ -18,8 +19,9 @@ import { Button } from '@/ui/Button';
 import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { useToast } from '@/ui/Toast';
 import { useLiveTopic } from '@/state/live';
-import type { RunResult } from '@/types';
-import { executionCompleted, openDeliveryExecutionIds } from '../tasks/select';
+import type { Delivery, RunResult } from '@/types';
+import { executionCompleted } from '../tasks/select';
+import { openDeliveryExecutionIds } from '../deliveries/deliveries';
 import { ExecutionDetail, RequestedBy } from './ExecutionDetail';
 import { TonePill } from './PipelineStages';
 import { UsageBadge } from './UsageBadge';
@@ -28,6 +30,9 @@ import { useRunStart } from './StartDialog';
 
 // The opened execution survives a browser reload: same view, same entry (REQ-035).
 const SEL_KEY = 'mercury.history.selected';
+
+/** The empty stand-in while the run pool is unread — a shared constant, so no render allocates one. */
+const NO_RUNS: ReadonlySet<string> = new Set();
 
 function readSel(): string | null {
   try {
@@ -49,6 +54,10 @@ export function ExecutionsView() {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [all, setAll] = useState<RunResult[] | null>(null);
+  const [deliveries, setDeliveries] = useState<Delivery[]>([]);
+  // null until the run pool has been read: "which runs exist" is unknown then, and an unknown
+  // answer offers no control and makes no claim.
+  const [runIds, setRunIds] = useState<ReadonlySet<string> | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [selId, setSelId] = useState<string | null>(readSel);
   const [busy, setBusy] = useState(false);
@@ -67,14 +76,42 @@ export function ExecutionsView() {
     }
   }, [source]);
 
+  // The delivery ledger decides membership (B-8) — the same pool, and the same rule, the server
+  // applies. Read through the ONE delivery access point, never re-derived from a stage name (B-35).
+  const loadDeliveries = useCallback(async () => {
+    try {
+      setDeliveries(await source.mercuryDeliveries());
+    } catch {
+      /* keep the last good ledger — a transient read never moves entries between the lists */
+    }
+  }, [source]);
+
+  // Which runs still EXIST decides whether a record can be started again at all. Read through the
+  // one run access point; on a failed read the set stays as it was, so no control is invented.
+  const loadRuns = useCallback(async () => {
+    try {
+      const { runs } = await source.mercuryRuns();
+      setRunIds(new Set(runs.map((r) => r.id)));
+    } catch {
+      /* keep the last good set */
+    }
+  }, [source]);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadDeliveries();
+    void loadRuns();
+  }, [load, loadDeliveries, loadRuns]);
 
   // A merge stamps the completion (B-8) and therefore moves an execution into this list; stage
-  // progress ends one. Both arrive over the one live stream — no polling (REQ-034).
+  // progress ends one; creating or deleting a run changes what can be started again. All three
+  // arrive over the one live stream — no polling (REQ-034).
   useLiveTopic('progress', load);
-  useLiveTopic('deliveries', load);
+  useLiveTopic('deliveries', () => {
+    void load();
+    void loadDeliveries();
+  });
+  useLiveTopic('runs', loadRuns);
 
   const start = useRunStart(load);
   useEffect(() => writeSel(selId), [selId]);
@@ -99,9 +136,9 @@ export function ExecutionsView() {
 
   const history = useMemo(() => {
     const list = all ?? [];
-    const open = openDeliveryExecutionIds(list);
+    const open = openDeliveryExecutionIds(deliveries);
     return sortExecutions(list.filter((res) => executionCompleted(res, open)));
-  }, [all]);
+  }, [all, deliveries]);
 
   if (failed) {
     return (
@@ -119,6 +156,10 @@ export function ExecutionsView() {
   }
 
   const selected = history.find((res) => res.id === selId) ?? null;
+  // The run pool, once read: known ids gate every run-bound control, and `runGone` is deliberately
+  // three-valued — true (deleted or never defined), false (still there), undefined (not read yet).
+  const knownRunIds = runIds ?? NO_RUNS;
+  const runGone = selected && runIds ? !runIds.has(selected.runId) : undefined;
   const openCount = all.length - history.length;
 
   return (
@@ -150,8 +191,17 @@ export function ExecutionsView() {
         <ErrorBoundary resetKeys={[selId]}>
           {selected ? (
             <>
+              {/* Every control of this pane acts THROUGH the run. Where the run is gone the record is
+                  history only: nothing is offered, and the pane says so instead of leaving a button
+                  that answers "no such run" (REQ-040.3). While the run list has not been read yet,
+                  nothing is offered AND nothing is claimed. */}
               <div className="flex flex-wrap items-center justify-end gap-2 px-8 pt-6">
-                {retriable(selected) && (
+                {runGone === true && (
+                  <p className="text-caption text-text-tertiary">
+                    The run behind this record no longer exists — it is kept as history and cannot be started from here.
+                  </p>
+                )}
+                {retriable(selected, knownRunIds) && (
                   <Button
                     variant="secondary"
                     size="sm"
@@ -166,8 +216,8 @@ export function ExecutionsView() {
                 key={selected.id}
                 runId={selected.runId}
                 resultId={selected.id}
-                onDeliver={() => void start.start({ id: selected.runId, title: selected.runTitle })}
-                onResume={() => void resume(selected.runId)}
+                onDeliver={runGone === false ? () => void start.start({ id: selected.runId, title: selected.runTitle }) : undefined}
+                onResume={runGone === false ? () => void resume(selected.runId) : undefined}
                 busy={busy || start.busyRunId === selected.runId}
               />
             </>
