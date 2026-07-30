@@ -105,7 +105,9 @@ func (s *Scheduler) executionView(d execstate.Doc) model.ExecutionView {
 	haveResult := false
 	if s.results != nil {
 		if res, ok, err := s.results.Get(d.ID); err == nil && ok {
-			v.Repos = res.Repos
+			// A copy: the normalisation below writes into this slice, and the pool's record must
+			// stay exactly as it was recorded.
+			v.Repos = append(v.Repos, res.Repos...)
 			v.Usage = res.Usage
 			if v.RunTitle == "" {
 				v.RunTitle = res.RunTitle
@@ -115,8 +117,17 @@ func (s *Scheduler) executionView(d execstate.Doc) model.ExecutionView {
 	}
 	if !haveResult {
 		for _, r := range d.Repos {
-			rp := model.RepoPipeline{Repo: r.Repo, Block: r.Block}
-			v.Repos = append(v.Repos, rp)
+			v.Repos = append(v.Repos, model.RepoPipeline{Repo: r.Repo, Block: r.Block})
+		}
+	}
+	// Every repo leaves here with a stage list that is EMPTY, never absent. A Go nil slice marshals
+	// to `null`, while the surface declares the field as an array — so the first consumer that
+	// iterates it throws. A queued execution is the one shape that reaches the client with no stage
+	// at all, and it took the whole active view down the first time one appeared. Normalising here
+	// covers both sources: the fallback above and a result document written before this rule held.
+	for i := range v.Repos {
+		if v.Repos[i].Stages == nil {
+			v.Repos[i].Stages = []model.StageView{}
 		}
 	}
 	if v.RunTitle == "" {

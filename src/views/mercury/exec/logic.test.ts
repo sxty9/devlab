@@ -29,6 +29,7 @@ import {
   stageBadge,
   stageHasDetail,
   stageLabel,
+  stagesOf,
   usageParts,
   withoutStageDetail,
 } from './logic.ts';
@@ -575,4 +576,28 @@ test('the history offers a restart only while the RUN exists — and states it o
   assert.match(code, /onResume=\{runGone === false \?/);
   // And the pane says WHY nothing is offered instead of leaving the user guessing.
   assert.match(src, /no longer exists/);
+});
+
+// A QUEUED execution reaches the surface with repos that carry no stage yet, and the wire sent
+// `null` for that list. The active view took the whole surface down over it — "This view could not
+// be displayed" — the first time a task queued behind a busy repository. Measured on the running
+// service on 2026-07-30 with the SDK task running and the backlog task queued behind it.
+test('a repo without any stage is read as "no stage yet", never as a crash', () => {
+  const queued = { repo: 'mail', stages: null, done: false, succeeded: false } as unknown as RepoPipeline;
+  assert.deepEqual(stagesOf(queued), []);
+  assert.equal(runningStage(queued), null);
+
+  const missing = { repo: 'notify', done: false, succeeded: false } as unknown as RepoPipeline;
+  assert.deepEqual(stagesOf(missing), []);
+  assert.equal(runningStage(missing), null);
+
+  // And the normal shape is passed through untouched.
+  const live = {
+    repo: 'holisdk',
+    stages: [{ stage: 'implement', state: 'running' }],
+    done: false,
+    succeeded: false,
+  } as unknown as RepoPipeline;
+  assert.equal(stagesOf(live).length, 1);
+  assert.equal(runningStage(live)?.state, 'running');
 });

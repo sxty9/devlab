@@ -18,7 +18,7 @@ import { useLiveTopic } from '@/state/live';
 import type { Authorship, RunResult, StageView } from '@/types';
 import { RepoPipelineCard, StageDetail, StageLegend, TonePill } from './PipelineStages';
 import { UsageBadge } from './UsageBadge';
-import { errMsg, executionOutcome, provenanceChips, runningStage } from './logic';
+import { errMsg, executionOutcome, provenanceChips, runningStage, stagesOf } from './logic';
 
 export interface ExecutionDetailProps {
   runId: string;
@@ -147,7 +147,7 @@ function ExecutionDetailBody({
           <div className="flex flex-col gap-2">
             {res.repos.map((rp, i) => {
               const live = runningStage(rp);
-              const liveIndex = live ? rp.stages.indexOf(live) : -1;
+              const liveIndex = live ? stagesOf(rp).indexOf(live) : -1;
               // The running stage is what one wants to see; the viewer's own pick wins over it.
               const index = open?.repo === rp.repo ? open.index : liveIndex;
               const stage: StageView | undefined = index >= 0 ? rp.stages[index] : undefined;

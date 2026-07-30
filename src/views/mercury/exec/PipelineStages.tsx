@@ -13,7 +13,7 @@ import { Button } from '@/ui/Button';
 import { badgeTone } from '@/ui/tint';
 import type { RepoPipeline, StageView } from '@/types';
 import { Transcript } from './Transcript';
-import { blockSummary, needsDelivery, repoOutcome, stageBadge, stageHasDetail, stageLabel, TASK_STATE, TERMINAL_STATES } from './logic';
+import { blockSummary, needsDelivery, repoOutcome, stageBadge, stageHasDetail, stageLabel, TASK_STATE, TERMINAL_STATES, stagesOf } from './logic';
 
 /** The shared pass/fail chip. */
 export function OkPill({ ok }: { ok: boolean }) {
@@ -83,12 +83,13 @@ export function PipelineStages({
   selected?: number;
   onSelect?: (index: number) => void;
 }) {
-  if (pipeline.stages.length === 0) {
+  const stages = stagesOf(pipeline);
+  if (stages.length === 0) {
     return <p className="text-caption text-text-tertiary">No stage recorded yet.</p>;
   }
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {pipeline.stages.map((sv, i) => (
+      {stages.map((sv, i) => (
         <StageBadge
           key={`${String(sv.stage)}:${i}`}
           stage={sv}

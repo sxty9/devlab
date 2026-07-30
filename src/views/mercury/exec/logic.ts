@@ -99,9 +99,17 @@ export function repoOutcome(rp: RepoPipeline): { label: string; tone: BadgeTone;
   return rp.succeeded ? { label: 'succeeded', tone: 'success', pulse: false } : { label: 'failed', tone: 'danger', pulse: false };
 }
 
+/** The stages of a repo, always a list. A QUEUED execution carries no stage yet and an archived
+ *  record may carry none either; the wire has sent `null` for both. Reading through this one helper
+ *  keeps a missing list meaning "no stage yet" instead of throwing — one such record used to take
+ *  the entire active view down with it (REQ-037.5, which had only been pinned for the history). */
+export function stagesOf(rp: RepoPipeline | null | undefined): StageView[] {
+  return Array.isArray(rp?.stages) ? rp.stages : [];
+}
+
 /** The stage a repo is working right now (the first running one), or null. */
 export function runningStage(rp: RepoPipeline): StageView | null {
-  return rp.stages.find((s) => s.state === 'running') ?? null;
+  return stagesOf(rp).find((s) => s.state === 'running') ?? null;
 }
 
 /** A blocked repo's honest line: reason, attempt count and when the next try is due
@@ -147,7 +155,7 @@ export function phaseBadge(phase: ExecutionView['phase']): { label: string; tone
  *  an EMPTY stage array. Such a record cannot be judged — there is nothing that ran, failed or was
  *  skipped to read. */
 export function withoutStageDetail(res: RunResult): boolean {
-  return res.repos.length > 0 && res.repos.every((rp) => rp.stages.length === 0);
+  return res.repos.length > 0 && res.repos.every((rp) => stagesOf(rp).length === 0);
 }
 
 /** A recorded execution's outcome, derived ONLY from server-stated fields: still running while it
