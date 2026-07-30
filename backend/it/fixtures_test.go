@@ -452,7 +452,7 @@ func (d *fixtureDeps) Workbench(repo string) executor.WorkbenchOps {
 	return benchOps{b: gr.bench}
 }
 
-func (d *fixtureDeps) Agent(ctx context.Context, repo, prompt string, _ runs.ResolvedTuning, resumeID string) (executor.AgentStream, error) {
+func (d *fixtureDeps) Agent(ctx context.Context, repo, prompt string, _ runs.ResolvedTuning, sess executor.AgentSession) (executor.AgentStream, error) {
 	r := d.repo(repo)
 	gr := d.git(repo)
 	d.mu.Lock()
@@ -487,7 +487,7 @@ func (d *fixtureDeps) Agent(ctx context.Context, repo, prompt string, _ runs.Res
 	if script == "" {
 		script = defaultAgentScript
 	}
-	return &fixtureAgent{ctx: ctx, out: strings.NewReader(script), err: aerr, block: block, prompt: prompt, resumeID: resumeID}, nil
+	return &fixtureAgent{ctx: ctx, out: strings.NewReader(script), err: aerr, block: block, prompt: prompt, sess: sess}, nil
 }
 
 // defaultAgentScript is one visible turn plus the authoritative final result event.
@@ -698,7 +698,7 @@ type fixtureAgent struct {
 	err      error
 	block    chan struct{}
 	prompt   string
-	resumeID string
+	sess     executor.AgentSession
 }
 
 func (a *fixtureAgent) Output() io.Reader { return a.out }

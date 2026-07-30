@@ -11,6 +11,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -205,11 +206,18 @@ func (d *ChainDeps) Workbench(repo string) executor.WorkbenchOps {
 // Agent starts the agent on the repo's workbench in stream-json form and hands back the live
 // stream. --verbose is what makes the CLI emit every event as it happens in -p mode, which is what
 // keeps the transcript and the live token counters honest (F7/F11).
-func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, resumeID string) (executor.AgentStream, error) {
+func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) (executor.AgentStream, error) {
 	_, wt, err := d.bench(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
+	ex := workspace.Executor{User: d.user, PerUser: true}
+	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, prompt, t, sess)), nil
+}
+
+// chainAgentArgs is the agent invocation of ONE stage, as a value — the seam that lets the
+// invocation be verified without a workspace and without root.
+func chainAgentArgs(repo, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
@@ -222,13 +230,19 @@ func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.Resol
 	if effort := chainEffort(t.Effort); effort != "" {
 		args = append(args, "--effort", effort)
 	}
-	if resumeID != "" {
-		args = append(args, "--resume", resumeID)
+	// The conversation is NAMED when it is opened, not only when it is continued. The CLI takes a
+	// UUID under --session-id and answers --resume only for a name it has already seen; handing it
+	// the execution id on resume alone made every continuation die with
+	// "--resume requires a valid session ID or session title". The name is derived — same execution
+	// and same repository always yield the same UUID, so no id has to be stored anywhere.
+	if sess.Key != "" {
+		if sess.Resume {
+			args = append(args, "--resume", sessionUUID(sess.Key, repo))
+		} else {
+			args = append(args, "--session-id", sessionUUID(sess.Key, repo))
+		}
 	}
-	args = append(args, "--append-system-prompt", chainPreamble(repo, t.Effort))
-
-	ex := workspace.Executor{User: d.user, PerUser: true}
-	return startAgentStream(ctx, ex, wt, args), nil
+	return append(args, "--append-system-prompt", chainPreamble(repo, t.Effort))
 }
 
 // chainEffort maps the run's effort onto the CLI ladder. "ultracode" is DevLab's own maximal tier:
@@ -808,4 +822,18 @@ func (a *agentStream) Wait() error {
 func (a *agentStream) Kill() error {
 	a.cancel()
 	return nil
+}
+
+// sessionUUID is the DERIVED name of one repository's agent conversation inside one execution.
+// Derived, not drawn: the same execution and the same repository always yield the same name, so a
+// resume finds the conversation again without any id having to be stored, and two repositories of
+// one execution never share a conversation. The shape is a RFC-4122 version-5 UUID because that is
+// the only shape the agent accepts as a session name.
+func sessionUUID(key, repo string) string {
+	sum := sha256.Sum256([]byte("devlab/agent-session\x00" + key + "\x00" + repo))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x50 // version 5
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC-4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

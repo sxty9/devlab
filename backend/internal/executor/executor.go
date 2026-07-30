@@ -132,10 +132,20 @@ type DeployOps interface {
 	DeliverDev(ctx context.Context, repo string) (DeployOutcome, error)
 }
 
+// AgentSession names the agent conversation of ONE repository inside ONE execution. Key is the
+// stable name of that conversation, so a later resume finds the SAME conversation again; Resume
+// says whether this call continues it or opens it. The name must be settled when the conversation
+// is OPENED — the runner used to hand the execution id to the agent only on resume, and the agent
+// rejected it because no conversation had ever been opened under that name.
+type AgentSession struct {
+	Key    string
+	Resume bool
+}
+
 // Deps is the ONE test seam — implemented by the domain packages, injected in cmd/devlabd.
 type Deps interface {
 	Workbench(repo string) WorkbenchOps
-	Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, resumeID string) (AgentStream, error)
+	Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
 	// StageAttachments materializes a run's media into the runner workspace (B-6) and returns
 	// the prompt manifest plus the mandatory cleanup (idempotent; runs before any commit).
 	StageAttachments(ctx context.Context, repo string, atts []runs.AttachmentRef) (manifest string, cleanup func() error, err error)
@@ -253,8 +263,8 @@ type RepoCtx struct {
 	// parent is the un-budgeted context — bookkeeping after a budget kill (publish, counting
 	// what was achieved) still needs a live context.
 	parent context.Context
-	// resumeID is the opaque continuation token handed to the agent on resume ("" fresh).
-	resumeID string
+	// session names this repo's agent conversation and says whether this run continues it.
+	session AgentSession
 
 	prepared        bool
 	prep            PrepareInfo
@@ -358,8 +368,11 @@ func Execute(ctx context.Context, deps Deps, req Request, sink Sink) error {
 			Deps: deps, Sink: sink, parent: ctx, usage: total,
 			Target: targetFor(req.Run, row.Repo),
 		}
+		// The conversation is named for EVERY run, not only for a resume — otherwise there is
+		// nothing to resume later. A continuation of this very repo continues it.
+		rc.session = AgentSession{Key: req.Doc.ID}
 		if c := req.Doc.Continuation; c != nil && c.Repo == row.Repo {
-			rc.resumeID = req.Doc.ID
+			rc.session.Resume = true
 		}
 
 		rp, err := runRepo(bctx, rc)

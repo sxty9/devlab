@@ -277,7 +277,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 	if err := wb.Publish(ctx); err == nil {
 		t.Errorf("Publish must refuse without a runner account")
 	}
-	if _, err := deps.Agent(ctx, "alpha", "do it", runs.ResolvedTuning{}, ""); err == nil {
+	if _, err := deps.Agent(ctx, "alpha", "do it", runs.ResolvedTuning{}, executor.AgentSession{}); err == nil {
 		t.Errorf("the agent must refuse without a runner account")
 	}
 	if _, _, err := deps.WorkbenchState(ctx, "alpha"); err == nil {

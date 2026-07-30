@@ -273,7 +273,8 @@ func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome
 // ── fake Deps ────────────────────────────────────────────────────────────────────────────
 
 type agentCall struct {
-	repo, prompt, resumeID string
+	repo, prompt string
+	sess        AgentSession
 }
 
 type pauseCall struct {
@@ -287,7 +288,7 @@ type fakeDeps struct {
 	gh       *fakeGH
 	deliver  *fakeDeliver
 	deploy   *fakeDeploy
-	agentFn  func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, resumeID string) (AgentStream, error)
+	agentFn  func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
 	attsFn   func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
 	findings map[string]preflight.Finding
 	findErr  error
@@ -330,7 +331,7 @@ func newFakeDeps(repos ...string) *fakeDeps {
 			ObservedAt: time.Now().UTC(),
 		}
 	}
-	d.agentFn = func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+	d.agentFn = func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 		return &scriptStream{r: strings.NewReader(script(
 			assistantEvent("m1", "working on it", 100, 20),
 			resultEventLine("done: implemented the change", false, 300, 60, 0.42),
@@ -340,11 +341,11 @@ func newFakeDeps(repos ...string) *fakeDeps {
 }
 
 func (d *fakeDeps) Workbench(repo string) WorkbenchOps { return d.benches[repo] }
-func (d *fakeDeps) Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+func (d *fakeDeps) Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 	d.mu.Lock()
-	d.agentCalls = append(d.agentCalls, agentCall{repo: repo, prompt: prompt, resumeID: resumeID})
+	d.agentCalls = append(d.agentCalls, agentCall{repo: repo, prompt: prompt, sess: sess})
 	d.mu.Unlock()
-	return d.agentFn(ctx, repo, prompt, t, resumeID)
+	return d.agentFn(ctx, repo, prompt, t, sess)
 }
 func (d *fakeDeps) StageAttachments(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error) {
 	if d.attsFn != nil {

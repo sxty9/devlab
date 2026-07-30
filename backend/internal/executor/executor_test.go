@@ -382,7 +382,7 @@ func TestAlreadySatisfiedIsSuccess(t *testing.T) {
 func TestBudgetOverrunHonest(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/slow", "org/never")
-	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 		return &blockingStream{ctx: ctx, pre: []byte(script(
 			assistantEvent("m1", "started working before the kill", 50, 10),
 		))}, nil
@@ -439,7 +439,7 @@ func TestBudgetOverrunHonest(t *testing.T) {
 func TestUsageClimbsLive(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/app")
-	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 		return &scriptStream{r: strings.NewReader(script(
 			assistantEvent("m1", "step one", 100, 10),
 			toolEvent("m2", "Bash", "go test ./...", 150, 30),
@@ -478,7 +478,7 @@ func TestUsageClimbsLive(t *testing.T) {
 func TestUsageLimitPausesCollectively(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/app")
-	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+	deps.agentFn = func(ctx context.Context, repo, prompt string, tn runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 		return &scriptStream{
 			r: strings.NewReader(script(
 				assistantEvent("m1", "working", 10, 5),
@@ -519,7 +519,7 @@ func TestInterruptPersistsContinuation(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/app")
 	ctx, cancel := context.WithCancel(context.Background())
-	deps.agentFn = func(actx context.Context, repo, prompt string, tn runs.ResolvedTuning, resumeID string) (AgentStream, error) {
+	deps.agentFn = func(actx context.Context, repo, prompt string, tn runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
 		cancel() // the service is asked to stop while the agent runs
 		return &blockingStream{ctx: actx, pre: []byte(script(assistantEvent("m1", "hi", 5, 1)))}, nil
 	}
@@ -538,7 +538,7 @@ func TestInterruptPersistsContinuation(t *testing.T) {
 	}
 }
 
-// A continuation whose stage is implement resumes the agent session (resumeID passes through)
+// A continuation whose stage is implement resumes the agent session (the named session passes through)
 // instead of taking the rest path — half-done work is finished, not delivered half-way.
 func TestResumeAtImplementResumesAgent(t *testing.T) {
 	stubConstitution(t, nil)
@@ -557,7 +557,7 @@ func TestResumeAtImplementResumesAgent(t *testing.T) {
 	if len(deps.agentCalls) != 1 {
 		t.Fatalf("agent not resumed: %d calls", len(deps.agentCalls))
 	}
-	if deps.agentCalls[0].resumeID != "exec_test" {
+	if !deps.agentCalls[0].sess.Resume || deps.agentCalls[0].sess.Key != "exec_test" {
 		t.Fatalf("resume token lost: %+v", deps.agentCalls[0])
 	}
 }
@@ -788,3 +788,79 @@ func TestPreflightUnreachableBlocks(t *testing.T) {
 }
 
 func errSatisfiedForTest() error { return faultclass.ErrSatisfied }
+
+// A resume whose conversation no longer exists opens a FRESH one on the same workbench instead of
+// ending the task. This is the shape that killed a live task on 2026-07-30: the agent answered
+// "Error: --resume requires a valid session ID or session title" and the run reported the whole
+// repository as failed, although its committed work was untouched on the workbench.
+func TestAResumeWhoseConversationIsGoneContinuesInAFreshOne(t *testing.T) {
+	stubConstitution(t, nil)
+	deps := newFakeDeps("org/app")
+	deps.findings["org/app"] = preflight.Finding{
+		State:    model.TaskImplementedUndelivered,
+		Evidence: []string{"workbench mercury-dev is ahead of the default branch @d00dfeed; no open delivery recorded"},
+	}
+	deps.agentFn = func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error) {
+		if sess.Resume {
+			return &scriptStream{
+				r:       strings.NewReader(script(resultEventLine("", true, 0, 0, 0))),
+				waitErr: errors.New("Error: --resume requires a valid session ID or session title when used with --print"),
+			}, nil
+		}
+		return &scriptStream{r: strings.NewReader(script(
+			assistantEvent("m1", "picking the work back up", 100, 20),
+			resultEventLine("done: finished the change", false, 300, 60, 0.42),
+		))}, nil
+	}
+	sink := newFakeSink()
+	req := mkRequest(model.KindTodo, "org/app")
+	req.Doc.Continuation = &model.ContinuationView{Repo: "org/app", Stage: model.StageImplement}
+
+	if err := Execute(context.Background(), deps, req, sink); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if len(deps.agentCalls) != 2 {
+		t.Fatalf("want the resume AND the fresh conversation, got %d calls", len(deps.agentCalls))
+	}
+	if !deps.agentCalls[0].sess.Resume || deps.agentCalls[1].sess.Resume {
+		t.Fatalf("wrong order: %+v", deps.agentCalls)
+	}
+	// The implement stage must have SUCCEEDED — the missing conversation is not failed work.
+	sv, ok := sink.terminal("org/app", model.StageImplement)
+	if !ok || sv.State != model.StepExecuted {
+		t.Fatalf("implement is %+v, want executed", sv)
+	}
+	// And it must be visible in the transcript, not silent.
+	sink.mu.Lock()
+	tail := strings.Join(sink.transcripts["org/app"], "\n")
+	sink.mu.Unlock()
+	if !strings.Contains(tail, "gone") {
+		t.Fatalf("the fresh start was silent:\n%s", tail)
+	}
+}
+
+// Only the agent's OWN wording about a missing conversation counts — an ordinary implementation
+// failure is never mistaken for it and retried behind the user's back.
+func TestAnOrdinaryFailureIsNotMistakenForAMissingConversation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{"the CLI's own refusal", "Error: --resume requires a valid session ID or session title", true},
+		{"no conversation found", "No conversation found with session ID abc", true},
+		{"a build failure", "exit status 1: go build ./... failed", false},
+		{"a failure that merely says session", "the session manager rejected the write", false},
+		{"nothing at all", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var werr error
+			if tc.msg != "" {
+				werr = errors.New(tc.msg)
+			}
+			if got := lostConversation(werr, nil); got != tc.want {
+				t.Fatalf("lostConversation(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}

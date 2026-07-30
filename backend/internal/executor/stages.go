@@ -121,7 +121,7 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// span of the existing, undelivered work so the remaining stages can walk it. EXCEPTION:
 	// a continuation that stopped INSIDE implement resumes the agent session instead — its
 	// half-done work must be finished, not delivered half-way.
-	resumingImplement := rc.resumeID != "" && rc.Doc.Continuation != nil && rc.Doc.Continuation.Stage == model.StageImplement
+	resumingImplement := rc.session.Resume && rc.Doc.Continuation != nil && rc.Doc.Continuation.Stage == model.StageImplement
 	if rc.Finding.State == model.TaskImplementedUndelivered && !resumingImplement {
 		return implementRestPath(ctx, rc, wb)
 	}
@@ -141,12 +141,28 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// The examined stand of THIS repository (read per repo, never folded into the shared snapshot):
 	// without it every prompt falls back to "never examined ⇒ examine everything".
 	prompt := AssemblePrompt(rc.Run.PromptSnapshot, rc.Finding, deps.AxiomScope(ctx, rc.Repo, rc.Run), manifest)
-	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.resumeID)
+	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
 	if err != nil {
 		return fmt.Errorf("start agent: %w", err)
 	}
 	out, _ := compactStreamFull(stream.Output(), rc.transcriptEmitter())
 	werr := stream.Wait()
+
+	// A resume whose conversation is GONE (the workspace was rebuilt, the agent's own store was
+	// cleared) must not end the task. The committed work is on the workbench either way, so the
+	// stage opens a FRESH conversation once and says so in the transcript — it never presents the
+	// missing conversation as failed work.
+	if rc.session.Resume && lostConversation(werr, out.RawFinal) {
+		rc.settleUsage(out) // the failed attempt still consumed what it consumed
+		rc.Sink.Transcript(rc.Repo, transcriptLine("the earlier conversation is gone — continuing in a new one on the same workbench"))
+		rc.session.Resume = false
+		stream, err = deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
+		if err != nil {
+			return fmt.Errorf("start agent: %w", err)
+		}
+		out, _ = compactStreamFull(stream.Output(), rc.transcriptEmitter())
+		werr = stream.Wait()
+	}
 
 	rc.settleUsage(out)
 	deps.RecordAiUsage(telemetry.UsageSample{
@@ -568,4 +584,32 @@ func limitMessage(out streamOutcome, werr error) string {
 		return out.ResultText
 	}
 	return "usage limit reached"
+}
+
+// lostConversation says whether the agent refused because the conversation this run wanted to
+// continue does not exist (any more). It is deliberately narrow: only the agent's own wording about
+// a session/conversation counts, so a genuine implementation failure is never mistaken for it and
+// silently retried. Measured against the wording the CLI produced on 2026-07-30:
+// "Error: --resume requires a valid session ID or session title when used with --print".
+func lostConversation(werr error, rawFinal []byte) bool {
+	hay := strings.ToLower(strings.TrimSpace(string(rawFinal)))
+	if werr != nil {
+		hay += " " + strings.ToLower(werr.Error())
+	}
+	if !strings.Contains(hay, "session") && !strings.Contains(hay, "conversation") {
+		return false
+	}
+	for _, m := range []string{
+		"--resume requires a valid session",
+		"no conversation found",
+		"no session found",
+		"session not found",
+		"could not find session",
+		"invalid session id",
+	} {
+		if strings.Contains(hay, m) {
+			return true
+		}
+	}
+	return false
 }
