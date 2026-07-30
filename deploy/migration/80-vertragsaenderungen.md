@@ -921,7 +921,7 @@ Identity` is its armed counterpart.
 `continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
 one table with which the operator is told where to READ each writing call before the first start.
 **What changed:** every anchor was verified against the code and corrected, and each one now carries
-the CALL it points at (`deliver/deliver.go:873 gh.PostCommitStatus`) instead of a bare line number.
+the CALL it points at (`deliver/deliver.go:879 gh.PostCommitStatus`) instead of a bare line number.
 **Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
 **Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
 runbook parts and fails unless the named line really carries the named call — and fails on an anchor

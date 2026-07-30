@@ -576,7 +576,13 @@ func VerifyProtection(ctx context.Context, gh GitHubOps, repos []string, n *runs
 	for _, repo := range repos {
 		cur, err := gh.GetProtection(ctx, repo)
 		if err != nil {
+			// An UNREADABLE protection is a FINDING, not a quiet skip: the pass cannot say whether
+			// this repository is protected, and that is exactly the state a drift hides in. Two
+			// repositories kept requiring a status context nobody writes any more; the pass met
+			// them, could not read them, wrote a line into a report nobody reads and stayed silent
+			// (measured 2026-07-30: 403 "Upgrade to GitHub Pro or make this repository public").
 			out = append(out, ProtectionReport{Repo: repo, Detail: "protection unreadable: " + err.Error()})
+			notify(n, "protection-deviation", repo, "branch protection could not be READ, so whether this repository is protected is UNKNOWN: "+err.Error())
 			if firstErr == nil {
 				firstErr = err
 			}

@@ -693,12 +693,12 @@ func (x brokenBench) MergeBaseDefault(context.Context) (string, error) { return 
 // ── the fixture agent ────────────────────────────────────────────────────────────────────────
 
 type fixtureAgent struct {
-	ctx      context.Context
-	out      io.Reader
-	err      error
-	block    chan struct{}
-	prompt   string
-	sess     executor.AgentSession
+	ctx    context.Context
+	out    io.Reader
+	err    error
+	block  chan struct{}
+	prompt string
+	sess   executor.AgentSession
 }
 
 func (a *fixtureAgent) Output() io.Reader { return a.out }

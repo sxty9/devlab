@@ -524,6 +524,14 @@ func (s *Server) VerifyRepoProtection(ctx context.Context) ([]deliver.Protection
 	reports, err := deliver.VerifyProtection(ctx, heldProtectionOps{deliverOps(s, token)}, full, nil)
 	notify, held := s.NoticeFunc(), false
 	for i := range reports {
+		// A repository whose protection could not be READ is announced here too. The held pass is
+		// handed no notice store (deliver's wording would speak of a failed RESTORATION), so
+		// without this the one finding that hides a drift would reach no one.
+		if strings.HasPrefix(reports[i].Detail, "protection unreadable: ") && notify != nil {
+			notify("protection-deviation", reports[i].Repo+": branch protection could not be READ, so whether this repository is protected is UNKNOWN — "+
+				strings.TrimPrefix(reports[i].Detail, "protection unreadable: "))
+			continue
+		}
 		if !strings.Contains(reports[i].Detail, errProtectionHeld.Error()) {
 			continue
 		}

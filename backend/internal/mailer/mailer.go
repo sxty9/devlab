@@ -1,9 +1,11 @@
 // Package mailer is a thin loopback client to the holistic `mail` service (maild). DevLab does NOT
-// run its own SMTP and holds no mail account of its own: it hands maild a Holistic username and a
-// message, and maild's local delivery agent resolves that user's mailbox from their landscape
-// identity and delivers it. There is thus exactly one delivery path in the landscape (no second
-// delivery truth), and DevLab configures no recipient address — it names the user, maild owns the
-// address.
+// run its own SMTP and holds no mail account of its own: the caller names a Holistic USER, and
+// maild's local delivery agent puts the message into that user's mailbox. There is thus exactly one
+// delivery path in the landscape and no second delivery truth.
+//
+// The one address DevLab does assemble is <user>@<mail domain>, because maild's internal endpoint
+// takes recipients as addresses. The domain is read from the dashboard's instance file — the very
+// source maild itself reads — so it is the same domain, not a second one (see Address).
 //
 // The internal-send endpoint is authenticated by the shared landscape internal secret (the same file
 // maild reads via MAILD_INTERNAL_SECRET_FILE), presented in the X-Mail-Internal-Secret header. It is
@@ -84,23 +86,43 @@ func NewWithSecret(base, secret string) *Client {
 	}
 }
 
-// Message is one internal send: a Holistic user's mailbox (by username — maild resolves the address
-// from their identity) plus a subject and both plaintext and HTML bodies.
+// Message is one internal send: the Holistic user whose mailbox it goes to, a subject, and both
+// plaintext and HTML bodies. This is the CALLER's vocabulary — DevLab names a user, never an
+// address. What goes over the wire is maild's own shape, assembled in Send.
 type Message struct {
-	Username string `json:"username"`
-	Subject  string `json:"subject"`
-	Body     string `json:"body"`
-	HTMLBody string `json:"htmlBody,omitempty"`
+	Username string
+	Subject  string
+	Body     string
+	HTMLBody string
+}
+
+// wireMessage is maild's /internal/send request, exactly as maild declares it: a sender who must be
+// a real local account, and recipients as addresses. DevLab used to post {username, subject, body}
+// instead — a shape maild has never had — so every single daily report was refused with
+// "400 Bad Request: A from user is required" and the report was never delivered once.
+type wireMessage struct {
+	From    string   `json:"from"`
+	To      []string `json:"to"`
+	Subject string   `json:"subject"`
+	Body    string   `json:"body"`
 }
 
 // Send delivers a message to the named user's mailbox via maild. It returns a non-nil error on any
 // transport failure or non-2xx status (with maild's {"detail":...} reason when present), so the
 // caller can surface and retry a failed send without losing it.
 func (c *Client) Send(ctx context.Context, m Message) error {
-	if strings.TrimSpace(m.Username) == "" {
+	user := strings.TrimSpace(m.Username)
+	if user == "" {
 		return errors.New("mailer: empty recipient username")
 	}
-	body, err := json.Marshal(m)
+	// The report is the user's OWN: it is sent from their account to their own mailbox. That needs
+	// no service account and no second identity — and maild insists the sender be a real local one.
+	body, err := json.Marshal(wireMessage{
+		From:    user,
+		To:      []string{Address(user)},
+		Subject: m.Subject,
+		Body:    m.Body,
+	})
 	if err != nil {
 		return err
 	}
@@ -135,4 +157,40 @@ func parseDetail(b []byte) string {
 		return e.Detail
 	}
 	return ""
+}
+
+// Address is the mailbox address of a Holistic user: <user>@<mail domain>. The domain is NOT
+// DevLab's own — it is read from the very source maild reads, the dashboard's instance file
+// (HOLISTIC_MAIL_DOMAIN wins, else `mail_domain` in HOLISTIC_INSTANCE, default
+// /var/lib/holistic/instance.json). Same names, same file, so there is one domain in the landscape
+// and not a second one here.
+//
+// Without a known domain the bare username is handed over and maild's alias registry decides. That
+// is the honest fallback: DevLab does not invent a domain to make the send look successful.
+func Address(user string) string {
+	if d := mailDomain(); d != "" {
+		return user + "@" + d
+	}
+	return user
+}
+
+func mailDomain() string {
+	if d := strings.TrimSpace(os.Getenv("HOLISTIC_MAIL_DOMAIN")); d != "" {
+		return d
+	}
+	path := os.Getenv("HOLISTIC_INSTANCE")
+	if path == "" {
+		path = "/var/lib/holistic/instance.json"
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var data struct {
+		MailDomain string `json:"mail_domain"`
+	}
+	if json.Unmarshal(b, &data) != nil {
+		return ""
+	}
+	return strings.TrimSpace(data.MailDomain)
 }

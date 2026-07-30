@@ -5,12 +5,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
+// The request must carry maild's OWN field names, not this package's. The previous version of this
+// test decoded the body into the client's own Message struct — so it agreed with whatever the client
+// happened to send and would have stayed green through any contract, which is exactly how a mailer
+// that maild refused with "A from user is required" shipped and never delivered a single report.
+// It therefore reads the RAW keys.
 func TestSendPostsInternalSendWithSecretAndPayload(t *testing.T) {
+	t.Setenv("HOLISTIC_MAIL_DOMAIN", "example.test")
 	var gotPath, gotSecret, gotCT string
-	var gotBody Message
+	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotSecret = r.Header.Get("X-Mail-Internal-Secret")
@@ -37,8 +45,44 @@ func TestSendPostsInternalSendWithSecretAndPayload(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Errorf("content-type = %q", gotCT)
 	}
-	if gotBody.Username != "alice" || gotBody.Subject != "Daily report" || gotBody.Body != "plain" || gotBody.HTMLBody != "<p>rich</p>" {
-		t.Errorf("body = %+v", gotBody)
+	// The sender maild insists on, and the recipient as an ADDRESS.
+	if gotBody["from"] != "alice" {
+		t.Errorf(`from = %v, want "alice" — maild refuses a send without one`, gotBody["from"])
+	}
+	to, _ := gotBody["to"].([]any)
+	if len(to) != 1 || to[0] != "alice@example.test" {
+		t.Errorf("to = %v, want [alice@example.test]", gotBody["to"])
+	}
+	if gotBody["subject"] != "Daily report" || gotBody["body"] != "plain" {
+		t.Errorf("subject/body = %v / %v", gotBody["subject"], gotBody["body"])
+	}
+	// The key the old client sent instead of a sender must be gone — otherwise both shapes are on
+	// the wire and the fix is only half done.
+	if _, stale := gotBody["username"]; stale {
+		t.Errorf("the request still carries the shape maild has never had: %v", gotBody)
+	}
+}
+
+// Without a known domain the bare username is handed over — DevLab does not invent a domain to make
+// the send look successful.
+func TestWithoutAKnownDomainTheBareUsernameIsHandedOver(t *testing.T) {
+	t.Setenv("HOLISTIC_MAIL_DOMAIN", "")
+	t.Setenv("HOLISTIC_INSTANCE", filepath.Join(t.TempDir(), "absent.json"))
+	if got := Address("alice"); got != "alice" {
+		t.Fatalf("Address = %q, want the bare username", got)
+	}
+}
+
+// The domain comes from the file maild itself reads — one domain in the landscape, not a second one.
+func TestTheDomainComesFromTheInstanceFileMaildReads(t *testing.T) {
+	t.Setenv("HOLISTIC_MAIL_DOMAIN", "")
+	path := filepath.Join(t.TempDir(), "instance.json")
+	if err := os.WriteFile(path, []byte(`{"mail_domain": "landscape.test"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOLISTIC_INSTANCE", path)
+	if got := Address("alice"); got != "alice@landscape.test" {
+		t.Fatalf("Address = %q, want alice@landscape.test", got)
 	}
 }
 

@@ -274,7 +274,7 @@ func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome
 
 type agentCall struct {
 	repo, prompt string
-	sess        AgentSession
+	sess         AgentSession
 }
 
 type pauseCall struct {
