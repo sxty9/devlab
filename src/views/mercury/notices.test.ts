@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   humanizeKind,
   isUnread,
+  maintenanceHold,
   noticeAxioms,
   noticeLabel,
   noticeText,
@@ -34,6 +35,7 @@ test('every notice kind renders a defined state', () => {
     'delivery-blocked',
     'delivery-selfcheck',
     'code-structure-violation',
+    'delivery-held',
     'protection-deviation',
     'admin-override',
     'startup-reconcile',
@@ -52,6 +54,21 @@ test('every notice kind renders a defined state', () => {
     assert.ok(noticeText(n).length > 0, `${kind}: text`);
     assert.ok(['alarm', 'note'].includes(noticeTone(n)), `${kind}: tone`);
   }
+});
+
+// The delivery surface asks the FEED why nothing moves — and only an unread record answers, because
+// the service re-raises the hint on every maintenance pass while the hold lasts.
+test('the standing maintenance hold is read off the feed, unread only', () => {
+  const held = notice({ id: 'ntc_hold', kind: 'delivery-held', text: 'maintenance is HELD — set …', read: false });
+  const acknowledged = { ...held, read: true };
+  const other = notice({ id: 'ntc_other', kind: 'delivery-alarm', text: 'something else' });
+
+  assert.equal(maintenanceHold([other, held])?.id, 'ntc_hold');
+  assert.equal(maintenanceHold([other, acknowledged]), null, 'a dismissed hold stops the banner until the next pass re-opens it');
+  assert.equal(maintenanceHold([]), null);
+  // Its own kind, its own label — never folded into the generic delivery alarm.
+  assert.equal(noticeLabel(held), 'Maintenance held');
+  assert.equal(noticeTone(held), 'alarm');
 });
 
 test('an unknown kind is humanized rather than shown raw', () => {

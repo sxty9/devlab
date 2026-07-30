@@ -20,7 +20,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { useToast } from '@/ui/Toast';
 import { useLiveTopic } from '@/state/live';
 import type { Delivery, RunResult } from '@/types';
-import { executionCompleted } from '../tasks/select';
+import { executionCompleted, outsideHistory } from '../tasks/select';
 import { openDeliveryExecutionIds } from '../deliveries/deliveries';
 import { ExecutionDetail, RequestedBy } from './ExecutionDetail';
 import { TonePill } from './PipelineStages';
@@ -140,6 +140,12 @@ export function ExecutionsView() {
     return sortExecutions(list.filter((res) => executionCompleted(res, open)));
   }, [all, deliveries]);
 
+  // What this list does NOT show, by the reason that keeps it out — never a bare subtraction. A
+  // remainder counted without its reason claimed executions nobody could point at: an archive record
+  // the mapping left without an end stamp was hidden here AND counted as open while the Active
+  // surface stood empty. Both numbers below name where the record IS shown.
+  const outside = useMemo(() => outsideHistory(all ?? [], openDeliveryExecutionIds(deliveries)), [all, deliveries]);
+
   if (failed) {
     return (
       <div className="flex h-full min-h-0 w-full items-center justify-center bg-bg-base px-6">
@@ -160,7 +166,14 @@ export function ExecutionsView() {
   // three-valued — true (deleted or never defined), false (still there), undefined (not read yet).
   const knownRunIds = runIds ?? NO_RUNS;
   const runGone = selected && runIds ? !runIds.has(selected.runId) : undefined;
-  const openCount = all.length - history.length;
+  // Each number says where that record IS shown. "unfinished" covers the running and the interrupted
+  // alike — both stand in Active — and an open delivery is named the way the ledger names it.
+  const elsewhere = [
+    outside.inFlight.length > 0 ? `${outside.inFlight.length} unfinished in Active` : '',
+    outside.awaitingDelivery.length > 0 ? `${outside.awaitingDelivery.length} with an open delivery` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <div className="flex h-full min-h-0 w-full">
@@ -168,12 +181,12 @@ export function ExecutionsView() {
       <div className="flex w-96 shrink-0 flex-col border-r border-separator bg-surface">
         <div className="flex items-center justify-between gap-2 border-b border-separator px-3 py-2">
           <span className="text-footnote font-medium text-text-primary">History ({history.length})</span>
-          {openCount > 0 && <span className="text-caption text-text-tertiary">{openCount} still open</span>}
+          {elsewhere && <span className="text-caption text-text-tertiary">{elsewhere}</span>}
         </div>
         <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
           {history.length === 0 ? (
             <p className="px-2.5 py-3 text-caption text-text-tertiary">
-              {openCount > 0 ? 'Nothing finished yet — open executions stay in Active until every delivery is settled.' : 'No executions yet.'}
+              {elsewhere ? 'Nothing finished yet — an execution enters the history once it ended and every delivery of it is settled.' : 'No executions yet.'}
             </p>
           ) : (
             <div className="flex flex-col gap-0.5">

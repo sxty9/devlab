@@ -10,6 +10,7 @@ package runs
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -255,6 +256,37 @@ type legacyRepoResult struct {
 	} `json:"steps"`
 }
 
+// The archive is a CLOSED PAST. The process that wrote it is long gone and no chain ever resumes an
+// archived document, so the mapping draws two consequences — and states both inside the document it
+// produces, because the surface renders what the document says and nothing else (B-17/B-35):
+//
+//  1. No archived step is RUNNING. A step the old store left running is closed as aborted, with the
+//     moment the archive recorded as its evidence. Carried verbatim it made the surface pulse
+//     "running" for a repository where nothing runs — the very ghost REQ-039.1 removes.
+//  2. No archived execution is still IN FLIGHT. A zero finishing time is a missing STAMP, not an open
+//     execution: left unstamped, the record fell out of the history while the history's counter still
+//     counted it — an entry that exists became invisible and a number nobody can point at was
+//     claimed. The end is therefore the last instant the RECORD ITSELF carries; the report names that
+//     substitution, and a record the source marked as not ok additionally carries the cutoff stage
+//     below, so a missing stamp can never read as a completed chain (K-4).
+const (
+	// stageArchivedCutoff is the ONE stage a cut-off archive record carries per repository. It is
+	// deliberately NOT a chain stage (the same reasoning as the import's `archived-outcome`): the
+	// record states that nothing followed — not that a particular chain step failed.
+	stageArchivedCutoff = model.Stage("archived-cutoff")
+
+	// legacyCutoffReason is the mandatory reason of that stage.
+	legacyCutoffReason = "the pre-rebuild archive recorded no finishing time and marked this " +
+		"execution as not ok: the chain was cut off after the last recorded step, so nothing " +
+		"beyond it ran"
+
+	// legacyAbortedReason is the mandatory reason of a step the archive left running (%s = the
+	// recorded moment, or nothing when the archive stamped none).
+	legacyAbortedReason = "aborted: the pre-rebuild archive recorded this step as running%s and " +
+		"recorded nothing after it — the archive is a closed past, so the step never ended and " +
+		"its outcome is unknown"
+)
+
 // mapLegacy maps one archived result onto the new shape. Legacy step names (analyze, dev-deploy,
 // push, pr, …) are carried VERBATIM as stage names — displayable, never produced anew.
 func mapLegacy(lr legacyResult) Result {
@@ -286,13 +318,17 @@ func mapLegacy(lr legacyResult) Result {
 		repos = append(repos, *lr.Live)
 	}
 	res.Repos = make([]model.RepoPipeline, 0, len(repos))
+	aborted := 0
 	for _, rr := range repos {
 		rp := model.RepoPipeline{Repo: rr.Repo}
 		for _, st := range rr.Steps {
 			sv := model.StageView{Stage: model.Stage(st.Name), Log: st.Log}
 			switch {
 			case st.Running:
-				sv.State = model.StepRunning
+				// Consequence 1: an archived step is never in flight — it is closed as aborted,
+				// naming what the archive recorded (a terminal state's reason is mandatory).
+				sv.State, sv.Reason = model.StepFailed, abortedReason(st.At)
+				aborted++
 			case st.Status == "ok" || (st.Status == "" && st.OK != nil && *st.OK):
 				sv.State = model.StepExecuted
 			case st.Status == "not-applicable":
@@ -315,10 +351,91 @@ func mapLegacy(lr legacyResult) Result {
 			// A repo that failed before any step ran still renders a defined state.
 			rp.Stages = []model.StageView{{Stage: model.StagePreflight, State: model.StepFailed, Reason: rr.Error}}
 		}
-		rp.Done, rp.Succeeded = model.PipelineSucceeded(rp.Stages)
 		res.Repos = append(res.Repos, rp)
 	}
+	if lr.FinishedAt.IsZero() {
+		closeUnstamped(&res, lr.OK, aborted)
+	}
+	for i := range res.Repos {
+		res.Repos[i].Done, res.Repos[i].Succeeded = model.PipelineSucceeded(res.Repos[i].Stages)
+	}
 	return res
+}
+
+// abortedReason names a step the archive left running, with the moment it recorded.
+func abortedReason(at time.Time) string {
+	when := ""
+	if !at.IsZero() {
+		when = " at " + at.UTC().Format(time.RFC3339)
+	}
+	return fmt.Sprintf(legacyAbortedReason, when)
+}
+
+// closeUnstamped applies consequence 2 to a record the old store left without a finishing time: the
+// execution is ENDED at the last instant the record itself carries, the report says which instant
+// that is and why it stands in for the missing stamp, and a record the source marked as not ok
+// carries the cutoff stage per repository so its unfinished chain cannot read as a completed one.
+func closeUnstamped(res *Result, sourceOK bool, aborted int) {
+	end, derived := lastRecordedInstant(*res)
+	res.EndedAt = &end
+	if !sourceOK {
+		for i := range res.Repos {
+			res.Repos[i].Stages = append(res.Repos[i].Stages, model.StageView{
+				Stage: stageArchivedCutoff, State: model.StepNotExecuted,
+				Reason: legacyCutoffReason, EndedAt: &end,
+			})
+		}
+	}
+	res.Report = unstampedReport(sourceOK, aborted, len(res.Repos), end, derived)
+}
+
+// lastRecordedInstant is the latest moment the record carries — the newest stage stamp, else its
+// start. `derived` distinguishes the two, so the report can say which one it is showing.
+func lastRecordedInstant(res Result) (last time.Time, derived bool) {
+	last = res.StartedAt
+	for _, rp := range res.Repos {
+		for _, sv := range rp.Stages {
+			for _, t := range []*time.Time{sv.EndedAt, sv.StartedAt} {
+				if t != nil && t.After(last) {
+					last, derived = *t, true
+				}
+			}
+		}
+	}
+	return last, derived
+}
+
+// unstampedReport states WHERE the end time comes from and WHAT the source did not carry, so the
+// history never presents a substituted end as a recorded one (REQ-038 renders it as Markdown).
+func unstampedReport(sourceOK bool, aborted, repos int, end time.Time, derived bool) string {
+	var b strings.Builder
+	b.WriteString("## Archive record without a recorded finish\n\n")
+	b.WriteString("The pre-rebuild store stamped no finishing time on this execution. The archive is " +
+		"a closed past — nothing in it runs — so the record is shown as ended.\n\n")
+	if derived {
+		b.WriteString("- end shown: `" + end.UTC().Format(time.RFC3339) +
+			"` — the last instant the record itself carries, standing in for the missing stamp\n")
+	} else {
+		b.WriteString("- end shown: `" + end.UTC().Format(time.RFC3339) +
+			"` — its own start; the record carries no later instant at all\n")
+	}
+	switch {
+	case sourceOK:
+		b.WriteString("- recorded outcome: succeeded — the source's own flag; only the finishing " +
+			"time is missing, so the recorded stages stand as they are\n")
+	case repos > 0:
+		b.WriteString("- recorded outcome: not ok — every repository therefore carries one `" +
+			string(stageArchivedCutoff) + "` stage stating that nothing followed the last recorded step\n")
+	default:
+		b.WriteString("- recorded outcome: not ok — the record names no repository at all, so it " +
+			"holds no chain that could be shown as cut off\n")
+	}
+	if aborted > 0 {
+		b.WriteString(fmt.Sprintf("- steps closed as aborted: %d — recorded as running, never followed "+
+			"by anything\n", aborted))
+	}
+	b.WriteString("\nThe moved-aside archive keeps the original document verbatim.\n")
+	return b.String()
 }
 
 // legacyAll reads the whole legacy archive tolerantly: any file that does not parse is skipped,

@@ -18,6 +18,12 @@ export type NoticeRecord = Omit<RunNotice, 'kind'> &
  *  decision (which colour, which order) — the service itself reports without judging. */
 export type NoticeTone = 'alarm' | 'note';
 
+/** The kind the service raises while its delivery maintenance stands still: its writing half is not
+ *  armed, so no pull request is merged, no branch pruned, no status written. Named ONCE here — the
+ *  client's single place for notice vocabulary, mirroring the service's — because two surfaces read
+ *  it: the feed, which labels it, and the delivery ledger, which explains with it why nothing moves. */
+const HOLD_KIND = 'delivery-held';
+
 /** The kinds this build knows, with their label and tone. An absent kind is not an error: it falls
  *  through to `humanizeKind` below. */
 const KINDS: Record<string, { label: string; tone: NoticeTone }> = {
@@ -26,6 +32,7 @@ const KINDS: Record<string, { label: string; tone: NoticeTone }> = {
   'delivery-blocked': { label: 'Delivery blocked', tone: 'alarm' },
   'delivery-selfcheck': { label: 'Self-check', tone: 'alarm' },
   'code-structure-violation': { label: 'Code structure', tone: 'alarm' },
+  [HOLD_KIND]: { label: 'Maintenance held', tone: 'alarm' },
   // Delivery-origin findings.
   'protection-deviation': { label: 'Protection deviation', tone: 'alarm' },
   'admin-override': { label: 'Emergency override', tone: 'alarm' },
@@ -98,6 +105,16 @@ export function isUnread(n: NoticeRecord): boolean {
 
 export function unreadCount(list: readonly NoticeRecord[]): number {
   return list.filter(isUnread).length;
+}
+
+/** The standing standstill of the delivery maintenance, or null — read off the feed the service
+ *  raises it in, so the wording lives where the finding is made and no surface invents a second one.
+ *
+ *  Only an UNREAD record counts: the service re-raises the hint on every maintenance pass, and a
+ *  repeat re-opens the record (bundled, with a count). So dismissing it hides the banner for at most
+ *  one pass while the hold lasts, and once the hold ends nothing re-opens it again. */
+export function maintenanceHold(list: readonly NoticeRecord[]): NoticeRecord | null {
+  return list.find((n) => n.kind === HOLD_KIND && isUnread(n)) ?? null;
 }
 
 /** Unread first, then newest first — what still needs attention leads, and within each group the

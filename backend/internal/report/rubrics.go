@@ -30,7 +30,10 @@ const (
 func rubricOf(kind string) string {
 	switch kind {
 	case runs.NoticeDeliveryAlarm, runs.NoticeDeliveryBlocked,
-		runs.NoticeDeliverySelfCheck, runs.NoticeStructureViolation:
+		runs.NoticeDeliverySelfCheck, runs.NoticeStructureViolation,
+		// A held maintenance is work that did not reach the user for the whole day — the daily
+		// report is exactly where that belongs.
+		runs.NoticeDeliveryHeld:
 		return RubricDeliveryAlarms
 	case runs.NoticeAdminOverride:
 		return RubricOverrides

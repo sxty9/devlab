@@ -10,18 +10,40 @@ variables here and in `00-cutover.md`; they never enter the repository._
 Order (B-9): **stop → migrate → start**. The import probes the ready socket; while anything
 answers there — free or busy — it declines, because the running daemon owns the pools.
 
+The import runs AS THE SERVICE ACCOUNT, because everything it writes must belong to that account.
+That makes the export's readability a PRECONDITION, not a detail: an export left in the operator's
+home is unreachable for the service account — a home is typically `0750`, so a foreign account
+cannot even traverse it and `test -r` already fails, whereupon the import ends with exit `5`. So the
+export is staged where the service account can read it, the readability is checked BEFORE the import
+starts, and the staging is removed afterwards (the raw export carries this instance's prompts and
+tasks). Steps 4 and 5 of `00-cutover.md` are where this happens inside the cutover; the same three
+lines are what makes a later, standalone re-run work.
+
 ```sh
 STATE_DIR=/var/lib/devlab                   # the instance's state root
+SVC_USER=devlab                             # the daemon's service account (unit: User=)
 EXPORT=<export-dir>/mercury-runs-roh.json   # the raw run export — instance data, never committed
 OLD=<old-checkout>                          # the pre-rebuild working copy (M1, M2, M6)
+IMPORT_DIR=$STATE_DIR/import                # the staging the service account can read
 
 sudo systemctl stop devlabd
+# 0) stage the export and PROVE it is readable for the account that will read it
+sudo install -d -o $SVC_USER -g $SVC_USER -m0700 $IMPORT_DIR
+sudo install -o $SVC_USER -g $SVC_USER -m0600 $EXPORT $IMPORT_DIR/mercury-runs-roh.json
+sudo -u $SVC_USER test -r $IMPORT_DIR/mercury-runs-roh.json \
+  && echo 'precondition met' || echo 'ABORT: unreadable for the service account — the import would exit 5'
 # 1) read-only rehearsal: prints the full protocol, writes nothing
-sudo -u devlab env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $EXPORT --dry-run
+sudo -u $SVC_USER env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $IMPORT_DIR/mercury-runs-roh.json --dry-run
 # 2) the import itself
-sudo -u devlab env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $EXPORT
+sudo -u $SVC_USER env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $IMPORT_DIR/mercury-runs-roh.json
+# 3) remove the staging — the export is instance data, not state
+sudo rm -rf $IMPORT_DIR && sudo test ! -e $IMPORT_DIR && echo 'staging removed'
 sudo systemctl start devlabd
 ```
+
+`devlab-migrate` is invoked by name because step 4 of `00-cutover.md` INSTALLS it beside the daemon
+(`/usr/local/bin`). Running it out of a build directory under `/tmp` would make the import depend on
+the umask of the account that built it — the service account must be able to traverse and execute it.
 
 Exit codes (uniform CLI convention): `0` ok · `1` generic · `2` usage · `5` config-state (no
 state root, unreadable export, a record that cannot be mapped faithfully, a record that would be
@@ -65,6 +87,8 @@ rebuilt form counts as already imported.
 | `mercury/runs-prs.json` | read as it lies: repository, number, URL, run, times and the blockade all arrive | **nothing** — the file is not touched. The single field with no counterpart is the pre-rebuild deploy-attempt counter; the rebuilt record keeps retry state in `backoff`, and the counter only ever accompanied an already **blocked** record whose attempts are spent |
 | `mercury/runs-notices.json` | read as it lies; the bundling fields that postdate these rows are filled on read | **nothing** — the migration protocol below is *added* beside the existing rows |
 | `mercury/runs-results/` | read tolerantly and mapped, including a step recorded as `ok` before statuses existed, historical stage names in the instance's own language, the separate live block and a zero finishing time (which stays "never finished") | imported into `mercury/executions/`, then moved aside (row above). The auxiliary fields of the old document — `mode`, `timeBudget`, `numTurns`, `effort`, `promptHash`, `interrupted`, `suspended`, `resumeAt` — have no place in the rebuilt result and are **not** carried: the archive is display-only, its stages carry the observable truth, and the moved-aside archive keeps the originals |
+| `mercury/daily-reports.json` | read as it lies — the rebuilt record spells `recipient`, `day`, `status`, `executions`, `attempts`, `lastAttempt`, `lastError` exactly as the source does, and the `backoff` field that postdates these rows is absent and reads as "no retry episode". But a record left in `failed` WITHOUT a backoff is **due again on the reporter's very first pass**, whatever its age: the reporter runs a pass before its first interval, so the first start re-attempts a send that the old instance already failed — and a report for a day inside the lookback window goes out for work the OLD instance did | **nothing** — and that is why it must be looked at before the runner identity is set: `00-cutover.md` step 6a prints day, status, attempts and the last error, step 6 keeps the reporter switched off until then. A day that may not be re-sent is settled by hand with the daemon stopped (status `blocked` waits for the explicit resumption, K-5); a day that no longer concerns anybody is moved aside with the file |
+| `mercury/axiom-checks.json`, `mercury/axiom-authors.json`, `mercury/attachments/` | read as they lie: the examined-stand pool is `{repos: {repo: {axiom: {commit, at}}}}`, the authorship pool `{authors: {axiom: {createdBy, createdAt, updatedBy, updatedAt}}}`, and the attachment tree is `<run>/<attachment>` — all three the shape the rebuilt stores spell. An unreadable examination pool is set aside by the store itself and NAMED in the prompt, so it never reads as "never examined here" | **nothing** — nothing to migrate. Without them the first pass of every run would examine each repository in full, which is correct but expensive |
 | `mercury/runs-settings.json`, `mercury/runs-incidents.json` | **no rebuilt store opens them** | moved to `<name>.pre-migration` with the reason in the protocol, so nothing is left that looks live and is not. The old slot capacity is **not** carried over: set it as `DEVLAB_RUNS_MAX_CONCURRENCY` in the drop-in (step 2 of `00-cutover.md`) if the pre-rebuild value is still wanted — read it out of `runs-settings.json.pre-migration` |
 | the pre-rebuild single-execution marker | no reader — the twin-marker trap does not exist in the rebuild (REQ-039.3) | **not** the import's job: it is a trap to remove, not stock to keep, and step **3** of `00-cutover.md` deletes it by name before the import runs |
 
@@ -80,15 +104,20 @@ Check the outcome after the import — the target state is the eight records of 
 nothing else:
 
 ```sh
-sudo -u devlab jq '[.runs[] | {id, kind, title, active}] | length, .' $STATE_DIR/mercury/runs.json
-sudo -u devlab jq '[.runs[] | keys] | flatten | unique' $STATE_DIR/mercury/runs.json   # no type/name/enabled/done/prompt
-sudo -u devlab ls -l $STATE_DIR/mercury/*.pre-migration $STATE_DIR/mercury/runs-history.pre-migration
+sudo -u $SVC_USER jq '[.runs[] | {id, kind, title, active}] | length, .' $STATE_DIR/mercury/runs.json
+sudo -u $SVC_USER jq '[.runs[] | keys] | flatten | unique' $STATE_DIR/mercury/runs.json   # no type/name/enabled/done/prompt
+sudo -u $SVC_USER ls -l $STATE_DIR/mercury/*.pre-migration $STATE_DIR/mercury/runs-history.pre-migration
 ```
 
 ## Step A — the axiom assignment (mandatory before any run is switched on)
 
 This step is part of the cutover, not an afterthought: until it is done and checked, the seven
 imported runs are switched off and the instance performs no recurring work.
+
+It comes AFTER step 7 of `00-cutover.md`, not before: the constitution store resolves its token
+through the runner identity (`DEVLAB_AXIOMS_TOKEN_USER`, else `DEVLAB_RUNS_TOKEN_USER`, else
+`DEVLAB_RUNS_USER`), and the held first start has none of the three — A1 would fail with the store's
+named "not configured" answer rather than write.
 
 ```sh
 ORIGIN=<origin>            # the instance's own origin, as in 00-cutover.md
@@ -125,7 +154,7 @@ way: acknowledging its notice.
 | **M1** rescue branches | Where the rebuild carries the capability anyway it is **proven**, not delivered twice: record per branch "folded in" or "superseded" (evidence: the acceptance lines for slots, time budget, usage and workbench), then remove all four | `git -C $OLD branch -D fix/auslieferungssperre-slots-lieferkette fix/zeitbudget-je-lauf fix/tokenverbrauch-live fix/arbeitsstand-vor-neustart-2136` and `git -C $OLD push origin --delete <branch>` where it exists remotely | |
 | **M2** rollout backlog | The retired rollout left open pull requests, branches and follow-up entries; the rebuild has no rollout path at all | `gh pr close <n>` per open rollout pull request, delete their branches, drop their follow-up entries, and revert or counter-book the one-pull-request-per-repository commit depending on its merge state | |
 | **M3** stale follow-up entry | A follow-up entry still points at a delivery branch that no longer exists (the prune loop that repeated forever) | Remove the entry for the deleted delivery branch from `mercury/runs-prs.json` while the service is stopped | |
-| **M4** tasks whose work already arrived | Handled by the startup reconciliation, which records a completed execution per task | No manual step: check the notice feed after the first start | |
+| **M4** tasks whose work already arrived | Handled by the startup reconciliation, which records a completed execution per task | No manual step, but it does not happen at the HELD first start: the reconciliation resolves repositories through the runner identity, which step 6 of `00-cutover.md` deliberately withholds, so it logs `startup reconciliation deferred: no runner account configured` and runs at the restart of step 7. Check the notice feed after THAT start | |
 | **M5** deliver the two pending services | The old path needed a per-repository script; the generic path replaces it | Create one task per service, run it through the chain, then verify: unit active, visible in the dashboard, right declared | |
 | **M6** obsolete process branches | Branches whose **content** arrived in the default branch (also through a collective merge) — content decides, never the commit id | Probe each branch by content (`git -C $OLD cherry <default> <branch>`, diff probe) and delete the contained ones | |
 | **M7** port inventory | One service once started on a port another already held | Open Atlas → Ports (or `curl -fsS <origin>/api/atlas/ports`) and confirm every conflict and deviation reported | |
@@ -153,11 +182,11 @@ Without the tarball, everything the import moved is still on disk under its own 
 back by hand — in this order, with the daemon stopped:
 
 ```sh
-sudo -u devlab mv $STATE_DIR/mercury/runs.json.pre-migration            $STATE_DIR/mercury/runs.json
-sudo -u devlab mv $STATE_DIR/mercury/runs-deliveries.json.pre-migration $STATE_DIR/mercury/runs-deliveries.json
-sudo -u devlab mv $STATE_DIR/mercury/runs-results.imported              $STATE_DIR/mercury/runs-results
-sudo -u devlab mv $STATE_DIR/mercury/runs-history.pre-migration/*.json  $STATE_DIR/mercury/runs-history/
-sudo -u devlab sh -c 'cd '$STATE_DIR'/mercury && for f in *.pre-migration; do mv "$f" "${f%.pre-migration}"; done'
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs.json.pre-migration            $STATE_DIR/mercury/runs.json
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-deliveries.json.pre-migration $STATE_DIR/mercury/runs-deliveries.json
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-results.imported              $STATE_DIR/mercury/runs-results
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-history.pre-migration/*.json  $STATE_DIR/mercury/runs-history/
+sudo -u $SVC_USER sh -c 'cd '$STATE_DIR'/mercury && for f in *.pre-migration; do mv "$f" "${f%.pre-migration}"; done'
 ```
 
 The executions the import wrote into `mercury/executions/` stay: they are archive documents of

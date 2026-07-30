@@ -3,6 +3,7 @@ package runs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,10 +81,18 @@ func TestLegacyResultsReadTolerantly(t *testing.T) {
 		t.Error("svc-b must not read as succeeded")
 	}
 
-	// Live repo svc-c: the running step stays visible, and the pipeline is honestly not done.
+	// Live repo svc-c: the step the old store left RUNNING is closed as aborted. The archive is a
+	// closed past — a stage carried as running would make the surface pulse for a repository where
+	// nothing runs — and the mandatory reason names what the archive recorded.
 	c := res.Repos[2]
-	if c.Stages[0].State != model.StepRunning || c.Done {
-		t.Errorf("svc-c must map the live running step, not terminalize it: %+v", c)
+	if c.Stages[0].State != model.StepFailed || !strings.Contains(c.Stages[0].Reason, "aborted") {
+		t.Errorf("svc-c: the step left running must be closed as aborted with its reason, got %+v", c.Stages[0])
+	}
+	if !strings.Contains(c.Stages[0].Reason, "2026-07-20T02:40:00Z") {
+		t.Errorf("svc-c: the aborted step must name the moment the archive recorded, got %q", c.Stages[0].Reason)
+	}
+	if !c.Done || c.Succeeded {
+		t.Errorf("svc-c must read as done (nothing runs in an archive) but never as succeeded: done=%v succeeded=%v", c.Done, c.Succeeded)
 	}
 
 	// Get by id finds the legacy document too.
@@ -91,6 +100,131 @@ func TestLegacyResultsReadTolerantly(t *testing.T) {
 	if err != nil || !ok || got.RunID != "run_legacy1" {
 		t.Fatalf("Get(legacy id) = %+v %v %v", got, ok, err)
 	}
+}
+
+// A record the pre-rebuild store left WITHOUT a finishing time must not fall between the two lists:
+// the history selector drops an execution that never ended (derive.go: ExecutionCompleted) while the
+// history's counter still counts every record it read — so an unstamped record was invisible in the
+// list and claimed in the number at the same time. An archived execution has ENDED; the four
+// documents below are the four forms the imported archive actually holds among its unstamped records
+// (a live block cut off mid-step; a live block whose recorded steps all ended; a record the source
+// flagged ok with complete chains; a record naming no repository at all), with neutral names.
+func TestArchiveRecordWithoutFinishingTimeIsEndedAndCounted(t *testing.T) {
+	const (
+		cutOffMidStep = `{"runId":"run_a","resultId":"r_cut","runName":"Sweep","type":"todo",
+			"startedAt":"2026-07-27T19:42:15Z","finishedAt":"0001-01-01T00:00:00Z","ok":false,
+			"live":{"repo":"svc-a","steps":[{"name":"implement","status":"","running":true,"at":"2026-07-28T10:37:49Z"}]}}`
+		stepsAllEnded = `{"runId":"run_b","resultId":"r_ended","runName":"Sweep","type":"todo",
+			"startedAt":"2026-07-28T06:45:18Z","finishedAt":"0001-01-01T00:00:00Z","ok":false,
+			"live":{"repo":"svc-a","steps":[
+				{"name":"fold","status":"not-applicable","at":"2026-07-28T06:45:20Z"},
+				{"name":"implement","status":"ok","at":"2026-07-28T06:45:21Z"}]}}`
+		flaggedOK = `{"runId":"run_c","resultId":"r_ok","runName":"Sweep",
+			"startedAt":"2026-07-22T02:33:05Z","finishedAt":"0001-01-01T00:00:00Z","ok":true,
+			"repos":[{"repo":"svc-a","ok":true,"steps":[
+				{"name":"implement","status":"ok","at":"2026-07-22T02:48:19Z"},
+				{"name":"push","status":"ok","at":"2026-07-22T02:48:21Z"},
+				{"name":"pr","status":"ok","at":"2026-07-22T02:48:22Z"}]}]}`
+		noRepoAtAll = `{"runId":"run_d","resultId":"r_bare","runName":"Sweep","type":"todo",
+			"startedAt":"2026-07-27T16:20:42Z","finishedAt":"0001-01-01T00:00:00Z","ok":false,"repos":[]}`
+	)
+	rs := archiveStore(t, map[string]string{
+		"run_a/r_cut.json": cutOffMidStep, "run_b/r_ended.json": stepsAllEnded,
+		"run_c/r_ok.json": flaggedOK, "run_d/r_bare.json": noRepoAtAll,
+	})
+	all, err := rs.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("List = %d records, want the four archive documents", len(all))
+	}
+	byID := map[string]Result{}
+	for _, res := range all {
+		byID[res.ID] = res
+		// THE invariant, for every archive record: it ended, no stage is still transient, and the
+		// document says where its end came from. Whatever the history counter counts, the list shows.
+		if res.EndedAt == nil {
+			t.Errorf("%s: an archived execution without an end stamp stays out of the history while the counter counts it", res.ID)
+		}
+		if res.Report == "" {
+			t.Errorf("%s: the substituted end is not stated anywhere — the record would claim a recorded finish", res.ID)
+		}
+		for _, rp := range res.Repos {
+			for _, sv := range rp.Stages {
+				if !sv.State.Terminal() {
+					t.Errorf("%s/%s: stage %q is %q — nothing in a closed archive is transient", res.ID, rp.Repo, sv.Stage, sv.State)
+				}
+			}
+			if !rp.Done {
+				t.Errorf("%s/%s: an archived pipeline must read as done", res.ID, rp.Repo)
+			}
+		}
+	}
+
+	// Cut off mid-step: the end is the last instant the record itself carries, the step is aborted,
+	// and the cutoff stage keeps the truncated chain from reading as a completed one.
+	cut := byID["r_cut"]
+	if want := time.Date(2026, 7, 28, 10, 37, 49, 0, time.UTC); !cut.EndedAt.Equal(want) {
+		t.Errorf("r_cut end = %v, want the last recorded step stamp %v", cut.EndedAt, want)
+	}
+	if cut.Repos[0].Succeeded {
+		t.Error("r_cut: a chain cut off mid-step must never read as succeeded")
+	}
+	if !strings.Contains(cut.Report, "2026-07-28T10:37:49Z") || !strings.Contains(cut.Report, "standing in for the missing stamp") {
+		t.Errorf("r_cut: the report must name the substituted end and say it stands in:\n%s", cut.Report)
+	}
+
+	// Every recorded step ended, yet the record was cut off: without the cutoff stage this is the
+	// false green — a truncated chain reading as a full success (K-4).
+	ended := byID["r_ended"]
+	if ended.Repos[0].Succeeded {
+		t.Error("r_ended: a record without a finishing time must not read as a completed chain")
+	}
+	last := ended.Repos[0].Stages[len(ended.Repos[0].Stages)-1]
+	if last.Stage != stageArchivedCutoff || last.State != model.StepNotExecuted || last.Reason == "" {
+		t.Errorf("r_ended: the cutoff stage is missing or unexplained: %+v", last)
+	}
+
+	// The source flagged the record ok and its chains are complete: only the STAMP is missing, so
+	// nothing is turned red — a false failure is as much a lie as a false success.
+	ok := byID["r_ok"]
+	if !ok.Repos[0].Succeeded {
+		t.Errorf("r_ok: a recorded success must survive the missing stamp: %+v", ok.Repos[0].Stages)
+	}
+	if want := time.Date(2026, 7, 22, 2, 48, 22, 0, time.UTC); !ok.EndedAt.Equal(want) {
+		t.Errorf("r_ok end = %v, want %v", ok.EndedAt, want)
+	}
+
+	// Nothing recorded at all: the end can only be the start, and the report says exactly that
+	// instead of implying a duration nobody measured.
+	bare := byID["r_bare"]
+	if !bare.EndedAt.Equal(bare.StartedAt) {
+		t.Errorf("r_bare end = %v, want its own start %v", bare.EndedAt, bare.StartedAt)
+	}
+	if !strings.Contains(bare.Report, "no later instant") || !strings.Contains(bare.Report, "names no repository") {
+		t.Errorf("r_bare: the report must state that nothing later and no repository was recorded:\n%s", bare.Report)
+	}
+}
+
+// archiveStore writes the given legacy documents (path relative to the archive root) and opens a
+// store over them — the ONE seam the archive is read through.
+func archiveStore(t *testing.T, docs map[string]string) *ResultStore {
+	t.Helper()
+	root := t.TempDir()
+	archive := filepath.Join(root, "runs-results")
+	for rel, body := range docs {
+		p := filepath.Join(archive, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", archive)
+	t.Setenv("DEVLAB_MERCURY_EXECUTIONS", filepath.Join(root, "executions"))
+	return NewResultStore(&statepath.Paths{Root: root})
 }
 
 // New-format documents and the transcript journal round-trip through the store.

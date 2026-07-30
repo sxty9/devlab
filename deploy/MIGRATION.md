@@ -18,35 +18,71 @@ contract (80), and what the scaffold deleted with its named replacement (90).
 
 _Owner: B5. The command sequence below is the binding cutover (BAUPLAN §5): backup, wrappers +
 sudoers, unit + drop-in, marker removal, build as an unprivileged user, install-only, migrate
-BEFORE the first start, start + honest probes. Instance values live in the drop-in and in the
-operator's shell — never in the repository. What this document cannot know is written as a
-placeholder (`<export-dir>`, `<github-owner>`, same convention as `10-daten.md`); substitute it
-before running the line._
+BEFORE the first start, a HELD first start with honest probes, and only then the runner identity.
+Instance values live in the drop-in and in the operator's shell — never in the repository. What this
+document cannot know is written as a placeholder (`<export-dir>`, `<github-owner>`,
+`<cookie-domain>`, same convention as `10-daten.md`); substitute it before running the line._
 
 _This machine is shared. The daemon is one of sixteen services behind one Caddy and one sudo
 configuration, so every step that touches something SHARED — `/etc/sudoers.d`, `/etc/caddy/conf.d`,
-the state root — validates before it adopts, and the sequence never leaves the host in a state where a
-mistake of ours breaks a neighbour. What reaches beyond this host at all (branch protection) is named
-in step 6 and stays held until it is armed deliberately._
+the state root, the web root — validates or measures before it adopts, and the sequence never leaves
+the host in a state where a mistake of ours breaks a neighbour._
+
+_What reaches beyond DevLab is **not one thing**. Fourteen writing sites are listed in
+„Fremdwirkung" below with the tick each one fires on; four of them fire within the first minute of a
+start, three of those on the very first scheduler tick. That is why the first start is run WITHOUT
+the runner identity (step 6) and the identity is added afterwards (step 7): without it every
+GitHub-reaching pass fails closed with a named error, and the operator looks at what the next tick
+WOULD touch before it touches it._
 
 ```sh
-# 0) Sicherung — VOLLSTÄNDIG (Rückweg von Schritt 4 und 5)
+# ── Werte dieses Durchgangs (Instanzwerte, nie im Repo) ──────────────────────────────────────
+STATE_DIR=/var/lib/devlab                          # State-Root dieser Instanz (Vorlagen-Default)
+SVC_USER=devlab                                    # Dienst-Account der Unit (User=, Vorlagen-Default)
+EXPORT=<export-dir>/mercury-runs-roh.json          # der Roh-Export (siehe 10-daten.md)
+BAK=/root/devlab-cutover-$(date +%Y%m%d-%H%M%S)    # Sicherung DIESES Durchgangs
+
+# 0) Sicherung — VOLLSTÄNDIG: der Zustand UND jedes Artefakt, das dieser Cutover verändert
 sudo systemctl stop devlabd
-#    Alles unter dem State-Root ausser workspaces (Arbeitsbäume, jederzeit neu klonbar):
-#    mercury (Läufe/Executions), links (Token-Store), chats, comments, www (die ALTE SPA, die
-#    Schritt 4 mit `rsync --delete` vernichtet) und axioms (der Verfassungs-Klon; ein nicht
-#    gepushter Stand darin existiert sonst nirgends). --ignore-failed-read: ein noch nicht
-#    angelegtes Verzeichnis ist kein Fehler.
-sudo tar -C /var/lib/devlab --ignore-failed-read \
-    -czf /root/devlab-state-$(date +%Y%m%d-%H%M%S).tar.gz \
+sudo install -d -m0700 "$BAK"
+#    0a) Der Zustand unter dem State-Root, ausser workspaces (Arbeitsbäume, jederzeit neu klonbar):
+#        mercury (Läufe/Executions), links (Token-Store), chats, comments, www (die ALTE SPA, die
+#        Schritt 4 überschreibt) und axioms (der Verfassungs-Klon; ein nicht gepushter Stand darin
+#        existiert sonst nirgends). --ignore-failed-read: ein noch nicht angelegtes Verzeichnis ist
+#        kein Fehler.
+sudo tar -C "$STATE_DIR" --ignore-failed-read \
+    -czf "$BAK/devlab-state-$(date +%Y%m%d-%H%M%S).tar.gz" \
     mercury links chats comments www axioms
-sudo cp -a /usr/local/bin/devlabd /root/devlabd.bak
-sudo cp -a /etc/systemd/system/devlabd.service /root/devlabd.service.bak
-sudo cp -a /etc/systemd/system/devlabd.service.d/runs.conf /root/runs.conf.bak
-#    Prüfen, dass die Sicherung die beiden neuen Glieder wirklich enthält (sonst ist der Rückweg
-#    unvollständig, und das merkt man erst, wenn man ihn braucht):
-tar -tzf /root/devlab-state-*.tar.gz | grep -qE '^www/'    && echo 'www gesichert'
-tar -tzf /root/devlab-state-*.tar.gz | grep -qE '^axioms/' && echo 'axioms gesichert'
+#        Prüfen, dass die Sicherung jedes Glied wirklich enthält (sonst ist der Rückweg
+#        unvollständig, und das merkt man erst, wenn man ihn braucht):
+for d in mercury links chats comments www axioms; do
+  sudo sh -c "tar -tzf $BAK/devlab-state-*.tar.gz | grep -q \"^$d/\"" \
+    && echo "gesichert: $d" || echo "NICHT im Tarball (fehlt oder ist leer): $d"
+done
+#    0b) Jedes GETEILTE Artefakt, das Schritt 1, 2 und 4 überschreiben oder entfernen — die Wrapper
+#        (mit dem Runner geteilt), die beiden sudoers-Dateien (maschinenweit wirksam), das Binary,
+#        die Unit und das Drop-in. Der Pfad bleibt im Sicherungsbaum erhalten, damit der Rückweg ein
+#        gerades Zurückkopieren ist. Ein nicht vorhandenes Artefakt wird BENANNT, nicht stillschweigend
+#        übersprungen: sonst hält man einen unvollständigen Rückweg für einen vollständigen.
+for f in /usr/local/bin/devlabd \
+         /etc/systemd/system/devlabd.service \
+         /etc/systemd/system/devlabd.service.d/runs.conf \
+         /usr/local/sbin/devlab-exec \
+         /usr/local/sbin/devlab-mkworkspace \
+         /usr/local/sbin/devlab-install \
+         /usr/local/sbin/devlab-restart-when-free \
+         /usr/local/sbin/devlab-restart-idle \
+         /usr/local/sbin/devlab-deploy \
+         /usr/local/sbin/devlab-preview \
+         /etc/sudoers.d/devlab \
+         /etc/sudoers.d/devlab-runs; do
+  if sudo test -e "$f"; then
+    sudo install -d -m0700 "$BAK$(dirname "$f")" && sudo cp -a "$f" "$BAK$f" && echo "gesichert: $f"
+  else
+    echo "nicht vorhanden, nichts zu sichern: $f"
+  fi
+done
+sudo find "$BAK" -type f -printf '%M %u:%g %p\n' | sort   # der Rückweg, Zeile für Zeile
 
 # 1) Wrapper + sudoers (gepinnt, eng; Runner behält GAR KEIN sudo)
 #    sudoers ZUERST prüfen, DANN einbauen: eine fehlerhafte Datei in /etc/sudoers.d macht sudo
@@ -61,8 +97,15 @@ sudo install -o root -g root -m0755 deploy/devlab-restart-when-free /usr/local/s
 sudo install -o root -g root -m0440 deploy/devlab.sudoers /etc/sudoers.d/devlab
 sudo install -o root -g root -m0440 deploy/devlab-runs.sudoers /etc/sudoers.d/devlab-runs   # Grant: devlab → devlab-install
 sudo visudo -c                                    # Gesamtprüfung NACH dem Einbau (Belt zur Brace)
+#    Die drei zurückgezogenen Wrapper sind in Schritt 0b gesichert — deshalb ist ihr Entfernen
+#    umkehrbar, ohne einen alten Checkout zu brauchen.
 sudo rm -f /usr/local/sbin/devlab-restart-idle /usr/local/sbin/devlab-deploy /usr/local/sbin/devlab-preview
-sudo mv /etc/devlab/deploy.d /root/deploy.d.bak    # per-Repo-Skriptmechanik außer Betrieb (B-44)
+sudo mv /etc/devlab/deploy.d "$BAK/deploy.d"       # per-Repo-Skriptmechanik außer Betrieb (B-44)
+#    Was in /etc/devlab liegen BLEIBT und im Neubau keinen Leser mehr hat, wird benannt statt
+#    vergessen: die per-Repo-Bauhilfen der alten Deploy-Mechanik und der Schlüssel des alten
+#    prod-Versands. Der Neubau liefert nur „dev" aus (deploy.SendProd hat keinen Aufrufer), also ist
+#    das eine Aufräum-Entscheidung des Betreibers, keine Voraussetzung des Cutovers.
+sudo ls -l /etc/devlab
 
 # 1a) Die Organisation als root-eigene Datei (PFLICHT, sonst verweigert der Install-Wrapper JEDE
 #     Auslieferung mit Exit 5). Sie steht bewusst NICHT in der Umgebung: der Aufrufer darf den
@@ -77,53 +120,163 @@ sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
 #    sudoedit, NICHT `sudo $EDITOR`: bei leerem EDITOR würde sudo die Drop-in-Datei als Kommando
 #    AUSFÜHREN. sudoedit editiert eine Kopie als der aufrufende User und spielt sie als root zurück.
 sudoedit /etc/systemd/system/devlabd.service.d/runs.conf
-#    Das Drop-in Zeile für Zeile (Tabelle „Das Alt-Drop-in, Zeile für Zeile" unten):
-#      ENTFERNEN:  PrivateTmp=true, DEVLAB_RUNS_MODE, DEVLAB_RUNS_AGENT_TIMEOUT
-#      UMBENENNEN: DEVLAB_RUNS_AUTOMERGE      → DEVLAB_RUNS_AUTOMERGE_WINDOW
-#                  DEVLAB_RUNS_LIMIT_MAXRESUMES → DEVLAB_RUNS_LIMIT_MAX_RESUMES
-#      ERGÄNZEN:   DEVLAB_GH_OWNER=<github-owner>   (PFLICHT, kein Default mehr)
-#      BLEIBT:     DEVLAB_RUNS_USER, DEVLAB_RUNS_TOKEN_USER, DEVLAB_RUNS_MAX_DURATION,
-#                  DEVLAB_RUNS_MAX_CONCURRENCY (nur Startwert), DEVLAB_RUNS_LIMIT_BACKOFF,
-#                  DEVLAB_RUNS_TICK
+#    Zwei Tabellen unten führen beide Quellen Zeile für Zeile: „Die Alt-Unit" (die Werte, die die
+#    installierte Unit trug und die Schritt 2 vollständig überschreibt) und „Das Alt-Drop-in".
+#      Aus der ALT-UNIT ins Drop-in:  DEVLAB_COOKIE_DOMAIN=<cookie-domain>
+#      Aus der ALT-UNIT ersatzlos:    DEVLAB_REPOS_PATH, DEVLAB_LINKS, DEVLAB_WORKSPACES,
+#                                     DEVLAB_STATIC_DIR (leiten sich aus DEVLAB_STATE_DIR ab)
+#      Im Drop-in ENTFERNEN:  PrivateTmp=true, DEVLAB_RUNS_MODE, DEVLAB_RUNS_AGENT_TIMEOUT
+#      Im Drop-in UMBENENNEN: DEVLAB_RUNS_AUTOMERGE        → DEVLAB_RUNS_AUTOMERGE_WINDOW
+#                             DEVLAB_RUNS_LIMIT_MAXRESUMES → DEVLAB_RUNS_LIMIT_MAX_RESUMES
+#      ERGÄNZEN:              DEVLAB_GH_OWNER=<github-owner>   (PFLICHT, kein Default mehr)
+#      NOCH NICHT setzen:     DEVLAB_RUNS_USER, DEVLAB_RUNS_TOKEN_USER — sie kommen in Schritt 7,
+#                             nach den Prüfungen. Ohne sie wendet sich der Dienst an NICHTS ausserhalb.
+#      BLEIBT:                DEVLAB_RUNS_MAX_DURATION, DEVLAB_RUNS_MAX_CONCURRENCY (nur Startwert),
+#                             DEVLAB_RUNS_LIMIT_BACKOFF, DEVLAB_RUNS_TICK
 sudo systemctl daemon-reload
 #    Die zusammengeführte Wahrheit lesen — ein Drop-in gewinnt gegen die Vorlage, also wird
 #    geprüft, was systemd am Ende sieht, nicht was in der Vorlage steht:
 systemd-analyze cat-config systemd/system/devlabd.service | grep -E '^(PrivateTmp|ReadWritePaths)='
 systemctl show -p Environment devlabd | tr ' ' '\n' | grep -E 'DEVLAB_RUNS_(MODE|AGENT_TIMEOUT|AUTOMERGE|LIMIT_MAXRESUMES)=' \
     && echo 'ÜBRIG: eine zurückgezogene Variable steht noch im Drop-in (Schritt 2)'
+#    Kein Instanzwert der Alt-Unit darf still verloren gehen. Der eine, den die Vorlage bewusst
+#    nicht trägt, muss jetzt im Drop-in stehen:
+systemctl show -p Environment devlabd | tr ' ' '\n' | grep -q '^DEVLAB_COOKIE_DOMAIN=' \
+    || echo 'FEHLT: DEVLAB_COOKIE_DOMAIN — die Alt-Unit trug ihn; ohne ihn mintet der Dienst host-eigene Cookies NEBEN den domänenweiten'
+#    Und die vier abgeleiteten Pfade dürfen NICHT mitwandern (eine Wiederholung ist eine zweite
+#    Wahrheit; DEVLAB_REPOS_PATH ist zusätzlich die Sandkasten-Basis des dev-Bypass):
+systemctl show -p Environment devlabd | tr ' ' '\n' | grep -E '^DEVLAB_(REPOS_PATH|LINKS|WORKSPACES|STATIC_DIR)=' \
+    && echo 'ÜBRIG: ein abgeleiteter Pfad ist noch gesetzt (Tabelle „Die Alt-Unit, Zeile für Zeile")'
+#    Die Adresse trug die Alt-Unit als Flag am ExecStart. Das neue Binary parst KEINE Flags — es
+#    liest allein DEVLAB_ADDR. Ein mitgeschlepptes Flag wirkt still nicht, und die Adresse muss die
+#    sein, auf die die Kante zeigt, sonst antwortet der Dienst niemandem:
+systemctl show -p ExecStart --value devlabd | grep -q -- '--listen' \
+    && echo 'ÜBRIG: --listen am ExecStart — das Binary liest die Adresse aus DEVLAB_ADDR'
+systemctl show -p Environment --value devlabd | tr ' ' '\n' | sed -n 's/^DEVLAB_ADDR=//p'
+sudo grep -rh 'reverse_proxy' /etc/caddy/conf.d/ 2>/dev/null | sort -u   # zeigt die Adressen der Kante
 
 # 3) Alt-Marker entfernen (REQ-039.3) — die Doppel-Falle existiert nicht mehr
-sudo rm -f /var/lib/devlab/mercury/run-active /var/lib/devlab/mercury/runs-active
+sudo rm -f "$STATE_DIR/mercury/run-active" "$STATE_DIR/mercury/runs-active"
 
 # 4) Bauen als UNPRIVILEGIERTER User (root baut nie), dann install-only
 (cd backend && go build -o /tmp/devlab-build/devlabd ./cmd/devlabd && go build -o /tmp/devlab-build/devlab-migrate ./cmd/devlab-migrate)
 npm ci && npm run build
 sudo install -o root -g root -m0755 /tmp/devlab-build/devlabd /usr/local/bin/devlabd
-sudo rsync -a --delete dist/ /var/lib/devlab/www/    # vernichtet die alte SPA — Sicherung: Schritt 0
+#    Das Migrations-Binary wird MIT installiert statt aus /tmp gestartet: Schritt 5 führt es als der
+#    Dienst-Account aus, und ob der ein Verzeichnis unter /tmp betreten darf, hängt an der umask des
+#    bauenden Kontos. Ein installiertes Binary hängt an nichts.
+sudo install -o root -g root -m0755 /tmp/devlab-build/devlab-migrate /usr/local/bin/devlab-migrate
+#    Die SPA ins Web-Root — OHNE Eigentümer und Modus des ZIELS umzuschreiben. `rsync -a` überträgt
+#    Eigentümer, Gruppe und Rechte des QUELL-Verzeichnisses auf das Ziel: aus einem 0750-Web-Root
+#    eines eigenen Kontos würde das bauende Konto mit dem Modus des Build-Verzeichnisses. Also erst
+#    messen, dann ohne diese drei Attribute übertragen, dann prüfen, dass das Ziel unverändert ist
+#    und der Dienst die neue SPA lesen kann.
+web_before="$(sudo stat -c '%U:%G %a' "$STATE_DIR/www")"
+sudo rsync -a --delete --no-owner --no-group --no-perms --omit-dir-times dist/ "$STATE_DIR/www/"
+web_after="$(sudo stat -c '%U:%G %a' "$STATE_DIR/www")"
+[ "$web_before" = "$web_after" ] \
+    && echo "Web-Root unverändert: $web_after" \
+    || echo "GEÄNDERT: Web-Root war $web_before, ist $web_after — zurücksetzen (chown/chmod), sonst liest ein anderes Konto als vorher"
+sudo -u "$SVC_USER" test -r "$STATE_DIR/www/index.html" \
+    && echo 'die neue SPA ist für den Dienst-Account lesbar' \
+    || echo 'FEHLT: der Dienst-Account kann die SPA nicht lesen — die Oberfläche bliebe leer'
 
 # 5) Datenmigration VOR dem ersten Start (B-9; migrate verweigert bei laufendem Dienst)
-#    <export-dir> = Ablage des Roh-Exports (Instanzdaten, nie im Repo — siehe 10-daten.md)
-sudo -u devlab env DEVLAB_STATE_DIR=/var/lib/devlab /tmp/devlab-build/devlab-migrate \
-    --input <export-dir>/mercury-runs-roh.json
+#    Der Export liegt beim Betreiber, und dort kann der Dienst-Account NICHTS lesen: ein Home ist
+#    typischerweise 0750 und für ein fremdes Konto nicht einmal durchquerbar, also scheitert schon
+#    `test -r`. Deshalb wird der Export an einen Ort gebracht, den der Dienst-Account lesen KANN,
+#    die Lesbarkeit wird VOR dem Import geprüft, und danach wird die Ablage entfernt: der
+#    Roh-Export trägt die Prompts und Aufgaben dieser Instanz.
+IMPORT_DIR="$STATE_DIR/import"
+sudo install -d -o "$SVC_USER" -g "$SVC_USER" -m0700 "$IMPORT_DIR"
+sudo install -o "$SVC_USER" -g "$SVC_USER" -m0600 "$EXPORT" "$IMPORT_DIR/mercury-runs-roh.json"
+sudo -u "$SVC_USER" test -r "$IMPORT_DIR/mercury-runs-roh.json" \
+    && echo 'Vorbedingung erfüllt: der Dienst-Account kann den Export lesen' \
+    || echo 'ABBRUCH: der Export ist für den Dienst-Account nicht lesbar — der Import endete mit Exit 5'
+#    Erst die Probe (schreibt nichts, druckt das ganze Protokoll), dann der Import selbst. Beide
+#    Ausgaben füllen die Ergebnis-Spalten in 10-daten.md.
+sudo -u "$SVC_USER" env DEVLAB_STATE_DIR="$STATE_DIR" devlab-migrate --input "$IMPORT_DIR/mercury-runs-roh.json" --dry-run
+sudo -u "$SVC_USER" env DEVLAB_STATE_DIR="$STATE_DIR" devlab-migrate --input "$IMPORT_DIR/mercury-runs-roh.json"
+sudo rm -rf "$IMPORT_DIR"
+sudo test ! -e "$IMPORT_DIR" && echo 'Export-Ablage entfernt'
 
-# 6) Start + ehrliche Prüfung
+# 6) Erster Start — ZURÜCKGEHALTEN (ohne Runner-Identität; siehe „Fremdwirkung")
 sudo systemctl start devlabd && systemctl status devlabd --no-pager
 systemctl show -p Environment devlabd | grep -q 'DEVLAB_GH_OWNER=[^[:space:]]' \
     || echo 'FEHLT: DEVLAB_GH_OWNER — die Repo-Menge bleibt leer (Schritt 2)'
 #    Adresse aus der Konfiguration ableiten statt einen Port zu behaupten: Ports sind
 #    Laufzeit-Konfiguration (REQ-044), und ein hart notierter Port prüft nach der ersten
-#    Umkonfiguration den falschen Socket.
+#    Umkonfiguration den falschen Socket. Die Adresse als GANZES vergleichen — eine nackte Portzahl
+#    trifft in `ss`-Ausgaben auch Prozess-Nummern.
 addr="$(systemctl show -p Environment --value devlabd | tr ' ' '\n' | sed -n 's/^DEVLAB_ADDR=//p' | tail -n1)"
 [ -n "$addr" ] || echo 'FEHLT: DEVLAB_ADDR — ohne Adresse ist nicht prüfbar, wo der Dienst hört'
 ss -tlnp | grep -F "$addr" && curl -fsS "http://$addr/api/health"
-curl -fsS --unix-socket /var/lib/devlab/restart-ready.sock http://x/ready -o /dev/null -w '%{http_code}\n'   # 204 erwartet
+#    Die Bereitschafts-Probe läuft ALS DER DIENST-ACCOUNT: der Socket ist 0660 und gehört dem
+#    Dienst-Account und dessen Gruppe (api.SocketMode). Das Betreiber-Konto ist in dieser Gruppe
+#    nicht, `curl` als Betreiber scheitert also mit „Permission denied" — was nichts über den
+#    Dienst sagt. Erwartet: 204 (frei). 423 hiesse „belegt", und das wäre nach einem gehaltenen
+#    Start ein Befund, kein Zustand.
+sudo -u "$SVC_USER" curl -fsS --unix-socket "$STATE_DIR/restart-ready.sock" http://x/ready \
+    -o /dev/null -w '%{http_code}\n'
+#    Der Beweis, dass der Start wirklich gehalten hat: die drei Pässe, die nach aussen wirken,
+#    benennen ihren fehlenden Zugang, statt zu handeln.
+systemctl show -p Environment devlabd | tr ' ' '\n' | grep -E '^DEVLAB_RUNS_(USER|TOKEN_USER)=' \
+    && echo 'NICHT GEHALTEN: die Runner-Identität steht schon im Drop-in — sie gehört in Schritt 7'
+journalctl -u devlabd --since '-5 min' | grep -E 'no runner account configured|reporter OFF'
+
+# 6a) Was der nächste Tick anfassen WÜRDE — messen, bevor er es tut (Zahlen dieser Instanz, nicht
+#     dieses Dokuments). Die drei Werte sind die ganze Breite der Wartung: wie viele PR-Sätze nicht
+#     blockiert sind, in wie vielen Repositories sie liegen, und wann der erste Auto-Merge fällig wird.
+sudo -u "$SVC_USER" jq '[.prs[]] | length' "$STATE_DIR/mercury/runs-prs.json"
+sudo -u "$SVC_USER" jq '[.prs[] | select(.blocked != true)] | length' "$STATE_DIR/mercury/runs-prs.json"
+sudo -u "$SVC_USER" jq -r '[.prs[].repo] | unique | length' "$STATE_DIR/mercury/runs-prs.json"
+sudo -u "$SVC_USER" jq -r '[.prs[] | select(.blocked != true) | .mergeBy] | min' "$STATE_DIR/mercury/runs-prs.json"
+#     Und der Tagesbericht: ein noch offener Tag ist beim ERSTEN Reporter-Durchgang wieder fällig.
+sudo -u "$SVC_USER" jq -r '.records[] | [.day, .status, .attempts, .lastError] | @tsv' "$STATE_DIR/mercury/daily-reports.json"
+
+# 7) Runner-Identität einsetzen — ab hier wirkt der Dienst nach aussen
+sudoedit /etc/systemd/system/devlabd.service.d/runs.conf   # DEVLAB_RUNS_USER, DEVLAB_RUNS_TOKEN_USER
+sudo systemctl daemon-reload && sudo systemctl restart devlabd
+#    Ab dem ersten Tick (DEVLAB_RUNS_TICK) läuft die PR-Wartung, und der Reporter tickt sofort.
+#    Beides einmal beobachten, statt es anzunehmen:
+journalctl -u devlabd --since '-2 min' | grep -E 'sched maintain|protection verify|daily-report reporter'
 ```
+
+Danach folgt Schritt **A** aus `10-daten.md` (Axiom-Zuordnung) — erst dann wird ein Lauf
+eingeschaltet.
 
 ## Fremdwirkung: was dieser Start ausserhalb von DevLab berührt
 
-Genau eine Sache. Der Verzweigungsschutz-Durchlauf (REQ-033.7) liest den Schutz JEDES Repositories
-der konfigurierten Organisation und schreibt bei Abweichung in dessen Standard-Verzweigung — auch in
-Repositories, mit denen dieser Cutover nichts zu tun hat. Er ist deshalb zurückgehalten:
+Vierzehn Stellen, nicht eine. Zwölf wirken ausserhalb dieses Hosts (GitHub und Mail), zwei auf
+diesem Host ausserhalb von DevLab (die Nachbardienste). **Drei feuern in der ersten Minute eines
+Starts** (1, 2, 4) und eine vierte beim Start selbst (12, der README-Keim) — sie sind der Grund für
+die Reihenfolge in Schritt 6/7: alle vier brauchen die Runner-Identität, und ohne sie benennen sie
+ihren fehlenden Zugang, statt zu handeln.
+
+| # | Stelle | Feuert sie beim ersten Start? | Was sie schreibt | Wie sie bis zur Freigabe stillhält |
+|---|---|---|---|---|
+| 1 | Origin-Status je offenem PR (`deliver.Maintain`, `deliver/deliver.go:798`) | **JA — beim ersten Scheduler-Tick** (`DEVLAB_RUNS_TICK`), und danach bei JEDEM Tick, unbedingt | einen Commit-Status auf dem Kopf-Commit JEDES offenen PRs jedes verwalteten Repositories — auch in PRs, die ein Mensch gestellt hat und die dieser Cutover nichts angehen | **Schalter:** ohne `DEVLAB_RUNS_MAINTAIN_ENFORCE` schreibt die Wartung NICHTS — sie stellt den Stillstand aus den eigenen Pools fest und meldet ihn, ohne einen einzigen fremden Aufruf. **Und Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER`/`DEVLAB_RUNS_TOKEN_USER` löst `runnerToken` gar keinen Token auf. Die Probe unter der Tabelle liest, ob dieser Build den Schalter trägt |
+| 2 | Branch-Löschung nach Merge (`finalizeMerged`, `deliver/deliver.go:820`) | **JA — beim ersten Tick**, für jeden verfolgten PR, der inzwischen gemerged ist (auch von einem Menschen) | löscht den Lieferungs-Branch im fremden Repository (404 gilt als erfüllt) | wie 1 (derselbe Schalter deckt die ganze Wartung ab) |
+| 3 | Auto-Merge (`deliver/deliver.go:762`) | beim ersten Tick, dessen `mergeBy` erreicht ist — bei Messung 6a war das keiner; die Frist der Alt-Sätze liegt Wochen in der Zukunft | einen Merge-Commit in den Standard-Branch des fremden Repositories, höchstens einer je Repository und Tick | wie 1, zusätzlich die Frist selbst (`DEVLAB_RUNS_AUTOMERGE_WINDOW` sät nur den ersten Start; gespeicherte Sätze tragen ihre eigene Frist) |
+| 4 | Tagesbericht-Mail (`api/handlers_mercury_report.go:79` → Landschafts-Mailer) | **JA — sofort beim Start**, denn der Reporter macht einen Durchgang vor dem ersten Intervall | eine Mail an den Empfänger, für jeden abgeschlossenen Tag im Rückblick-Fenster ohne Zustellsatz — und für jeden noch offenen Satz, gleich wie alt, weil ein `failed`-Satz ohne Backoff sofort wieder fällig ist | **Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER` ist der Reporter AUS („reporter OFF (no run user provisioned)"). Messung 6a zeigt, welcher Tag sonst als erstes ginge |
+| 5 | Verzweigungsschutz-Durchlauf (`deliver.VerifyProtection`, `deliver/deliver.go:559`, `:590`) | nein — der erste Durchgang wartet `DEVLAB_RUNS_PROTECTION_START_DELAY` (Vorgabe 15m) | liest den Schutz JEDES Repositories der Organisation; scharf PATCHt er den Standard-Branch jedes abweichenden | zwei Schalter (unten) **und** die Reihenfolge aus 1: auch dieser Pass braucht den Runner-Token |
+| 6 | PR öffnen (`deliver.OpenOrAdopt`, `deliver/deliver.go:145`) | nein — nur innerhalb einer Ausführung | einen Pull Request im Ziel-Repository (oder adoptiert den offenen) | kein Lauf ist eingeschaltet (Aktivierungs-Sperre, `10-daten.md` Schritt A); zusätzlich Reihenfolge aus 1 |
+| 7 | Origin-Status direkt nach dem Öffnen/Adoptieren (`deliver/deliver.go:683`) | nein — nur innerhalb einer Ausführung | einen Commit-Status auf dem Kopf-Commit dieses PRs | wie 6 |
+| 8 | Push des Arbeitsstands und des Lieferungs-Branches (`executor/stages.go:467` über `api/exec_deps.go:561`) | nein — nur innerhalb einer Ausführung | zwei Branches im fremden Repository (`mercury-dev` und der Lieferungs-Branch) | wie 6 |
+| 9 | Repository anlegen (`executor/stages.go:284` → `deliver/deliver.go:199`) | nein — nur innerhalb einer Ausführung, und nur für ein Ziel, das es nicht gibt | ein NEUES privates Repository in der konfigurierten Organisation | wie 6 |
+| 10 | Verzweigungsschutz direkt nach der Anlage (`api/exec_deps.go:691`) | nein — nur mit 9 | den Schutz des Standard-Branches des neu angelegten Repositories | wie 6 |
+| 11 | PR schliessen (`deliver/deliver.go:337`, `:392`) | nein — nur auf eine Bedienhandlung (Rücknahme, Gegenbuchung) | schliesst einen PR im fremden Repository mit benanntem Grund | niemand bedient sie während des Cutovers |
+| 12 | Verfassungs-Repository: Klon und Push (`axiomrepo/store.go:420`) | **beim Start, sobald eine Runner-Identität steht** — `api.New` startet den README-Keim (`api/api.go:137` → `axiomrepo/readme.go:28`) als Hintergrund-Aufgabe. Er ist create-only, feuert also höchstens einmal; jeder weitere Push ist ein Verfassungs-Schreibvorgang, und der erste davon ist Schritt **A1** | klont das Verfassungs-Repository und legt, wenn es keine README hat, EINEN Commit darauf an; später je Verfassungs-Änderung einen | im gehaltenen Start ist `axiomsTokenUser()` leer, also startet die Hintergrund-Aufgabe gar nicht. Ab Schritt 7 ist der README-Keim beabsichtigt |
+| 13 | dev-Auslieferung eines NACHBARDIENSTES (`api/exec_deps.go:749` → `devlab-install`) | nein — nur innerhalb einer Ausführung | Unit, `/opt/<repo>`, Rechte-Manifest, eine Route im GETEILTEN Caddy-Verzeichnis, und einen Neustart genau dieser Unit | wie 6; der Wrapper validiert die Kante vor der Übernahme und nimmt die eigene Datei bei Fehlschlag zurück |
+| 14 | Der Cutover selbst (Schritt 1) | ja, von Hand | `/etc/sudoers.d` (maschinenweit) und `/usr/local/sbin` (mit dem Runner geteilt) | jede sudoers-Datei wird EINZELN geprüft, bevor sie eingebaut wird, und Schritt 0b sichert jedes Artefakt |
+
+Nur LESEND, aber nach aussen: `ListOpenPullRequests`/`GetPullRequest` je Tick, `GetProtection`/
+`DefaultBranch` je Schutz-Durchlauf, die Repo-Menge je Auflösung, und die Anlauf-Abstimmung
+(`SyncStartupTodos`), die sofort beim Booten läuft. Sie schreiben nichts, verbrauchen aber
+API-Kontingent und stehen im Audit-Log der Organisation. Mit der Reihenfolge aus 1 fällt auch das
+weg: die Abstimmung meldet „startup reconciliation deferred: no runner account configured".
+
+Die zwei Schalter des Schutz-Durchlaufs (Stelle 5):
 
 * **Kein Durchlauf beim Booten.** Der erste Durchlauf wartet `DEVLAB_RUNS_PROTECTION_START_DELAY`
   (Vorgabe 15m). Wer den Dienst innerhalb dieses Fensters wieder stoppt, hat GitHub nicht berührt —
@@ -138,11 +291,58 @@ sudoedit /etc/systemd/system/devlabd.service.d/runs.conf    # Environment=DEVLAB
 sudo systemctl daemon-reload && sudo systemctl restart devlabd
 ```
 
+Die Stellen 1–3 sind die PR-Wartung, und sie ist der Grund für die Reihenfolge: sie läuft ab dem
+ersten Tick, und ihr Origin-Status-Durchgang schreibt bei JEDEM Tick auf jeden offenen PR jedes
+verwalteten Repositories — die Kadenz, in der dieser Dienst nach aussen schreibt, ist also
+`DEVLAB_RUNS_TICK`. Zwei Dinge halten sie zurück, und sie sind nicht dasselbe: ein SCHALTER ist eine
+Eigenschaft der Software und gilt auch für den, der die Anleitung nicht liest; die REIHENFOLGE aus
+Schritt 6/7 ist eine Eigenschaft des Vorgehens und gilt nur, solange man sie einhält. Stelle 4 (die
+Mail) hat nur die Reihenfolge.
+
+Welche Schalter dieser Build mitbringt, wird nicht behauptet, sondern gelesen — im Binary, das gerade
+installiert wurde, und in der Vorlage, die die Umgebung dokumentiert:
+
+```sh
+# NICHT verankert (^…$): Go packt seine String-Konstanten ohne Trenner in einen Block, eine
+# verankerte Suche findet deshalb NICHTS und meldete „kein Schalter", wo zwei sind.
+strings /usr/local/bin/devlabd | grep -oE 'DEVLAB_RUNS_[A-Z_]*ENFORCE' | sort -u
+grep -nE 'DEVLAB_RUNS_[A-Z_]*ENFORCE' deploy/devlabd.service
+```
+
+Erwartet wird `DEVLAB_RUNS_MAINTAIN_ENFORCE`: ungeschärft ist der Vorgabewert, und geschärft wird er
+nach denselben Prüfungen wie der Schutz-Durchlauf — nach Schritt 6a, wenn der PR-Pool angesehen ist:
+
+```sh
+sudoedit /etc/systemd/system/devlabd.service.d/runs.conf    # Environment=DEVLAB_RUNS_MAINTAIN_ENFORCE=1
+sudo systemctl daemon-reload && sudo systemctl restart devlabd
+```
+
+Findet die Probe keinen Schalter, hält allein die Reihenfolge — und dann ist die Kadenz des
+Origin-Status (`DEVLAB_RUNS_TICK`) die Kadenz, in der dieser Dienst in fremde Repositories schreibt.
+
 Alles andere, was dieser Cutover anfasst, ist geteilt aber lokal, und jeder Schritt prüft vor dem
 Übernehmen: `visudo -c -f` je sudoers-Datei vor dem Einbau (Schritt 1), `caddy validate` vor dem
-Übernehmen einer Route und Rücknahme der eigenen Datei bei Fehlschlag (im Install-Wrapper), und der
+Übernehmen einer Route und Rücknahme der eigenen Datei bei Fehlschlag (im Install-Wrapper), das
+Messen von Eigentümer und Modus des Web-Roots vor und nach der Auslieferung (Schritt 4), und der
 Neustart eines Nachbardienstes findet nicht statt — der Wrapper startet nur die Unit, die er gerade
 installiert hat.
+
+## Die Alt-Unit, Zeile für Zeile
+
+Schritt 2 überschreibt die installierte Unit VOLLSTÄNDIG. Alles, was sie trug und die Vorlage nicht
+trägt, ist damit weg — still, denn eine fehlende Umgebungsvariable ist kein Fehler, sondern ein
+anderes Verhalten. Deshalb steht hier jede Zeile der Alt-Unit mit ihrem Verdikt. Die Werte selbst
+sind Instanzwerte und stehen als Platzhalter.
+
+| Zeile der Alt-Unit | Verdikt |
+|---|---|
+| `ExecStart=…/devlabd --listen <adresse>` | **ersetzt** — die Adresse ist jetzt `DEVLAB_ADDR` (Vorlage). Das neue Binary parst KEINE Flags: ein mitgeschlepptes `--listen` wirkt still nicht, und die Adresse muss die sein, auf die die Kante zeigt (Prüfung in Schritt 2) |
+| `DEVLAB_COOKIE_DOMAIN=<cookie-domain>` | **ins Drop-in übernehmen** — Instanzwert, in der Vorlage bewusst nicht. Ohne ihn mintet der Dienst beim Refresh host-eigene Cookies NEBEN den domänenweiten der Landschaft; welche der beiden der Browser dann sendet, entscheidet der Zufall, und ein Logout der Landschaft räumt die host-eigene nicht mit weg |
+| `DEVLAB_REPOS_PATH=<pfad>` | **entfällt, und darf nicht mitwandern** — der Wert ist nur die Sandkasten-Basis des dev-Bypass. Auf ein Betreiber-Home gesetzt zeigt er die Auflösung auf fremde Arbeitskopien statt auf die per-User-Workspaces unter dem State-Root |
+| `DEVLAB_LINKS`, `DEVLAB_WORKSPACES`, `DEVLAB_STATIC_DIR` | **entfallen** — sie leiten sich aus `DEVLAB_STATE_DIR` ab (`internal/statepath`). Die historischen Overrides funktionieren weiter, aber eine Wiederholung des abgeleiteten Werts ist keine Konfiguration, sondern eine zweite Wahrheit |
+| `HOLISTIC_SECRET_FILE`, `HOLISTIC_REVOKED`, `DEVLAB_COOKIE_SECURE`, `DEVLAB_LINK_ENC_KEY_FILE`, `DEVLAB_GITHUB_OAUTH_FILE` | **stehen in der Vorlage** — nur dann ins Drop-in, wenn diese Instanz vom Vorlagenwert abweicht |
+| `StateDirectory`, `NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `PrivateTmp` | **stehen in der Vorlage**, dort mit zwei Verschärfungen, die die Alt-Unit nicht hatte: `StateDirectoryMode=0711` (systemds Vorgabe 0755 liess jedes lokale Konto den State-Root AUFLISTEN) und `UMask=0027` |
+| `ReadWritePaths=<state-root>` | **erweitert** — die Vorlage nennt zusätzlich `/tmp`, weil `ProtectSystem=strict` auch `/tmp` schreibgeschützt macht und jedes per-User-Kind dort seinen Scratch braucht |
 
 ## Das Alt-Drop-in, Zeile für Zeile
 
@@ -157,14 +357,16 @@ neuen Vorlage, und zwei Schalter waren umbenannt worden und taten still nichts m
 | `DEVLAB_RUNS_AGENT_TIMEOUT` | **entfernen** — wird von nichts mehr gelesen; das Zeitbudget je Versuch ist `DefaultTimeBudget` im Einstellungs-Pool (Startwert `DEVLAB_RUNS_TIME_BUDGET`) |
 | `DEVLAB_RUNS_AUTOMERGE` | **umbenennen** → `DEVLAB_RUNS_AUTOMERGE_WINDOW`; sät nur noch den ersten Start, danach gewinnt der gespeicherte Wert (REQ-013.2) |
 | `DEVLAB_RUNS_LIMIT_MAXRESUMES` | **umbenennen** → `DEVLAB_RUNS_LIMIT_MAX_RESUMES`; unter dem alten Namen liest es niemand, die Grenze fiele still auf die Vorgabe zurück |
-| `DEVLAB_RUNS_USER` | **bleibt** — Instanzwert: das rechtelose OS-Konto des Runners |
-| `DEVLAB_RUNS_TOKEN_USER` | **bleibt** — Instanzwert: das verknüpfte GitHub-Konto, mit dem geklont/gepusht wird |
+| `DEVLAB_RUNS_USER` | **bleibt** — Instanzwert: das rechtelose OS-Konto des Runners. Aber erst in Schritt 7: solange es fehlt, wendet sich der Dienst an nichts ausserhalb (Tabelle „Fremdwirkung", Stellen 1–5) |
+| `DEVLAB_RUNS_TOKEN_USER` | **bleibt** — Instanzwert: das verknüpfte GitHub-Konto, mit dem geklont/gepusht wird. Ebenfalls erst in Schritt 7 |
 | `DEVLAB_RUNS_MAX_DURATION` | **bleibt** — harte Wanduhr-Grenze je Versuch im Scheduler |
 | `DEVLAB_RUNS_MAX_CONCURRENCY` | **bleibt** — aber nur als STARTWERT; eine Laufzeit-Änderung gewinnt (REQ-013.2) |
 | `DEVLAB_RUNS_LIMIT_BACKOFF` | **bleibt** — Wartezeit auf das echte Usage-Limit-Fenster |
-| `DEVLAB_RUNS_TICK` | **bleibt** — Takt des Fälligkeits-Tickers |
+| `DEVLAB_RUNS_TICK` | **bleibt** — Takt des Fälligkeits-Tickers, und damit auch der Takt, in dem die PR-Wartung nach aussen wirkt |
 | `DEVLAB_GH_OWNER` | **ergänzen** — PFLICHT, kein Default mehr; ohne ihn bleibt die Repo-Menge leer |
+| `DEVLAB_COOKIE_DOMAIN` | **ergänzen** — der Instanzwert der Alt-Unit (Tabelle „Die Alt-Unit, Zeile für Zeile") |
 | `DEVLAB_RUNS_PROTECTION_ENFORCE` | **später ergänzen** — erst nach dem ersten gemeldeten Schutz-Durchlauf (siehe oben) |
+| `DEVLAB_RUNS_MAINTAIN_ENFORCE` | **später ergänzen** — erst nachdem der PR-Pool angesehen ist (Schritt 6a). Ungeschärft meldet die Wartung ihren Stillstand und macht keinen fremden Aufruf |
 
 `DEVLAB_STATE_DIR`, `DEVLAB_ADDR`, `DEVLAB_RUNS_DRAIN_GRACE`, `DEVLAB_RUNS_RESUME_WINDOW` und
 `DEVLAB_RUNS_PROTECTION_START_DELAY` stehen in der Vorlage. Sie gehören nur dann ins Drop-in, wenn
@@ -173,25 +375,44 @@ sondern eine zweite Wahrheit.
 
 ## Rollback
 
-Rückwärts, mit den Sicherungen aus Schritt 0 — Reihenfolge zählt, weil der Dienst nichts lesen darf,
-was gerade zurückgespielt wird:
+Rückwärts, mit den Sicherungen aus Schritt 0 — die Reihenfolge ist die umgekehrte des Cutovers, weil
+der Dienst nichts lesen darf, was gerade zurückgespielt wird. `$BAK` ist das Sicherungsverzeichnis
+dieses Durchgangs.
 
 1. `sudo systemctl stop devlabd`
-2. `sudo cp -a /root/devlabd.bak /usr/local/bin/devlabd` (das alte Binary)
-3. `sudo cp -a /root/devlabd.service.bak /etc/systemd/system/devlabd.service` und
-   `sudo cp -a /root/runs.conf.bak /etc/systemd/system/devlabd.service.d/runs.conf`, dann
-   `sudo systemctl daemon-reload`
-4. Zustand zurückspielen — der Tarball enthält `mercury links chats comments www axioms`:
-   `sudo tar -C /var/lib/devlab -xzf /root/devlab-state-<ts>.tar.gz`. Das holt auch die **alte SPA**
-   zurück, die Schritt 4 mit `rsync --delete` vernichtet hat, und den **Verfassungs-Klon** `axioms`
-   mit seinem nicht gepushten Stand. Ein Neu-Klon der Verfassung ersetzt Letzteren NICHT.
-5. `sudo mv /root/deploy.d.bak /etc/devlab/deploy.d` (per-Repo-Skriptmechanik zurück)
-6. Die zurückgezogenen Wrapper aus dem vorherigen Checkout wieder installieren
-   (`devlab-restart-idle`, `devlab-deploy`, `devlab-preview`).
-7. `sudo systemctl start devlabd`
+2. **Schritt 7/2 zurück (Unit und Drop-in):**
+   `sudo cp -a "$BAK/etc/systemd/system/devlabd.service" /etc/systemd/system/devlabd.service` und
+   `sudo cp -a "$BAK/etc/systemd/system/devlabd.service.d/runs.conf" /etc/systemd/system/devlabd.service.d/runs.conf`,
+   dann `sudo systemctl daemon-reload`.
+3. **Schritt 5 zurück (Daten):** Zustand zurückspielen — der Tarball enthält
+   `mercury links chats comments www axioms`:
+   `sudo tar -C "$STATE_DIR" -xzf "$BAK"/devlab-state-*.tar.gz`. Das holt auch die **alte SPA**
+   zurück, die Schritt 4 überschrieben hat, und den **Verfassungs-Klon** `axioms` mit seinem nicht
+   gepushten Stand. Ein Neu-Klon der Verfassung ersetzt Letzteren NICHT. Der by-hand-Weg ohne
+   Tarball steht in `10-daten.md` („Rollback").
+4. **Schritt 4 zurück (Binaries):**
+   `sudo cp -a "$BAK/usr/local/bin/devlabd" /usr/local/bin/devlabd`, und
+   `sudo rm -f /usr/local/bin/devlab-migrate` (der Alt-Stand kannte es nicht).
+5. **Schritt 1 zurück (Wrapper und sudoers) — jedes gesicherte Artefakt, in der umgekehrten
+   Reihenfolge seiner Installation.** Die Schleife spielt genau zurück, was Schritt 0b gesichert hat,
+   und benennt, was der Alt-Stand nicht hatte:
+   ```sh
+   for f in /etc/sudoers.d/devlab-runs /etc/sudoers.d/devlab \
+            /usr/local/sbin/devlab-preview /usr/local/sbin/devlab-deploy \
+            /usr/local/sbin/devlab-restart-idle /usr/local/sbin/devlab-restart-when-free \
+            /usr/local/sbin/devlab-mkworkspace /usr/local/sbin/devlab-install \
+            /usr/local/sbin/devlab-exec; do
+     if sudo test -e "$BAK$f"; then sudo cp -a "$BAK$f" "$f" && echo "zurück: $f"
+     else sudo rm -f "$f" && echo "im Alt-Stand nicht vorhanden, entfernt: $f"; fi
+   done
+   sudo visudo -c                                   # nach dem Zurückspielen, vor dem Start
+   sudo mv "$BAK/deploy.d" /etc/devlab/deploy.d      # per-Repo-Skriptmechanik zurück
+   ```
+6. `sudo systemctl start devlabd`
 
 `/etc/devlab/gh-owner` bleibt liegen: die Datei ist auch für den alten Stand harmlos und wird beim
-nächsten Anlauf wieder gebraucht.
+nächsten Anlauf wieder gebraucht. Die Export-Ablage aus Schritt 5 ist dort bereits entfernt; liegt
+sie noch, gehört sie gelöscht — sie trägt die Prompts der Instanz.
 
 
 ---
@@ -210,18 +431,40 @@ variables here and in `00-cutover.md`; they never enter the repository._
 Order (B-9): **stop → migrate → start**. The import probes the ready socket; while anything
 answers there — free or busy — it declines, because the running daemon owns the pools.
 
+The import runs AS THE SERVICE ACCOUNT, because everything it writes must belong to that account.
+That makes the export's readability a PRECONDITION, not a detail: an export left in the operator's
+home is unreachable for the service account — a home is typically `0750`, so a foreign account
+cannot even traverse it and `test -r` already fails, whereupon the import ends with exit `5`. So the
+export is staged where the service account can read it, the readability is checked BEFORE the import
+starts, and the staging is removed afterwards (the raw export carries this instance's prompts and
+tasks). Steps 4 and 5 of `00-cutover.md` are where this happens inside the cutover; the same three
+lines are what makes a later, standalone re-run work.
+
 ```sh
 STATE_DIR=/var/lib/devlab                   # the instance's state root
+SVC_USER=devlab                             # the daemon's service account (unit: User=)
 EXPORT=<export-dir>/mercury-runs-roh.json   # the raw run export — instance data, never committed
 OLD=<old-checkout>                          # the pre-rebuild working copy (M1, M2, M6)
+IMPORT_DIR=$STATE_DIR/import                # the staging the service account can read
 
 sudo systemctl stop devlabd
+# 0) stage the export and PROVE it is readable for the account that will read it
+sudo install -d -o $SVC_USER -g $SVC_USER -m0700 $IMPORT_DIR
+sudo install -o $SVC_USER -g $SVC_USER -m0600 $EXPORT $IMPORT_DIR/mercury-runs-roh.json
+sudo -u $SVC_USER test -r $IMPORT_DIR/mercury-runs-roh.json \
+  && echo 'precondition met' || echo 'ABORT: unreadable for the service account — the import would exit 5'
 # 1) read-only rehearsal: prints the full protocol, writes nothing
-sudo -u devlab env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $EXPORT --dry-run
+sudo -u $SVC_USER env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $IMPORT_DIR/mercury-runs-roh.json --dry-run
 # 2) the import itself
-sudo -u devlab env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $EXPORT
+sudo -u $SVC_USER env DEVLAB_STATE_DIR=$STATE_DIR devlab-migrate --input $IMPORT_DIR/mercury-runs-roh.json
+# 3) remove the staging — the export is instance data, not state
+sudo rm -rf $IMPORT_DIR && sudo test ! -e $IMPORT_DIR && echo 'staging removed'
 sudo systemctl start devlabd
 ```
+
+`devlab-migrate` is invoked by name because step 4 of `00-cutover.md` INSTALLS it beside the daemon
+(`/usr/local/bin`). Running it out of a build directory under `/tmp` would make the import depend on
+the umask of the account that built it — the service account must be able to traverse and execute it.
 
 Exit codes (uniform CLI convention): `0` ok · `1` generic · `2` usage · `5` config-state (no
 state root, unreadable export, a record that cannot be mapped faithfully, a record that would be
@@ -265,6 +508,8 @@ rebuilt form counts as already imported.
 | `mercury/runs-prs.json` | read as it lies: repository, number, URL, run, times and the blockade all arrive | **nothing** — the file is not touched. The single field with no counterpart is the pre-rebuild deploy-attempt counter; the rebuilt record keeps retry state in `backoff`, and the counter only ever accompanied an already **blocked** record whose attempts are spent |
 | `mercury/runs-notices.json` | read as it lies; the bundling fields that postdate these rows are filled on read | **nothing** — the migration protocol below is *added* beside the existing rows |
 | `mercury/runs-results/` | read tolerantly and mapped, including a step recorded as `ok` before statuses existed, historical stage names in the instance's own language, the separate live block and a zero finishing time (which stays "never finished") | imported into `mercury/executions/`, then moved aside (row above). The auxiliary fields of the old document — `mode`, `timeBudget`, `numTurns`, `effort`, `promptHash`, `interrupted`, `suspended`, `resumeAt` — have no place in the rebuilt result and are **not** carried: the archive is display-only, its stages carry the observable truth, and the moved-aside archive keeps the originals |
+| `mercury/daily-reports.json` | read as it lies — the rebuilt record spells `recipient`, `day`, `status`, `executions`, `attempts`, `lastAttempt`, `lastError` exactly as the source does, and the `backoff` field that postdates these rows is absent and reads as "no retry episode". But a record left in `failed` WITHOUT a backoff is **due again on the reporter's very first pass**, whatever its age: the reporter runs a pass before its first interval, so the first start re-attempts a send that the old instance already failed — and a report for a day inside the lookback window goes out for work the OLD instance did | **nothing** — and that is why it must be looked at before the runner identity is set: `00-cutover.md` step 6a prints day, status, attempts and the last error, step 6 keeps the reporter switched off until then. A day that may not be re-sent is settled by hand with the daemon stopped (status `blocked` waits for the explicit resumption, K-5); a day that no longer concerns anybody is moved aside with the file |
+| `mercury/axiom-checks.json`, `mercury/axiom-authors.json`, `mercury/attachments/` | read as they lie: the examined-stand pool is `{repos: {repo: {axiom: {commit, at}}}}`, the authorship pool `{authors: {axiom: {createdBy, createdAt, updatedBy, updatedAt}}}`, and the attachment tree is `<run>/<attachment>` — all three the shape the rebuilt stores spell. An unreadable examination pool is set aside by the store itself and NAMED in the prompt, so it never reads as "never examined here" | **nothing** — nothing to migrate. Without them the first pass of every run would examine each repository in full, which is correct but expensive |
 | `mercury/runs-settings.json`, `mercury/runs-incidents.json` | **no rebuilt store opens them** | moved to `<name>.pre-migration` with the reason in the protocol, so nothing is left that looks live and is not. The old slot capacity is **not** carried over: set it as `DEVLAB_RUNS_MAX_CONCURRENCY` in the drop-in (step 2 of `00-cutover.md`) if the pre-rebuild value is still wanted — read it out of `runs-settings.json.pre-migration` |
 | the pre-rebuild single-execution marker | no reader — the twin-marker trap does not exist in the rebuild (REQ-039.3) | **not** the import's job: it is a trap to remove, not stock to keep, and step **3** of `00-cutover.md` deletes it by name before the import runs |
 
@@ -280,15 +525,20 @@ Check the outcome after the import — the target state is the eight records of 
 nothing else:
 
 ```sh
-sudo -u devlab jq '[.runs[] | {id, kind, title, active}] | length, .' $STATE_DIR/mercury/runs.json
-sudo -u devlab jq '[.runs[] | keys] | flatten | unique' $STATE_DIR/mercury/runs.json   # no type/name/enabled/done/prompt
-sudo -u devlab ls -l $STATE_DIR/mercury/*.pre-migration $STATE_DIR/mercury/runs-history.pre-migration
+sudo -u $SVC_USER jq '[.runs[] | {id, kind, title, active}] | length, .' $STATE_DIR/mercury/runs.json
+sudo -u $SVC_USER jq '[.runs[] | keys] | flatten | unique' $STATE_DIR/mercury/runs.json   # no type/name/enabled/done/prompt
+sudo -u $SVC_USER ls -l $STATE_DIR/mercury/*.pre-migration $STATE_DIR/mercury/runs-history.pre-migration
 ```
 
 ## Step A — the axiom assignment (mandatory before any run is switched on)
 
 This step is part of the cutover, not an afterthought: until it is done and checked, the seven
 imported runs are switched off and the instance performs no recurring work.
+
+It comes AFTER step 7 of `00-cutover.md`, not before: the constitution store resolves its token
+through the runner identity (`DEVLAB_AXIOMS_TOKEN_USER`, else `DEVLAB_RUNS_TOKEN_USER`, else
+`DEVLAB_RUNS_USER`), and the held first start has none of the three — A1 would fail with the store's
+named "not configured" answer rather than write.
 
 ```sh
 ORIGIN=<origin>            # the instance's own origin, as in 00-cutover.md
@@ -325,7 +575,7 @@ way: acknowledging its notice.
 | **M1** rescue branches | Where the rebuild carries the capability anyway it is **proven**, not delivered twice: record per branch "folded in" or "superseded" (evidence: the acceptance lines for slots, time budget, usage and workbench), then remove all four | `git -C $OLD branch -D fix/auslieferungssperre-slots-lieferkette fix/zeitbudget-je-lauf fix/tokenverbrauch-live fix/arbeitsstand-vor-neustart-2136` and `git -C $OLD push origin --delete <branch>` where it exists remotely | |
 | **M2** rollout backlog | The retired rollout left open pull requests, branches and follow-up entries; the rebuild has no rollout path at all | `gh pr close <n>` per open rollout pull request, delete their branches, drop their follow-up entries, and revert or counter-book the one-pull-request-per-repository commit depending on its merge state | |
 | **M3** stale follow-up entry | A follow-up entry still points at a delivery branch that no longer exists (the prune loop that repeated forever) | Remove the entry for the deleted delivery branch from `mercury/runs-prs.json` while the service is stopped | |
-| **M4** tasks whose work already arrived | Handled by the startup reconciliation, which records a completed execution per task | No manual step: check the notice feed after the first start | |
+| **M4** tasks whose work already arrived | Handled by the startup reconciliation, which records a completed execution per task | No manual step, but it does not happen at the HELD first start: the reconciliation resolves repositories through the runner identity, which step 6 of `00-cutover.md` deliberately withholds, so it logs `startup reconciliation deferred: no runner account configured` and runs at the restart of step 7. Check the notice feed after THAT start | |
 | **M5** deliver the two pending services | The old path needed a per-repository script; the generic path replaces it | Create one task per service, run it through the chain, then verify: unit active, visible in the dashboard, right declared | |
 | **M6** obsolete process branches | Branches whose **content** arrived in the default branch (also through a collective merge) — content decides, never the commit id | Probe each branch by content (`git -C $OLD cherry <default> <branch>`, diff probe) and delete the contained ones | |
 | **M7** port inventory | One service once started on a port another already held | Open Atlas → Ports (or `curl -fsS <origin>/api/atlas/ports`) and confirm every conflict and deviation reported | |
@@ -353,11 +603,11 @@ Without the tarball, everything the import moved is still on disk under its own 
 back by hand — in this order, with the daemon stopped:
 
 ```sh
-sudo -u devlab mv $STATE_DIR/mercury/runs.json.pre-migration            $STATE_DIR/mercury/runs.json
-sudo -u devlab mv $STATE_DIR/mercury/runs-deliveries.json.pre-migration $STATE_DIR/mercury/runs-deliveries.json
-sudo -u devlab mv $STATE_DIR/mercury/runs-results.imported              $STATE_DIR/mercury/runs-results
-sudo -u devlab mv $STATE_DIR/mercury/runs-history.pre-migration/*.json  $STATE_DIR/mercury/runs-history/
-sudo -u devlab sh -c 'cd '$STATE_DIR'/mercury && for f in *.pre-migration; do mv "$f" "${f%.pre-migration}"; done'
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs.json.pre-migration            $STATE_DIR/mercury/runs.json
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-deliveries.json.pre-migration $STATE_DIR/mercury/runs-deliveries.json
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-results.imported              $STATE_DIR/mercury/runs-results
+sudo -u $SVC_USER mv $STATE_DIR/mercury/runs-history.pre-migration/*.json  $STATE_DIR/mercury/runs-history/
+sudo -u $SVC_USER sh -c 'cd '$STATE_DIR'/mercury && for f in *.pre-migration; do mv "$f" "${f%.pre-migration}"; done'
 ```
 
 The executions the import wrote into `mercury/executions/` stay: they are archive documents of
@@ -397,19 +647,27 @@ is the STATE of each line, in exactly four kinds:
   person clicking the whole path at the running instance. Nothing in this repository can discharge
   it — no grep, no unit or integration test — so it stays open until it has been walked, and a line
   that names E2E is never reported as finished on the strength of its unit tests alone.
-- **Visual inspection open** — the line additionally demands a look, a measurement or a review at
-  the running instance. Those are the items of THIS document; a line marked "not itemised" is
-  covered by a section here without naming the id, so read the section it belongs to.
+- **Visual inspection open** — the line additionally demands one of the three kinds the matrix
+  spells for it: a LOOK (`Sichtprüfung`) or a MEASUREMENT (`Messung`) at the running instance, or a
+  REVIEW (`Review`) of the artefact — which is a reading of code, permissions or a module cut and
+  needs no running service at all. The working list below says which of the three each line asks
+  for, because the three are not interchangeable: a review can be done before the daemon is up, a
+  measurement cannot be done at all without it. Those are the items of THIS document; a line marked
+  "not itemised" is covered by a section here without naming the id, so read the section it belongs
+  to.
 
 A line with several kinds needs all of them.
 
 Fifteen lines name an end-to-end walk-through in the matrix: REQ-007, REQ-012, REQ-035, REQ-036,
 REQ-037, B-25, B-27, B-28, B-31, B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open**
-below. Four of them previously read "Test green" and nothing else — an acceptance claim wider than the
-evidence, which is the one thing this document may never make. B-27, B-40 and REQ-035 were corrected in
-repair wave 2; REQ-037 in wave 3, where the kind was still misread: its cell asks for a
+below. Four of them once read "Test green" and nothing else — an acceptance claim wider than the
+evidence, which is the one thing this document may never make. B-27, B-40 and REQ-035 were corrected
+in `c98d4a9`; REQ-037 in `89ee3da`, where the kind was still misread: its cell asks for a
 "Klick-Durchgang" over every history entry (including the dead and the failed ones), which is a person
-clicking the running instance — an E2E proof under a different word, not a unit test.
+clicking the running instance — an E2E proof under a different word, not a unit test. A commit is
+named here rather than a wave, for the same reason the measurement row carries one: a wave is not a
+state of this repository, and a claim about a correction has to be re-checkable
+(`git show <commit> -- deploy/migration/20-sichtpruefung.md`).
 
 ### How the automated half is established
 
@@ -440,6 +698,32 @@ The row states what was actually run, and nothing further: an unrun command is r
 never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
 edits rather than the delivered state, so the closing row belongs to whoever closes the wave — and it
 carries the commit that wave produced, not the commit it started from.
+
+### The operator's working list — the 65 lines that no grep and no test can close
+
+Everything above is either green or one of these 65 rows. They are listed here as ONE list, by kind,
+so the operator can plan: **54 of them need the running instance**, the remaining **11 are reviews of
+the artefact** and can be done before the daemon comes up. A line appears under every kind it asks
+for, so the four counts add up to more than 65 while the union is exactly 65.
+
+Recompute the list and the total from this document at any time — it ages with the table above, so
+the commands are the criterion and the numbers below are a reading:
+
+```sh
+grep -cE '^\| (K|REQ|B)-[0-9]+ \|.*(E2E open|Visual inspection open)' deploy/migration/20-sichtpruefung.md   # 65
+grep -cE '^\| (K|REQ|B)-[0-9]+ \|.*E2E open' deploy/migration/20-sichtpruefung.md                            # 15
+```
+
+| Kind | What it needs | Lines |
+|---|---|---|
+| **E2E** (15) | a person clicking the whole path at the running instance | REQ-007 · REQ-012 · REQ-035 · REQ-036 · REQ-037 · B-25 · B-27 · B-28 · B-31 · B-32 · B-33 · B-34 · B-37 · B-39 · B-40 |
+| **Measurement** (8) | logs, counters, request lists — at the running instance, over time | K-2 · K-5 · K-6 · REQ-017 · REQ-018 · REQ-034 · REQ-044 · B-36 |
+| **Look** (37) | the surface in front of you at the running instance | K-4 · K-5 · REQ-002 · REQ-004 · REQ-005 · REQ-009 · REQ-010 · REQ-015 · REQ-016 · REQ-020 · REQ-021 · REQ-022 · REQ-024 · REQ-029 · REQ-030 · REQ-031 · REQ-033 · REQ-034 · REQ-036 · REQ-038 · REQ-040 · REQ-041 · REQ-042 · REQ-043 · REQ-044 · B-01 · B-03 · B-18 · B-24 · B-28 · B-29 · B-30 · B-36 · B-38 · B-42 · B-43 · B-45 |
+| **Review** (22) | reading the artefact — code, permissions, module cut, invariant checklist. **No running service.** Eleven lines need nothing else: REQ-023 · REQ-026 · REQ-028 · B-06 · B-14 · B-15 · B-17 · B-20 · B-23 · B-41 · B-44 | REQ-022 · REQ-023 · REQ-026 · REQ-028 · REQ-040 · REQ-041 · REQ-043 · B-03 · B-06 · B-14 · B-15 · B-17 · B-20 · B-23 · B-24 · B-28 · B-31 · B-32 · B-37 · B-39 · B-41 · B-44 |
+
+The kinds are not this document's invention: each is the word the acceptance matrix uses in the
+line's own "Wie geprüft wird" cell (`Sichtprüfung`, `Messung`, `Review`, `E2E`/`Klick-Durchgang`).
+Where this document and the matrix disagree, the matrix decides.
 
 ### §1 — the six construction faults (K-1 … K-6)
 
@@ -1375,6 +1659,235 @@ pool against a fixture derived field-by-field from the real file
 `TestLegacyPendingPRPoolNeedsNoConversion`, `TestLegacyNoticePoolNeedsNoConversion`,
 `TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead`,
 `TestPoolsWithoutAReaderAreSetAsideWithTheirReason`).
+
+---
+
+## Repair wave 4
+
+### `deploy/devlabd.service` — the address is an environment value, and one instance value returns to the drop-in
+
+**Who:** repair wave 4 (U1). The template is not on the §0.2 freeze list; this entry is recorded
+because it names two REQUIREMENTS the cutover must satisfy, and a cutover that misses either changes
+observable behaviour without failing.
+**Reason (measured against the installed unit, read-only, `systemctl cat devlabd`):** the running
+instance carries two values in the UNIT — not in the drop-in — that step 2 of `00-cutover.md`
+overwrites wholesale, and the drop-in table treated only the drop-in:
+
+1. `DEVLAB_COOKIE_DOMAIN`. It is read by the shipped code (`api/cookies.go`) and deliberately absent
+   from this template because it is an instance value. Lost, the session cookies this service
+   re-mints on refresh become HOST-ONLY and stand beside the landscape's domain-wide ones instead of
+   overwriting them — which is the exact duplicate the code's own comment exists to prevent, and a
+   logout at the landscape no longer clears the host-only copy.
+2. The listen address. The old unit passed it as `ExecStart=… --listen <addr>`; the rebuilt binary
+   parses NO command-line flags and reads `DEVLAB_ADDR` alone, so a carried-over flag silently does
+   nothing and the process listens wherever `DEVLAB_ADDR` points. If that is not the address the
+   shared edge proxies to, every request to the service fails while the unit reads as active.
+
+Additionally `DEVLAB_REPOS_PATH`, which the old unit set to an operator home, is now only the
+dev-bypass sandbox base — carried over it aims repository resolution at foreign working copies
+instead of the per-user workspaces under the state root.
+**What changed:** three notes in the template's environment-contract block (the address, the cookie
+domain, the sharpened `DEVLAB_REPOS_PATH` warning) plus the commented instance-value line for
+`DEVLAB_COOKIE_DOMAIN`, in the same form `DEVLAB_GH_OWNER` already uses. No directive and no
+`Environment=` line changed value, so no instance behaviour changes from the template alone.
+**Also recorded here:** `DEVLAB_RUNS_MAINTAIN_ENFORCE` — the arming switch of the pull-request
+maintenance, added to `internal/deliver` in this same wave — joins the environment contract and the
+commented arming block beside `DEVLAB_RUNS_PROTECTION_ENFORCE`. An arming switch that no template
+documents is a switch nobody sets: the drop-in table of `00-cutover.md` carries its row, and the
+table's own audit passes only because the shipped code reads exactly that name.
+**Consequence for operation:** `00-cutover.md` gains the table „Die Alt-Unit, Zeile für Zeile" beside
+the existing drop-in table, the drop-in table gains the `DEVLAB_COOKIE_DOMAIN` row, and step 2 checks
+all three: the cookie domain must be present, the four derived paths must be absent, and `--listen`
+must be gone from `ExecStart` while `DEVLAB_ADDR` matches the edge.
+**Diff hint:** `git diff 89ee3da -- deploy/devlabd.service deploy/migration/00-cutover.md`.
+**Proof:** `backend/it/cutover_runbook_test.go`
+(`TestCutoverDropInTableAgreesWithTheShippedEnvironmentContract` holds every row of the drop-in table
+to the shipped environment contract — the new `DEVLAB_COOKIE_DOMAIN` row passes only because the code
+reads that name), plus the two probes the step itself performs.
+
+### `deploy/migration/00-cutover.md` — the first start is HELD, and the foreign effect is the whole list
+
+**Who:** repair wave 4 (U1).
+**Reason:** the runbook claimed exactly one thing reaches outside DevLab (the branch-protection pass).
+Read against the code that is wrong by an order of magnitude, and the difference is not academic:
+`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246`), so from the FIRST tick
+after the first start it posts a delivery-origin status on every open pull request of every managed
+repository — hand-raised ones included — deletes the delivery branch of any tracked pull request a
+human merged meanwhile, and merges whatever has passed its window. The daily reporter performs a pass
+BEFORE its first interval, so a mail can leave the host seconds after the start; and `api.New` starts
+the constitution README seed as a background task, which clones the constitution repository and may
+push one commit. Measured on the real pre-cutover state directory: 61 tracked pull requests in 21
+repositories (5 blocked), 13 open ledger deliveries in 12 repositories, and one daily-report record
+still in `failed` with 46 attempts — which, having no backoff, is due again on the first pass.
+**What changed (no code):** the section „Fremdwirkung" now lists **fourteen** writing sites with the
+code position of each, whether it fires at the first start, what it writes and how it is held. The
+sequence gained the hold that follows from it: step 6 starts the daemon WITHOUT the runner identity
+(`DEVLAB_RUNS_USER`, `DEVLAB_RUNS_TOKEN_USER`), which makes `runnerToken()` answer "no runner account
+configured" — so PR maintenance, the protection pass, the chain, the reporter and the README seed all
+fail closed with a named error — step 6a MEASURES what the next tick would touch, and step 7 sets the
+identity and restarts. Step 0 now saves every artefact the cutover overwrites or removes (the four
+shared wrappers, both sudoers files, binary, unit, drop-in) with its path preserved, and the rollback
+restores each one in reverse order. Step 4 delivers the web root without rewriting its owner and mode
+(`rsync -a` transfers the SOURCE directory's owner and mode onto the target; measured in a sandbox:
+`drwxr-x---` became `drwxrwxr-x`) and proves the target unchanged. Step 5 stages the export where the
+service account can read it, proves the readability before the import, and removes the staging.
+**Consequence for operation:** the cutover is two starts, not one, and the acceptance walk of
+`20-sichtpruefung.md` happens after step 7. The hold the ORDER provides is a property of the
+procedure, not of the software; a switch that would make it one belongs to the owner of
+`internal/deliver` and `internal/api`, so the runbook does not assert its absence — it READS whether
+the installed binary and the template carry one (the `strings`/`grep` probe under the table) and says
+what follows in either case.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/00-cutover.md`.
+**Proof:** the eight assertions of `backend/it/cutover_runbook_test.go` still hold (backup complete
+against the derived state layout, sudoers validated before installing, organisation file provisioned,
+health probe derived from the configuration, `sudoedit` only, drop-in treated line by line, protection
+hold named); every new claim carries its own probe in the step that makes it — the backup lists what
+it saved and names what was absent, the web root is compared before and after, the export's
+readability is asserted before the import runs, and the held start is proven by the three log lines
+that say the passes had no runner account.
+
+### `deploy/migration/10-daten.md` — two more pools have a reader, and the import has a precondition
+
+**Who:** repair wave 4 (U1).
+**Reason:** the takeover table surveyed every pool of the pre-rebuild state directory except three
+that DO have a reader in the rebuild. `mercury/daily-reports.json` is the load-bearing one: the
+rebuilt ledger reads it field for field, and a record left in `failed` without a backoff is due again
+on the reporter's very first pass, whatever its age — so the first start re-attempts a send the old
+instance already failed, and a day inside the lookback window is reported for work the OLD instance
+did. `mercury/axiom-checks.json`, `mercury/axiom-authors.json` and `mercury/attachments/` were
+measured to read as they lie and need no conversion; saying so is what keeps the next reader from
+converting them. Separately, the import's own command was not executable as written: it ran as the
+service account against an export in the operator's home, where that account cannot even traverse
+(`0750`), so the documented line ended in exit `5`.
+**What changed:** three rows in the takeover table, and an import block that stages the export into a
+directory the service account owns, PROVES the readability before the import runs, and removes the
+staging afterwards (the raw export carries this instance's prompts). The binary is invoked by name
+because the cutover now installs it — running it out of `/tmp` made the import depend on the umask of
+the account that built it. M4 states that the startup reconciliation is DEFERRED at the held first
+start and runs at the restart of step 7; step A states that it must follow step 7, because the
+constitution store resolves its token through the same runner identity.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/10-daten.md`.
+**Proof:** the readability precondition and the staging removal are probes in the step itself; the
+three pool rows were measured against the real state directory (shape comparison against
+`report.Record`, `runs.AxiomChecks`, `axiomauthors.Author` and the attachment path layout), and the
+"due again" claim is the shipped `due()` in `report/reporter.go:251`, which returns true for a failed
+record with no backoff.
+
+### `deploy/migration/20-sichtpruefung.md` — the inspection kinds are the matrix's own, and the open work is one list
+
+**Who:** repair wave 4 (U1).
+**Reason:** the document bound two claims to a wave name rather than a commit, and its legend called
+every open item an inspection "at the running instance" — which is wrong for the matrix's `Review`
+kind: reading file permissions, a module cut or an invariant checklist needs no running service, and
+lumping it in with a measurement hides which work can start before the daemon is up. The document
+also never said WHICH lines the operator still has to walk, so the open half of the acceptance had no
+list.
+**What changed:** the two corrections now name commits (`c98d4a9`, `89ee3da`); the legend spells the
+three kinds the matrix uses (`Sichtprüfung`, `Messung`, `Review`) and states that a review needs no
+running instance; and a working list carries all 65 open lines grouped by kind — 15 E2E, 8
+measurements, 37 looks, 22 reviews, of which 11 need nothing but a review — with the two grep commands
+that recompute the totals from the table itself.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/20-sichtpruefung.md`.
+**Proof:** the kinds were derived by comparing every row against the "Wie geprüft wird" cell of the
+same line in the acceptance matrix; the comparison reports zero disagreements in either direction.
+`tools/abnahme.sh` check `doc-a` (cited check ids exist, section sizes match) and
+`backend/it/cutover_runbook_test.go` (`TestInspectionResultRowIsBoundToACommit`,
+`TestInspectionReportsE2ELinesAsE2E` — the working list sits outside the enumeration block that test
+parses, so it cannot dilute the E2E claim) both hold.
+
+### `backend/cmd/devlabd/main.go` — the restart gate is a boot precondition, and the boot names the maintenance hold
+
+**Who:** repair wave 4 (U2).
+**State of record:** `backend/cmd/devlabd/main.go@62ed7ea56be4` — this entry describes it (entry 1
+describes the boot order it extends).
+**Reason (measured):** the readiness socket was started in a goroutine whose only reaction to a
+failure was `log.Printf`. That socket is not a status line: it is the interlock `devlab-migrate`
+takes. Measured against the shipped binary — with the socket up the migration refuses with exit `10`
+while an execution runs; with no socket at all there is NO refusal, because a daemon that does not
+answer reads as dead and therefore as "nothing running". A daemon that had lost its gate went on
+serving, and the next import would have worked a LIVE state tree with two writers on it.
+**Decision:** refuse the start, rather than carrying the lock elsewhere. A second lock path (a pid
+file, a unit query) would be a parallel access point to the same truth, and the gate must be
+answerable for the migration to take it at all — so the honest rule is that the daemon does not serve
+what it cannot protect. This is symmetric with the two boot preconditions above it: an unwritable
+state root and an unreadable session secret already refuse the start.
+**What changed:** the gate goes up BEFORE the HTTP listener. `awaitGate` waits until the socket
+ANSWERS a dial, or until the attempt to bring it up reports its failure, or until
+`DEVLAB_READY_GATE_TIMEOUT` (default 10s) is over; the first two are named, the third is named as
+silence, and each refuses the start. A gate lost LATER brings the daemon down through the existing
+drain (a running execution is still persisted as interrupted, K-2) and exits non-zero. The boot
+additionally states in ONE line whether the pull-request maintenance starts armed or held (see the
+`deliver.go` entry below), the way it already states the self-check and the reporter.
+**Diff hint:** `git diff 89ee3da -- backend/cmd/devlabd/main.go`.
+**Proof:** `backend/cmd/devlabd/main_test.go` — a gate that comes up late is awaited, a bind failure
+is handed back verbatim, and silence refuses within its budget. Probe against the built binary: with
+the socket path blocked the process exits `1` with `refusing to serve without the interlock …` and
+answers nothing on its HTTP address; with a free state root it logs `pull-request maintenance HELD`,
+then `listening on …`, and `GET /ready` over the socket answers `204`.
+
+### `backend/internal/deliver/deliver.go` — the pull-request maintenance stands still until the operator arms it
+
+**Who:** repair wave 4 (U2). `deliver.go` is not on the §0.2 freeze list; this entry is recorded
+because it changes the SHIPPED DEFAULT of an effect outside DevLab.
+**Reason:** `deliver.Maintain` merges pull requests, deletes their branches and writes commit statuses
+in other organisations' repositories, and the scheduler drives it from the FIRST tick after boot —
+over a pool that a cutover imported minutes earlier and that nobody has looked at. That is the one
+effect no restart may cause on its own; the protection check next to it was already held for exactly
+this reason (`DEVLAB_RUNS_PROTECTION_ENFORCE`, entry above).
+**What changed:** `DEVLAB_RUNS_MAINTAIN_ENFORCE` arms the writing half; unarmed — the shipped default
+— `Maintain` performs an OBSERVATION pass: it reads its own pools, makes no GitHub call at all (so it
+needs neither token nor network), changes none of its own records either, and raises ONE notice
+(`delivery-held`) naming the standstill and the switch that ends it. It stays silent while nothing is
+waiting. Holding the pass whole is deliberate: a pass that mirrored half its findings and held back
+the other half would leave a mixed state nobody can reason about, so the state the migration produced
+stays exactly as it is until the operator arms it, and the first armed pass then works the queue in
+creation order. The word set of the switch is parsed by ONE function (`deliver.ArmedByEnv`), so the
+two holds cannot disagree about what "armed" means.
+**Visible where it matters:** the notice feed labels the kind (`Maintenance held`), the daily report
+carries it in the delivery-alarm rubric, the Deliveries surface shows the service's own sentence with
+the moment it was last reported, and the boot log names the state.
+**Diff hint:** `git diff 89ee3da -- backend/internal/deliver/deliver.go`.
+**Proof:** `TestMaintainHeldWritesNothing` (unarmed: zero calls of any kind on the fixture GitHub,
+ledger/PR pool/result untouched, the notice raised with the switch in it, a second pass bundled into
+one row; armed: the same situation merged and pruned) and `TestMaintainHeldStaysSilentWithNothing-
+Waiting`. Every pre-existing test that exercises the writing half now arms it explicitly through
+`armMaintain(t)` / `t.Setenv(deliver.EnvMaintainEnforce, "1")` — the default is off, and the suite
+says so.
+
+### `backend/internal/runs/results.go` — an archived execution has ended, and nothing in it is running
+
+**Who:** repair wave 4 (U2).
+**Reason (measured against the imported archive, 82 records):** the mapping left `EndedAt` nil for a
+zero `finishedAt` (14 records) and carried a step recorded as `running` verbatim (4 records). Both are
+claims the stock does not cover. The history selector drops an execution that never ended while the
+history's counter counted every record it read — measured on the imported stock: `History (65) · 17
+still open` with an EMPTY Active list, so an entry that exists was invisible and a number nobody can
+point at was claimed. And a `running` stage made the surface pulse for a repository where nothing
+runs, which is the ghost REQ-039.1 exists to remove.
+**What changed:** the archive is read as the closed past it is. A step recorded as running is closed
+as ABORTED — a terminal state whose mandatory reason names what the archive recorded and that the
+outcome is unknown. A record without a finishing time is ENDED at the last instant the record itself
+carries (its own start when it carries no later one), and it SAYS so: the result's report states which
+instant stands in for the missing stamp. Where the source additionally flagged the record as not ok,
+every repository carries one `archived-cutoff` stage (`not-executed`, with its reason) stating that
+nothing followed the last recorded step — otherwise a chain cut off after `implement` would read as a
+completed success (K-4). A record the source flagged as ok keeps its recorded success: a false failure
+is as much a lie as a false green. Nothing is invented beyond the record: no time is claimed that the
+document does not carry, and the moved-aside archive keeps every original verbatim.
+**Consequence for the surface:** `src/views/mercury/tasks/select.ts` gains `outsideHistory`, which
+splits what the history does NOT show by the reason that keeps it out — running (shown in Active) or
+awaiting delivery (shown in the ledger) — and `ExecutionsView` renders those two named numbers instead
+of subtracting the history from the pool. Measured after the change: all 82 archive records carry an
+end, no stage is transient, and the counter claims nothing.
+**Diff hint:** `git diff 89ee3da -- backend/internal/runs/results.go src/views/mercury/tasks/select.ts`.
+**Proof:** `TestArchiveRecordWithoutFinishingTimeIsEndedAndCounted` over the four forms the imported
+archive actually holds among its unstamped records (instance-neutral fixtures: cut off mid-step, all
+recorded steps ended, flagged ok with complete chains, no repository at all) plus the invariant "every
+archive record ended, holds nothing transient and states where its end came from";
+`TestLegacyResultsReadTolerantly` and `backend/it/legacy_test.go` for the aborted step;
+`TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead` for the imported document; and
+`src/views/mercury/tasks/select.test.ts` for the partition (history ∪ running ∪ awaiting = the pool,
+each record in exactly one place).
 
 
 ---

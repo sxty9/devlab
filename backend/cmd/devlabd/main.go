@@ -8,7 +8,8 @@
 //     "interrupted"; running stages are terminalized honestly (B2/B3)
 //  4. restart completion: restart.json present ⇒ THIS boot is the restart — notice, delete,
 //     release the queued starts through normal admission (B2)
-//  5. HTTP + SSE + ready socket up — the first answers are ghost-free
+//  5. ready socket up FIRST (it is the interlock devlab-migrate takes; a start without it is
+//     refused), then HTTP + SSE — the first answers are ghost-free
 //  6. startup reconciliation: preflight.SyncStartupTodos (synthetic results, B-5/B3)
 //  7. enqueue resumes: every interrupted execution, newest first, via normal admission (B2)
 //  8. ticks: due ticker, PR maintenance (deliver.Maintain), protection verify, reporter,
@@ -25,7 +26,9 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,6 +39,7 @@ import (
 
 	"devlab/backend/internal/api"
 	"devlab/backend/internal/auth"
+	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/execstate"
 	"devlab/backend/internal/executor"
 	"devlab/backend/internal/live"
@@ -129,11 +133,25 @@ func main() {
 
 	// The Unix-socket readiness endpoint (statepath.ReadySocket; 204 free / 423 busy; a dead
 	// daemon reads as free on the wrapper's side). NEVER on the TCP mux (A2-7).
+	//
+	// This socket is NOT a status line: it is the interlock devlab-migrate takes. The migration asks
+	// it whether an execution is running and refuses (exit 10) while one is — and a daemon whose
+	// socket never came up reads as "dead, nothing running", so the migration would proceed against a
+	// LIVE daemon and two writers would work one state tree. A daemon must not serve what it cannot
+	// protect, so the gate is a boot precondition, exactly like the writable state root and the
+	// readable session secret above: it goes up BEFORE the first answer, and its absence refuses the
+	// start by name instead of leaving a log line nobody reads.
+	gateDown := make(chan error, 1)
 	go func() {
+		// nil = the gate served until shutdown; that is not a failure.
 		if err := server.ServeReadySocket(rootCtx); err != nil {
-			log.Printf("devlabd: ready socket: %v", err)
+			gateDown <- err
 		}
 	}()
+	if err := awaitGate(rootCtx, paths.ReadySocket(), gateDown, envDuration("DEVLAB_READY_GATE_TIMEOUT", 10*time.Second)); err != nil {
+		log.Fatalf("devlabd: the restart gate (%s) did not come up — refusing to serve without the interlock that keeps a migration off a live state tree: %v",
+			paths.ReadySocket(), err)
+	}
 
 	go func() {
 		log.Printf("devlabd: listening on %s", addr)
@@ -152,7 +170,14 @@ func main() {
 			log.Printf("devlabd: startup reconciliation checked off %d todo(s) already in a default branch", n)
 		}
 	}()
-	// Resume enqueueing (7) plus the due ticker and the PR maintenance (8).
+	// Resume enqueueing (7) plus the due ticker and the PR maintenance (8). The maintenance writes
+	// into FOREIGN repositories and is held until the operator arms it, so the boot says which of the
+	// two states it is starting in — the cutover reads this line before any surface is open.
+	if deliver.MaintainArmed() {
+		log.Printf("devlabd: pull-request maintenance ARMED (%s) — it merges, prunes and stamps", deliver.EnvMaintainEnforce)
+	} else {
+		log.Printf("devlabd: pull-request maintenance HELD — it reports and writes nothing; arm it with %s=1", deliver.EnvMaintainEnforce)
+	}
 	if err := scheduler.Start(rootCtx); err != nil {
 		log.Printf("devlabd: scheduler start: %v", err)
 	}
@@ -162,8 +187,17 @@ func main() {
 	// unreachable GitHub costs one pass, never the daemon.
 	go verifyProtectionLoop(rootCtx, server)
 
-	<-rootCtx.Done()
-	log.Printf("devlabd: shutdown requested — draining")
+	// The gate can also fall LATER (its listener dies while the daemon runs). The interlock is gone
+	// from that moment on, so the daemon stops — draining first, so a running execution is still
+	// persisted as interrupted (K-2) — and exits non-zero, which is what the unit restarts on.
+	lost := false
+	select {
+	case <-rootCtx.Done():
+		log.Printf("devlabd: shutdown requested — draining")
+	case err := <-gateDown:
+		lost = true
+		log.Printf("devlabd: restart gate lost (%v) — stopping: without it a migration would run against a live state tree", err)
+	}
 
 	// SIGTERM drain (K-2): gate admissions, persist interrupted, then stop HTTP. The grace
 	// budget stays below systemd's TimeoutStopSec (90 s).
@@ -177,6 +211,37 @@ func main() {
 		log.Printf("devlabd: shutdown: %v", err)
 	}
 	log.Printf("devlabd: stopped")
+	if lost {
+		os.Exit(1)
+	}
+}
+
+// awaitGate waits until the readiness gate ANSWERS — a socket that accepts a connection is bound and
+// listening — or until the attempt to bring it up failed, or until the budget is over. All three
+// answers are named; a silent "the gate is probably up" is not one of them. The probe is a plain dial
+// (the gate's own route belongs to its client, devlab-migrate) and closes immediately.
+func awaitGate(ctx context.Context, sock string, failed <-chan error, budget time.Duration) error {
+	if budget <= 0 {
+		budget = 10 * time.Second
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		select {
+		case err := <-failed:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if c, err := net.Dial("unix", sock); err == nil {
+			_ = c.Close()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no answer on the readiness socket within %s", budget)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // execute is the ExecFunc the scheduler drives — the ONE place the chain motor is invoked. It

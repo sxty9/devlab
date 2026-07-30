@@ -27,19 +27,27 @@ is the STATE of each line, in exactly four kinds:
   person clicking the whole path at the running instance. Nothing in this repository can discharge
   it — no grep, no unit or integration test — so it stays open until it has been walked, and a line
   that names E2E is never reported as finished on the strength of its unit tests alone.
-- **Visual inspection open** — the line additionally demands a look, a measurement or a review at
-  the running instance. Those are the items of THIS document; a line marked "not itemised" is
-  covered by a section here without naming the id, so read the section it belongs to.
+- **Visual inspection open** — the line additionally demands one of the three kinds the matrix
+  spells for it: a LOOK (`Sichtprüfung`) or a MEASUREMENT (`Messung`) at the running instance, or a
+  REVIEW (`Review`) of the artefact — which is a reading of code, permissions or a module cut and
+  needs no running service at all. The working list below says which of the three each line asks
+  for, because the three are not interchangeable: a review can be done before the daemon is up, a
+  measurement cannot be done at all without it. Those are the items of THIS document; a line marked
+  "not itemised" is covered by a section here without naming the id, so read the section it belongs
+  to.
 
 A line with several kinds needs all of them.
 
 Fifteen lines name an end-to-end walk-through in the matrix: REQ-007, REQ-012, REQ-035, REQ-036,
 REQ-037, B-25, B-27, B-28, B-31, B-32, B-33, B-34, B-37, B-39, B-40. Each of them carries **E2E open**
-below. Four of them previously read "Test green" and nothing else — an acceptance claim wider than the
-evidence, which is the one thing this document may never make. B-27, B-40 and REQ-035 were corrected in
-repair wave 2; REQ-037 in wave 3, where the kind was still misread: its cell asks for a
+below. Four of them once read "Test green" and nothing else — an acceptance claim wider than the
+evidence, which is the one thing this document may never make. B-27, B-40 and REQ-035 were corrected
+in `c98d4a9`; REQ-037 in `89ee3da`, where the kind was still misread: its cell asks for a
 "Klick-Durchgang" over every history entry (including the dead and the failed ones), which is a person
-clicking the running instance — an E2E proof under a different word, not a unit test.
+clicking the running instance — an E2E proof under a different word, not a unit test. A commit is
+named here rather than a wave, for the same reason the measurement row carries one: a wave is not a
+state of this repository, and a claim about a correction has to be re-checkable
+(`git show <commit> -- deploy/migration/20-sichtpruefung.md`).
 
 ### How the automated half is established
 
@@ -70,6 +78,32 @@ The row states what was actually run, and nothing further: an unrun command is r
 never as green. While several agents work in ONE tree a whole-tree run also reads their unfinished
 edits rather than the delivered state, so the closing row belongs to whoever closes the wave — and it
 carries the commit that wave produced, not the commit it started from.
+
+### The operator's working list — the 65 lines that no grep and no test can close
+
+Everything above is either green or one of these 65 rows. They are listed here as ONE list, by kind,
+so the operator can plan: **54 of them need the running instance**, the remaining **11 are reviews of
+the artefact** and can be done before the daemon comes up. A line appears under every kind it asks
+for, so the four counts add up to more than 65 while the union is exactly 65.
+
+Recompute the list and the total from this document at any time — it ages with the table above, so
+the commands are the criterion and the numbers below are a reading:
+
+```sh
+grep -cE '^\| (K|REQ|B)-[0-9]+ \|.*(E2E open|Visual inspection open)' deploy/migration/20-sichtpruefung.md   # 65
+grep -cE '^\| (K|REQ|B)-[0-9]+ \|.*E2E open' deploy/migration/20-sichtpruefung.md                            # 15
+```
+
+| Kind | What it needs | Lines |
+|---|---|---|
+| **E2E** (15) | a person clicking the whole path at the running instance | REQ-007 · REQ-012 · REQ-035 · REQ-036 · REQ-037 · B-25 · B-27 · B-28 · B-31 · B-32 · B-33 · B-34 · B-37 · B-39 · B-40 |
+| **Measurement** (8) | logs, counters, request lists — at the running instance, over time | K-2 · K-5 · K-6 · REQ-017 · REQ-018 · REQ-034 · REQ-044 · B-36 |
+| **Look** (37) | the surface in front of you at the running instance | K-4 · K-5 · REQ-002 · REQ-004 · REQ-005 · REQ-009 · REQ-010 · REQ-015 · REQ-016 · REQ-020 · REQ-021 · REQ-022 · REQ-024 · REQ-029 · REQ-030 · REQ-031 · REQ-033 · REQ-034 · REQ-036 · REQ-038 · REQ-040 · REQ-041 · REQ-042 · REQ-043 · REQ-044 · B-01 · B-03 · B-18 · B-24 · B-28 · B-29 · B-30 · B-36 · B-38 · B-42 · B-43 · B-45 |
+| **Review** (22) | reading the artefact — code, permissions, module cut, invariant checklist. **No running service.** Eleven lines need nothing else: REQ-023 · REQ-026 · REQ-028 · B-06 · B-14 · B-15 · B-17 · B-20 · B-23 · B-41 · B-44 | REQ-022 · REQ-023 · REQ-026 · REQ-028 · REQ-040 · REQ-041 · REQ-043 · B-03 · B-06 · B-14 · B-15 · B-17 · B-20 · B-23 · B-24 · B-28 · B-31 · B-32 · B-37 · B-39 · B-41 · B-44 |
+
+The kinds are not this document's invention: each is the word the acceptance matrix uses in the
+line's own "Wie geprüft wird" cell (`Sichtprüfung`, `Messung`, `Review`, `E2E`/`Klick-Durchgang`).
+Where this document and the matrix disagree, the matrix decides.
 
 ### §1 — the six construction faults (K-1 … K-6)
 

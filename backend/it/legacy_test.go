@@ -3,6 +3,7 @@ package it
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,14 +100,20 @@ func TestLegacyResultsStayReadableThroughTheHistoryRoute(t *testing.T) {
 		t.Errorf("the legacy skip is not named as a failure: %+v", b.Stages[0])
 	}
 
-	// A step the old system left "running" is NOT terminal — so the pipeline is not done, and the
-	// entry renders as the unfinished thing it is instead of pretending completion.
+	// A step the old system left "running" is closed as ABORTED: the archive is a closed past, so a
+	// stage carried as running would make this surface pulse for a repository where nothing runs. The
+	// pipeline therefore reads as done — and never as a success, because nothing ever ended it.
 	c := byRepo["svc-c"]
-	if c.Done || c.Succeeded {
-		t.Errorf("a legacy execution frozen mid-step reads as done=%v succeeded=%v", c.Done, c.Succeeded)
+	if !c.Done || c.Succeeded {
+		t.Errorf("a legacy execution frozen mid-step reads as done=%v succeeded=%v, want done and not succeeded", c.Done, c.Succeeded)
 	}
-	if c.Stages[0].State != model.StepRunning {
-		t.Errorf("the frozen legacy step reads as %q, want running (display-only, never produced anew)", c.Stages[0].State)
+	if c.Stages[0].State != model.StepFailed || !strings.Contains(c.Stages[0].Reason, "aborted") {
+		t.Errorf("the frozen legacy step reads as %q/%q, want a terminal state naming it aborted", c.Stages[0].State, c.Stages[0].Reason)
+	}
+	for _, sv := range c.Stages {
+		if !sv.State.Terminal() {
+			t.Errorf("stage %q is %q — an archived record holds nothing transient", sv.Stage, sv.State)
+		}
 	}
 
 	// The detail route serves the same document — one data path for list and detail.

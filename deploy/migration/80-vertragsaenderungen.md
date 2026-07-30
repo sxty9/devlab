@@ -611,3 +611,232 @@ pool against a fixture derived field-by-field from the real file
 `TestLegacyPendingPRPoolNeedsNoConversion`, `TestLegacyNoticePoolNeedsNoConversion`,
 `TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead`,
 `TestPoolsWithoutAReaderAreSetAsideWithTheirReason`).
+
+---
+
+## Repair wave 4
+
+### `deploy/devlabd.service` — the address is an environment value, and one instance value returns to the drop-in
+
+**Who:** repair wave 4 (U1). The template is not on the §0.2 freeze list; this entry is recorded
+because it names two REQUIREMENTS the cutover must satisfy, and a cutover that misses either changes
+observable behaviour without failing.
+**Reason (measured against the installed unit, read-only, `systemctl cat devlabd`):** the running
+instance carries two values in the UNIT — not in the drop-in — that step 2 of `00-cutover.md`
+overwrites wholesale, and the drop-in table treated only the drop-in:
+
+1. `DEVLAB_COOKIE_DOMAIN`. It is read by the shipped code (`api/cookies.go`) and deliberately absent
+   from this template because it is an instance value. Lost, the session cookies this service
+   re-mints on refresh become HOST-ONLY and stand beside the landscape's domain-wide ones instead of
+   overwriting them — which is the exact duplicate the code's own comment exists to prevent, and a
+   logout at the landscape no longer clears the host-only copy.
+2. The listen address. The old unit passed it as `ExecStart=… --listen <addr>`; the rebuilt binary
+   parses NO command-line flags and reads `DEVLAB_ADDR` alone, so a carried-over flag silently does
+   nothing and the process listens wherever `DEVLAB_ADDR` points. If that is not the address the
+   shared edge proxies to, every request to the service fails while the unit reads as active.
+
+Additionally `DEVLAB_REPOS_PATH`, which the old unit set to an operator home, is now only the
+dev-bypass sandbox base — carried over it aims repository resolution at foreign working copies
+instead of the per-user workspaces under the state root.
+**What changed:** three notes in the template's environment-contract block (the address, the cookie
+domain, the sharpened `DEVLAB_REPOS_PATH` warning) plus the commented instance-value line for
+`DEVLAB_COOKIE_DOMAIN`, in the same form `DEVLAB_GH_OWNER` already uses. No directive and no
+`Environment=` line changed value, so no instance behaviour changes from the template alone.
+**Also recorded here:** `DEVLAB_RUNS_MAINTAIN_ENFORCE` — the arming switch of the pull-request
+maintenance, added to `internal/deliver` in this same wave — joins the environment contract and the
+commented arming block beside `DEVLAB_RUNS_PROTECTION_ENFORCE`. An arming switch that no template
+documents is a switch nobody sets: the drop-in table of `00-cutover.md` carries its row, and the
+table's own audit passes only because the shipped code reads exactly that name.
+**Consequence for operation:** `00-cutover.md` gains the table „Die Alt-Unit, Zeile für Zeile" beside
+the existing drop-in table, the drop-in table gains the `DEVLAB_COOKIE_DOMAIN` row, and step 2 checks
+all three: the cookie domain must be present, the four derived paths must be absent, and `--listen`
+must be gone from `ExecStart` while `DEVLAB_ADDR` matches the edge.
+**Diff hint:** `git diff 89ee3da -- deploy/devlabd.service deploy/migration/00-cutover.md`.
+**Proof:** `backend/it/cutover_runbook_test.go`
+(`TestCutoverDropInTableAgreesWithTheShippedEnvironmentContract` holds every row of the drop-in table
+to the shipped environment contract — the new `DEVLAB_COOKIE_DOMAIN` row passes only because the code
+reads that name), plus the two probes the step itself performs.
+
+### `deploy/migration/00-cutover.md` — the first start is HELD, and the foreign effect is the whole list
+
+**Who:** repair wave 4 (U1).
+**Reason:** the runbook claimed exactly one thing reaches outside DevLab (the branch-protection pass).
+Read against the code that is wrong by an order of magnitude, and the difference is not academic:
+`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246`), so from the FIRST tick
+after the first start it posts a delivery-origin status on every open pull request of every managed
+repository — hand-raised ones included — deletes the delivery branch of any tracked pull request a
+human merged meanwhile, and merges whatever has passed its window. The daily reporter performs a pass
+BEFORE its first interval, so a mail can leave the host seconds after the start; and `api.New` starts
+the constitution README seed as a background task, which clones the constitution repository and may
+push one commit. Measured on the real pre-cutover state directory: 61 tracked pull requests in 21
+repositories (5 blocked), 13 open ledger deliveries in 12 repositories, and one daily-report record
+still in `failed` with 46 attempts — which, having no backoff, is due again on the first pass.
+**What changed (no code):** the section „Fremdwirkung" now lists **fourteen** writing sites with the
+code position of each, whether it fires at the first start, what it writes and how it is held. The
+sequence gained the hold that follows from it: step 6 starts the daemon WITHOUT the runner identity
+(`DEVLAB_RUNS_USER`, `DEVLAB_RUNS_TOKEN_USER`), which makes `runnerToken()` answer "no runner account
+configured" — so PR maintenance, the protection pass, the chain, the reporter and the README seed all
+fail closed with a named error — step 6a MEASURES what the next tick would touch, and step 7 sets the
+identity and restarts. Step 0 now saves every artefact the cutover overwrites or removes (the four
+shared wrappers, both sudoers files, binary, unit, drop-in) with its path preserved, and the rollback
+restores each one in reverse order. Step 4 delivers the web root without rewriting its owner and mode
+(`rsync -a` transfers the SOURCE directory's owner and mode onto the target; measured in a sandbox:
+`drwxr-x---` became `drwxrwxr-x`) and proves the target unchanged. Step 5 stages the export where the
+service account can read it, proves the readability before the import, and removes the staging.
+**Consequence for operation:** the cutover is two starts, not one, and the acceptance walk of
+`20-sichtpruefung.md` happens after step 7. The hold the ORDER provides is a property of the
+procedure, not of the software; a switch that would make it one belongs to the owner of
+`internal/deliver` and `internal/api`, so the runbook does not assert its absence — it READS whether
+the installed binary and the template carry one (the `strings`/`grep` probe under the table) and says
+what follows in either case.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/00-cutover.md`.
+**Proof:** the eight assertions of `backend/it/cutover_runbook_test.go` still hold (backup complete
+against the derived state layout, sudoers validated before installing, organisation file provisioned,
+health probe derived from the configuration, `sudoedit` only, drop-in treated line by line, protection
+hold named); every new claim carries its own probe in the step that makes it — the backup lists what
+it saved and names what was absent, the web root is compared before and after, the export's
+readability is asserted before the import runs, and the held start is proven by the three log lines
+that say the passes had no runner account.
+
+### `deploy/migration/10-daten.md` — two more pools have a reader, and the import has a precondition
+
+**Who:** repair wave 4 (U1).
+**Reason:** the takeover table surveyed every pool of the pre-rebuild state directory except three
+that DO have a reader in the rebuild. `mercury/daily-reports.json` is the load-bearing one: the
+rebuilt ledger reads it field for field, and a record left in `failed` without a backoff is due again
+on the reporter's very first pass, whatever its age — so the first start re-attempts a send the old
+instance already failed, and a day inside the lookback window is reported for work the OLD instance
+did. `mercury/axiom-checks.json`, `mercury/axiom-authors.json` and `mercury/attachments/` were
+measured to read as they lie and need no conversion; saying so is what keeps the next reader from
+converting them. Separately, the import's own command was not executable as written: it ran as the
+service account against an export in the operator's home, where that account cannot even traverse
+(`0750`), so the documented line ended in exit `5`.
+**What changed:** three rows in the takeover table, and an import block that stages the export into a
+directory the service account owns, PROVES the readability before the import runs, and removes the
+staging afterwards (the raw export carries this instance's prompts). The binary is invoked by name
+because the cutover now installs it — running it out of `/tmp` made the import depend on the umask of
+the account that built it. M4 states that the startup reconciliation is DEFERRED at the held first
+start and runs at the restart of step 7; step A states that it must follow step 7, because the
+constitution store resolves its token through the same runner identity.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/10-daten.md`.
+**Proof:** the readability precondition and the staging removal are probes in the step itself; the
+three pool rows were measured against the real state directory (shape comparison against
+`report.Record`, `runs.AxiomChecks`, `axiomauthors.Author` and the attachment path layout), and the
+"due again" claim is the shipped `due()` in `report/reporter.go:251`, which returns true for a failed
+record with no backoff.
+
+### `deploy/migration/20-sichtpruefung.md` — the inspection kinds are the matrix's own, and the open work is one list
+
+**Who:** repair wave 4 (U1).
+**Reason:** the document bound two claims to a wave name rather than a commit, and its legend called
+every open item an inspection "at the running instance" — which is wrong for the matrix's `Review`
+kind: reading file permissions, a module cut or an invariant checklist needs no running service, and
+lumping it in with a measurement hides which work can start before the daemon is up. The document
+also never said WHICH lines the operator still has to walk, so the open half of the acceptance had no
+list.
+**What changed:** the two corrections now name commits (`c98d4a9`, `89ee3da`); the legend spells the
+three kinds the matrix uses (`Sichtprüfung`, `Messung`, `Review`) and states that a review needs no
+running instance; and a working list carries all 65 open lines grouped by kind — 15 E2E, 8
+measurements, 37 looks, 22 reviews, of which 11 need nothing but a review — with the two grep commands
+that recompute the totals from the table itself.
+**Diff hint:** `git diff 89ee3da -- deploy/migration/20-sichtpruefung.md`.
+**Proof:** the kinds were derived by comparing every row against the "Wie geprüft wird" cell of the
+same line in the acceptance matrix; the comparison reports zero disagreements in either direction.
+`tools/abnahme.sh` check `doc-a` (cited check ids exist, section sizes match) and
+`backend/it/cutover_runbook_test.go` (`TestInspectionResultRowIsBoundToACommit`,
+`TestInspectionReportsE2ELinesAsE2E` — the working list sits outside the enumeration block that test
+parses, so it cannot dilute the E2E claim) both hold.
+
+### `backend/cmd/devlabd/main.go` — the restart gate is a boot precondition, and the boot names the maintenance hold
+
+**Who:** repair wave 4 (U2).
+**State of record:** `backend/cmd/devlabd/main.go@62ed7ea56be4` — this entry describes it (entry 1
+describes the boot order it extends).
+**Reason (measured):** the readiness socket was started in a goroutine whose only reaction to a
+failure was `log.Printf`. That socket is not a status line: it is the interlock `devlab-migrate`
+takes. Measured against the shipped binary — with the socket up the migration refuses with exit `10`
+while an execution runs; with no socket at all there is NO refusal, because a daemon that does not
+answer reads as dead and therefore as "nothing running". A daemon that had lost its gate went on
+serving, and the next import would have worked a LIVE state tree with two writers on it.
+**Decision:** refuse the start, rather than carrying the lock elsewhere. A second lock path (a pid
+file, a unit query) would be a parallel access point to the same truth, and the gate must be
+answerable for the migration to take it at all — so the honest rule is that the daemon does not serve
+what it cannot protect. This is symmetric with the two boot preconditions above it: an unwritable
+state root and an unreadable session secret already refuse the start.
+**What changed:** the gate goes up BEFORE the HTTP listener. `awaitGate` waits until the socket
+ANSWERS a dial, or until the attempt to bring it up reports its failure, or until
+`DEVLAB_READY_GATE_TIMEOUT` (default 10s) is over; the first two are named, the third is named as
+silence, and each refuses the start. A gate lost LATER brings the daemon down through the existing
+drain (a running execution is still persisted as interrupted, K-2) and exits non-zero. The boot
+additionally states in ONE line whether the pull-request maintenance starts armed or held (see the
+`deliver.go` entry below), the way it already states the self-check and the reporter.
+**Diff hint:** `git diff 89ee3da -- backend/cmd/devlabd/main.go`.
+**Proof:** `backend/cmd/devlabd/main_test.go` — a gate that comes up late is awaited, a bind failure
+is handed back verbatim, and silence refuses within its budget. Probe against the built binary: with
+the socket path blocked the process exits `1` with `refusing to serve without the interlock …` and
+answers nothing on its HTTP address; with a free state root it logs `pull-request maintenance HELD`,
+then `listening on …`, and `GET /ready` over the socket answers `204`.
+
+### `backend/internal/deliver/deliver.go` — the pull-request maintenance stands still until the operator arms it
+
+**Who:** repair wave 4 (U2). `deliver.go` is not on the §0.2 freeze list; this entry is recorded
+because it changes the SHIPPED DEFAULT of an effect outside DevLab.
+**Reason:** `deliver.Maintain` merges pull requests, deletes their branches and writes commit statuses
+in other organisations' repositories, and the scheduler drives it from the FIRST tick after boot —
+over a pool that a cutover imported minutes earlier and that nobody has looked at. That is the one
+effect no restart may cause on its own; the protection check next to it was already held for exactly
+this reason (`DEVLAB_RUNS_PROTECTION_ENFORCE`, entry above).
+**What changed:** `DEVLAB_RUNS_MAINTAIN_ENFORCE` arms the writing half; unarmed — the shipped default
+— `Maintain` performs an OBSERVATION pass: it reads its own pools, makes no GitHub call at all (so it
+needs neither token nor network), changes none of its own records either, and raises ONE notice
+(`delivery-held`) naming the standstill and the switch that ends it. It stays silent while nothing is
+waiting. Holding the pass whole is deliberate: a pass that mirrored half its findings and held back
+the other half would leave a mixed state nobody can reason about, so the state the migration produced
+stays exactly as it is until the operator arms it, and the first armed pass then works the queue in
+creation order. The word set of the switch is parsed by ONE function (`deliver.ArmedByEnv`), so the
+two holds cannot disagree about what "armed" means.
+**Visible where it matters:** the notice feed labels the kind (`Maintenance held`), the daily report
+carries it in the delivery-alarm rubric, the Deliveries surface shows the service's own sentence with
+the moment it was last reported, and the boot log names the state.
+**Diff hint:** `git diff 89ee3da -- backend/internal/deliver/deliver.go`.
+**Proof:** `TestMaintainHeldWritesNothing` (unarmed: zero calls of any kind on the fixture GitHub,
+ledger/PR pool/result untouched, the notice raised with the switch in it, a second pass bundled into
+one row; armed: the same situation merged and pruned) and `TestMaintainHeldStaysSilentWithNothing-
+Waiting`. Every pre-existing test that exercises the writing half now arms it explicitly through
+`armMaintain(t)` / `t.Setenv(deliver.EnvMaintainEnforce, "1")` — the default is off, and the suite
+says so.
+
+### `backend/internal/runs/results.go` — an archived execution has ended, and nothing in it is running
+
+**Who:** repair wave 4 (U2).
+**Reason (measured against the imported archive, 82 records):** the mapping left `EndedAt` nil for a
+zero `finishedAt` (14 records) and carried a step recorded as `running` verbatim (4 records). Both are
+claims the stock does not cover. The history selector drops an execution that never ended while the
+history's counter counted every record it read — measured on the imported stock: `History (65) · 17
+still open` with an EMPTY Active list, so an entry that exists was invisible and a number nobody can
+point at was claimed. And a `running` stage made the surface pulse for a repository where nothing
+runs, which is the ghost REQ-039.1 exists to remove.
+**What changed:** the archive is read as the closed past it is. A step recorded as running is closed
+as ABORTED — a terminal state whose mandatory reason names what the archive recorded and that the
+outcome is unknown. A record without a finishing time is ENDED at the last instant the record itself
+carries (its own start when it carries no later one), and it SAYS so: the result's report states which
+instant stands in for the missing stamp. Where the source additionally flagged the record as not ok,
+every repository carries one `archived-cutoff` stage (`not-executed`, with its reason) stating that
+nothing followed the last recorded step — otherwise a chain cut off after `implement` would read as a
+completed success (K-4). A record the source flagged as ok keeps its recorded success: a false failure
+is as much a lie as a false green. Nothing is invented beyond the record: no time is claimed that the
+document does not carry, and the moved-aside archive keeps every original verbatim.
+**Consequence for the surface:** `src/views/mercury/tasks/select.ts` gains `outsideHistory`, which
+splits what the history does NOT show by the reason that keeps it out — running (shown in Active) or
+awaiting delivery (shown in the ledger) — and `ExecutionsView` renders those two named numbers instead
+of subtracting the history from the pool. Measured after the change: all 82 archive records carry an
+end, no stage is transient, and the counter claims nothing.
+**Diff hint:** `git diff 89ee3da -- backend/internal/runs/results.go src/views/mercury/tasks/select.ts`.
+**Proof:** `TestArchiveRecordWithoutFinishingTimeIsEndedAndCounted` over the four forms the imported
+archive actually holds among its unstamped records (instance-neutral fixtures: cut off mid-step, all
+recorded steps ended, flagged ok with complete chains, no repository at all) plus the invariant "every
+archive record ended, holds nothing transient and states where its end came from";
+`TestLegacyResultsReadTolerantly` and `backend/it/legacy_test.go` for the aborted step;
+`TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead` for the imported document; and
+`src/views/mercury/tasks/select.test.ts` for the partition (history ∪ running ∪ awaiting = the pool,
+each record in exactly one place).

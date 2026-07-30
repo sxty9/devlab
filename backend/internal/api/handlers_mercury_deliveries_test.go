@@ -324,6 +324,9 @@ func TestRollbackEndpointGuards(t *testing.T) {
 // an overdue tracked PR of a recorded delivery is merged and untracked, and the ledger is
 // mirrored (the endpoint the scheduler will drive).
 func TestMaintainDeliveriesComposition(t *testing.T) {
+	// The maintenance is HELD until the operator arms it (deliver.EnvMaintainEnforce); this test
+	// drives the writing half, so it arms it explicitly.
+	t.Setenv(deliver.EnvMaintainEnforce, "1")
 	s := deliveriesServer(t)
 	f := &fakeDeliverOps{prState: map[string]deliver.PRState{
 		"o/x|5": {Number: 5, State: "closed", Merged: true, MergedAt: &tD, HeadRef: "fix/one-a1", HeadSHA: "c1"},

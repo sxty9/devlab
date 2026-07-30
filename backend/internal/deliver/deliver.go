@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -687,14 +688,80 @@ func postOriginStatusBestEffort(ctx context.Context, gh GitHubOps, ledger *runs.
 
 // ── Maintenance (auto-merge + prune + status, F14/REQ-026.4/B-8) ─────────────────────────
 
+// EnvMaintainEnforce names the switch that ARMS the writing half of Maintain — a named handover by
+// the operator, never a default.
+//
+// FOREIGN EFFECT, HELD BY DEFAULT: this maintenance merges pull requests, deletes their branches and
+// writes commit statuses in OTHER organisations' repositories. On the first start of a rebuilt
+// instance it would do all of that from the very first scheduler tick, over a pool that was imported
+// minutes earlier and that nobody has looked at — the one effect no restart may cause on its own. So
+// it is held: unarmed, the pass establishes the situation and REPORTS it, and writes nothing at all.
+// The switch is read here, inside the one function that performs the effect, so every caller — the
+// scheduler tick, the maintenance route, a test harness — is covered by the same hold.
+const EnvMaintainEnforce = "DEVLAB_RUNS_MAINTAIN_ENFORCE"
+
+// ArmedByEnv reads an arming switch: a foreign-effect pass writes only where the operator has
+// affirmatively armed it. ONE parser for every such switch — the protection hold reads the same word
+// set — so two holds can never disagree about what "armed" means, and the runbook has one answer.
+func ArmedByEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// MaintainArmed reports whether the operator armed the writing half of the maintenance.
+func MaintainArmed() bool { return ArmedByEnv(EnvMaintainEnforce) }
+
+// maintainHeldText is the standstill as the feed states it. It carries NO counts on purpose: an
+// unchanged message bundles into ONE record with a count and a period (REQ-032.5), while a text that
+// moved with every tick would file a new row every tick. What is waiting is visible where it lives —
+// the delivery ledger — and this sentence says why none of it moves.
+const maintainHeldText = "pull-request maintenance is HELD: nothing is merged, no delivery branch " +
+	"is pruned and no delivery-origin status is written until the operator arms it — set " +
+	EnvMaintainEnforce + "=1. Until then every tracked pull request stays exactly as it is; the " +
+	"first armed pass then merges what is due, in creation order."
+
+// reportMaintainStandstill is the UNARMED pass: it establishes the situation from DevLab's OWN pools
+// and reports it — no foreign call is made at all, so it needs neither token nor network, and no
+// record of DevLab's own is changed either. A pass that mirrored half its findings and held back the
+// other half would leave a mixed state nobody can reason about; a standstill is a standstill. The
+// report is raised only while something is actually waiting: with an empty pool there is nothing to
+// explain and the feed stays silent.
+func reportMaintainStandstill(prs *runs.PRStore, ledger *runs.DeliveryStore, n *runs.NoticeStore) error {
+	tracked, err := prs.List()
+	if err != nil {
+		return err
+	}
+	waiting := len(tracked)
+	if all, lerr := ledger.All(); lerr == nil {
+		for _, d := range all {
+			if d.OpenState() {
+				waiting++
+			}
+		}
+	}
+	if waiting == 0 {
+		return nil
+	}
+	notify(n, runs.NoticeDeliveryHeld, "", maintainHeldText)
+	return nil
+}
+
 // Maintain is the recurring PR maintenance: auto-merge after the window (method EXCLUSIVELY
 // "merge"); the SAME place merges AND deletes the delivery branch (F14/REQ-026.4; branch 404 =
 // Satisfied); sets Result.MergedAt per the B-8 rule; backoff/blockade at the PR record;
 // mercury-dev NEVER falls under prune. It also re-posts the delivery-origin status on every
 // open PR of the repos it manages, so a hand-raised PR carries its explained rejection.
+//
+// Every line below writes into foreign repositories, so the whole pass is behind the hold above.
 func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs.DeliveryStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher) error {
 	if prs == nil || ledger == nil {
 		return errors.New("deliver: maintain needs the PR pool and the ledger")
+	}
+	if !MaintainArmed() {
+		return reportMaintainStandstill(prs, ledger, n)
 	}
 	tracked, err := prs.List()
 	if err != nil {

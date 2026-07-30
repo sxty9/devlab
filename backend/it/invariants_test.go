@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/executor"
 	"devlab/backend/internal/faultclass"
 	"devlab/backend/internal/github"
@@ -191,6 +192,9 @@ func TestPermanentDeliveryFaultIsAttemptedExactlyOnce(t *testing.T) {
 // Catches: a maintenance loop that keeps retrying a permanent fault (the old 20-second forever), and
 // a blockade without a reason.
 func TestMaintenanceBlocksAPermanentMergeFaultWithoutRetrying(t *testing.T) {
+	// The maintenance writes into foreign repositories and is HELD until the operator arms it
+	// (deliver.EnvMaintainEnforce). This test drives the writing half, so it arms it explicitly.
+	t.Setenv(deliver.EnvMaintainEnforce, "1")
 	shrinkBackoff(t)
 	e := newEnv(t, sched.Config{Tick: time.Hour}) // the ticks are driven by hand here
 	ctx := e.ctx
@@ -338,6 +342,9 @@ func TestEvidenceFreeSkipIsRefusedAndAttestedSkipIsAccepted(t *testing.T) {
 // Catches: dropping the auto-merge registration (nothing would ever be merged), merging with another
 // method, pruning somewhere else, and a task-state derivation that does not see the arrival.
 func TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault(t *testing.T) {
+	// The maintenance writes into foreign repositories and is HELD until the operator arms it
+	// (deliver.EnvMaintainEnforce). This test drives the writing half, so it arms it explicitly.
+	t.Setenv(deliver.EnvMaintainEnforce, "1")
 	e := newEnv(t, sched.Config{Tick: time.Hour})
 	ctx := e.ctx
 	e.mergeNow()

@@ -8,10 +8,55 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// The readiness socket is the interlock devlab-migrate takes: a live daemon answers 423 and the
+// migration refuses (exit 10), while a daemon whose socket never came up reads as dead and lets the
+// migration work a LIVE state tree. So the boot waits for the gate to answer and names every way it
+// can fail to — it never continues on the assumption that the gate is probably up.
+func TestAwaitGateWaitsForAnAnsweringSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "ready.sock")
+	// The gate comes up a moment after the boot asks for it — the normal case.
+	go func() {
+		time.Sleep(60 * time.Millisecond)
+		l, err := net.Listen("unix", sock)
+		if err != nil {
+			return
+		}
+		t.Cleanup(func() { _ = l.Close() })
+	}()
+	if err := awaitGate(context.Background(), sock, make(chan error), 3*time.Second); err != nil {
+		t.Fatalf("a gate that comes up must be awaited, got %v", err)
+	}
+}
+
+func TestAwaitGateRefusesWhenTheSocketCannotComeUp(t *testing.T) {
+	failed := make(chan error, 1)
+	boom := errors.New("bind: permission denied")
+	failed <- boom
+	// No socket will ever exist here; the attempt reported its own failure.
+	err := awaitGate(context.Background(), filepath.Join(t.TempDir(), "ready.sock"), failed, 3*time.Second)
+	if !errors.Is(err, boom) {
+		t.Fatalf("the failure to bring the gate up must be handed back verbatim, got %v", err)
+	}
+}
+
+func TestAwaitGateRefusesOnSilence(t *testing.T) {
+	start := time.Now()
+	err := awaitGate(context.Background(), filepath.Join(t.TempDir(), "ready.sock"), make(chan error), 120*time.Millisecond)
+	if err == nil {
+		t.Fatal("a gate that never answers must refuse the start — a silent pass is the old behaviour under a new name")
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("the wait is unbounded (%s) — a boot must not hang on a missing gate", took)
+	}
+}
 
 // The first pass waits for the start delay — a boot alone changes nothing on GitHub.
 func TestProtectionLoopDoesNotRunAtBoot(t *testing.T) {

@@ -71,6 +71,9 @@ const (
 	NoticeDeliveryBlocked    = "delivery-blocked"
 	NoticeDeliverySelfCheck  = "delivery-selfcheck"
 	NoticeStructureViolation = "code-structure-violation"
+	// The standstill of the delivery maintenance: its writing half is not armed, so nothing is
+	// merged, pruned or stamped. A STATE the operator ends, and the reason nothing moves.
+	NoticeDeliveryHeld = "delivery-held"
 	// Delivery-origin findings (REQ-033): a protection that drifted, and a deliberate override.
 	NoticeProtectionDeviation = "protection-deviation"
 	NoticeAdminOverride       = "admin-override"

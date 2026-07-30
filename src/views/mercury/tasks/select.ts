@@ -52,3 +52,27 @@ export function splitOpenHistory(
     history: results.filter((res) => executionCompleted(res, openDeliveryExecutionIds)),
   };
 }
+
+/** What the history does NOT show, split by the REASON that keeps each record out — the exact
+ *  complement of `splitOpenHistory`'s history, derived from the same predicate over the same pool.
+ *
+ *  A remainder computed as "everything minus the history" is a number without a subject: it counts
+ *  records the list hides without saying what they are, so a count can stand beside an empty list
+ *  and nobody can point at what it counts. The two reasons are the only two there are, and each has
+ *  a place the record IS shown:
+ *
+ *   - `inFlight` — no end stamp: the execution is running, and the Active surface shows it.
+ *   - `awaitingDelivery` — ended, but the ledger still holds a delivery of it open (B-8): the
+ *     delivery ledger shows it, and its todo stays in the open list. */
+export function outsideHistory(
+  results: RunResult[],
+  openDeliveryExecutionIds?: ReadonlySet<string>,
+): { inFlight: RunResult[]; awaitingDelivery: RunResult[] } {
+  const out: { inFlight: RunResult[]; awaitingDelivery: RunResult[] } = { inFlight: [], awaitingDelivery: [] };
+  for (const res of results) {
+    if (executionCompleted(res, openDeliveryExecutionIds)) continue;
+    if (!res.endedAt) out.inFlight.push(res);
+    else out.awaitingDelivery.push(res);
+  }
+  return out;
+}

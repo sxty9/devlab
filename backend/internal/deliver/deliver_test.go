@@ -716,10 +716,99 @@ func trackedPR(d runs.Delivery, mergeBy time.Time) runs.PendingPR {
 	}
 }
 
+// armMaintain arms the writing half of the maintenance — the operator's named handover. Every test
+// that expects a WRITE says so through this line: unarmed is the shipped default (pinned by
+// TestMaintainHeldWritesNothing), so a pass that merges, prunes or stamps runs only after it.
+func armMaintain(t *testing.T) {
+	t.Helper()
+	t.Setenv(EnvMaintainEnforce, "1")
+}
+
+// TestMaintainHeldWritesNothing — the standstill of the first start: unarmed (the shipped default)
+// the maintenance makes NO call into a foreign repository at all, changes none of its own records,
+// and says in the feed why nothing moves. Armed, the very same situation is worked.
+func TestMaintainHeldWritesNothing(t *testing.T) {
+	if MaintainArmed() {
+		t.Fatalf("%s must be off by default — a first start must not write into foreign repositories", EnvMaintainEnforce)
+	}
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour))) // overdue: an armed pass WOULD merge it
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d.Branch, HeadSHA: "c1"}
+	_ = res.Put(runs.Result{ID: "exec_1", RunID: "run_1", Kind: model.KindTodo, StartedAt: t0})
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("a hold is a decision, not a failure: %v", err)
+	}
+	// Not one mutating call — and not even a read: the held pass needs neither token nor network.
+	if len(gh.mergeCalls) != 0 || len(gh.deleted) != 0 || len(gh.statuses) != 0 || len(gh.closeCalls) != 0 || len(gh.protectCalls) != 0 {
+		t.Errorf("the held pass wrote into a foreign repository: merges=%v deleted=%v statuses=%v closed=%v protect=%v",
+			gh.mergeCalls, gh.deleted, gh.statuses, gh.closeCalls, gh.protectCalls)
+	}
+	if gh.getPRCalls != 0 {
+		t.Errorf("the held pass called GitHub %d time(s) — it establishes the situation from its own pools", gh.getPRCalls)
+	}
+	// Nothing of DevLab's own moved either: a half-mirrored state is nobody's truth.
+	if got, _, _ := ledger.ByID("dlv_1"); got.MergedAt != nil || got.ClosedAt != nil {
+		t.Errorf("the held pass settled a delivery: %+v", got)
+	}
+	if left, _ := prs.List(); len(left) != 1 {
+		t.Errorf("the tracked pull request must stay tracked, left %+v", left)
+	}
+	if r, _, _ := res.Get("exec_1"); r.MergedAt != nil {
+		t.Errorf("the held pass closed an execution: %+v", r)
+	}
+	// …and the standstill is stated, with the switch that ends it.
+	notices, err := n.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notices) != 1 || notices[0].Kind != runs.NoticeDeliveryHeld {
+		t.Fatalf("the standstill is not in the feed: %+v", notices)
+	}
+	if !strings.Contains(notices[0].Message(), EnvMaintainEnforce) {
+		t.Errorf("the notice does not name the switch that ends the hold: %q", notices[0].Message())
+	}
+	// A second held pass bundles onto the same record instead of filing a row every tick.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatal(err)
+	}
+	if notices, _ = n.List(); len(notices) != 1 || notices[0].Count != 2 {
+		t.Errorf("the repeated standstill must bundle into one row with a count, got %+v", notices)
+	}
+
+	// Armed — and the very same situation is worked.
+	armMaintain(t)
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain (armed): %v", err)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != "o/x|5|merge" {
+		t.Errorf("the armed pass must merge what is due, calls = %v", gh.mergeCalls)
+	}
+	if len(gh.deleted) != 1 {
+		t.Errorf("the armed pass must prune the delivery branch, deleted = %v", gh.deleted)
+	}
+}
+
+// TestMaintainHeldStaysSilentWithNothingWaiting: no tracked pull request and no open delivery means
+// there is nothing the hold explains — and the feed stays silent.
+func TestMaintainHeldStaysSilentWithNothingWaiting(t *testing.T) {
+	ledger, prs, res, n := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t)
+	if err := Maintain(context.Background(), newFakeGH(), prs, ledger, res, n, &fakePub{}); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	if notices, _ := n.List(); len(notices) != 0 {
+		t.Errorf("an empty pool needs no explanation, got %+v", notices)
+	}
+}
+
 // TestMaintainMergesAndPrunes: an overdue open PR is merged with the LITERAL method "merge",
 // the SAME pass deletes the delivery branch, mirrors MergedAt onto the ledger, drops the pool
 // entry, closes the execution result per B-8 and ticks the deliveries topic.
 func TestMaintainMergesAndPrunes(t *testing.T) {
+	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
@@ -758,6 +847,7 @@ func TestMaintainMergesAndPrunes(t *testing.T) {
 // TestMaintainDetectsHumanMerge: a PR merged by a human between ticks is finalized the same
 // way — mirrored (with GitHub's merge time), pruned, untracked.
 func TestMaintainDetectsHumanMerge(t *testing.T) {
+	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
@@ -784,6 +874,7 @@ func TestMaintainDetectsHumanMerge(t *testing.T) {
 // TestMaintainBranchAlreadyGone: "the branch no longer exists" is SUCCESS (404 = Satisfied) —
 // the record completes normally.
 func TestMaintainBranchAlreadyGone(t *testing.T) {
+	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
@@ -803,6 +894,7 @@ func TestMaintainBranchAlreadyGone(t *testing.T) {
 // TestMaintainNeverPrunesWorkbench: mercury-dev never falls under the prune — even when a
 // corrupt record names it.
 func TestMaintainNeverPrunesWorkbench(t *testing.T) {
+	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: workbench.Branch, PRNumber: 5, CreatedAt: t0}
@@ -826,6 +918,7 @@ func TestMaintainNeverPrunesWorkbench(t *testing.T) {
 // TestMaintainCreationOrder: PRs of one repo merge strictly in creation order — a failing
 // older PR gates the younger one this tick.
 func TestMaintainCreationOrder(t *testing.T) {
+	armMaintain(t)
 	stubClassification(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
@@ -871,6 +964,7 @@ func TestMaintainBlockedSkipped(t *testing.T) {
 // the PR record; exhausted attempts block it honestly (reason, time, attempts) and the
 // blockade is surfaced as a notice.
 func TestMaintainBackoffThenBlock(t *testing.T) {
+	armMaintain(t)
 	stubClassification(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
@@ -918,6 +1012,7 @@ func TestMaintainBackoffThenBlock(t *testing.T) {
 // recorded head passes, a hand PR and a namesake branch whose head moved both fail with the
 // explained path.
 func TestMaintainOriginStatuses(t *testing.T) {
+	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	_ = ledger.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0})

@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
@@ -734,10 +735,18 @@ func TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead(t *testing.T) {
 	if !res.Legacy {
 		t.Error("an archived execution must be marked as archive provenance")
 	}
-	// A zero finishing time means "never finished" — and that is what it says, rather than a
-	// fabricated end.
-	if res.EndedAt != nil {
-		t.Errorf("a zero finishing time must not become an end: %v", res.EndedAt)
+	// A zero finishing time is a missing STAMP, not an open execution: the archive is a closed past,
+	// so the record is ENDED at the last instant it itself carries — and its report says that this
+	// instant stands in for the stamp the source never wrote. Left unstamped the entry fell out of the
+	// history while the history's counter still counted it.
+	if res.EndedAt == nil {
+		t.Fatal("a zero finishing time left the record without an end — invisible in the history, counted in its number")
+	}
+	if want := time.Date(2026, 7, 28, 6, 45, 20, 305518250, time.UTC); !res.EndedAt.Equal(want) {
+		t.Errorf("end = %v, want the last instant the record carries (%v)", res.EndedAt, want)
+	}
+	if !strings.Contains(res.Report, "standing in for the missing stamp") {
+		t.Errorf("the substituted end is not stated in the record:\n%s", res.Report)
 	}
 	// repos + live, each with its stages VERBATIM.
 	stages := map[string]model.StepState{}
@@ -746,6 +755,11 @@ func TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead(t *testing.T) {
 		repos = append(repos, rp.Repo)
 		for _, st := range rp.Stages {
 			stages[string(st.Stage)] = st.State
+		}
+		// …and none of them reads as a completed chain: the source flagged the record as not ok, so
+		// every pipeline states that nothing followed its last recorded step (no false green, K-4).
+		if rp.Succeeded {
+			t.Errorf("%s reads as succeeded although the record was cut off: %+v", rp.Repo, rp.Stages)
 		}
 	}
 	if !equalSorted(repos, []string{"alpha", "beta", "gamma"}) {

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { executionCompleted, runCompleted, splitOpenHistory } from './select.ts';
+import { executionCompleted, outsideHistory, runCompleted, splitOpenHistory } from './select.ts';
 // Which executions still hold an open delivery is READ off the ledger, where the server states it —
 // these selectors never derive it, so the set comes from the delivery module (B-35).
 import { openDeliveryExecutionIds } from '../deliveries/deliveries.ts';
@@ -102,6 +102,36 @@ test('open deliveries come from the LEDGER, never from a stage name (B-35)', () 
     assert.ok(!src.includes(`'${s}'`), `select.ts must not carry the stage literal ${s}`);
   }
   assert.ok(!/\.stage\b/.test(src), 'select.ts must not read a chain stage at all');
+});
+
+test('what the history hides is counted BY ITS REASON, and every record lands in exactly one place', () => {
+  // The three states a record can be in, and nothing else: settled, still running, ended with an
+  // open delivery. The archive record is the case that broke the surface — mapped without an end
+  // stamp it was hidden from the list AND counted as open while Active stood empty — so it appears
+  // here as the mapping now delivers it: ended, hence history.
+  const settled = result('exec_settled', 'run_a');
+  const archived = result('exec_archived', 'run_a', { legacy: true, endedAt: '2026-07-26T10:30:00Z' });
+  const live = result('exec_live', 'run_a', { endedAt: undefined });
+  const undelivered = result('exec_open_pr', 'run_a');
+  const all = [settled, archived, live, undelivered];
+
+  const open = openDeliveryExecutionIds([dlv('dlv_1', 'exec_open_pr', 'open')]);
+  const history = all.filter((res) => executionCompleted(res, open));
+  const outside = outsideHistory(all, open);
+
+  assert.deepEqual(history.map((r) => r.id), ['exec_settled', 'exec_archived']);
+  assert.deepEqual(outside.inFlight.map((r) => r.id), ['exec_live'], 'only an execution without an end stamp is running');
+  assert.deepEqual(outside.awaitingDelivery.map((r) => r.id), ['exec_open_pr'], 'the ledger, not a stage, holds this one back');
+
+  // The invariant the header depends on: the list and its counters PARTITION the pool, so no number
+  // can stand beside a list that does not contain what it counts.
+  const placed = [...history, ...outside.inFlight, ...outside.awaitingDelivery].map((r) => r.id);
+  assert.equal(placed.length, all.length, 'a record is counted twice or not at all');
+  assert.deepEqual([...new Set(placed)].sort(), all.map((r) => r.id).sort());
+
+  // An empty pool claims nothing at all.
+  const none = outsideHistory([], open);
+  assert.deepEqual([none.inFlight.length, none.awaitingDelivery.length], [0, 0]);
 });
 
 test('open ∩ history = ∅ (REQ-011.2)', () => {

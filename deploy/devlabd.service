@@ -36,12 +36,33 @@
 #                             configured organisation, so it is held: the first pass waits (default
 #                             15m) instead of running at boot, and it only READS and REPORTS until
 #                             the operator arms writing. See the hardening block below.
+#   DEVLAB_RUNS_MAINTAIN_ENFORCE
+#                             NEW, and the second switch of the same kind. The recurring pull-request
+#                             maintenance merges, prunes delivery branches and writes commit statuses
+#                             in the managed repositories, driven by the scheduler tick — so on a
+#                             freshly migrated instance it would do all of that from the FIRST tick,
+#                             over a pool nobody has looked at yet. Unarmed (the default) the pass
+#                             reports the standstill from DevLab's own pools and makes no foreign call
+#                             at all. Arm it in the drop-in once the pool has been inspected
+#                             (00-cutover.md step 6a).
 #   run-active/runs-active    REMOVED (REQ-039.3). Activity is a projection over the execution
 #                             documents; the only marker file is mercury/restart.json.
 #   DEVLAB_LINKS, DEVLAB_WORKSPACES, DEVLAB_STATIC_DIR, DEVLAB_REPOS_PATH
 #                             now DERIVE from DEVLAB_STATE_DIR (internal/statepath). The
 #                             historical per-variable overrides keep working as overrides for
-#                             genuinely split roots; stop setting them otherwise.
+#                             genuinely split roots; stop setting them otherwise. DEVLAB_REPOS_PATH
+#                             in particular is only the dev-bypass sandbox base: carried over from an
+#                             older unit that pointed it at an operator home, it aims repository
+#                             resolution at foreign working copies instead of the per-user
+#                             workspaces under the state root.
+#   listen address            DEVLAB_ADDR ONLY. The binary parses NO command-line flags, so a
+#                             `--listen <addr>` argument carried over from an older ExecStart is
+#                             silently ignored and the process listens wherever DEVLAB_ADDR points
+#                             — which must be the address the edge proxies to.
+#   DEVLAB_COOKIE_DOMAIN      unchanged in meaning, but it is an INSTANCE value and therefore no
+#                             longer in this template (see the commented line below). Unset, the
+#                             session cookies this service re-mints are host-only and stand BESIDE
+#                             the landscape's domain-wide ones instead of overwriting them.
 #   DEVLAB_RESTART_POLL / DEVLAB_RESTART_MAXWAIT
 #                             unchanged, but now consumed by devlab-restart-when-free polling
 #                             the ready SOCKET (restart-ready.sock) — the PID busy-marker of
@@ -81,6 +102,10 @@ Environment=DEVLAB_ADDR=127.0.0.1:8781
 # secret makes devlabd refuse to start in SSO mode (fail closed).
 Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
 Environment=DEVLAB_COOKIE_SECURE=1
+# The shared parent domain the landscape's session cookies are scoped to. It is an instance value,
+# so it is set in the drop-in and stays out of this template; unset, the cookies re-minted here are
+# host-only and shadow the domain-wide ones instead of overwriting them:
+#   Environment=DEVLAB_COOKIE_DOMAIN=<cookie-domain>
 # Honor a Holistic logout/rotation at refresh time (read-only).
 Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json
 # Per-user GitHub link store key + OAuth app config (operator-provisioned files).
@@ -101,6 +126,11 @@ Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
 # without changing anything. Arm it in the drop-in once the reported findings are the intended ones:
 #   Environment=DEVLAB_RUNS_PROTECTION_ENFORCE=1
 Environment=DEVLAB_RUNS_PROTECTION_START_DELAY=15m
+# The pull-request maintenance is the SECOND pass whose effect leaves DevLab: it merges, prunes
+# delivery branches and writes commit statuses in the managed repositories, on the scheduler's tick.
+# It is held the same way — unarmed it reports the standstill and makes no foreign call — and it is
+# armed in the drop-in once the pending-pull-request pool has been inspected:
+#   Environment=DEVLAB_RUNS_MAINTAIN_ENFORCE=1
 
 # Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo
 # wrappers to run ops as the end user); ProtectHome false so per-user git/claude configs

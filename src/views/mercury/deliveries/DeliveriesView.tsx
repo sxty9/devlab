@@ -22,6 +22,7 @@ import { useToast } from '@/ui/Toast';
 import { badgeTone } from '@/ui/tint';
 import { useLiveTopic } from '@/state/live';
 import type { Delivery, Repo } from '@/types';
+import { maintenanceHold, noticeAt, noticeText, type NoticeRecord } from '../notices';
 import {
   canRollback,
   commitRange,
@@ -48,6 +49,7 @@ export function DeliveriesView() {
   const [failed, setFailed] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
+  const [hold, setHold] = useState<NoticeRecord | null>(null);
 
   const gotRef = useRef(false);
 
@@ -59,6 +61,19 @@ export function DeliveriesView() {
     } catch (e) {
       // A transient tick never blanks a ledger that is already on screen.
       if (!gotRef.current) setFailed(msg(e));
+    }
+  }, [source]);
+
+  // Why nothing here moves is a question the ledger's own rows cannot answer: while the maintenance
+  // stands still (its writing half unarmed) every delivery simply stays open. The service says so in
+  // the notice feed, and this surface reads THAT — through the one notices access point, in the
+  // service's own wording — instead of inventing a second description of the same state.
+  const loadHold = useCallback(async () => {
+    try {
+      const { notices } = await source.mercuryRunNotices();
+      setHold(maintenanceHold(notices));
+    } catch {
+      /* keep what is known — a failed read never claims the maintenance is running */
     }
   }, [source]);
 
@@ -76,8 +91,10 @@ export function DeliveriesView() {
   useEffect(() => {
     void load();
     void loadRepos();
-  }, [load, loadRepos]);
+    void loadHold();
+  }, [load, loadRepos, loadHold]);
   useLiveTopic('deliveries', load);
+  useLiveTopic('notices', loadHold);
 
   const confirm = useCallback(async () => {
     if (!pending || busy) return;
@@ -128,6 +145,14 @@ export function DeliveriesView() {
     <div className="dl-scroll min-h-0 w-full flex-1 overflow-y-auto bg-bg-base">
       <div className="mx-auto max-w-4xl px-8 py-7">
         <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Deliveries</h1>
+
+        {/* The standstill, in the service's own words and with the moment it last reported it — so
+            nobody has to guess why open deliveries stay open. */}
+        {hold && (
+          <p className="mt-4 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-caption text-warning">
+            {noticeText(hold)} <span className="text-text-tertiary">Last reported {fmtDateTime(noticeAt(hold))}.</span>
+          </p>
+        )}
 
         {groups.length === 0 ? (
           <p className="mt-4 text-footnote text-text-tertiary">No repository to deliver to yet.</p>

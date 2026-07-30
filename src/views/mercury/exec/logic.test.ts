@@ -550,12 +550,18 @@ test('the calendar reads through the SAME access points as the history (REQ-012)
 
 test('the history states no membership rule of its own — it consumes the shared selector (B-8)', () => {
   const src = surfaceFiles().find((f) => f.name === 'ExecutionsView.tsx')!.src;
-  assert.match(src, /import \{ executionCompleted \} from '\.\.\/tasks\/select'/);
+  assert.match(src, /import \{[^}]*\bexecutionCompleted\b[^}]*\} from '\.\.\/tasks\/select'/);
   // Openness is READ from the ledger through the one delivery access point, not derived here.
   assert.match(src, /import \{ openDeliveryExecutionIds \} from '\.\.\/deliveries\/deliveries'/);
   const code = codeOnly(src);
   assert.match(code, /source\.mercuryDeliveries\(/, 'the ledger the membership rule needs must be read');
   assert.ok(!/mergedAt/.test(code), 'the completion stamp is the selector\'s business, not the view\'s');
+
+  // And what the list does NOT show comes from the SAME module, split by its reason: a remainder
+  // subtracted from the pool counted records nobody could point at — an archive entry left without an
+  // end stamp was hidden here and counted as open while the Active surface stood empty.
+  assert.match(src, /import \{[^}]*\boutsideHistory\b[^}]*\} from '\.\.\/tasks\/select'/);
+  assert.ok(!/all\.length - history\.length/.test(code), 'the remainder must be named by its reason, never subtracted');
 });
 
 test('the history offers a restart only while the RUN exists — and states it otherwise (REQ-040.3)', () => {
