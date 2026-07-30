@@ -412,6 +412,18 @@ type orphan struct {
 	from string
 	to   string
 	why  string
+	// held is what the file actually CONTAINED, in one line — stated only for a pool whose value
+	// the operator has to carry over by hand, so the protocol names a number instead of leaving
+	// them to open the set-aside file and work it out. "" where there is nothing to carry.
+	held string
+}
+
+// orphanPool is one entry of the list below: the file name, the reason the rebuild has no reader
+// for it, and — optionally — a reader that states in one line what the file held.
+type orphanPool struct {
+	name string
+	why  string
+	held func([]byte) string
 }
 
 // orphanPools names every pre-rebuild pool below mercury/ that the rebuilt code has no reader for,
@@ -422,14 +434,92 @@ type orphan struct {
 // preserve but a trap to remove, and the cutover removes it by name in its own step
 // (deploy/migration/00-cutover.md, step 3) — a second mechanism here would be the same job done
 // twice, and naming the marker in the shipped source is exactly what the REQ-039b tripwire forbids.
-func orphanPools() []struct{ name, why string } {
-	return []struct{ name, why string }{
-		{"runs-settings.json", "the rebuilt settings pool is settings.json and names the field " +
-			"maxConcurrency; its first-start value comes from DEVLAB_RUNS_MAX_CONCURRENCY, and from " +
-			"the first change on the stored value wins (REQ-013.2)"},
-		{"runs-incidents.json", "the rebuild raises every finding in the notice pool " +
-			"(runs-notices.json); there is no second pool beside it"},
+func orphanPools() []orphanPool {
+	return []orphanPool{
+		{
+			name: "runs-settings.json",
+			// The DECISION, and why it is not the other one: the rebuilt settings pool is a
+			// THREE-field document that the store returns WHOLE once the file exists. Writing it
+			// here with the slot capacity alone would therefore pin the default time budget and the
+			// automerge window at zero and silently switch both off — values the rebuild otherwise
+			// seeds from the environment on the first start. Converting one field is not a
+			// conversion, it is a quiet loss of two others, so the capacity is carried over by the
+			// operator, in the one place that seeds it, and the value stands in the protocol.
+			why: "the rebuilt settings pool is settings.json and names the field maxConcurrency. " +
+				"It is NOT converted here: settings.json is read whole, so a file written with the " +
+				"capacity alone would pin the default time budget and the automerge window at zero " +
+				"and switch both off. OPERATOR HANDLING: carry the value into " +
+				"DEVLAB_RUNS_MAX_CONCURRENCY in the unit drop-in (00-cutover.md step 2), which seeds " +
+				"the first start; from the first change on, the stored value wins (REQ-013.2)",
+			held: heldConcurrency,
+		},
+		{
+			name: "runs-incidents.json",
+			why: "the rebuild raises every finding in the notice pool (runs-notices.json); there is " +
+				"no second pool beside it",
+		},
 	}
+}
+
+// heldConcurrency states the slot capacity the pre-rebuild settings pool carried, in the old
+// field's own name, so the protocol names the number the operator has to carry over. An
+// unreadable or capacity-less file yields "" — nothing is guessed.
+func heldConcurrency(b []byte) string {
+	var f struct {
+		MaxConcurrent *int `json:"maxConcurrent"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil || f.MaxConcurrent == nil {
+		return ""
+	}
+	return fmt.Sprintf("maxConcurrent = %d", *f.MaxConcurrent)
+}
+
+// ── the operator's own copies of the run pool ────────────────────────────────────────────────
+
+// backupPrefix is the name a hand-made copy of the run pool carries on this instance
+// (`runs.json.bak-<something>`). It is NOT an artifact of the service: nothing writes it, nothing
+// reads it, and no surface offers it as a restore point — a human made it with cp.
+const backupPrefix = "runs.json.bak"
+
+// leftoverBackups are those copies. They are neither moved nor rewritten: unlike the config
+// snapshots, which the service itself offers as restore points, these can only be brought back by
+// a human deliberately copying one over runs.json — and doing that would re-inject exactly the
+// pre-rebuild records the takeover just converted. So they are REPORTED, with how many of them
+// still hold pre-rebuild records, and the decision is left where it belongs.
+type leftoverBackups struct {
+	dir    string
+	names  []string
+	legacy int
+}
+
+// readLeftoverBackups lists them, classifying each by the same shape test the config snapshots use.
+func readLeftoverBackups(dir string) (*leftoverBackups, error) {
+	lb := &leftoverBackups{dir: dir}
+	if dir == "" {
+		return lb, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return lb, nil
+		}
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), backupPrefix) {
+			continue
+		}
+		legacy, err := snapshotIsLegacy(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		if legacy {
+			lb.legacy++
+		}
+		lb.names = append(lb.names, e.Name())
+	}
+	sort.Strings(lb.names)
+	return lb, nil
 }
 
 // ── moving and copying ───────────────────────────────────────────────────────────────────────

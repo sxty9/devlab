@@ -110,6 +110,10 @@ func (r *ResultRecorder) repo(repo string) *model.RepoPipeline {
 
 // StageUpdate replaces (never appends twice) the recorded state of one stage — the stage array IS
 // the server's truth, so a running stage becomes its own terminal state in place.
+//
+// stage-vocabulary: both sides of the comparison below are stages THIS recorder just wrote for the
+// execution it is recording, so both stand in the chain's own vocabulary. The recorder never opens
+// a stored document, and an archived one — which carries the retired names — cannot reach it.
 func (r *ResultRecorder) StageUpdate(repo string, sv model.StageView) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

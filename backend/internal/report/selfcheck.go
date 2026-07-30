@@ -83,7 +83,8 @@ func (sc *SelfCheck) Run(ctx context.Context, interval time.Duration) {
 // Tick performs one pass and reports whether the finding holds. It raises the notice through
 // Coalesce, so repeated passes over the same unresolved situation bundle into one hint whose count
 // and period say how long it has been true. It is silent in every other case: no executions at
-// all, no changes, or at least one delivery.
+// all, no changes, at least one delivery — and it says nothing at all about the pre-rebuild
+// archive (writtenInThisVocabulary).
 func (sc *SelfCheck) Tick() (bool, error) {
 	if sc.execs == nil || sc.notices == nil {
 		return false, nil
@@ -98,7 +99,7 @@ func (sc *SelfCheck) Tick() (bool, error) {
 
 	changed, delivered := 0, 0
 	for _, res := range results {
-		if !inWindow(res, cutoff) {
+		if !writtenInThisVocabulary(res) || !inWindow(res, cutoff) {
 			continue
 		}
 		if resultChangedCode(res) {
@@ -131,6 +132,22 @@ func (sc *SelfCheck) Tick() (bool, error) {
 	return true, nil
 }
 
+// writtenInThisVocabulary reports whether an execution's stages are written in the vocabulary the
+// comparisons below use. A document from the pre-rebuild archive is NOT (REQ-027.3): the tolerant
+// reader carries its stage names verbatim, so it says `dev-deploy` where the chain says
+// `deliver-dev` and `pr` where it says `pull-request`. Compared strictly, every archived record
+// therefore reads as "implement ran, nothing was delivered" — and the very first start of a
+// rebuilt instance raised exactly that finding over a past that is closed.
+//
+// Translating the old names would not repair it either: "delivered" meant something else there (a
+// push plus an opened pull request, not a dev delivery), so a mapping would trade a wrong finding
+// for a guessed one. And the finding's next step — check the delivery path and RESUME — has no
+// addressee in the archive: nothing in it can be resumed.
+//
+// So the archive is neither translated nor judged, it is left out: this check watches THIS
+// system's outcome, and an archived record is evidence neither for it nor against it.
+func writtenInThisVocabulary(res runs.Result) bool { return !res.Legacy }
+
 // inWindow reports whether an execution belongs to the observed period: by when it finished, or —
 // while it is still unfinished — by when it started.
 func inWindow(res runs.Result, cutoff time.Time) bool {
@@ -156,6 +173,10 @@ func resultDelivered(res runs.Result) bool {
 	return anyStageExecuted(res, model.StageDeliverDev)
 }
 
+// anyStageExecuted compares stage names STRICTLY against the chain's vocabulary, which is only
+// meaningful for a document written in it — the archive's retired names would never match and the
+// absence would read as a finding. Tick therefore filters with writtenInThisVocabulary (Legacy)
+// before it asks, and this function answers for nothing else.
 func anyStageExecuted(res runs.Result, stage model.Stage) bool {
 	for _, rp := range res.Repos {
 		for _, sv := range rp.Stages {

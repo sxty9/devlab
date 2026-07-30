@@ -443,16 +443,28 @@ func shortCommit(sha string) string {
 
 // MaintainDeliveries is the PR-maintenance tick (deliver.Maintain) over the production
 // GitHubOps — handed to the scheduler as its MaintainFunc.
+//
+// The runner identity is resolved for the WRITING half only, and a missing one is fatal only there.
+// The held pass — unarmed, which is the default AND the configuration the cutover's first start
+// runs in (00-cutover.md step 6: no DEVLAB_RUNS_USER, no DEVLAB_RUNS_TOKEN_USER) — makes no foreign
+// call at all: it establishes the standstill from DevLab's own pools and reports it. Returning
+// early on the missing identity therefore silenced exactly the configuration the standstill report
+// exists for, and the operator saw no sign that the maintenance stands still.
 func (s *Server) MaintainDeliveries(ctx context.Context) error {
-	token, err := s.runnerToken()
-	if err != nil {
+	var ops deliver.GitHubOps
+	switch token, err := s.runnerToken(); {
+	case err == nil:
+		ops = deliverOps(s, token)
+	case deliver.MaintainArmed():
+		// Armed, the pass WRITES into foreign repositories. Without an identity it must fail by
+		// name rather than report a standstill it never actually attempted to end.
 		return err
 	}
 	var pub live.Publisher
 	if s.broker != nil {
 		pub = s.broker
 	}
-	return deliver.Maintain(ctx, deliverOps(s, token), s.runPRs, s.deliveries, s.results, s.runNotices, pub)
+	return deliver.Maintain(ctx, ops, s.runPRs, s.deliveries, s.results, s.runNotices, pub)
 }
 
 // protectionEnforcementArmed reports whether the operator has armed protection WRITES.

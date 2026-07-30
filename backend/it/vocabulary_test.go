@@ -145,6 +145,165 @@ func TestRetiredStepNamesLiveOnlyOnTheLegacyPath(t *testing.T) {
 	}
 }
 
+// ── REQ-027.3, the reading half ──────────────────────────────────────────────────────────────
+//
+// The two checks above police PRODUCING a retired name. Neither says anything about READING one,
+// and that is the gap a delivery blocker fell through: the delivery self-check compared stages
+// STRICTLY against the new vocabulary over a result list that mixes in the archive, where the
+// delivery stage is still called `dev-deploy`. No archived record ever matched, so every one of
+// them read as "implemented, nothing delivered" and the first start raised a finding about a
+// closed past. readsAlongsideCanonical could not see it: the file names no retired word at all —
+// it simply never asks whether the document in front of it is an archived one.
+//
+// So the third check is about the COMPARISON, not the word: every place that compares a stage must
+// say what it does about the retired vocabulary, and a place that says nothing is a failure.
+//
+// stageCompareRe matches the comparison itself in either spelling — `x.Stage == …`, `stage != …`,
+// `case model.StageX:` — and deliberately not the CONSTRUCTION of a stage (`Stage: model.StageX`),
+// which states a vocabulary rather than reading one.
+var stageCompareRe = regexp.MustCompile(
+	`\.Stage[[:space:]]*[=!]=|\bstage[[:space:]]*[=!]=|[=!]=[[:space:]]*model\.Stage[A-Z]|\bcase[[:space:]]+model\.Stage[A-Z]`)
+
+// legacyAware names the two ways a comparing function may satisfy the rule. Either it CONSULTS the
+// provenance (the Legacy flag the tolerant reader sets on every archived document), or it states in
+// one marked line why no archived document can reach it. Both are explicit; silence is not.
+const stageVocabularyMarker = "stage-vocabulary:"
+
+// sourceText is a file as the audit sees it — path plus content, so the same checker can be run
+// over the tree AND over a canary that is not in the tree.
+type sourceText struct {
+	path string
+	src  string
+}
+
+// TestEveryStageComparisonHandlesTheLegacyVocabulary is that third check, plus a canary proving it
+// has teeth: fed the pre-fix self-check, it must report exactly that file.
+func TestEveryStageComparisonHandlesTheLegacyVocabulary(t *testing.T) {
+	files := []sourceText{}
+	for _, f := range sourceFiles(t) {
+		files = append(files, sourceText{path: f, src: readFile(t, f)})
+	}
+	sites, faults := stageComparisons(files)
+	if sites < 4 {
+		t.Fatalf("only %d stage comparisons found — the check is not seeing the tree", sites)
+	}
+	for _, f := range faults {
+		t.Error(f)
+	}
+
+	// The canary: the self-check EXACTLY as it stood when the blocker was raised — it compares
+	// stages, names no retired word, and consults no provenance. The extended check must report it;
+	// if it does not, the check would pass the very defect it was written for.
+	canary := []sourceText{{
+		path: filepath.Join("..", "internal", "report", "selfcheck.go"),
+		src: `package report
+
+// resultDelivered reports whether anything of an execution reached the user: a dev delivery that
+// ran, or deliveries that have since been merged.
+func resultDelivered(res runs.Result) bool {
+	if res.MergedAt != nil {
+		return true
+	}
+	return anyStageExecuted(res, model.StageDeliverDev)
+}
+
+func anyStageExecuted(res runs.Result, stage model.Stage) bool {
+	for _, rp := range res.Repos {
+		for _, sv := range rp.Stages {
+			if sv.Stage == stage && sv.State == model.StepExecuted {
+				return true
+			}
+		}
+	}
+	return false
+}
+`,
+	}}
+	canarySites, canaryFaults := stageComparisons(canary)
+	if canarySites != 1 {
+		t.Fatalf("the canary must present exactly one comparison, the checker saw %d", canarySites)
+	}
+	if len(canaryFaults) != 1 || !strings.Contains(canaryFaults[0], "selfcheck.go") {
+		t.Fatalf("the canary must be reported as a fault naming selfcheck.go, got %v", canaryFaults)
+	}
+}
+
+// stageComparisons counts the stage comparisons in the given sources and returns the ones whose
+// enclosing function neither consults the archived provenance nor carries the marker. The legacy
+// bridge itself is exempt: it IS the old path, and the retired-names test already fences it.
+//
+// Go only, and deliberately: the client never compares a CHAIN stage — it renders the server's
+// stage array as it arrives (B-17), which is precisely why an archived record displays its retired
+// names correctly. The one `.stage ===` in the frontend belongs to the delivery LIFECYCLE
+// (open/merged/closed/reverted), a different vocabulary the archive does not touch. If a chain-stage
+// comparison ever appears on the client, this scan is where it has to be extended.
+func stageComparisons(files []sourceText) (sites int, faults []string) {
+	for _, f := range files {
+		if isLegacyPath(f.path) || !strings.HasSuffix(f.path, ".go") {
+			continue
+		}
+		for _, fn := range goFuncs(f.src) {
+			hits := []int{}
+			for i, line := range fn.lines {
+				trimmed := strings.TrimSpace(line)
+				if strings.HasPrefix(trimmed, "//") || !stageCompareRe.MatchString(line) {
+					continue
+				}
+				hits = append(hits, fn.start+i)
+			}
+			if len(hits) == 0 {
+				continue
+			}
+			sites += len(hits)
+			body := strings.Join(fn.lines, "\n")
+			if strings.Contains(body, "Legacy") || strings.Contains(body, stageVocabularyMarker) {
+				continue
+			}
+			for _, ln := range hits {
+				faults = append(faults, fmt.Sprintf(
+					"%s:%d compares a stage, and %s neither consults the archived provenance (Result.Legacy) "+
+						"nor carries a `%s` line saying why no archived document reaches it — an archived "+
+						"document carries the RETIRED stage names, so a strict comparison silently reads it as "+
+						"\"this stage never ran\"", rel(f.path), ln, fn.name, stageVocabularyMarker))
+			}
+		}
+	}
+	return sites, faults
+}
+
+// goFunc is one top-level function with its doc comment: gofmt puts `func` at column 0 and its
+// closing brace at column 0, which is all the boundary this audit needs.
+type goFunc struct {
+	name  string
+	start int // 1-based line of the doc comment or the func keyword, whichever comes first
+	lines []string
+}
+
+var funcNameRe = regexp.MustCompile(`^func(?:[[:space:]]+\([^)]*\))?[[:space:]]+([A-Za-z0-9_]+)`)
+
+func goFuncs(src string) []goFunc {
+	lines := strings.Split(src, "\n")
+	out := []goFunc{}
+	for i := 0; i < len(lines); i++ {
+		m := funcNameRe.FindStringSubmatch(lines[i])
+		if m == nil {
+			continue
+		}
+		// Walk back over the doc comment so a reason stated ABOVE the function counts as stated.
+		from := i
+		for from > 0 && strings.HasPrefix(strings.TrimSpace(lines[from-1]), "//") {
+			from--
+		}
+		end := i
+		for end < len(lines) && lines[end] != "}" {
+			end++
+		}
+		out = append(out, goFunc{name: m[1], start: from + 1, lines: lines[from:min(end+1, len(lines))]})
+		i = end
+	}
+	return out
+}
+
 // REQ-030 / W-B: the contract's own shape must hold — five stages, four terminal states, and the
 // success formula reading exactly "no failure and nothing skipped as not-executed".
 func TestChainVocabularyIsClosed(t *testing.T) {

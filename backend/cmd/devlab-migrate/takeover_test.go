@@ -866,3 +866,83 @@ func TestFormOfDecidesByMarkersAndRefusesToGuess(t *testing.T) {
 		}
 	}
 }
+
+// The pre-rebuild settings pool holds ONE value (`maxConcurrent`) and the rebuilt one is a
+// three-field document read whole. Converting the single field would pin the other two at zero and
+// silently switch off the default time budget and the automerge window, so the value is carried
+// over by the OPERATOR — and the protocol has to name the number and where it goes, otherwise
+// "carried over by the operator" is only a word for "dropped".
+func TestTheSetAsideSettingsValueIsNamedAsAnOperatorHandling(t *testing.T) {
+	p := stateRoot(t)
+	installLegacyRunPool(t, p)
+	installLegacyState(t, p)
+
+	pl := migrate(t, p)
+	var buf bytes.Buffer
+	writeProtocol(&buf, pl, false)
+	out := buf.String()
+
+	for _, want := range []string{
+		"maxConcurrent = 10",          // the value the old pool actually held
+		"DEVLAB_RUNS_MAX_CONCURRENCY", // where the operator puts it
+		"OPERATOR HANDLING",           // that it is a handling, not an automatic conversion
+		"time budget",                 // and why it is not converted here
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the protocol must name %q:\n%s", want, out)
+		}
+	}
+	// And the rebuilt pool is NOT written by the migration: a settings.json with one field would be
+	// exactly the silent loss the decision avoids.
+	if _, err := os.Stat(p.Settings()); !os.IsNotExist(err) {
+		t.Errorf("the migration must not write %s — it cannot know the other two fields", p.Settings())
+	}
+}
+
+// Hand-made copies of the run pool (`runs.json.bak-*`) are stock nothing reads and nothing offers
+// as a restore point. They are reported with their form — copying one back over runs.json would
+// re-inject exactly the records the takeover converted — and left untouched.
+func TestHandMadeRunPoolCopiesAreReportedAndLeftAlone(t *testing.T) {
+	p := stateRoot(t)
+	installLegacyRunPool(t, p)
+	installLegacyState(t, p)
+
+	before := map[string][]byte{}
+	for _, name := range []string{"runs.json.bak-20260718", "runs.json.bak-smoketest"} {
+		b, err := os.ReadFile(filepath.Join(p.Mercury(), name))
+		if err != nil {
+			t.Fatalf("fixture %s: %v", name, err)
+		}
+		before[name] = b
+	}
+
+	pl := migrate(t, p)
+	if pl.backups == nil || len(pl.backups.names) != 2 {
+		t.Fatalf("both copies must be found, got %+v", pl.backups)
+	}
+	if pl.backups.legacy != 1 {
+		t.Errorf("exactly one copy holds pre-rebuild records, the plan counted %d", pl.backups.legacy)
+	}
+
+	var buf bytes.Buffer
+	writeProtocol(&buf, pl, false)
+	out := buf.String()
+	for _, want := range []string{"runs.json.bak-20260718", "runs.json.bak-smoketest", "re-inject"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the protocol must name %q:\n%s", want, out)
+		}
+	}
+
+	for name, content := range before {
+		got, err := os.ReadFile(filepath.Join(p.Mercury(), name))
+		if err != nil {
+			t.Fatalf("%s was moved or removed: %v", name, err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Errorf("%s was changed — the copies are reported, never touched", name)
+		}
+		if _, err := os.Stat(filepath.Join(p.Mercury(), name+asideSuffix)); err == nil {
+			t.Errorf("%s was set aside; it is the operator's own copy and stays where they put it", name)
+		}
+	}
+}

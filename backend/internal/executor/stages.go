@@ -79,6 +79,9 @@ func implementApplies(ctx context.Context, rc *RepoCtx) (bool, string) {
 	return true, ""
 }
 
+// stage-vocabulary: the stage compared below is the continuation stamp of THIS execution's own
+// state document, written by this chain in the chain's own vocabulary. The archive holds no
+// continuation at all — it is a closed past, and nothing in it is ever resumed.
 func implementRun(ctx context.Context, rc *RepoCtx) error {
 	deps := rc.Deps
 	wb := deps.Workbench(rc.Repo)

@@ -97,6 +97,7 @@ func deliveriesServer(t *testing.T) *Server {
 	t.Setenv("DEVLAB_MERCURY_RUNS_HISTORY", filepath.Join(dir, "hist"))
 	t.Setenv("DEVLAB_MERCURY_EXECUTIONS", filepath.Join(dir, "executions"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "legacy"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_NOTICES", filepath.Join(dir, "notices.json"))
 
 	keyPath := filepath.Join(dir, "key")
 	if err := os.WriteFile(keyPath, []byte("0123456789abcdef0123456789abcdef"), 0o600); err != nil {
@@ -121,6 +122,7 @@ func deliveriesServer(t *testing.T) *Server {
 		results:    runs.NewResultStore(nil),
 		runPRs:     runs.NewPRStore(nil),
 		deliveries: runs.NewDeliveryStore(nil),
+		runNotices: runs.NewNoticeStore(nil),
 	}
 }
 
@@ -540,5 +542,70 @@ func TestDeliveriesListCarriesExecutionLink(t *testing.T) {
 	}
 	if got["dlv_done"] != [2]string{"merged", "exec_done"} {
 		t.Errorf("settled delivery = %v, want stage merged of exec_done", got["dlv_done"])
+	}
+}
+
+// BLOCKER: the standstill report must reach the configuration it was written for — the cutover's
+// FIRST start (00-cutover.md step 6), which runs deliberately WITHOUT a runner identity so no pass
+// can reach GitHub. The tick resolved the token first and returned on its absence, so in exactly
+// that configuration the operator saw nothing: not the standstill, and not the pool waiting behind
+// it. Unarmed, the pass needs no identity at all — it reads DevLab's own pools and reports.
+func TestMaintainReportsTheStandstillWithoutARunnerIdentity(t *testing.T) {
+	s := deliveriesServer(t)
+	// The held start, exactly: neither identity is in the drop-in, and the maintenance is unarmed.
+	t.Setenv("DEVLAB_RUNS_USER", "")
+	t.Setenv("DEVLAB_RUNS_TOKEN_USER", "")
+	t.Setenv(deliver.EnvMaintainEnforce, "")
+	if _, err := s.runnerToken(); err == nil {
+		t.Fatal("the premise of this test is that no runner identity resolves")
+	}
+	// Something IS waiting: without it the report stays silent by design.
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-a1", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: tD, ExecutionID: "exec_1"})
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/x", Number: 5, DeliveryID: "dlv_1", CreatedAt: tD, MergeBy: tD})
+
+	// No ops fixture is injected: a held pass must make no foreign call, so it needs none.
+	if err := s.MaintainDeliveries(context.Background()); err != nil {
+		t.Fatalf("the held pass must not fail on a missing identity it does not need: %v", err)
+	}
+	list, err := s.runNotices.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := 0
+	for _, n := range list {
+		if n.Kind == runs.NoticeDeliveryHeld {
+			held++
+		}
+	}
+	if held != 1 {
+		t.Fatalf("the standstill must be reported exactly once, got %d of %d notices: %+v", held, len(list), list)
+	}
+	// And nothing moved: a standstill that quietly merged something would be no standstill.
+	if left, _ := s.runPRs.List(); len(left) != 1 {
+		t.Errorf("the held pass must leave the tracked pull request exactly as it is, got %+v", left)
+	}
+	if got, _, _ := s.deliveries.ByID("dlv_1"); got.MergedAt != nil {
+		t.Errorf("the held pass must change no delivery record: %+v", got)
+	}
+}
+
+// The other half of the same decision: ARMED, the pass writes into foreign repositories, so a
+// missing identity is fatal and named — never a standstill report about work it never attempted.
+func TestMaintainRefusesToWriteWithoutARunnerIdentity(t *testing.T) {
+	s := deliveriesServer(t)
+	t.Setenv("DEVLAB_RUNS_USER", "")
+	t.Setenv("DEVLAB_RUNS_TOKEN_USER", "")
+	t.Setenv(deliver.EnvMaintainEnforce, "1")
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/x", Number: 5, DeliveryID: "dlv_1", CreatedAt: tD, MergeBy: tD})
+
+	err := s.MaintainDeliveries(context.Background())
+	if err == nil {
+		t.Fatal("armed without a runner identity must fail by name")
+	}
+	if !strings.Contains(err.Error(), "runner account") {
+		t.Errorf("the failure must name the missing identity, got %v", err)
+	}
+	if list, _ := s.runNotices.List(); len(list) != 0 {
+		t.Errorf("an armed pass that could not run reports no standstill, got %+v", list)
 	}
 }

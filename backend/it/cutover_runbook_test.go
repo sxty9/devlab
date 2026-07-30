@@ -55,8 +55,10 @@ func TestCutoverBackupCoversEveryStateDirectory(t *testing.T) {
 	}
 
 	doc := readDoc(t, cutoverDoc)
-	backup := lineWith(t, doc, "devlab-state-")
-	if !strings.Contains(backup, "tar") {
+	// Keyed on the tar invocation over the state root, not on the archive's file NAME: the name is
+	// an instance detail that may change, the archiving is the claim.
+	backup := lineWith(t, doc, `tar -C "$STATE_DIR"`)
+	if !strings.Contains(backup, "-czf") {
 		t.Fatalf("the backup step does not archive anything: %q", backup)
 	}
 	// The tar invocation spans several lines (the member list follows the -czf argument).
@@ -78,6 +80,63 @@ func TestCutoverBackupCoversEveryStateDirectory(t *testing.T) {
 		if !strings.Contains(rollback, want) {
 			t.Errorf("the rollback never names %q — the way back is not written down", want)
 		}
+	}
+}
+
+// The backup archive is named ONCE, not globbed. `tar -tzf <glob>` over two archives — which a
+// second pass into the same $BAK would produce — makes tar read the second file as a MEMBER of the
+// first, so the verification loop would fail on a backup that is perfectly fine.
+func TestCutoverBackupIsVerifiedThroughOneNamedArchive(t *testing.T) {
+	doc := readDoc(t, cutoverDoc)
+	for i, line := range strings.Split(doc, "\n") {
+		if !strings.Contains(line, "tar -tzf") {
+			continue
+		}
+		if strings.Contains(line, "*") {
+			t.Errorf("line %d verifies the backup through a glob: %q — two archives in one $BAK "+
+				"would make tar read the second as a member of the first", i+1, strings.TrimSpace(line))
+		}
+	}
+	if !strings.Contains(doc, `STATE_TAR="$BAK/`) {
+		t.Error("the backup archive has no single named path — the verification cannot refer to one archive")
+	}
+}
+
+// The rollback must UNDO, not merely overlay: `tar -x` overwrites but deletes nothing, so every
+// artifact the rebuild newly created has to be removed by name. Otherwise the state tree carries
+// both worlds and the "way back" left the new one in place.
+func TestRollbackRemovesWhatTheRebuildNewlyCreated(t *testing.T) {
+	doc := readDoc(t, cutoverDoc)
+	i := strings.Index(doc, "## Rollback")
+	if i < 0 {
+		t.Fatal("the runbook has no rollback section at all")
+	}
+	rollback := doc[i:]
+	// Derived, not listed twice: the pools the rebuilt layout puts under mercury/ that the
+	// pre-rebuild instance never had, plus the two artifacts the migration itself creates.
+	for _, artifact := range []string{
+		"executions",            // the execution tree the import fills
+		"runs-results.imported", // the archive after the import moved it aside
+		".pre-migration",        // every set-aside copy of the pre-rebuild stock
+		"settings.json",         // the rebuilt settings pool
+		"ai-usage.json",         // the rebuilt usage pool
+		"usage-limit.json",      // the rebuilt limit cache
+		"restart.json",          // the rebuilt restart marker
+		"order.json",            // the rebuilt tree order
+	} {
+		if !strings.Contains(rollback, artifact) {
+			t.Errorf("the rollback never names %q — after the way back the state tree carries both worlds", artifact)
+		}
+	}
+	if !indexOfLineWithAllOK(rollback, "rm -rf", "executions") {
+		t.Error("the rollback names the execution tree but never removes it")
+	}
+	if !indexOfLineWithAllOK(rollback, "find", ".pre-migration") {
+		t.Error("the set-aside copies are never swept — a repeated takeover numbers them, so one name is not enough")
+	}
+	// Removing a tree wholesale is only safe where the archive really carries it.
+	if !indexOfLineWithAllOK(rollback, "tar -tzf", "grep -q") {
+		t.Error("a tree is removed without first proving the archive carries it — that would be a loss, not a rollback")
 	}
 }
 

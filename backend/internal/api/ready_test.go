@@ -183,3 +183,37 @@ func TestReadySocketFreeWithoutSchedulerAndAfterStaleFile(t *testing.T) {
 		t.Fatalf("serve: %v", err)
 	}
 }
+
+// A Unix socket path is limited to sun_path (108 bytes with the NUL), and the failure the kernel
+// returns for an overrun is the bare "bind: invalid argument" — which names neither the limit nor
+// the state root. Two things are proven here: a state root that is too deep fails with a sentence
+// the operator can act on, and the private staging directory is always SHORTER than the published
+// socket, so it can never be the thing that overruns while the contract path would have fitted.
+func TestReadySocketNamesThePathLimitInsteadOfBindInvalidArgument(t *testing.T) {
+	root := filepath.Join(t.TempDir(), strings.Repeat("d", 120))
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{paths: &statepath.Paths{Root: root}}
+	err := s.ServeReadySocket(context.Background())
+	if err == nil {
+		t.Fatal("a state root beyond the socket-path limit must fail, not bind")
+	}
+	for _, want := range []string{"Unix socket path", "DEVLAB_STATE_DIR", "sun_path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the failure must name %q, got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "invalid argument") {
+		t.Errorf("the operator must not be handed the bare kernel error: %v", err)
+	}
+
+	// The staging invariant, stated as arithmetic over the two names rather than measured on one
+	// lucky path: `.r` + at most 10 digits + "/s" must stay below "restart-ready.sock".
+	staged := len(stagePrefix) + 10 + len("/s")
+	published := len(filepath.Base((&statepath.Paths{Root: "/x"}).ReadySocket()))
+	if staged >= published {
+		t.Errorf("the staging path (%d bytes) must stay shorter than the published socket (%d) — "+
+			"otherwise a root that fits the contract path can still fail while binding", staged, published)
+	}
+}

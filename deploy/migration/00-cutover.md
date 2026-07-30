@@ -25,6 +25,7 @@ STATE_DIR=/var/lib/devlab                          # State-Root dieser Instanz (
 SVC_USER=devlab                                    # Dienst-Account der Unit (User=, Vorlagen-Default)
 EXPORT=<export-dir>/mercury-runs-roh.json          # der Roh-Export (siehe 10-daten.md)
 BAK=/root/devlab-cutover-$(date +%Y%m%d-%H%M%S)    # Sicherung DIESES Durchgangs
+STATE_TAR="$BAK/devlab-state.tar.gz"               # EIN Durchgang, EINE Zustandssicherung
 
 # 0) Sicherung — VOLLSTÄNDIG: der Zustand UND jedes Artefakt, das dieser Cutover verändert
 sudo systemctl stop devlabd
@@ -34,13 +35,16 @@ sudo install -d -m0700 "$BAK"
 #        Schritt 4 überschreibt) und axioms (der Verfassungs-Klon; ein nicht gepushter Stand darin
 #        existiert sonst nirgends). --ignore-failed-read: ein noch nicht angelegtes Verzeichnis ist
 #        kein Fehler.
-sudo tar -C "$STATE_DIR" --ignore-failed-read \
-    -czf "$BAK/devlab-state-$(date +%Y%m%d-%H%M%S).tar.gz" \
+#        Der Tarball trägt einen FESTEN Namen: $BAK trägt den Zeitstempel bereits, und ein zweiter
+#        Anlauf in dasselbe $BAK ersetzt damit die eine Sicherung, statt eine zweite danebenzulegen.
+#        Ein Glob über zwei Tarbälle hätte `tar -tzf` zwei Argumente gegeben — tar liest das zweite
+#        dann als Mitglied IM ersten, und die Prüfung unten wäre fälschlich fehlgeschlagen.
+sudo tar -C "$STATE_DIR" --ignore-failed-read -czf "$STATE_TAR" \
     mercury links chats comments www axioms
 #        Prüfen, dass die Sicherung jedes Glied wirklich enthält (sonst ist der Rückweg
 #        unvollständig, und das merkt man erst, wenn man ihn braucht):
 for d in mercury links chats comments www axioms; do
-  sudo sh -c "tar -tzf $BAK/devlab-state-*.tar.gz | grep -q \"^$d/\"" \
+  sudo tar -tzf "$STATE_TAR" | grep -q "^$d/" \
     && echo "gesichert: $d" || echo "NICHT im Tarball (fehlt oder ist leer): $d"
 done
 #    0b) Jedes GETEILTE Artefakt, das Schritt 1, 2 und 4 überschreiben oder entfernen — die Wrapper
@@ -239,20 +243,26 @@ ihren fehlenden Zugang, statt zu handeln.
 
 | # | Stelle | Feuert sie beim ersten Start? | Was sie schreibt | Wie sie bis zur Freigabe stillhält |
 |---|---|---|---|---|
-| 1 | Origin-Status je offenem PR (`deliver.Maintain`, `deliver/deliver.go:798`) | **JA — beim ersten Scheduler-Tick** (`DEVLAB_RUNS_TICK`), und danach bei JEDEM Tick, unbedingt | einen Commit-Status auf dem Kopf-Commit JEDES offenen PRs jedes verwalteten Repositories — auch in PRs, die ein Mensch gestellt hat und die dieser Cutover nichts angehen | **Schalter:** ohne `DEVLAB_RUNS_MAINTAIN_ENFORCE` schreibt die Wartung NICHTS — sie stellt den Stillstand aus den eigenen Pools fest und meldet ihn, ohne einen einzigen fremden Aufruf. **Und Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER`/`DEVLAB_RUNS_TOKEN_USER` löst `runnerToken` gar keinen Token auf. Die Probe unter der Tabelle liest, ob dieser Build den Schalter trägt |
-| 2 | Branch-Löschung nach Merge (`finalizeMerged`, `deliver/deliver.go:820`) | **JA — beim ersten Tick**, für jeden verfolgten PR, der inzwischen gemerged ist (auch von einem Menschen) | löscht den Lieferungs-Branch im fremden Repository (404 gilt als erfüllt) | wie 1 (derselbe Schalter deckt die ganze Wartung ab) |
-| 3 | Auto-Merge (`deliver/deliver.go:762`) | beim ersten Tick, dessen `mergeBy` erreicht ist — bei Messung 6a war das keiner; die Frist der Alt-Sätze liegt Wochen in der Zukunft | einen Merge-Commit in den Standard-Branch des fremden Repositories, höchstens einer je Repository und Tick | wie 1, zusätzlich die Frist selbst (`DEVLAB_RUNS_AUTOMERGE_WINDOW` sät nur den ersten Start; gespeicherte Sätze tragen ihre eigene Frist) |
-| 4 | Tagesbericht-Mail (`api/handlers_mercury_report.go:79` → Landschafts-Mailer) | **JA — sofort beim Start**, denn der Reporter macht einen Durchgang vor dem ersten Intervall | eine Mail an den Empfänger, für jeden abgeschlossenen Tag im Rückblick-Fenster ohne Zustellsatz — und für jeden noch offenen Satz, gleich wie alt, weil ein `failed`-Satz ohne Backoff sofort wieder fällig ist | **Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER` ist der Reporter AUS („reporter OFF (no run user provisioned)"). Messung 6a zeigt, welcher Tag sonst als erstes ginge |
-| 5 | Verzweigungsschutz-Durchlauf (`deliver.VerifyProtection`, `deliver/deliver.go:559`, `:590`) | nein — der erste Durchgang wartet `DEVLAB_RUNS_PROTECTION_START_DELAY` (Vorgabe 15m) | liest den Schutz JEDES Repositories der Organisation; scharf PATCHt er den Standard-Branch jedes abweichenden | zwei Schalter (unten) **und** die Reihenfolge aus 1: auch dieser Pass braucht den Runner-Token |
-| 6 | PR öffnen (`deliver.OpenOrAdopt`, `deliver/deliver.go:145`) | nein — nur innerhalb einer Ausführung | einen Pull Request im Ziel-Repository (oder adoptiert den offenen) | kein Lauf ist eingeschaltet (Aktivierungs-Sperre, `10-daten.md` Schritt A); zusätzlich Reihenfolge aus 1 |
-| 7 | Origin-Status direkt nach dem Öffnen/Adoptieren (`deliver/deliver.go:683`) | nein — nur innerhalb einer Ausführung | einen Commit-Status auf dem Kopf-Commit dieses PRs | wie 6 |
-| 8 | Push des Arbeitsstands und des Lieferungs-Branches (`executor/stages.go:467` über `api/exec_deps.go:561`) | nein — nur innerhalb einer Ausführung | zwei Branches im fremden Repository (`mercury-dev` und der Lieferungs-Branch) | wie 6 |
-| 9 | Repository anlegen (`executor/stages.go:284` → `deliver/deliver.go:199`) | nein — nur innerhalb einer Ausführung, und nur für ein Ziel, das es nicht gibt | ein NEUES privates Repository in der konfigurierten Organisation | wie 6 |
-| 10 | Verzweigungsschutz direkt nach der Anlage (`api/exec_deps.go:691`) | nein — nur mit 9 | den Schutz des Standard-Branches des neu angelegten Repositories | wie 6 |
-| 11 | PR schliessen (`deliver/deliver.go:337`, `:392`) | nein — nur auf eine Bedienhandlung (Rücknahme, Gegenbuchung) | schliesst einen PR im fremden Repository mit benanntem Grund | niemand bedient sie während des Cutovers |
-| 12 | Verfassungs-Repository: Klon und Push (`axiomrepo/store.go:420`) | **beim Start, sobald eine Runner-Identität steht** — `api.New` startet den README-Keim (`api/api.go:137` → `axiomrepo/readme.go:28`) als Hintergrund-Aufgabe. Er ist create-only, feuert also höchstens einmal; jeder weitere Push ist ein Verfassungs-Schreibvorgang, und der erste davon ist Schritt **A1** | klont das Verfassungs-Repository und legt, wenn es keine README hat, EINEN Commit darauf an; später je Verfassungs-Änderung einen | im gehaltenen Start ist `axiomsTokenUser()` leer, also startet die Hintergrund-Aufgabe gar nicht. Ab Schritt 7 ist der README-Keim beabsichtigt |
-| 13 | dev-Auslieferung eines NACHBARDIENSTES (`api/exec_deps.go:749` → `devlab-install`) | nein — nur innerhalb einer Ausführung | Unit, `/opt/<repo>`, Rechte-Manifest, eine Route im GETEILTEN Caddy-Verzeichnis, und einen Neustart genau dieser Unit | wie 6; der Wrapper validiert die Kante vor der Übernahme und nimmt die eigene Datei bei Fehlschlag zurück |
+| 1 | Origin-Status je offenem PR (`deliver.Maintain` → `deliver/deliver.go:873 gh.PostCommitStatus`) | **JA — beim ersten Scheduler-Tick** (`DEVLAB_RUNS_TICK`), und danach bei JEDEM Tick, unbedingt | einen Commit-Status auf dem Kopf-Commit JEDES offenen PRs jedes verwalteten Repositories — auch in PRs, die ein Mensch gestellt hat und die dieser Cutover nichts angehen | **Schalter:** ohne `DEVLAB_RUNS_MAINTAIN_ENFORCE` schreibt die Wartung NICHTS — sie stellt den Stillstand aus den eigenen Pools fest und meldet ihn, ohne einen einzigen fremden Aufruf. **Und Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER`/`DEVLAB_RUNS_TOKEN_USER` löst `runnerToken` gar keinen Token auf. Die Probe unter der Tabelle liest, ob dieser Build den Schalter trägt |
+| 2 | Branch-Löschung nach Merge (`finalizeMerged` → `deliver/deliver.go:895 gh.DeleteBranch`) | **JA — beim ersten Tick**, für jeden verfolgten PR, der inzwischen gemerged ist (auch von einem Menschen) | löscht den Lieferungs-Branch im fremden Repository (404 gilt als erfüllt) | wie 1 (derselbe Schalter deckt die ganze Wartung ab) |
+| 3 | Auto-Merge (`deliver/deliver.go:837 gh.MergePullRequest`) | beim ersten Tick, dessen `mergeBy` erreicht ist — bei Messung 6a war das keiner; die Frist der Alt-Sätze liegt Wochen in der Zukunft | einen Merge-Commit in den Standard-Branch des fremden Repositories, höchstens einer je Repository und Tick | wie 1, zusätzlich die Frist selbst (`DEVLAB_RUNS_AUTOMERGE_WINDOW` sät nur den ersten Start; gespeicherte Sätze tragen ihre eigene Frist) |
+| 4 | Tagesbericht-Mail (`api/handlers_mercury_report.go:181 cl.Send` → Landschafts-Mailer) | **JA — sofort beim Start**, denn der Reporter macht einen Durchgang vor dem ersten Intervall | eine Mail an den Empfänger, für jeden abgeschlossenen Tag im Rückblick-Fenster ohne Zustellsatz — und für jeden noch offenen Satz, gleich wie alt, weil ein `failed`-Satz ohne Backoff sofort wieder fällig ist | **Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER` ist der Reporter AUS („reporter OFF (no run user provisioned)"). Messung 6a zeigt, welcher Tag sonst als erstes ginge |
+| 5 | Verzweigungsschutz-Durchlauf (`deliver.VerifyProtection` → `deliver/deliver.go:560 gh.ProtectDefaultBranch`, `deliver/deliver.go:591 gh.ProtectDefaultBranch`) | nein — der erste Durchgang wartet `DEVLAB_RUNS_PROTECTION_START_DELAY` (Vorgabe 15m) | liest den Schutz JEDES Repositories der Organisation; scharf PATCHt er den Standard-Branch jedes abweichenden | zwei Schalter (unten) **und** die Reihenfolge aus 1: auch dieser Pass braucht den Runner-Token |
+| 6 | PR öffnen (`deliver.OpenOrAdopt` → `deliver/deliver.go:146 gh.CreatePullRequest`) | nein — nur innerhalb einer Ausführung | einen Pull Request im Ziel-Repository (oder adoptiert den offenen) | kein Lauf ist eingeschaltet (Aktivierungs-Sperre, `10-daten.md` Schritt A); zusätzlich Reihenfolge aus 1 |
+| 7 | Origin-Status direkt nach dem Öffnen/Adoptieren (`deliver/deliver.go:678 gh.PostCommitStatus`) | nein — nur innerhalb einer Ausführung | einen Commit-Status auf dem Kopf-Commit dieses PRs | wie 6 |
+| 8 | Push des Arbeitsstands und des Lieferungs-Branches (`executor/stages.go:470 wb.PushBranch` über `api/exec_deps.go:566 b.PushBranch`) | nein — nur innerhalb einer Ausführung | zwei Branches im fremden Repository (`mercury-dev` und der Lieferungs-Branch) | wie 6 |
+| 9 | Repository anlegen (`executor/stages.go:287 gh.CreateRepo`; der geschützte Zwilling: `deliver/deliver.go:200 gh.CreateRepo`) | nein — nur innerhalb einer Ausführung, und nur für ein Ziel, das es nicht gibt | ein NEUES privates Repository in der konfigurierten Organisation | wie 6 |
+| 10 | Verzweigungsschutz direkt nach der Anlage (`api/exec_deps.go:691 ops.ProtectDefaultBranch`) | nein — nur mit 9 | den Schutz des Standard-Branches des neu angelegten Repositories | wie 6 |
+| 11 | PR schliessen (`deliver/deliver.go:338 gh.ClosePullRequest`, `deliver/deliver.go:393 gh.ClosePullRequest`) | nein — nur auf eine Bedienhandlung (Rücknahme, Gegenbuchung) | schliesst einen PR im fremden Repository mit benanntem Grund | niemand bedient sie während des Cutovers |
+| 12 | Verfassungs-Repository: Klon und Push (`axiomrepo/store.go:420 s.git`) | **beim Start, sobald eine Runner-Identität steht** — `api.New` startet den README-Keim (`api/api.go:137 s.axioms.EnsureReadme` → `axiomrepo/readme.go:28 s.Put`) als Hintergrund-Aufgabe. Er ist create-only, feuert also höchstens einmal; jeder weitere Push ist ein Verfassungs-Schreibvorgang, und der erste davon ist Schritt **A1** | klont das Verfassungs-Repository und legt, wenn es keine README hat, EINEN Commit darauf an; später je Verfassungs-Änderung einen | im gehaltenen Start ist `axiomsTokenUser()` leer, also startet die Hintergrund-Aufgabe gar nicht. Ab Schritt 7 ist der README-Keim beabsichtigt |
+| 13 | dev-Auslieferung eines NACHBARDIENSTES (`api/exec_deps.go:749 deploy.DeliverDev` → `devlab-install`) | nein — nur innerhalb einer Ausführung | Unit, `/opt/<repo>`, Rechte-Manifest, eine Route im GETEILTEN Caddy-Verzeichnis, und einen Neustart genau dieser Unit | wie 6; der Wrapper validiert die Kante vor der Übernahme und nimmt die eigene Datei bei Fehlschlag zurück |
 | 14 | Der Cutover selbst (Schritt 1) | ja, von Hand | `/etc/sudoers.d` (maschinenweit) und `/usr/local/sbin` (mit dem Runner geteilt) | jede sudoers-Datei wird EINZELN geprüft, bevor sie eingebaut wird, und Schritt 0b sichert jedes Artefakt |
+
+Jeder Anker der Tabelle nennt `datei:zeile` **und den Aufruf**, der dort steht — nicht aus Sorgfalt,
+sondern damit er prüfbar ist: eine blosse Zeilennummer veraltet beim nächsten Commit über der Datei,
+und zwar lautlos. Prüfung `doc-b` in `tools/abnahme.sh` liest jeden Anker dieser Dokumente und
+verlangt, dass die genannte Zeile den genannten Aufruf wirklich trägt; ein Anker ohne Aufruf
+scheitert ebenfalls, sonst liesse sich die Prüfung durch Weglassen umgehen.
 
 Nur LESEND, aber nach aussen: `ListOpenPullRequests`/`GetPullRequest` je Tick, `GetProtection`/
 `DefaultBranch` je Schutz-Durchlauf, die Repo-Menge je Auflösung, und die Anlauf-Abstimmung
@@ -368,11 +378,44 @@ dieses Durchgangs.
    `sudo cp -a "$BAK/etc/systemd/system/devlabd.service" /etc/systemd/system/devlabd.service` und
    `sudo cp -a "$BAK/etc/systemd/system/devlabd.service.d/runs.conf" /etc/systemd/system/devlabd.service.d/runs.conf`,
    dann `sudo systemctl daemon-reload`.
-3. **Schritt 5 zurück (Daten):** Zustand zurückspielen — der Tarball enthält
-   `mercury links chats comments www axioms`:
-   `sudo tar -C "$STATE_DIR" -xzf "$BAK"/devlab-state-*.tar.gz`. Das holt auch die **alte SPA**
-   zurück, die Schritt 4 überschrieben hat, und den **Verfassungs-Klon** `axioms` mit seinem nicht
-   gepushten Stand. Ein Neu-Klon der Verfassung ersetzt Letzteren NICHT. Der by-hand-Weg ohne
+3. **Schritt 5 zurück (Daten) — in drei Teilen.** `tar -x` ÜBERSCHREIBT, aber es LÖSCHT nichts:
+   Entpacken allein liesse jedes Artefakt liegen, das erst der Neubau angelegt hat, und der
+   Zustandsbaum trüge danach beide Welten — den alten Bestand und daneben `executions/`,
+   `runs-results.imported`, die `.pre-migration`-Ablagen und die Pools, die es vorher nicht gab.
+   ```sh
+   # 3a) Was der Neubau NEU angelegt hat, benannt entfernen (der Alt-Stand kennt nichts davon)
+   sudo rm -rf "$STATE_DIR/mercury/executions" \
+               "$STATE_DIR/mercury/runs-results.imported" \
+               "$STATE_DIR/mercury/settings.json" \
+               "$STATE_DIR/mercury/ai-usage.json" \
+               "$STATE_DIR/mercury/usage-limit.json" \
+               "$STATE_DIR/mercury/restart.json" \
+               "$STATE_DIR/mercury/order.json"
+   #      Die Ablagen der Übernahme — Datei UND Verzeichnis, auch die durchnummerierten Wiederholungen
+   sudo find "$STATE_DIR/mercury" -maxdepth 1 -name '*.pre-migration*' -exec rm -rf {} +
+   # 3b) Drei Bäume schreibt der Cutover als GANZES neu: den Konfigurations-Verlauf (der Import legt
+   #     einen zusätzlichen Schnappschuss an), die SPA (Schritt 4 legt neue, anders benannte Dateien
+   #     darüber) und den Verfassungs-Klon. Sie werden ERSETZT statt überlagert — aber nur, wenn der
+   #     Tarball sie wirklich trägt, sonst wäre das Entfernen ein Datenverlust statt eines Rückwegs.
+   for d in mercury/runs-history www axioms; do
+     if sudo tar -tzf "$BAK/devlab-state.tar.gz" | grep -q "^$d/"; then
+       sudo rm -rf "$STATE_DIR/$d" && echo "wird ersetzt: $d"
+     else
+       echo "NICHT im Tarball — bleibt stehen, Entfernen wäre Verlust: $d"
+     fi
+   done
+   # 3c) Zustand zurückspielen; der Tarball enthält mercury links chats comments www axioms
+   sudo tar -C "$STATE_DIR" -xzf "$BAK/devlab-state.tar.gz"
+   # 3d) Beweis, dass nichts aus dem Neubau übrig ist — die Liste MUSS leer sein
+   sudo find "$STATE_DIR/mercury" -maxdepth 1 \
+        \( -name executions -o -name 'runs-results.imported' -o -name '*.pre-migration*' \
+           -o -name settings.json -o -name ai-usage.json -o -name usage-limit.json \
+           -o -name restart.json -o -name order.json \) -print
+   ```
+   Das holt auch die **alte SPA** zurück, die Schritt 4 überschrieben hat, und den
+   **Verfassungs-Klon** `axioms` mit seinem nicht gepushten Stand. Ein Neu-Klon der Verfassung
+   ersetzt Letzteren NICHT. Die hand-gemachten Kopien `runs.json.bak-*` hat die Übernahme nie
+   angefasst; sie liegen unverändert dort, wo der Betreiber sie hingelegt hat. Der by-hand-Weg ohne
    Tarball steht in `10-daten.md` („Rollback").
 4. **Schritt 4 zurück (Binaries):**
    `sudo cp -a "$BAK/usr/local/bin/devlabd" /usr/local/bin/devlabd`, und

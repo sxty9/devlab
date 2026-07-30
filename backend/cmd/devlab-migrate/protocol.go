@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"devlab/backend/internal/model"
@@ -150,6 +151,19 @@ func writeTakeover(w io.Writer, p *plan) {
 	for _, o := range p.orphans {
 		fmt.Fprintf(w, "  no reader            %s → %s\n", o.from, o.to)
 		fmt.Fprintf(w, "    %s\n", o.why)
+		if o.held != "" {
+			fmt.Fprintf(w, "    it held %s — the value to carry over; it is not converted here\n", o.held)
+		}
+	}
+
+	if p.backups != nil && len(p.backups.names) > 0 {
+		fmt.Fprintf(w, "  operator's own copies %s — %d beside the pool, %d of them in the pre-rebuild form\n",
+			filepath.Join(p.backups.dir, backupPrefix+"*"), len(p.backups.names), p.backups.legacy)
+		fmt.Fprintf(w, "    %s\n", strings.Join(p.backups.names, ", "))
+		fmt.Fprintln(w, "    left exactly as they are: nothing writes them, nothing reads them, and no surface offers")
+		fmt.Fprintln(w, "    them as a restore point — only a human copying one over runs.json would bring them back,")
+		fmt.Fprintln(w, "    and that would re-inject the very records this takeover converted. Naming them here makes")
+		fmt.Fprintln(w, "    that an operator decision instead of a surprise weeks later")
 	}
 }
 

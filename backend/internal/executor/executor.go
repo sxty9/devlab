@@ -561,6 +561,10 @@ func finishStage(rc *RepoCtx, sv *model.StageView, views *[]model.StageView) {
 
 // finishRepo assembles the pipeline, raises the K-4 alarm when implemented work was left
 // undelivered, and reports the repo done.
+//
+// stage-vocabulary: `views` are the stages this run just walked, named by the chain itself. The
+// executor reads no stored execution document, so an archived one — which carries the retired
+// stage names — cannot reach this comparison.
 func (rc *RepoCtx) finishRepo(views []model.StageView, block *model.Backoff) model.RepoPipeline {
 	rp := model.RepoPipeline{Repo: rc.Repo, Stages: views, TaskState: rc.Finding.State, Block: block}
 	rp.Done, rp.Succeeded = model.PipelineSucceeded(views)

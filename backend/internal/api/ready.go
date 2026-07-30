@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +22,18 @@ import (
 // file may rely on, so the mode is set here and proven by test.
 const SocketMode = 0o660
 
+// MaxSocketPath is the kernel's limit on a Unix-socket path: `sun_path` holds 108 bytes including
+// the terminating NUL, so 107 are usable. Go surfaces an overrun as the bare "bind: invalid
+// argument", which names neither the limit nor the state root that hit it — so the limit is named
+// here, checked before the bind, and reported with the length and the knob that changes it.
+const MaxSocketPath = 107
+
+// stagePrefix names the private staging directory the socket is bound in before it is published.
+// It is deliberately SHORTER than the socket's own file name (`restart-ready.sock`), so the staged
+// path is always shorter than the published one: the staging can never be the thing that overruns
+// the limit while the contract path itself would have fitted.
+const stagePrefix = ".r"
+
 // ServeReadySocket runs the readiness endpoint until ctx ends. It must never be mounted on
 // the TCP mux.
 func (s *Server) ServeReadySocket(ctx context.Context) error {
@@ -28,6 +41,11 @@ func (s *Server) ServeReadySocket(ctx context.Context) error {
 		return errors.New("ready socket: no state paths configured")
 	}
 	sock := s.paths.ReadySocket()
+	if len(sock) > MaxSocketPath {
+		return fmt.Errorf("ready socket: %s is %d bytes and a Unix socket path may be at most %d "+
+			"(the kernel's sun_path) — the restart gate needs a shorter state root (DEVLAB_STATE_DIR)",
+			sock, len(sock), MaxSocketPath)
+	}
 	// A stale socket file of a dead predecessor blocks the bind — replace it.
 	if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
 		return err
@@ -36,7 +54,7 @@ func (s *Server) ServeReadySocket(ctx context.Context) error {
 	// fixed. Binding straight at the contract path and chmod'ing afterwards leaves a window in
 	// which the socket already accepts connections at the umask's mode; inside the staging
 	// directory no foreign process can even traverse to it, so that window does not exist.
-	stage, err := os.MkdirTemp(filepath.Dir(sock), ".ready-")
+	stage, err := os.MkdirTemp(filepath.Dir(sock), stagePrefix)
 	if err != nil {
 		return err
 	}
@@ -44,7 +62,7 @@ func (s *Server) ServeReadySocket(ctx context.Context) error {
 	staged := filepath.Join(stage, "s")
 	l, err := net.Listen("unix", staged)
 	if err != nil {
-		return err
+		return fmt.Errorf("ready socket: binding %s (%d bytes): %w", staged, len(staged), err)
 	}
 	if err := os.Chmod(staged, SocketMode); err != nil {
 		l.Close()

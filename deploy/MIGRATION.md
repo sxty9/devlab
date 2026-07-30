@@ -41,6 +41,7 @@ STATE_DIR=/var/lib/devlab                          # State-Root dieser Instanz (
 SVC_USER=devlab                                    # Dienst-Account der Unit (User=, Vorlagen-Default)
 EXPORT=<export-dir>/mercury-runs-roh.json          # der Roh-Export (siehe 10-daten.md)
 BAK=/root/devlab-cutover-$(date +%Y%m%d-%H%M%S)    # Sicherung DIESES Durchgangs
+STATE_TAR="$BAK/devlab-state.tar.gz"               # EIN Durchgang, EINE Zustandssicherung
 
 # 0) Sicherung — VOLLSTÄNDIG: der Zustand UND jedes Artefakt, das dieser Cutover verändert
 sudo systemctl stop devlabd
@@ -50,13 +51,16 @@ sudo install -d -m0700 "$BAK"
 #        Schritt 4 überschreibt) und axioms (der Verfassungs-Klon; ein nicht gepushter Stand darin
 #        existiert sonst nirgends). --ignore-failed-read: ein noch nicht angelegtes Verzeichnis ist
 #        kein Fehler.
-sudo tar -C "$STATE_DIR" --ignore-failed-read \
-    -czf "$BAK/devlab-state-$(date +%Y%m%d-%H%M%S).tar.gz" \
+#        Der Tarball trägt einen FESTEN Namen: $BAK trägt den Zeitstempel bereits, und ein zweiter
+#        Anlauf in dasselbe $BAK ersetzt damit die eine Sicherung, statt eine zweite danebenzulegen.
+#        Ein Glob über zwei Tarbälle hätte `tar -tzf` zwei Argumente gegeben — tar liest das zweite
+#        dann als Mitglied IM ersten, und die Prüfung unten wäre fälschlich fehlgeschlagen.
+sudo tar -C "$STATE_DIR" --ignore-failed-read -czf "$STATE_TAR" \
     mercury links chats comments www axioms
 #        Prüfen, dass die Sicherung jedes Glied wirklich enthält (sonst ist der Rückweg
 #        unvollständig, und das merkt man erst, wenn man ihn braucht):
 for d in mercury links chats comments www axioms; do
-  sudo sh -c "tar -tzf $BAK/devlab-state-*.tar.gz | grep -q \"^$d/\"" \
+  sudo tar -tzf "$STATE_TAR" | grep -q "^$d/" \
     && echo "gesichert: $d" || echo "NICHT im Tarball (fehlt oder ist leer): $d"
 done
 #    0b) Jedes GETEILTE Artefakt, das Schritt 1, 2 und 4 überschreiben oder entfernen — die Wrapper
@@ -255,20 +259,26 @@ ihren fehlenden Zugang, statt zu handeln.
 
 | # | Stelle | Feuert sie beim ersten Start? | Was sie schreibt | Wie sie bis zur Freigabe stillhält |
 |---|---|---|---|---|
-| 1 | Origin-Status je offenem PR (`deliver.Maintain`, `deliver/deliver.go:798`) | **JA — beim ersten Scheduler-Tick** (`DEVLAB_RUNS_TICK`), und danach bei JEDEM Tick, unbedingt | einen Commit-Status auf dem Kopf-Commit JEDES offenen PRs jedes verwalteten Repositories — auch in PRs, die ein Mensch gestellt hat und die dieser Cutover nichts angehen | **Schalter:** ohne `DEVLAB_RUNS_MAINTAIN_ENFORCE` schreibt die Wartung NICHTS — sie stellt den Stillstand aus den eigenen Pools fest und meldet ihn, ohne einen einzigen fremden Aufruf. **Und Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER`/`DEVLAB_RUNS_TOKEN_USER` löst `runnerToken` gar keinen Token auf. Die Probe unter der Tabelle liest, ob dieser Build den Schalter trägt |
-| 2 | Branch-Löschung nach Merge (`finalizeMerged`, `deliver/deliver.go:820`) | **JA — beim ersten Tick**, für jeden verfolgten PR, der inzwischen gemerged ist (auch von einem Menschen) | löscht den Lieferungs-Branch im fremden Repository (404 gilt als erfüllt) | wie 1 (derselbe Schalter deckt die ganze Wartung ab) |
-| 3 | Auto-Merge (`deliver/deliver.go:762`) | beim ersten Tick, dessen `mergeBy` erreicht ist — bei Messung 6a war das keiner; die Frist der Alt-Sätze liegt Wochen in der Zukunft | einen Merge-Commit in den Standard-Branch des fremden Repositories, höchstens einer je Repository und Tick | wie 1, zusätzlich die Frist selbst (`DEVLAB_RUNS_AUTOMERGE_WINDOW` sät nur den ersten Start; gespeicherte Sätze tragen ihre eigene Frist) |
-| 4 | Tagesbericht-Mail (`api/handlers_mercury_report.go:79` → Landschafts-Mailer) | **JA — sofort beim Start**, denn der Reporter macht einen Durchgang vor dem ersten Intervall | eine Mail an den Empfänger, für jeden abgeschlossenen Tag im Rückblick-Fenster ohne Zustellsatz — und für jeden noch offenen Satz, gleich wie alt, weil ein `failed`-Satz ohne Backoff sofort wieder fällig ist | **Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER` ist der Reporter AUS („reporter OFF (no run user provisioned)"). Messung 6a zeigt, welcher Tag sonst als erstes ginge |
-| 5 | Verzweigungsschutz-Durchlauf (`deliver.VerifyProtection`, `deliver/deliver.go:559`, `:590`) | nein — der erste Durchgang wartet `DEVLAB_RUNS_PROTECTION_START_DELAY` (Vorgabe 15m) | liest den Schutz JEDES Repositories der Organisation; scharf PATCHt er den Standard-Branch jedes abweichenden | zwei Schalter (unten) **und** die Reihenfolge aus 1: auch dieser Pass braucht den Runner-Token |
-| 6 | PR öffnen (`deliver.OpenOrAdopt`, `deliver/deliver.go:145`) | nein — nur innerhalb einer Ausführung | einen Pull Request im Ziel-Repository (oder adoptiert den offenen) | kein Lauf ist eingeschaltet (Aktivierungs-Sperre, `10-daten.md` Schritt A); zusätzlich Reihenfolge aus 1 |
-| 7 | Origin-Status direkt nach dem Öffnen/Adoptieren (`deliver/deliver.go:683`) | nein — nur innerhalb einer Ausführung | einen Commit-Status auf dem Kopf-Commit dieses PRs | wie 6 |
-| 8 | Push des Arbeitsstands und des Lieferungs-Branches (`executor/stages.go:467` über `api/exec_deps.go:561`) | nein — nur innerhalb einer Ausführung | zwei Branches im fremden Repository (`mercury-dev` und der Lieferungs-Branch) | wie 6 |
-| 9 | Repository anlegen (`executor/stages.go:284` → `deliver/deliver.go:199`) | nein — nur innerhalb einer Ausführung, und nur für ein Ziel, das es nicht gibt | ein NEUES privates Repository in der konfigurierten Organisation | wie 6 |
-| 10 | Verzweigungsschutz direkt nach der Anlage (`api/exec_deps.go:691`) | nein — nur mit 9 | den Schutz des Standard-Branches des neu angelegten Repositories | wie 6 |
-| 11 | PR schliessen (`deliver/deliver.go:337`, `:392`) | nein — nur auf eine Bedienhandlung (Rücknahme, Gegenbuchung) | schliesst einen PR im fremden Repository mit benanntem Grund | niemand bedient sie während des Cutovers |
-| 12 | Verfassungs-Repository: Klon und Push (`axiomrepo/store.go:420`) | **beim Start, sobald eine Runner-Identität steht** — `api.New` startet den README-Keim (`api/api.go:137` → `axiomrepo/readme.go:28`) als Hintergrund-Aufgabe. Er ist create-only, feuert also höchstens einmal; jeder weitere Push ist ein Verfassungs-Schreibvorgang, und der erste davon ist Schritt **A1** | klont das Verfassungs-Repository und legt, wenn es keine README hat, EINEN Commit darauf an; später je Verfassungs-Änderung einen | im gehaltenen Start ist `axiomsTokenUser()` leer, also startet die Hintergrund-Aufgabe gar nicht. Ab Schritt 7 ist der README-Keim beabsichtigt |
-| 13 | dev-Auslieferung eines NACHBARDIENSTES (`api/exec_deps.go:749` → `devlab-install`) | nein — nur innerhalb einer Ausführung | Unit, `/opt/<repo>`, Rechte-Manifest, eine Route im GETEILTEN Caddy-Verzeichnis, und einen Neustart genau dieser Unit | wie 6; der Wrapper validiert die Kante vor der Übernahme und nimmt die eigene Datei bei Fehlschlag zurück |
+| 1 | Origin-Status je offenem PR (`deliver.Maintain` → `deliver/deliver.go:873 gh.PostCommitStatus`) | **JA — beim ersten Scheduler-Tick** (`DEVLAB_RUNS_TICK`), und danach bei JEDEM Tick, unbedingt | einen Commit-Status auf dem Kopf-Commit JEDES offenen PRs jedes verwalteten Repositories — auch in PRs, die ein Mensch gestellt hat und die dieser Cutover nichts angehen | **Schalter:** ohne `DEVLAB_RUNS_MAINTAIN_ENFORCE` schreibt die Wartung NICHTS — sie stellt den Stillstand aus den eigenen Pools fest und meldet ihn, ohne einen einzigen fremden Aufruf. **Und Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER`/`DEVLAB_RUNS_TOKEN_USER` löst `runnerToken` gar keinen Token auf. Die Probe unter der Tabelle liest, ob dieser Build den Schalter trägt |
+| 2 | Branch-Löschung nach Merge (`finalizeMerged` → `deliver/deliver.go:895 gh.DeleteBranch`) | **JA — beim ersten Tick**, für jeden verfolgten PR, der inzwischen gemerged ist (auch von einem Menschen) | löscht den Lieferungs-Branch im fremden Repository (404 gilt als erfüllt) | wie 1 (derselbe Schalter deckt die ganze Wartung ab) |
+| 3 | Auto-Merge (`deliver/deliver.go:837 gh.MergePullRequest`) | beim ersten Tick, dessen `mergeBy` erreicht ist — bei Messung 6a war das keiner; die Frist der Alt-Sätze liegt Wochen in der Zukunft | einen Merge-Commit in den Standard-Branch des fremden Repositories, höchstens einer je Repository und Tick | wie 1, zusätzlich die Frist selbst (`DEVLAB_RUNS_AUTOMERGE_WINDOW` sät nur den ersten Start; gespeicherte Sätze tragen ihre eigene Frist) |
+| 4 | Tagesbericht-Mail (`api/handlers_mercury_report.go:181 cl.Send` → Landschafts-Mailer) | **JA — sofort beim Start**, denn der Reporter macht einen Durchgang vor dem ersten Intervall | eine Mail an den Empfänger, für jeden abgeschlossenen Tag im Rückblick-Fenster ohne Zustellsatz — und für jeden noch offenen Satz, gleich wie alt, weil ein `failed`-Satz ohne Backoff sofort wieder fällig ist | **Reihenfolge (Schritt 6):** ohne `DEVLAB_RUNS_USER` ist der Reporter AUS („reporter OFF (no run user provisioned)"). Messung 6a zeigt, welcher Tag sonst als erstes ginge |
+| 5 | Verzweigungsschutz-Durchlauf (`deliver.VerifyProtection` → `deliver/deliver.go:560 gh.ProtectDefaultBranch`, `deliver/deliver.go:591 gh.ProtectDefaultBranch`) | nein — der erste Durchgang wartet `DEVLAB_RUNS_PROTECTION_START_DELAY` (Vorgabe 15m) | liest den Schutz JEDES Repositories der Organisation; scharf PATCHt er den Standard-Branch jedes abweichenden | zwei Schalter (unten) **und** die Reihenfolge aus 1: auch dieser Pass braucht den Runner-Token |
+| 6 | PR öffnen (`deliver.OpenOrAdopt` → `deliver/deliver.go:146 gh.CreatePullRequest`) | nein — nur innerhalb einer Ausführung | einen Pull Request im Ziel-Repository (oder adoptiert den offenen) | kein Lauf ist eingeschaltet (Aktivierungs-Sperre, `10-daten.md` Schritt A); zusätzlich Reihenfolge aus 1 |
+| 7 | Origin-Status direkt nach dem Öffnen/Adoptieren (`deliver/deliver.go:678 gh.PostCommitStatus`) | nein — nur innerhalb einer Ausführung | einen Commit-Status auf dem Kopf-Commit dieses PRs | wie 6 |
+| 8 | Push des Arbeitsstands und des Lieferungs-Branches (`executor/stages.go:470 wb.PushBranch` über `api/exec_deps.go:566 b.PushBranch`) | nein — nur innerhalb einer Ausführung | zwei Branches im fremden Repository (`mercury-dev` und der Lieferungs-Branch) | wie 6 |
+| 9 | Repository anlegen (`executor/stages.go:287 gh.CreateRepo`; der geschützte Zwilling: `deliver/deliver.go:200 gh.CreateRepo`) | nein — nur innerhalb einer Ausführung, und nur für ein Ziel, das es nicht gibt | ein NEUES privates Repository in der konfigurierten Organisation | wie 6 |
+| 10 | Verzweigungsschutz direkt nach der Anlage (`api/exec_deps.go:691 ops.ProtectDefaultBranch`) | nein — nur mit 9 | den Schutz des Standard-Branches des neu angelegten Repositories | wie 6 |
+| 11 | PR schliessen (`deliver/deliver.go:338 gh.ClosePullRequest`, `deliver/deliver.go:393 gh.ClosePullRequest`) | nein — nur auf eine Bedienhandlung (Rücknahme, Gegenbuchung) | schliesst einen PR im fremden Repository mit benanntem Grund | niemand bedient sie während des Cutovers |
+| 12 | Verfassungs-Repository: Klon und Push (`axiomrepo/store.go:420 s.git`) | **beim Start, sobald eine Runner-Identität steht** — `api.New` startet den README-Keim (`api/api.go:137 s.axioms.EnsureReadme` → `axiomrepo/readme.go:28 s.Put`) als Hintergrund-Aufgabe. Er ist create-only, feuert also höchstens einmal; jeder weitere Push ist ein Verfassungs-Schreibvorgang, und der erste davon ist Schritt **A1** | klont das Verfassungs-Repository und legt, wenn es keine README hat, EINEN Commit darauf an; später je Verfassungs-Änderung einen | im gehaltenen Start ist `axiomsTokenUser()` leer, also startet die Hintergrund-Aufgabe gar nicht. Ab Schritt 7 ist der README-Keim beabsichtigt |
+| 13 | dev-Auslieferung eines NACHBARDIENSTES (`api/exec_deps.go:749 deploy.DeliverDev` → `devlab-install`) | nein — nur innerhalb einer Ausführung | Unit, `/opt/<repo>`, Rechte-Manifest, eine Route im GETEILTEN Caddy-Verzeichnis, und einen Neustart genau dieser Unit | wie 6; der Wrapper validiert die Kante vor der Übernahme und nimmt die eigene Datei bei Fehlschlag zurück |
 | 14 | Der Cutover selbst (Schritt 1) | ja, von Hand | `/etc/sudoers.d` (maschinenweit) und `/usr/local/sbin` (mit dem Runner geteilt) | jede sudoers-Datei wird EINZELN geprüft, bevor sie eingebaut wird, und Schritt 0b sichert jedes Artefakt |
+
+Jeder Anker der Tabelle nennt `datei:zeile` **und den Aufruf**, der dort steht — nicht aus Sorgfalt,
+sondern damit er prüfbar ist: eine blosse Zeilennummer veraltet beim nächsten Commit über der Datei,
+und zwar lautlos. Prüfung `doc-b` in `tools/abnahme.sh` liest jeden Anker dieser Dokumente und
+verlangt, dass die genannte Zeile den genannten Aufruf wirklich trägt; ein Anker ohne Aufruf
+scheitert ebenfalls, sonst liesse sich die Prüfung durch Weglassen umgehen.
 
 Nur LESEND, aber nach aussen: `ListOpenPullRequests`/`GetPullRequest` je Tick, `GetProtection`/
 `DefaultBranch` je Schutz-Durchlauf, die Repo-Menge je Auflösung, und die Anlauf-Abstimmung
@@ -384,11 +394,44 @@ dieses Durchgangs.
    `sudo cp -a "$BAK/etc/systemd/system/devlabd.service" /etc/systemd/system/devlabd.service` und
    `sudo cp -a "$BAK/etc/systemd/system/devlabd.service.d/runs.conf" /etc/systemd/system/devlabd.service.d/runs.conf`,
    dann `sudo systemctl daemon-reload`.
-3. **Schritt 5 zurück (Daten):** Zustand zurückspielen — der Tarball enthält
-   `mercury links chats comments www axioms`:
-   `sudo tar -C "$STATE_DIR" -xzf "$BAK"/devlab-state-*.tar.gz`. Das holt auch die **alte SPA**
-   zurück, die Schritt 4 überschrieben hat, und den **Verfassungs-Klon** `axioms` mit seinem nicht
-   gepushten Stand. Ein Neu-Klon der Verfassung ersetzt Letzteren NICHT. Der by-hand-Weg ohne
+3. **Schritt 5 zurück (Daten) — in drei Teilen.** `tar -x` ÜBERSCHREIBT, aber es LÖSCHT nichts:
+   Entpacken allein liesse jedes Artefakt liegen, das erst der Neubau angelegt hat, und der
+   Zustandsbaum trüge danach beide Welten — den alten Bestand und daneben `executions/`,
+   `runs-results.imported`, die `.pre-migration`-Ablagen und die Pools, die es vorher nicht gab.
+   ```sh
+   # 3a) Was der Neubau NEU angelegt hat, benannt entfernen (der Alt-Stand kennt nichts davon)
+   sudo rm -rf "$STATE_DIR/mercury/executions" \
+               "$STATE_DIR/mercury/runs-results.imported" \
+               "$STATE_DIR/mercury/settings.json" \
+               "$STATE_DIR/mercury/ai-usage.json" \
+               "$STATE_DIR/mercury/usage-limit.json" \
+               "$STATE_DIR/mercury/restart.json" \
+               "$STATE_DIR/mercury/order.json"
+   #      Die Ablagen der Übernahme — Datei UND Verzeichnis, auch die durchnummerierten Wiederholungen
+   sudo find "$STATE_DIR/mercury" -maxdepth 1 -name '*.pre-migration*' -exec rm -rf {} +
+   # 3b) Drei Bäume schreibt der Cutover als GANZES neu: den Konfigurations-Verlauf (der Import legt
+   #     einen zusätzlichen Schnappschuss an), die SPA (Schritt 4 legt neue, anders benannte Dateien
+   #     darüber) und den Verfassungs-Klon. Sie werden ERSETZT statt überlagert — aber nur, wenn der
+   #     Tarball sie wirklich trägt, sonst wäre das Entfernen ein Datenverlust statt eines Rückwegs.
+   for d in mercury/runs-history www axioms; do
+     if sudo tar -tzf "$BAK/devlab-state.tar.gz" | grep -q "^$d/"; then
+       sudo rm -rf "$STATE_DIR/$d" && echo "wird ersetzt: $d"
+     else
+       echo "NICHT im Tarball — bleibt stehen, Entfernen wäre Verlust: $d"
+     fi
+   done
+   # 3c) Zustand zurückspielen; der Tarball enthält mercury links chats comments www axioms
+   sudo tar -C "$STATE_DIR" -xzf "$BAK/devlab-state.tar.gz"
+   # 3d) Beweis, dass nichts aus dem Neubau übrig ist — die Liste MUSS leer sein
+   sudo find "$STATE_DIR/mercury" -maxdepth 1 \
+        \( -name executions -o -name 'runs-results.imported' -o -name '*.pre-migration*' \
+           -o -name settings.json -o -name ai-usage.json -o -name usage-limit.json \
+           -o -name restart.json -o -name order.json \) -print
+   ```
+   Das holt auch die **alte SPA** zurück, die Schritt 4 überschrieben hat, und den
+   **Verfassungs-Klon** `axioms` mit seinem nicht gepushten Stand. Ein Neu-Klon der Verfassung
+   ersetzt Letzteren NICHT. Die hand-gemachten Kopien `runs.json.bak-*` hat die Übernahme nie
+   angefasst; sie liegen unverändert dort, wo der Betreiber sie hingelegt hat. Der by-hand-Weg ohne
    Tarball steht in `10-daten.md` („Rollback").
 4. **Schritt 4 zurück (Binaries):**
    `sudo cp -a "$BAK/usr/local/bin/devlabd" /usr/local/bin/devlabd`, und
@@ -510,7 +553,8 @@ rebuilt form counts as already imported.
 | `mercury/runs-results/` | read tolerantly and mapped, including a step recorded as `ok` before statuses existed, historical stage names in the instance's own language, the separate live block and a zero finishing time (which stays "never finished") | imported into `mercury/executions/`, then moved aside (row above). The auxiliary fields of the old document — `mode`, `timeBudget`, `numTurns`, `effort`, `promptHash`, `interrupted`, `suspended`, `resumeAt` — have no place in the rebuilt result and are **not** carried: the archive is display-only, its stages carry the observable truth, and the moved-aside archive keeps the originals |
 | `mercury/daily-reports.json` | read as it lies — the rebuilt record spells `recipient`, `day`, `status`, `executions`, `attempts`, `lastAttempt`, `lastError` exactly as the source does, and the `backoff` field that postdates these rows is absent and reads as "no retry episode". But a record left in `failed` WITHOUT a backoff is **due again on the reporter's very first pass**, whatever its age: the reporter runs a pass before its first interval, so the first start re-attempts a send that the old instance already failed — and a report for a day inside the lookback window goes out for work the OLD instance did | **nothing** — and that is why it must be looked at before the runner identity is set: `00-cutover.md` step 6a prints day, status, attempts and the last error, step 6 keeps the reporter switched off until then. A day that may not be re-sent is settled by hand with the daemon stopped (status `blocked` waits for the explicit resumption, K-5); a day that no longer concerns anybody is moved aside with the file |
 | `mercury/axiom-checks.json`, `mercury/axiom-authors.json`, `mercury/attachments/` | read as they lie: the examined-stand pool is `{repos: {repo: {axiom: {commit, at}}}}`, the authorship pool `{authors: {axiom: {createdBy, createdAt, updatedBy, updatedAt}}}`, and the attachment tree is `<run>/<attachment>` — all three the shape the rebuilt stores spell. An unreadable examination pool is set aside by the store itself and NAMED in the prompt, so it never reads as "never examined here" | **nothing** — nothing to migrate. Without them the first pass of every run would examine each repository in full, which is correct but expensive |
-| `mercury/runs-settings.json`, `mercury/runs-incidents.json` | **no rebuilt store opens them** | moved to `<name>.pre-migration` with the reason in the protocol, so nothing is left that looks live and is not. The old slot capacity is **not** carried over: set it as `DEVLAB_RUNS_MAX_CONCURRENCY` in the drop-in (step 2 of `00-cutover.md`) if the pre-rebuild value is still wanted — read it out of `runs-settings.json.pre-migration` |
+| `mercury/runs-settings.json`, `mercury/runs-incidents.json` | **no rebuilt store opens them** | moved to `<name>.pre-migration` with the reason in the protocol, so nothing is left that looks live and is not. The old slot capacity is deliberately **not** converted: the rebuilt `settings.json` is a three-field document the store reads WHOLE, so writing it with the capacity alone would pin the default time budget and the automerge window at zero and switch both off. It is therefore an **operator handling**, and the protocol prints the number for it (`it held maxConcurrent = N`): put that value into `DEVLAB_RUNS_MAX_CONCURRENCY` in the drop-in (step 2 of `00-cutover.md`), which seeds the first start; from the first change on, the stored value wins (REQ-013.2) |
+| `mercury/runs.json.bak-*` (the operator's own copies) | no reader, and no surface offers them as a restore point — only a human copying one over `runs.json` brings them back, and that re-injects exactly the records the takeover just converted | **nothing** — they are the operator's own files, made outside the service, so they are neither moved nor renamed. The protocol names each one and how many still hold pre-rebuild records, which makes deleting or keeping them a decision instead of a surprise |
 | the pre-rebuild single-execution marker | no reader — the twin-marker trap does not exist in the rebuild (REQ-039.3) | **not** the import's job: it is a trap to remove, not stock to keep, and step **3** of `00-cutover.md` deletes it by name before the import runs |
 
 A record that is in **neither** shape — one carrying markers of both, or none at all — is never
@@ -1066,7 +1110,7 @@ then broken five times in one commit. The paths are therefore spelled exactly as
 spells them, and the paragraph beginning "Frozen were:" is the one the check parses.
 
 Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`, Welle 3 = `3e2019b`,
-repair wave 1 = `0a9f8fe`.
+repair wave 1 = `0a9f8fe`, repair wave 4 = `2e6a1ab`.
 
 ---
 
@@ -1710,7 +1754,7 @@ reads that name), plus the two probes the step itself performs.
 **Who:** repair wave 4 (U1).
 **Reason:** the runbook claimed exactly one thing reaches outside DevLab (the branch-protection pass).
 Read against the code that is wrong by an order of magnitude, and the difference is not academic:
-`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246`), so from the FIRST tick
+`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246 s.runMaintain`), so from the FIRST tick
 after the first start it posts a delivery-origin status on every open pull request of every managed
 repository — hand-raised ones included — deletes the delivery branch of any tracked pull request a
 human merged meanwhile, and merges whatever has passed its window. The daily reporter performs a pass
@@ -1770,7 +1814,7 @@ constitution store resolves its token through the same runner identity.
 **Proof:** the readability precondition and the staging removal are probes in the step itself; the
 three pool rows were measured against the real state directory (shape comparison against
 `report.Record`, `runs.AxiomChecks`, `axiomauthors.Author` and the attachment path layout), and the
-"due again" claim is the shipped `due()` in `report/reporter.go:251`, which returns true for a failed
+"due again" claim is the shipped `due()` in `report/reporter.go:251 due`, which returns true for a failed
 record with no backoff.
 
 ### `deploy/migration/20-sichtpruefung.md` — the inspection kinds are the matrix's own, and the open work is one list
@@ -1888,6 +1932,132 @@ archive record ended, holds nothing transient and states where its end came from
 `TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead` for the imported document; and
 `src/views/mercury/tasks/select.test.ts` for the partition (history ∪ running ∪ awaiting = the pool,
 each record in exactly one place).
+
+---
+
+## Repair wave 5
+
+**No frozen file changed in this wave.** Every entry below is recorded for the same reason the
+earlier waves recorded theirs: it changes what the delivery CLAIMS about itself, or how a claim is
+kept honest. `contract-a` and `contract-b` stay green because the §0.2 list was not touched.
+
+### `backend/internal/report/selfcheck.go` — the self-check says nothing about a past it cannot read
+
+**Who:** repair wave 5. Not a frozen file; recorded because it is a display that contradicted the
+stock, in a file no earlier repair had opened.
+**Reason (measured on the real archive, 82 records):** the delivery self-check compares stages
+STRICTLY against the chain's vocabulary, over `ResultStore.List()`, which mixes the pre-rebuild
+archive in. An archived record carries its stage names verbatim — `implement`, but `dev-deploy`
+where the chain says `deliver-dev` — so `implement` matched and the delivery never did. Every
+archived execution therefore read as "implemented, never delivered", and the FIRST start of a
+rebuilt instance raised `changes were implemented but nothing was delivered in the last 72h` over a
+past that is closed and cannot be resumed. The finding's own next step ("check the delivery path and
+resume") has no addressee there at all.
+**What changed:** the pass filters on the provenance the tolerant reader already records
+(`Result.Legacy`) and judges only documents written in its own vocabulary. The archive is neither
+translated nor judged: a translation would trade a wrong finding for a guessed one, because
+"delivered" meant something else in the old system (a push plus an opened pull request, not a dev
+delivery). An archived record is now evidence neither for the finding nor against it — it cannot
+raise one and it cannot silence one.
+**Diff hint:** `git diff 2e6a1ab -- backend/internal/report/selfcheck.go`.
+**Proof:** `TestSelfCheckSaysNothingAboutTheArchive` drives ONE real archived document — instance
+stripped out, its shape (per-step `ok` booleans, no `status`, exactly the four archived step names)
+kept — through the PRODUCTION tolerant reader, and first asserts the premise (implement executed,
+no delivery visible) so the fixture cannot silently stop reproducing the blocker.
+`TestSelfCheckStillFiresOnTheSameSituationInTheCurrentVocabulary` and
+`TestSelfCheckArchiveNeitherRaisesNorSilences` are the two controls.
+
+### `backend/it/vocabulary_test.go` — the audit now sees READING a retired name, not only producing one
+
+**Who:** repair wave 5.
+**Reason:** six review rounds passed over the self-check because the vocabulary audit only ever
+policed the PRODUCTION of a retired word (`TestNoSynonymForAFixedWord`,
+`TestRetiredStepNamesLiveOnlyOnTheLegacyPath`), and `readsAlongsideCanonical` explicitly permits
+reading one anywhere. The defect names no retired word at all — it simply never asks whether the
+document in front of it is an archived one — so no check could have failed.
+**What changed:** a third check, `TestEveryStageComparisonHandlesTheLegacyVocabulary`, over the
+COMPARISON rather than the word. Every place that compares a stage must either consult the archived
+provenance (`Result.Legacy`) or carry a `stage-vocabulary:` line stating why no archived document
+reaches it; a place that says neither is a failure. Three live-path sites (`exec_record.go`
+`StageUpdate`, `executor.go` `finishRepo`, `stages.go` `implementRun`) now state it; they compare
+stages this execution just wrote and never open a stored document.
+**Diff hint:** `git diff 2e6a1ab -- backend/it/vocabulary_test.go`.
+**Proof:** a CANARY inside the test: the checker is fed the self-check exactly as it stood when the
+blocker was raised and must report exactly that file. Without the canary the extended check would be
+one that passes on everything, including the defect it was written for.
+
+### `backend/internal/api/handlers_mercury_deliveries.go`, `backend/internal/deliver/deliver.go` — the standstill is reported in the configuration it exists for
+
+**Who:** repair wave 5.
+**Reason:** `MaintainDeliveries` resolved the runner token BEFORE `deliver.Maintain` and returned on
+its absence. The cutover's first start (step 6) runs deliberately WITHOUT `DEVLAB_RUNS_USER` and
+`DEVLAB_RUNS_TOKEN_USER`, so in exactly the configuration `reportMaintainStandstill` was written for
+it was unreachable: the operator saw no sign that the maintenance stands still, although the
+standstill is intended and although the delivery ledger behind it is what step 6a asks them to look
+at.
+**What changed:** the identity is resolved for the WRITING half only. Unarmed — the default, and the
+state of the first start — the pass runs without one and reports; armed, a missing identity fails by
+name rather than reporting a standstill it never attempted to end. `Maintain` states the nil-ops
+tolerance in its contract and refuses it one line below the hold, so it can never reach a writing
+line.
+**Diff hint:** `git diff 2e6a1ab -- backend/internal/api/handlers_mercury_deliveries.go backend/internal/deliver/deliver.go`.
+**Proof:** `TestMaintainReportsTheStandstillWithoutARunnerIdentity` builds exactly the step-6
+configuration (no identity, unarmed, nothing injected into the ops seam) and asserts one standstill
+notice AND that neither the PR pool nor the ledger moved; `TestMaintainRefusesToWriteWithoutARunner-
+Identity` is its armed counterpart.
+
+### `deploy/migration/00-cutover.md` — the foreign-effect table's anchors point at the code again
+
+**Who:** repair wave 5.
+**Reason:** six of the ten `deliver.go` anchors of the "Fremdwirkung" table had drifted onto a
+`continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
+one table with which the operator is told where to READ each writing call before the first start.
+**What changed:** every anchor was verified against the code and corrected, and each one now carries
+the CALL it points at (`deliver/deliver.go:873 gh.PostCommitStatus`) instead of a bare line number.
+**Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
+**Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
+runbook parts and fails unless the named line really carries the named call — and fails on an anchor
+that names no call, so the check cannot be dodged by omitting the verifiable half. Both failure
+modes were provoked once before the check was kept.
+
+### The five smaller findings of the same review
+
+**Who:** repair wave 5.
+
+* **`backend/internal/api/ready.go`** bound the readiness socket inside `<state-root>/.ready-<rand>/s`.
+  A Unix socket path is limited to `sun_path` (108 bytes with the NUL) and the kernel answers an
+  overrun with the bare "bind: invalid argument", which names neither the limit nor the state root.
+  The staging prefix is now `.r`, which makes the staged path always SHORTER than the published
+  `restart-ready.sock` — the staging can no longer be the thing that fails while the contract path
+  would have fitted — and the length is checked before the bind and reported with the knob that
+  changes it (`DEVLAB_STATE_DIR`). Proof:
+  `TestReadySocketNamesThePathLimitInsteadOfBindInvalidArgument`.
+* **`backend/cmd/devlab-migrate/takeover.go`** set `runs-settings.json` aside as "no reader" without
+  naming the slot capacity it held. The value is deliberately NOT converted — the rebuilt
+  `settings.json` is a three-field document the store reads whole, so writing it with the capacity
+  alone would pin the default time budget and the automerge window at zero and switch both off — so
+  it is an OPERATOR HANDLING, and the protocol now prints the number (`it held maxConcurrent = N`)
+  together with the one place that carries it into the first start
+  (`DEVLAB_RUNS_MAX_CONCURRENCY`). Proof: `TestTheSetAsideSettingsValueIsNamedAsAnOperatorHandling`,
+  which also asserts the migration writes no `settings.json` of its own.
+* **`deploy/migration/00-cutover.md`, Rollback** restored the tarball over the tree but removed
+  nothing, and `tar -x` deletes nothing — so the state tree carried BOTH worlds afterwards
+  (`executions/`, `runs-results.imported`, the `.pre-migration` set-asides and the pools the old
+  stand does not know). The rollback now removes them by name, REPLACES the three trees the cutover
+  rewrites as a whole (`mercury/runs-history`, `www`, `axioms` — each only if the tarball actually
+  carries it, so the removal can never become a loss), and ends with a `find` whose output must be
+  empty.
+* **`deploy/migration/00-cutover.md`, step 0** verified the backup through
+  `tar -tzf $BAK/devlab-state-*.tar.gz`. A second pass into the same `$BAK` would have given `tar`
+  two arguments — it reads the second as a MEMBER of the first — and the backup verification would
+  have failed on a backup that is fine. The tarball now has a fixed name (`$STATE_TAR`; `$BAK`
+  already carries the timestamp), so a repeat replaces the one backup instead of leaving two behind.
+* **`runs.json.bak-*`** — hand-made copies of the run pool that the takeover never looked at. They
+  are the operator's own files: nothing writes them, nothing reads them, and no surface offers them
+  as a restore point, so they are neither moved nor renamed. But copying one back over `runs.json`
+  would re-inject exactly the records the takeover converted, so the protocol now names each one and
+  how many still hold pre-rebuild records — which makes keeping or deleting them a decision instead
+  of a surprise. Proof: `TestHandMadeRunPoolCopiesAreReportedAndLeftAlone`.
 
 
 ---

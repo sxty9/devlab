@@ -78,6 +78,9 @@ type plan struct {
 	ledger  *ledgerTakeover
 	snaps   *snapshotTakeover
 	orphans []orphan
+	// backups are the operator's own hand-made copies of the run pool. They are reported and
+	// deliberately not touched (leftoverBackups), so they never make the plan non-empty.
+	backups *leftoverBackups
 
 	skippedOwn     int
 	presentRuns    []string
@@ -247,8 +250,9 @@ func (m *migrator) plan(inputPath string) (*plan, error) {
 }
 
 // planTakeover plans everything the import carries over rather than adds: the delivery ledger's
-// conversion, the config snapshots that would re-inject pre-rebuild records, and the pools the
-// rebuild has no reader for. The run pool itself was already classified in plan().
+// conversion, the config snapshots that would re-inject pre-rebuild records, the pools the rebuild
+// has no reader for, and the operator's own copies of the run pool (reported, never touched). The
+// run pool itself was already classified in plan().
 func (m *migrator) planTakeover(p *plan) error {
 	ledger, err := readLedgerTakeover(m.ledgerPath())
 	if err != nil {
@@ -265,15 +269,26 @@ func (m *migrator) planTakeover(p *plan) error {
 
 	for _, o := range orphanPools() {
 		from := filepath.Join(m.paths.Mercury(), o.name)
-		if _, err := os.Stat(from); err != nil {
+		b, err := os.ReadFile(from)
+		if err != nil {
 			continue // not on this instance
 		}
 		to, err := freeAsidePath(from)
 		if err != nil {
 			return err
 		}
-		p.orphans = append(p.orphans, orphan{from: from, to: to, why: o.why})
+		held := ""
+		if o.held != nil {
+			held = o.held(b)
+		}
+		p.orphans = append(p.orphans, orphan{from: from, to: to, why: o.why, held: held})
 	}
+
+	backups, err := readLeftoverBackups(m.paths.Mercury())
+	if err != nil {
+		return err
+	}
+	p.backups = backups
 	return nil
 }
 

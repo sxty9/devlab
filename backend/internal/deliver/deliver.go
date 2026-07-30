@@ -756,12 +756,20 @@ func reportMaintainStandstill(prs *runs.PRStore, ledger *runs.DeliveryStore, n *
 // open PR of the repos it manages, so a hand-raised PR carries its explained rejection.
 //
 // Every line below writes into foreign repositories, so the whole pass is behind the hold above.
+//
+// gh may be nil, and only while the hold stands: the held pass makes no foreign call, so it needs
+// no identity — which is what lets the first, deliberately identity-less start still SAY that the
+// maintenance stands still. Armed without ops is refused by name one line below the hold, so the
+// tolerance can never reach a writing line.
 func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs.DeliveryStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher) error {
 	if prs == nil || ledger == nil {
 		return errors.New("deliver: maintain needs the PR pool and the ledger")
 	}
 	if !MaintainArmed() {
 		return reportMaintainStandstill(prs, ledger, n)
+	}
+	if gh == nil {
+		return errors.New("deliver: the armed maintenance writes into foreign repositories and has no GitHub identity to do it with")
 	}
 	tracked, err := prs.List()
 	if err != nil {

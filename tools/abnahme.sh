@@ -1471,6 +1471,73 @@ else
   fail "doc-a" "the inspection document cites only checks that exist, and counts its own items correctly" "${doc_faults%$'\n'}"
 fi
 
+# doc-b — every `<pfad>:<zeile> <aufruf>` anchor of the runbook points at the line it claims.
+#
+# The cutover's foreign-effect table is the ONE place the operator is told where to read each
+# writing call. A line number goes stale on the next commit that touches the file above it, and it
+# goes stale SILENTLY: six of the ten deliver.go anchors had drifted onto a `continue`, a `}` and a
+# `default:`, so the table sent the reader to code that writes nothing while the pass it describes
+# writes on every tick.
+#
+# Which is why the anchor carries the CALL it points at: `deliver/deliver.go:873 gh.PostCommitStatus`
+# is checkable, a bare line number is not. An anchor without a call is itself a failure — otherwise
+# the check could be dodged by omitting the only part that makes it verifiable.
+anchor_faults=""
+mapfile -t ANCHOR_DOCS < <(sel '^deploy/migration/.*\.md$')
+if [[ ${#ANCHOR_DOCS[@]} -eq 0 ]]; then
+  anchor_faults="no runbook part found at all — the anchor check would pass on nothing"$'\n'
+else
+  anchor_count=0
+  while IFS= read -r raw; do
+    [[ -z $raw ]] && continue
+    doc="${raw%%:*}"
+    rest="${raw#*:}"
+    docline="${rest%%:*}"
+    anchor="${rest#*:}"
+    anchor="${anchor//\`/}"
+    spec="${anchor%% *}"
+    call=""
+    [[ $anchor == *" "* ]] && call="${anchor#* }"
+    path="${spec%:*}"
+    line="${spec##*:}"
+    if [[ -z $call ]]; then
+      anchor_faults+="$doc:$docline names $spec without the call it points at — a bare line number cannot be verified and goes stale unnoticed"$'\n'
+      continue
+    fi
+    # The runbook writes paths as the reader walks the tree: below backend/internal, else from the
+    # repository root.
+    target=""
+    for cand in "backend/internal/$path" "$path" "backend/$path"; do
+      [[ -f $cand ]] && {
+        target="$cand"
+        break
+      }
+    done
+    if [[ -z $target ]]; then
+      anchor_faults+="$doc:$docline points at $path, which does not exist (renamed or moved)"$'\n'
+      continue
+    fi
+    anchor_count=$((anchor_count + 1))
+    total="$(wc -l <"$target")"
+    if ((line < 1 || line > total)); then
+      anchor_faults+="$doc:$docline points at $path:$line, which is past the end of the file ($total lines)"$'\n'
+      continue
+    fi
+    at="$(sed -n "${line}p" "$target")"
+    if [[ $at != *"$call"* ]]; then
+      anchor_faults+="$doc:$docline claims $path:$line carries $call, the line reads: $(printf '%s' "$at" | sed 's/^[[:space:]]*//')"$'\n'
+    fi
+  done < <(grep -oEn '`[a-zA-Z0-9_./-]+\.(go|ts|tsx|sh):[0-9]+[^`]*`' "${ANCHOR_DOCS[@]}")
+  if ((anchor_count < 15)); then
+    anchor_faults+="only $anchor_count resolvable anchors were checked — the foreign-effect table alone names more, so the scan is not seeing the runbook"$'\n'
+  fi
+fi
+if [[ -z $anchor_faults ]]; then
+  pass "doc-b" "every runbook anchor points at a line that really carries the named call"
+else
+  fail "doc-b" "every runbook anchor points at a line that really carries the named call" "${anchor_faults%$'\n'}"
+fi
+
 # ── informational: prose that mentions a retired construct ──────────────────────────────────
 
 note "info-1" "documentation mentions the default state directory (review by hand)" \

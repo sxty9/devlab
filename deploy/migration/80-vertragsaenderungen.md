@@ -18,7 +18,7 @@ then broken five times in one commit. The paths are therefore spelled exactly as
 spells them, and the paragraph beginning "Frozen were:" is the one the check parses.
 
 Baseline for every diff hint below: Welle 0 = `cbffed4`, Welle 2 = `4b54464`, Welle 3 = `3e2019b`,
-repair wave 1 = `0a9f8fe`.
+repair wave 1 = `0a9f8fe`, repair wave 4 = `2e6a1ab`.
 
 ---
 
@@ -662,7 +662,7 @@ reads that name), plus the two probes the step itself performs.
 **Who:** repair wave 4 (U1).
 **Reason:** the runbook claimed exactly one thing reaches outside DevLab (the branch-protection pass).
 Read against the code that is wrong by an order of magnitude, and the difference is not academic:
-`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246`), so from the FIRST tick
+`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246 s.runMaintain`), so from the FIRST tick
 after the first start it posts a delivery-origin status on every open pull request of every managed
 repository — hand-raised ones included — deletes the delivery branch of any tracked pull request a
 human merged meanwhile, and merges whatever has passed its window. The daily reporter performs a pass
@@ -722,7 +722,7 @@ constitution store resolves its token through the same runner identity.
 **Proof:** the readability precondition and the staging removal are probes in the step itself; the
 three pool rows were measured against the real state directory (shape comparison against
 `report.Record`, `runs.AxiomChecks`, `axiomauthors.Author` and the attachment path layout), and the
-"due again" claim is the shipped `due()` in `report/reporter.go:251`, which returns true for a failed
+"due again" claim is the shipped `due()` in `report/reporter.go:251 due`, which returns true for a failed
 record with no backoff.
 
 ### `deploy/migration/20-sichtpruefung.md` — the inspection kinds are the matrix's own, and the open work is one list
@@ -840,3 +840,129 @@ archive record ended, holds nothing transient and states where its end came from
 `TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead` for the imported document; and
 `src/views/mercury/tasks/select.test.ts` for the partition (history ∪ running ∪ awaiting = the pool,
 each record in exactly one place).
+
+---
+
+## Repair wave 5
+
+**No frozen file changed in this wave.** Every entry below is recorded for the same reason the
+earlier waves recorded theirs: it changes what the delivery CLAIMS about itself, or how a claim is
+kept honest. `contract-a` and `contract-b` stay green because the §0.2 list was not touched.
+
+### `backend/internal/report/selfcheck.go` — the self-check says nothing about a past it cannot read
+
+**Who:** repair wave 5. Not a frozen file; recorded because it is a display that contradicted the
+stock, in a file no earlier repair had opened.
+**Reason (measured on the real archive, 82 records):** the delivery self-check compares stages
+STRICTLY against the chain's vocabulary, over `ResultStore.List()`, which mixes the pre-rebuild
+archive in. An archived record carries its stage names verbatim — `implement`, but `dev-deploy`
+where the chain says `deliver-dev` — so `implement` matched and the delivery never did. Every
+archived execution therefore read as "implemented, never delivered", and the FIRST start of a
+rebuilt instance raised `changes were implemented but nothing was delivered in the last 72h` over a
+past that is closed and cannot be resumed. The finding's own next step ("check the delivery path and
+resume") has no addressee there at all.
+**What changed:** the pass filters on the provenance the tolerant reader already records
+(`Result.Legacy`) and judges only documents written in its own vocabulary. The archive is neither
+translated nor judged: a translation would trade a wrong finding for a guessed one, because
+"delivered" meant something else in the old system (a push plus an opened pull request, not a dev
+delivery). An archived record is now evidence neither for the finding nor against it — it cannot
+raise one and it cannot silence one.
+**Diff hint:** `git diff 2e6a1ab -- backend/internal/report/selfcheck.go`.
+**Proof:** `TestSelfCheckSaysNothingAboutTheArchive` drives ONE real archived document — instance
+stripped out, its shape (per-step `ok` booleans, no `status`, exactly the four archived step names)
+kept — through the PRODUCTION tolerant reader, and first asserts the premise (implement executed,
+no delivery visible) so the fixture cannot silently stop reproducing the blocker.
+`TestSelfCheckStillFiresOnTheSameSituationInTheCurrentVocabulary` and
+`TestSelfCheckArchiveNeitherRaisesNorSilences` are the two controls.
+
+### `backend/it/vocabulary_test.go` — the audit now sees READING a retired name, not only producing one
+
+**Who:** repair wave 5.
+**Reason:** six review rounds passed over the self-check because the vocabulary audit only ever
+policed the PRODUCTION of a retired word (`TestNoSynonymForAFixedWord`,
+`TestRetiredStepNamesLiveOnlyOnTheLegacyPath`), and `readsAlongsideCanonical` explicitly permits
+reading one anywhere. The defect names no retired word at all — it simply never asks whether the
+document in front of it is an archived one — so no check could have failed.
+**What changed:** a third check, `TestEveryStageComparisonHandlesTheLegacyVocabulary`, over the
+COMPARISON rather than the word. Every place that compares a stage must either consult the archived
+provenance (`Result.Legacy`) or carry a `stage-vocabulary:` line stating why no archived document
+reaches it; a place that says neither is a failure. Three live-path sites (`exec_record.go`
+`StageUpdate`, `executor.go` `finishRepo`, `stages.go` `implementRun`) now state it; they compare
+stages this execution just wrote and never open a stored document.
+**Diff hint:** `git diff 2e6a1ab -- backend/it/vocabulary_test.go`.
+**Proof:** a CANARY inside the test: the checker is fed the self-check exactly as it stood when the
+blocker was raised and must report exactly that file. Without the canary the extended check would be
+one that passes on everything, including the defect it was written for.
+
+### `backend/internal/api/handlers_mercury_deliveries.go`, `backend/internal/deliver/deliver.go` — the standstill is reported in the configuration it exists for
+
+**Who:** repair wave 5.
+**Reason:** `MaintainDeliveries` resolved the runner token BEFORE `deliver.Maintain` and returned on
+its absence. The cutover's first start (step 6) runs deliberately WITHOUT `DEVLAB_RUNS_USER` and
+`DEVLAB_RUNS_TOKEN_USER`, so in exactly the configuration `reportMaintainStandstill` was written for
+it was unreachable: the operator saw no sign that the maintenance stands still, although the
+standstill is intended and although the delivery ledger behind it is what step 6a asks them to look
+at.
+**What changed:** the identity is resolved for the WRITING half only. Unarmed — the default, and the
+state of the first start — the pass runs without one and reports; armed, a missing identity fails by
+name rather than reporting a standstill it never attempted to end. `Maintain` states the nil-ops
+tolerance in its contract and refuses it one line below the hold, so it can never reach a writing
+line.
+**Diff hint:** `git diff 2e6a1ab -- backend/internal/api/handlers_mercury_deliveries.go backend/internal/deliver/deliver.go`.
+**Proof:** `TestMaintainReportsTheStandstillWithoutARunnerIdentity` builds exactly the step-6
+configuration (no identity, unarmed, nothing injected into the ops seam) and asserts one standstill
+notice AND that neither the PR pool nor the ledger moved; `TestMaintainRefusesToWriteWithoutARunner-
+Identity` is its armed counterpart.
+
+### `deploy/migration/00-cutover.md` — the foreign-effect table's anchors point at the code again
+
+**Who:** repair wave 5.
+**Reason:** six of the ten `deliver.go` anchors of the "Fremdwirkung" table had drifted onto a
+`continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
+one table with which the operator is told where to READ each writing call before the first start.
+**What changed:** every anchor was verified against the code and corrected, and each one now carries
+the CALL it points at (`deliver/deliver.go:873 gh.PostCommitStatus`) instead of a bare line number.
+**Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
+**Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
+runbook parts and fails unless the named line really carries the named call — and fails on an anchor
+that names no call, so the check cannot be dodged by omitting the verifiable half. Both failure
+modes were provoked once before the check was kept.
+
+### The five smaller findings of the same review
+
+**Who:** repair wave 5.
+
+* **`backend/internal/api/ready.go`** bound the readiness socket inside `<state-root>/.ready-<rand>/s`.
+  A Unix socket path is limited to `sun_path` (108 bytes with the NUL) and the kernel answers an
+  overrun with the bare "bind: invalid argument", which names neither the limit nor the state root.
+  The staging prefix is now `.r`, which makes the staged path always SHORTER than the published
+  `restart-ready.sock` — the staging can no longer be the thing that fails while the contract path
+  would have fitted — and the length is checked before the bind and reported with the knob that
+  changes it (`DEVLAB_STATE_DIR`). Proof:
+  `TestReadySocketNamesThePathLimitInsteadOfBindInvalidArgument`.
+* **`backend/cmd/devlab-migrate/takeover.go`** set `runs-settings.json` aside as "no reader" without
+  naming the slot capacity it held. The value is deliberately NOT converted — the rebuilt
+  `settings.json` is a three-field document the store reads whole, so writing it with the capacity
+  alone would pin the default time budget and the automerge window at zero and switch both off — so
+  it is an OPERATOR HANDLING, and the protocol now prints the number (`it held maxConcurrent = N`)
+  together with the one place that carries it into the first start
+  (`DEVLAB_RUNS_MAX_CONCURRENCY`). Proof: `TestTheSetAsideSettingsValueIsNamedAsAnOperatorHandling`,
+  which also asserts the migration writes no `settings.json` of its own.
+* **`deploy/migration/00-cutover.md`, Rollback** restored the tarball over the tree but removed
+  nothing, and `tar -x` deletes nothing — so the state tree carried BOTH worlds afterwards
+  (`executions/`, `runs-results.imported`, the `.pre-migration` set-asides and the pools the old
+  stand does not know). The rollback now removes them by name, REPLACES the three trees the cutover
+  rewrites as a whole (`mercury/runs-history`, `www`, `axioms` — each only if the tarball actually
+  carries it, so the removal can never become a loss), and ends with a `find` whose output must be
+  empty.
+* **`deploy/migration/00-cutover.md`, step 0** verified the backup through
+  `tar -tzf $BAK/devlab-state-*.tar.gz`. A second pass into the same `$BAK` would have given `tar`
+  two arguments — it reads the second as a MEMBER of the first — and the backup verification would
+  have failed on a backup that is fine. The tarball now has a fixed name (`$STATE_TAR`; `$BAK`
+  already carries the timestamp), so a repeat replaces the one backup instead of leaving two behind.
+* **`runs.json.bak-*`** — hand-made copies of the run pool that the takeover never looked at. They
+  are the operator's own files: nothing writes them, nothing reads them, and no surface offers them
+  as a restore point, so they are neither moved nor renamed. But copying one back over `runs.json`
+  would re-inject exactly the records the takeover converted, so the protocol now names each one and
+  how many still hold pre-rebuild records — which makes keeping or deleting them a decision instead
+  of a surprise. Proof: `TestHandMadeRunPoolCopiesAreReportedAndLeftAlone`.
