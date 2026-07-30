@@ -1,6 +1,7 @@
 // Package chats persists the repo-scoped AI-assistant transcript per user+repo, so a conversation
 // survives a reload. Plain JSON (not secret), atomic tmp+rename, nested <user>/<repo>.json under
-// /var/lib/devlab/chats — mirroring the workspace layout. Mirrors package links minus encryption.
+// <state root>/chats (statepath.Chats) — mirroring the workspace layout. Mirrors package links
+// minus encryption. The state root itself is runtime configuration; no path is baked in here.
 package chats
 
 import (

@@ -144,6 +144,21 @@ func (s *Server) SetBroker(b *live.Broker) { s.broker = b }
 // SetSettings wires the settings store (constructed in cmd/devlabd with its env seed).
 func (s *Server) SetSettings(set *runs.SettingsStore) { s.settings = set }
 
+// RunStore and ResultStore hand out the pools the scheduler reads through. They are handed OUT
+// rather than re-opened: two handles over one file would mean two mutexes over one truth, so the
+// pool's owner stays the single access point (atomic access, single source of truth).
+func (s *Server) RunStore() *runs.Store          { return s.runs }
+func (s *Server) ResultStore() *runs.ResultStore { return s.results }
+
+// Settings resolves the current service settings — the one runtime source the executor's tuning
+// resolution reads. Without a wired pool the zero settings apply (defaults resolve downstream).
+func (s *Server) Settings() (runs.Settings, error) {
+	if s.settings == nil {
+		return runs.Settings{}, nil
+	}
+	return s.settings.Get()
+}
+
 // publish notifies the SSE broker after a successful write — nil-safe (pools stay passive;
 // the publisher is always the caller).
 func (s *Server) publish(t live.Topic) {
@@ -286,7 +301,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/service/ai-usage", s.guard(s.serviceAiUsage))
 
 	// Δ MCP (REQ-043): the tool table with per-tool rights coverage lives in handlers_mcp.go.
-	mux.HandleFunc("POST /api/mcp", s.guard(s.mcpEndpoint))
+	// The endpoint carries the CSRF-enforcing guard like every other mutating route — an agent
+	// authenticates by bearer, where the double submit does not apply, so the uniform tier costs
+	// the protocol nothing and leaves no route reachable cross-site with the caller's cookies.
+	// Per-tool CSRF stays in force inside the handler (a reading tool still needs it here).
+	mux.HandleFunc("POST /api/mcp", s.guardCSRF(s.mcpEndpoint))
 
 	// GET /ready exists ONLY on the Unix socket (ready.go) — never in this TCP mux (A2-7).
 

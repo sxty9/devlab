@@ -12,6 +12,7 @@ import { ErrorBoundary } from '@/ui/ErrorBoundary';
 import { useLiveTopic } from '@/state/live';
 import { cn } from '@/lib/cn';
 import { PlusIcon } from '@/ui/icons';
+import { useRunStart } from '../exec/StartDialog';
 import { NO_RUN_FILTER, RunFilterBar, applyRunFilter, type RunFilter } from './Filters';
 import { TaskForm } from './TaskForm';
 import { TaskList } from './TaskList';
@@ -104,6 +105,12 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   useLiveTopic('deliveries', reloadExecutions);
   useLiveTopic('active', reloadActive);
 
+  // The ONE start flow of this surface (the very flow the execution surface uses): resume-vs-fresh,
+  // the slot decision (queue · set aside · overload) and the honest naming of every outcome. It lives
+  // HERE, not in the panes, so switching from the editor to the detail view cannot unmount a dialog
+  // the user is still deciding in.
+  const runStart = useRunStart(reloadActive);
+
   const handleSaved = useCallback(
     async (id: string) => {
       setSelectedId(id);
@@ -150,7 +157,15 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   let rightPane: ReactNode;
   if (mode === 'create') {
     rightPane = (
-      <TaskForm kind={kind} base={null} repos={repos} coverage={coverage} onCancel={() => setMode('view')} onSaved={handleSaved} onRunStarted={reloadActive} />
+      <TaskForm
+        kind={kind}
+        base={null}
+        repos={repos}
+        coverage={coverage}
+        onCancel={() => setMode('view')}
+        onSaved={handleSaved}
+        onStart={runStart.start}
+      />
     );
   } else if (mode === 'edit' && selected) {
     rightPane = (
@@ -162,7 +177,7 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
         coverage={coverage}
         onCancel={() => setMode('view')}
         onSaved={handleSaved}
-        onRunStarted={reloadActive}
+        onStart={runStart.start}
       />
     );
   } else if (selected) {
@@ -176,7 +191,8 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
         results={executions.filter((res) => res.runId === selected.id)}
         onEdit={() => setMode('edit')}
         onDeleted={handleDeleted}
-        onRunStarted={reloadActive}
+        onStart={runStart.start}
+        starting={runStart.busyRunId === selected.id}
       />
     );
   } else {
@@ -236,6 +252,10 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
       <div className="dl-scroll min-h-0 flex-1 overflow-y-auto bg-bg-base">
         <ErrorBoundary resetKeys={[selectedId, mode]}>{rightPane}</ErrorBoundary>
       </div>
+
+      {/* The resume and slot dialogs of the one start flow — mounted by the surface, so they outlive
+          a pane switch. */}
+      {runStart.render()}
     </div>
   );
 }

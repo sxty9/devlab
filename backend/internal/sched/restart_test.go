@@ -280,10 +280,9 @@ func TestKillThenBootInterruptsAndAutoResumes(t *testing.T) {
 	}
 	h.sch.pass(context.Background(), false)
 	h.waitPhase(doc.ID, model.PhaseRunning)
-	seen, ok := h.exec.startedDoc(doc.ID)
-	if !ok {
-		t.Fatal("the executor must receive the SAME execution id (REQ-019.1)")
-	}
+	// The executor must receive the SAME execution id (REQ-019.1) — waited for, because the
+	// document's phase flips before the goroutine that hands it over even starts.
+	seen := h.waitStarted(doc.ID, 1) // the predecessor process was simulated: this is the first handover
 	if seen.Continuation == nil || seen.Continuation.Repo != "beta" || seen.Continuation.Stage != model.StagePublish {
 		t.Fatalf("resume must continue at the same spot: %+v", seen.Continuation)
 	}

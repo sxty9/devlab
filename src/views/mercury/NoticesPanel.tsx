@@ -98,7 +98,7 @@ export function NoticesPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-default px-3 py-2">
+      <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-separator px-3 py-2">
         <h2 className="text-subhead font-medium text-text-primary">Notices</h2>
         <span className="text-caption text-text-tertiary">
           {open > 0 ? `${open} unread` : notices && notices.length > 0 ? 'all read' : ''}
@@ -151,7 +151,7 @@ function NoticeRow({ notice, busy, onDismiss }: { notice: NoticeRecord; busy: bo
     <li
       className={cn(
         'rounded-md border px-3 py-2',
-        unread ? 'border-border-default bg-fill/[0.04]' : 'border-border-default/60 opacity-60',
+        unread ? 'border-separator bg-fill/[0.04]' : 'border-separator opacity-60',
       )}
     >
       <div className="flex items-start gap-2">

@@ -53,7 +53,7 @@ func sampleItems() []Item {
 		{RunName: "Fix login bug", TypeLabel: "ToDo", Finished: true, OK: false,
 			Repos:    []RepoLine{{Repo: "studiq", Stage: "failed at pushed"}},
 			InTokens: 5000, OutTokens: 900, CostUSD: 0.10},
-		{RunName: "Big migration", TypeLabel: "ToDo", Finished: false, Suspended: true,
+		{RunName: "Big migration", TypeLabel: "ToDo", Finished: false, Paused: true,
 			Repos:    []RepoLine{{Repo: "hostek", Stage: "implemented"}},
 			InTokens: 2000, OutTokens: 100, CostUSD: 0.03},
 	}
@@ -85,9 +85,9 @@ func TestComposeSectionsTotalsAndSubject(t *testing.T) {
 		if !strings.Contains(body, "Nightly axioms") || !strings.Contains(body, "deployed") {
 			t.Errorf("completed run missing")
 		}
-		// Suspended item flagged as pending.
+		// Paused item flagged as pending.
 		if !strings.Contains(body, "usage limit") {
-			t.Errorf("suspended item not flagged")
+			t.Errorf("paused item not flagged")
 		}
 		// Totals: 3 distinct repos across the day (devlab, aigentic, studiq, hostek = 4 actually).
 		if !strings.Contains(body, "4 repositories") {

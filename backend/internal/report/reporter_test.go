@@ -232,3 +232,61 @@ func TestBuildItemsFillsRepoStages(t *testing.T) {
 		t.Errorf("stages = %+v", items[0].Repos)
 	}
 }
+
+// fakePaused answers the pause seam over a fixed id set.
+type fakePaused struct {
+	ids map[string]bool
+	err error
+}
+
+func (f fakePaused) PausedIDs() (map[string]bool, error) { return f.ids, f.err }
+
+// An unfinished execution is only named as paused when a state DOCUMENT says so — the missing end
+// stamp alone never earns the word (REQ-040.4: the one pause vocabulary, stated where it is true).
+func TestPausedIsReadOffTheDocumentsNotGuessed(t *testing.T) {
+	running := summary("a", "Still running", at(26, 20))
+	running.ID = "exec_running"
+	running.EndedAt = nil
+	standing := summary("b", "Standing on the limit", at(26, 21))
+	standing.ID = "exec_paused"
+	standing.EndedAt = nil
+
+	ledger := NewLedgerAt(filepath.Join(t.TempDir(), "l.json"))
+	all := []runs.Result{running, standing}
+
+	// (a) no pause seam wired ⇒ nothing claims a pause.
+	rp := newReporter(t, &fakeExecs{summaries: all}, &fakeSender{}, ledger, at(27, 0))
+	for _, it := range rp.buildItems(all) {
+		if it.Paused {
+			t.Errorf("%s claimed a pause without a document saying so", it.RunName)
+		}
+	}
+
+	// (b) the documents name exactly one paused execution.
+	rp2 := NewReporter(Config{
+		Recipient: "owner", Execs: &fakeExecs{summaries: all}, Ledger: ledger, Sender: &fakeSender{},
+		Paused: fakePaused{ids: map[string]bool{"exec_paused": true}},
+		Now:    func() time.Time { return at(27, 0) }, Loc: time.UTC, Lookback: 3,
+		Logf: func(string, ...any) {},
+	})
+	items := rp2.buildItems(all)
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2", len(items))
+	}
+	if items[0].Paused {
+		t.Errorf("the running execution must not read as paused")
+	}
+	if !items[1].Paused {
+		t.Errorf("the execution whose document is paused must say so")
+	}
+	if body := Compose("2026-07-26", items, nil, "").Text; !strings.Contains(body, "paused on the usage limit") {
+		t.Errorf("the report never names the pause:\n%s", body)
+	}
+
+	// (c) a FINISHED execution never reads as paused, even if a stale document lingers.
+	done := summary("c", "Finished", at(26, 22))
+	done.ID = "exec_paused"
+	if rp2.buildItems([]runs.Result{done})[0].Paused {
+		t.Errorf("a finished execution must not read as paused")
+	}
+}

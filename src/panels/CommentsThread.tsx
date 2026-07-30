@@ -5,13 +5,9 @@ import { useToast } from '@/ui/Toast';
 import { SendIcon, XIcon } from '@/ui/icons';
 import { Person } from '@/ui/Person';
 import { renderMarkdown } from '@/lib/markdown';
+import { fmtDateTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { Comment } from '@/types';
-
-function when(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
 
 /** A compact comment composer (top-level or reply). */
 function Composer({ onSubmit, onCancel, placeholder }: { onSubmit: (body: string) => Promise<void>; onCancel?: () => void; placeholder: string }) {
@@ -128,7 +124,7 @@ export function CommentsThread({ repoId, path }: { repoId: string; path: string 
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="text-footnote font-medium text-text-primary">{c.authorName || c.author}</span>
-              <span className="text-caption text-text-tertiary">{when(c.createdAt)}</span>
+              <span className="text-caption text-text-tertiary">{fmtDateTime(c.createdAt)}</span>
               {mine && (
                 <button type="button" onClick={() => void del(c.id)} aria-label="Delete comment" className="ml-auto flex h-5 w-5 items-center justify-center rounded-sm text-text-tertiary opacity-0 transition hover:bg-fill/15 hover:text-danger group-hover:opacity-100">
                   <XIcon className="h-3.5 w-3.5" />

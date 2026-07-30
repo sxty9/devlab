@@ -173,19 +173,19 @@ func ParsePlacement(output string, knownCategories []string, ns string) (Placeme
 	}
 	var p Placement
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		return Placement{}, fmt.Errorf("%w: kein gültiges JSON", ErrInvalidPlacement)
+		return Placement{}, fmt.Errorf("%w: not valid JSON", ErrInvalidPlacement)
 	}
 	p.Pfad = strings.TrimSpace(p.Pfad)
 	if !ValidPlacementPath(p.Pfad, ns) {
-		return p, fmt.Errorf("%w: pfad %q muss unter %s/ liegen, nur Kleinbuchstaben/Ziffern/Bindestriche je Segment nutzen und auf .md enden", ErrInvalidPlacement, p.Pfad, ns)
+		return p, fmt.Errorf("%w: pfad %q must sit under %s/, use only lowercase letters, digits and hyphens per segment, and end in .md", ErrInvalidPlacement, p.Pfad, ns)
 	}
 	if strings.TrimSpace(p.Beschreibung) == "" {
-		return p, fmt.Errorf("%w: beschreibung fehlt", ErrInvalidPlacement)
+		return p, fmt.Errorf("%w: beschreibung is missing", ErrInvalidPlacement)
 	}
 	if !p.NeueKategorie {
 		parent := p.Pfad[:strings.LastIndex(p.Pfad, "/")]
 		if parent != ns && !contains(knownCategories, parent) {
-			return p, fmt.Errorf("%w: kategorie %q existiert nicht; setze neue_kategorie:true oder wähle eine bestehende", ErrInvalidPlacement, parent)
+			return p, fmt.Errorf("%w: category %q does not exist; set neue_kategorie:true or pick an existing one", ErrInvalidPlacement, parent)
 		}
 	}
 	return p, nil

@@ -14,10 +14,10 @@ package axiomauthors
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/statepath"
 )
 
@@ -30,8 +30,9 @@ type Author struct {
 	UpdatedAt time.Time `json:"updatedAt,omitempty"`
 }
 
-// Store is the JSON-file pool (atomic tmp+rename, 0600, missing → empty), matching the other DevLab
-// stores' conventions. A nil *Store is a valid no-op sink so a disabled pool never fails an axiom write.
+// Store is the JSON-file pool (persisted through fsatomic — the ONE atomic write path of every
+// DevLab pool, 0600, missing → empty). A nil *Store is a valid no-op sink so a disabled pool never
+// fails an axiom write.
 type Store struct {
 	path string
 	mu   sync.Mutex
@@ -107,17 +108,8 @@ func (s *Store) Mutate(id string, fn func(Author) Author) {
 	_ = s.save(m)
 }
 
+// save persists the pool through the ONE atomic write path (fsatomic): parent directory, tmp file,
+// rename — the crash-safety guarantee is not re-derived here (B-11).
 func (s *Store) save(m map[string]Author) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(file{Authors: m}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return fsatomic.WriteJSON(s.path, file{Authors: m})
 }

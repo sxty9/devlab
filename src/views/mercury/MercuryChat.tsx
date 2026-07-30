@@ -5,6 +5,7 @@ import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { LightbulbIcon, SendIcon } from '@/ui/icons';
+import { classifyStartOutcome } from './exec/logic';
 import type { ActionTarget, MercuryAction, RunChatMessage, RunSchedule } from '@/types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
@@ -101,9 +102,16 @@ async function dispatchAction(source: DataSource, a: MercuryAction, force = fals
     case 'delete_run':
       await source.mercuryDeleteRun(a.runId);
       return;
-    case 'run_now':
-      await source.mercuryRunNow(a.runId);
+    case 'run_now': {
+      // The chat applies through the same access point the UI uses — and reads the outcome through
+      // the SAME mapping (classifyStartOutcome), so a reasoned refusal ("already delivered") or a
+      // contended floor is reported as what it is instead of a cheerful "Applied".
+      const verdict = classifyStartOutcome(await source.mercuryRunNow(a.runId));
+      if (verdict.kind === 'refused' || verdict.kind === 'contended') {
+        throw new Error(verdict.detail ? `${verdict.title}: ${verdict.detail}` : verdict.title);
+      }
       return;
+    }
     case 'plan_runs':
       await source.mercuryApplyRunProposal(a.mode, { runs: a.runs });
       return;

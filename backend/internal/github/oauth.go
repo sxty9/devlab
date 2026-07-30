@@ -22,7 +22,8 @@ const Scopes = "repo read:org"
 type OAuthConfig struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
-	// RedirectURI is the absolute callback, e.g. https://devlab.henrysoase.org/api/github/callback.
+	// RedirectURI is the absolute callback on the instance host, e.g.
+	// https://devlab.example.org/api/github/callback.
 	RedirectURI string `json:"redirect_uri"`
 }
 

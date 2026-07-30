@@ -28,24 +28,24 @@ var timeOfDayRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
 // Valid reports whether the schedule is well-formed.
 func (s ScheduleSpec) Valid() error {
 	if !timeOfDayRe.MatchString(s.TimeOfDay) {
-		return fmt.Errorf("timeOfDay %q ist nicht HH:MM (24h)", s.TimeOfDay)
+		return fmt.Errorf("timeOfDay %q is not HH:MM (24h)", s.TimeOfDay)
 	}
 	switch s.Kind {
 	case Daily:
 		if len(s.Weekdays) != 0 {
-			return fmt.Errorf("daily-Schedule darf keine Wochentage haben")
+			return fmt.Errorf("a daily schedule must carry no weekdays")
 		}
 	case Weekly:
 		if len(s.Weekdays) == 0 {
-			return fmt.Errorf("weekly-Schedule braucht mindestens einen Wochentag")
+			return fmt.Errorf("a weekly schedule needs at least one weekday")
 		}
 		for _, d := range s.Weekdays {
 			if d < time.Sunday || d > time.Saturday {
-				return fmt.Errorf("ungültiger Wochentag %d", d)
+				return fmt.Errorf("invalid weekday %d", d)
 			}
 		}
 	default:
-		return fmt.Errorf("schedule-Kind %q ist nicht daily|weekly", s.Kind)
+		return fmt.Errorf("schedule kind %q is not daily|weekly", s.Kind)
 	}
 	return nil
 }

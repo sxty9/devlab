@@ -36,6 +36,7 @@ import {
   type ExecutionMode,
   type TargetRow,
 } from './logic';
+import type { StartTarget } from '../exec/StartDialog';
 import type {
   Repo,
   Run,
@@ -69,11 +70,13 @@ export interface TaskFormProps {
   coverage?: RunCoverage | null;
   onCancel: () => void;
   onSaved: (id: string) => void | Promise<void>;
-  /** Called when "now" actually started an execution. */
-  onRunStarted?: () => void;
+  /** Starts the saved entry through the surface's ONE start flow (execution mode "now"): it asks
+   *  about resuming, offers the slot decision on a contended floor, and names every outcome. The
+   *  flow is mounted by the surface, so its dialogs survive this editor closing. */
+  onStart?: (target: StartTarget) => void | Promise<void>;
 }
 
-export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, onRunStarted }: TaskFormProps) {
+export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, onStart }: TaskFormProps) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
 
@@ -185,27 +188,16 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
           }
         }
       }
-      if (isTodo && mode === 'now') {
-        // "Now": save, then execute at once — the very same start access point as the detail
-        // view (REQ-008.1). The todo is already saved, so a refused start is a warning, not a
-        // lost todo.
-        try {
-          const outcome = await source.mercuryRunNow(saved.id);
-          if (outcome.notStarted) {
-            toast({ title: 'Not started', description: outcome.notStarted, variant: 'default' });
-          } else if (outcome.queued) {
-            toast({ title: 'Queued', description: 'A restart is pending; the run starts by itself afterwards.', variant: 'default' });
-          } else {
-            toast({ title: 'Execution started', variant: 'success' });
-            onRunStarted?.();
-          }
-        } catch (e) {
-          toast({ title: 'Start failed', description: errMsg(e), variant: 'danger' });
-        }
+      // The saved entry is committed either way — the surface takes over the pane.
+      await onSaved(saved.id);
+      if (isTodo && mode === 'now' && onStart) {
+        // "Now": save, then execute at once through the very same start access point the detail
+        // view uses (REQ-008.1) — including the slot decision. The todo is already saved, so a
+        // refused or queued start is an answer, never a lost todo.
+        await onStart({ id: saved.id, title: title.trim() });
       } else {
         toast({ title: base ? 'Saved' : 'Created', variant: 'success' });
       }
-      await onSaved(saved.id);
     } catch (e) {
       toast({ title: 'Saving failed', description: errMsg(e), variant: 'danger' });
       setBusy(false);

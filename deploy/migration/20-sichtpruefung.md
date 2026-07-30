@@ -12,6 +12,134 @@ through it end to end. The bracketed id is the acceptance line the item belongs 
 
 ---
 
+## Status per acceptance line (Welle 3, integration)
+
+The wording of every line lives in `spec/ABNAHME.md` — it is not repeated here. What this table adds
+is the STATE of each line after the integration wave, in exactly three kinds:
+
+- **Grep green** — the audit check(s) of `tools/abnahme.sh` that carry this line pass. The check ids
+  are named, so a failure points at the exact check.
+- **Test green** — the line's automated test(s) pass (`go test ./...` including `backend/it`,
+  `node --test`). "via the referenced line" means the matrix itself points at another line's tests.
+- **Visual inspection open** — the line additionally demands a look, a measurement or a review at
+  the running instance. Those are the items of THIS document; a line marked "not itemised" is
+  covered by a section here without naming the id, so read the section it belongs to.
+
+A line with several kinds needs all of them. Automated state as of the integration wave:
+`tools/abnahme.sh --tests` = 57 checks, 0 failing; `gofmt -l`, `go build ./...`, `go vet ./...` and
+`go test ./...` (including `backend/it`, also under `-race`) green; `npx tsc --noEmit`, `node --test`
+(163 tests) and `npm run build` green.
+
+### §1 — the six construction faults (K-1 … K-6)
+
+| Line | Status |
+|---|---|
+| K-1 | Grep green (K-1a, K-1b) · Test green |
+| K-2 | Grep green (K-2, K-2b) · Test green · Visual inspection open (measurement) |
+| K-3 | Test green |
+| K-4 | Test green · Visual inspection open (visual) |
+| K-5 | Test green · Visual inspection open (visual/measurement) |
+| K-6 | Grep green (K-6a, K-6b, K-6c) · Test green · Visual inspection open (measurement) |
+
+### §2 — requirements (REQ-001 … REQ-044)
+
+| Line | Status |
+|---|---|
+| REQ-001 | Grep green (REQ-001a, REQ-001b) · Test green |
+| REQ-002 | Grep green (REQ-002) · Test green · Visual inspection open (visual) |
+| REQ-003 | Grep green (REQ-003a, REQ-003b) · Test green |
+| REQ-004 | Grep green (REQ-004) · Test green · Visual inspection open (visual) |
+| REQ-005 | Test green · Visual inspection open (visual) |
+| REQ-006 | Test green |
+| REQ-007 | Test green · Visual inspection open (visual) |
+| REQ-008 | Test green |
+| REQ-009 | Test green · Visual inspection open (visual) |
+| REQ-010 | Grep green (REQ-010) · Test green · Visual inspection open (visual) |
+| REQ-011 | Test green |
+| REQ-012 | Grep green (REQ-012) · Test green · Visual inspection open (visual) |
+| REQ-013 | Grep green (REQ-013) · Test green |
+| REQ-014 | Test green |
+| REQ-015 | Grep green (REQ-015a, REQ-015b) · Test green · Visual inspection open (visual) |
+| REQ-016 | Test green · Visual inspection open (visual) |
+| REQ-017 | Grep green (REQ-017) · Visual inspection open (measurement) |
+| REQ-018 | Test green · Visual inspection open (measurement) |
+| REQ-019 | Test green |
+| REQ-020 | Test green · Visual inspection open (visual) |
+| REQ-021 | Test green · Visual inspection open (visual) |
+| REQ-022 | Grep green (REQ-022a, REQ-022b) · Test green · Visual inspection open (visual/review) |
+| REQ-023 | Test green (via the referenced line) · Visual inspection open (review, not itemised) |
+| REQ-024 | Test green · Visual inspection open (visual) |
+| REQ-025 | Test green |
+| REQ-026 | Test green · Visual inspection open (review, not itemised) |
+| REQ-027 | Grep green (REQ-027a, REQ-027b, REQ-027c) · Test green |
+| REQ-028 | Grep green (REQ-028) · Test green · Visual inspection open (review, not itemised) |
+| REQ-029 | Test green · Visual inspection open (visual) |
+| REQ-030 | Test green · Visual inspection open (visual) |
+| REQ-031 | Test green · Visual inspection open (visual) |
+| REQ-032 | Test green |
+| REQ-033 | Test green · Visual inspection open (visual) |
+| REQ-034 | Grep green (REQ-034a, REQ-034b) · Test green · Visual inspection open (visual/measurement) |
+| REQ-035 | Test green |
+| REQ-036 | Test green · Visual inspection open (visual) |
+| REQ-037 | Test green |
+| REQ-038 | Visual inspection open (visual) |
+| REQ-039 | Grep green (REQ-039a, REQ-039b) · Test green |
+| REQ-040 | Grep green (REQ-040a, REQ-040b, REQ-040c, REQ-040d, REQ-040e, REQ-040f, REQ-040g) · Visual inspection open (visual/review) |
+| REQ-041 | Test green · Visual inspection open (visual/review) |
+| REQ-042 | Grep green (REQ-042) · Test green · Visual inspection open (visual) |
+| REQ-043 | Test green · Visual inspection open (visual/review) |
+| REQ-044 | Grep green (REQ-044) · Test green · Visual inspection open (visual/measurement) |
+
+### §3 — inventory of the old system (B-01 … B-45)
+
+| Line | Status |
+|---|---|
+| B-01 | Test green · Visual inspection open (visual) |
+| B-02 | Grep green (B-02) · Test green |
+| B-03 | Grep green (B-03) · Test green · Visual inspection open (visual/review) |
+| B-04 | Test green |
+| B-05 | Test green |
+| B-06 | Test green · Visual inspection open (review, not itemised) |
+| B-07 | Test green (via the referenced line) |
+| B-08 | Test green |
+| B-09 | Test green |
+| B-10 | Test green |
+| B-11 | Grep green (B-11) · Test green |
+| B-12 | Test green |
+| B-13 | Grep green (B-13) · Test green |
+| B-14 | Test green · Visual inspection open (review, not itemised) |
+| B-15 | Test green · Visual inspection open (review, not itemised) |
+| B-16 | Grep green (B-16) · Test green |
+| B-17 | Visual inspection open (review, not itemised) |
+| B-18 | Grep green (B-18) · Visual inspection open (visual) |
+| B-19 | Test green (via the referenced line) |
+| B-20 | Grep green (B-20) · Test green · Visual inspection open (review, not itemised) |
+| B-21 | Grep green (B-21) · Test green |
+| B-22 | Grep green (B-22) · Test green |
+| B-23 | Test green · Visual inspection open (review) |
+| B-24 | Visual inspection open (visual/review) |
+| B-25 | Test green |
+| B-26 | Test green (via the referenced line) |
+| B-27 | Test green |
+| B-28 | Test green · Visual inspection open (visual/review) |
+| B-29 | Test green · Visual inspection open (visual) |
+| B-30 | Visual inspection open (visual) |
+| B-31 | Test green · Visual inspection open (review) |
+| B-32 | Test green · Visual inspection open (review) |
+| B-33 | Test green |
+| B-34 | Test green |
+| B-35 | Grep green (B-35) |
+| B-36 | Visual inspection open (visual/measurement) |
+| B-37 | Test green · Visual inspection open (review) |
+| B-38 | Visual inspection open (visual, not itemised) |
+| B-39 | Test green · Visual inspection open (review) |
+| B-40 | Test green |
+| B-41 | Grep green (B-41a, B-41b) · Visual inspection open (review, not itemised) |
+| B-42 | Visual inspection open (visual) |
+| B-43 | Grep green (B-43) · Test green · Visual inspection open (visual) |
+| B-44 | Grep green (B-44) · Test green (via the referenced line) · Visual inspection open (review) |
+| B-45 | Grep green (B-45, B-45b) · Test green · Visual inspection open (visual) |
+
 ## 0. Before the first look
 
 - [ ] `tools/abnahme.sh --tests` is green, or every open line is known and accepted.

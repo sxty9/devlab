@@ -67,11 +67,15 @@ func (s *Server) StartReporter(ctx context.Context) {
 	rp := report.NewReporter(report.Config{
 		Recipient: recipient,
 		Execs:     s.results,
-		Notices:   s.runNotices, // the day's alarms, overrides and deviations (REQ-042.6)
-		Ledger:    s.reportLedger,
-		Sender:    mailSender{},
-		Lookback:  lookback,
-		LinkBase:  strings.TrimSpace(os.Getenv("DEVLAB_PUBLIC_URL")),
+		// The pause lives on the state documents, so an unfinished execution is named as
+		// "paused" only when a document says so (nil-safe: without the machinery the report
+		// claims no pause).
+		Paused:   s.pausedExecutions(),
+		Notices:  s.runNotices, // the day's alarms, overrides and deviations (REQ-042.6)
+		Ledger:   s.reportLedger,
+		Sender:   mailSender{},
+		Lookback: lookback,
+		LinkBase: strings.TrimSpace(os.Getenv("DEVLAB_PUBLIC_URL")),
 	})
 	log.Printf("devlabd: daily-report reporter ENABLED — recipient=%s lookback=%dd interval=%s", recipient, lookback, interval)
 	go rp.Run(ctx, interval)
@@ -96,6 +100,15 @@ func (s *Server) startSelfCheck(ctx context.Context) {
 	})
 	log.Printf("devlabd: delivery self-check ENABLED — window=%s interval=%s", window, interval)
 	go sc.Run(ctx, interval)
+}
+
+// pausedExecutions hands out the execution documents as the report's pause seam, or nil while the
+// machinery is not wired (a typed nil would read as "present" through the interface).
+func (s *Server) pausedExecutions() report.PausedExecutions {
+	if s.docs == nil {
+		return nil
+	}
+	return s.docs
 }
 
 // publisher hands out the SSE broker as a live.Publisher, or nil when none is wired — so a

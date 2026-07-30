@@ -8,10 +8,11 @@ import { useToast } from '@/ui/Toast';
 import { Button } from '@/ui/Button';
 import { Person } from '@/ui/Person';
 import { cn } from '@/lib/cn';
-import { fmtDateTime } from '@/lib/format';
+import { fmtDateTime, fmtNum } from '@/lib/format';
 import { ChevronRightIcon, PlayIcon } from '@/ui/icons';
 import { AttachmentCard } from './TaskForm';
 import { errMsg, isImageMime, scheduleSummary, storedBudgetLabel, targetLabel, tuningChips } from './logic';
+import type { StartTarget } from '../exec/StartDialog';
 import type { Actor, Repo, Run, RunResult } from '@/types';
 
 export interface TaskDetailProps {
@@ -23,14 +24,17 @@ export interface TaskDetailProps {
   results: RunResult[];
   onEdit: () => void;
   onDeleted: () => void | Promise<void>;
-  onRunStarted: () => void;
+  /** Starts (or continues) this entry through the surface's ONE start flow: it asks about resuming,
+   *  offers the slot decision when the floor is contended, and names every outcome itself. */
+  onStart: (target: StartTarget) => void | Promise<void>;
+  /** True while that flow is working on THIS entry. */
+  starting?: boolean;
 }
 
-export function TaskDetail({ run, repos, axioms, live, results, onEdit, onDeleted, onRunStarted }: TaskDetailProps) {
+export function TaskDetail({ run, repos, axioms, live, results, onEdit, onDeleted, onStart, starting }: TaskDetailProps) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
-  const [starting, setStarting] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [prompt, setPrompt] = useState<string | null>(null);
   const promptLoading = useRef(false);
@@ -68,27 +72,6 @@ export function TaskDetail({ run, repos, axioms, live, results, onEdit, onDelete
     }
   };
 
-  const runNow = async () => {
-    if (starting) return;
-    setStarting(true);
-    try {
-      const outcome = await source.mercuryRunNow(run.id);
-      if (outcome.notStarted) {
-        // The reasoned refusal (K-3: fully delivered work starts not at all).
-        toast({ title: 'Not started', description: outcome.notStarted, variant: 'default' });
-      } else if (outcome.queued) {
-        toast({ title: 'Queued', description: 'A restart is pending; the run starts by itself afterwards.', variant: 'default' });
-      } else {
-        toast({ title: outcome.resumed ? 'Execution resumed' : 'Execution started', variant: 'success' });
-        onRunStarted();
-      }
-    } catch (e) {
-      toast({ title: 'Start failed', description: errMsg(e), variant: 'danger' });
-    } finally {
-      setStarting(false);
-    }
-  };
-
   const axiomIds = run.axiomIds ?? [];
   const chips = tuningChips(run.tuning);
 
@@ -102,7 +85,7 @@ export function TaskDetail({ run, repos, axioms, live, results, onEdit, onDelete
           </p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-          <Button variant="primary" size="sm" disabled={starting} onClick={runNow}>
+          <Button variant="primary" size="sm" disabled={starting} onClick={() => void onStart({ id: run.id, title: run.title })}>
             <PlayIcon className="h-3.5 w-3.5" /> {starting ? 'Starting…' : 'Run now'}
           </Button>
           <Button variant="secondary" size="sm" onClick={onEdit}>
@@ -239,7 +222,7 @@ function ExecutionRow({ result }: { result: RunResult }) {
       {result.synthetic && <span className="rounded bg-fill/15 px-1.5 py-0.5 text-caption text-text-tertiary">reconciled</span>}
       <span className="text-caption text-text-tertiary">
         {result.usage.inputTokens + result.usage.outputTokens > 0
-          ? `${result.usage.inputTokens.toLocaleString()} in · ${result.usage.outputTokens.toLocaleString()} out`
+          ? `${fmtNum(result.usage.inputTokens)} in · ${fmtNum(result.usage.outputTokens)} out`
           : ''}
       </span>
     </li>

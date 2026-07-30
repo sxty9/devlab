@@ -820,11 +820,16 @@ func MCPParityList() MCPParity {
 }
 
 // mcpOmittedOps are the DataSource operations that deliberately have no tool. They are not
-// capabilities: they build an address the browser navigates to, or they open a stream.
+// capabilities: they build an address the browser navigates to, they open a stream, or they are
+// cookie-session plumbing an agent does not have.
 var mcpOmittedOps = []MCPException{
 	{
 		Subject: "init",
 		Reason:  "Bootstrap probe of the web surface (liveness plus identity); its substance is user_get.",
+	},
+	{
+		Subject: "refreshSession",
+		Reason:  "Re-mints the browser's short-lived cookie session; an agent authenticates per request with its own bearer token, so it has no session to refresh.",
 	},
 	{
 		Subject: "githubAuthorizeUrl",

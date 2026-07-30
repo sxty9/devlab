@@ -9,6 +9,11 @@ export const stubSource: DataSource = {
   async init(): Promise<InitResult> {
     return { mode: 'stub', signedIn: true, canUseDevlab: true, githubLinked: true };
   },
+  // Offline there is no session to re-mint — "not refreshed" is the honest answer, never a
+  // pretended success that would make a caller retry forever.
+  async refreshSession() {
+    return false;
+  },
   async getUser() {
     return { username: 'dev', displayName: 'Dev (offline)', isAdmin: false, canUseDevlab: true, githubLinked: true };
   },

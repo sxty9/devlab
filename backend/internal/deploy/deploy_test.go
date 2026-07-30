@@ -39,10 +39,10 @@ func mkRepo(t *testing.T, files map[string]string, execs ...string) string {
 // the daemon cmd, and the rights manifest carrying its id.
 func templateServiceRepo(t *testing.T, id string) string {
 	return mkRepo(t, map[string]string{
-		"service":                       "#!/usr/bin/env bash\n# uniform holistic service CLI\n",
-		"permissions/" + id + ".json":   `{"service":"` + id + `","categories":[]}`,
+		"service":                         "#!/usr/bin/env bash\n# uniform holistic service CLI\n",
+		"permissions/" + id + ".json":     `{"service":"` + id + `","categories":[]}`,
 		"backend/cmd/" + id + "d/main.go": "package main\nfunc main() {}\n",
-		"backend/go.mod":                "module example.invalid/" + id + "\n",
+		"backend/go.mod":                  "module example.invalid/" + id + "\n",
 	}, "service")
 }
 

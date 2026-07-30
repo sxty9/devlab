@@ -19,7 +19,9 @@ type Item struct {
 	StartedAt time.Time
 	Finished  bool
 	OK        bool
-	Suspended bool // paused on the usage limit, awaiting resume
+	// Paused carries the ONE pause vocabulary (paused | skipped | blocked): this execution
+	// stands on the shared usage limit and resumes on its own.
+	Paused    bool
 	Repos     []RepoLine
 	InTokens  int
 	OutTokens int
@@ -42,7 +44,7 @@ type Content struct {
 
 // buckets splits a day's items into the three sections the user communication uses: what was
 // completed, what is still running or pending, and what needs attention (failed or blocked). An
-// unfinished execution (still running, or suspended on the usage limit) is pending; a finished-but-
+// unfinished execution (still running, or paused on the usage limit) is pending; a finished-but-
 // not-OK one needs attention; the rest completed.
 func buckets(items []Item) (completed, pending, attention []Item) {
 	for _, it := range items {
@@ -116,7 +118,7 @@ func textSection(b *strings.Builder, title string, items []Item) {
 		if s := reposText(it); s != "" {
 			fmt.Fprintf(b, "      %s\n", s)
 		}
-		if it.Suspended {
+		if it.Paused {
 			b.WriteString("      paused on the usage limit — resumes automatically\n")
 		}
 		fmt.Fprintf(b, "      %s tokens · %s\n", tokenPhrase(it.InTokens, it.OutTokens), costPhrase(it.CostUSD))
@@ -227,7 +229,7 @@ func htmlSection(b *strings.Builder, title, color string, items []Item) {
 		if s := reposHTML(it); s != "" {
 			fmt.Fprintf(b, `<br><span style="color:#333">%s</span>`, s)
 		}
-		if it.Suspended {
+		if it.Paused {
 			b.WriteString(`<br><span style="color:#8a6d00">paused on the usage limit — resumes automatically</span>`)
 		}
 		fmt.Fprintf(b, `<br><span style="color:#777">%s tokens · %s</span>`,

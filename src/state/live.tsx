@@ -6,7 +6,6 @@
 import { createContext, useContext, useEffect, useRef, type ReactNode } from 'react';
 import type { LiveTopic } from '@/types';
 import { getDataSource } from '@/data';
-import { apiFetch, withCsrf } from '@/data/httpSource';
 import { connectLive, createTopicRegistry, type ExternalChange, type TopicRegistry } from '@/lib/live';
 
 interface LiveContextValue {
@@ -17,13 +16,12 @@ interface LiveContextValue {
 /** Outside a provider the subscription is inert (static views degrade gracefully). */
 const LiveContext = createContext<LiveContextValue>({ subscribe: () => () => undefined });
 
-/** Best-effort session refresh before an SSE retry (C F5) — rides the ONE refresh-aware
- *  fetch of httpSource instead of opening a second refresh path. A raw EventSource cannot
- *  re-mint an expired access cookie on its own; this can. */
+/** Best-effort session refresh before an SSE retry (C F5) — through the data seam's ONE refresh
+ *  access point, so no second path to the same entity is opened and no API path is named outside
+ *  the seam. A raw EventSource cannot re-mint an expired access cookie on its own; this can. */
 async function refreshSessionForStream(): Promise<boolean> {
   try {
-    const res = await apiFetch('/api/auth/refresh', withCsrf({ method: 'POST' }));
-    return res.ok;
+    return await getDataSource().refreshSession();
   } catch {
     return false;
   }

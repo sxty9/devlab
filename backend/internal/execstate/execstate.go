@@ -271,6 +271,23 @@ func (s *Store) Live() ([]Doc, error) {
 	return out, nil
 }
 
+// PausedIDs returns the ids of the executions that stand on the ONE pause right now (phase
+// paused — deferred-by-user or usage-limit). A caller that must tell "still running" from
+// "standing still" reads it here instead of inferring it from a missing end stamp.
+func (s *Store) PausedIDs() (map[string]bool, error) {
+	live, err := s.Live()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, d := range live {
+		if d.Phase == model.PhasePaused {
+			out[d.ID] = true
+		}
+	}
+	return out, nil
+}
+
 // LiveForRun returns the live document of one run. INVARIANT: per run there is at most ONE
 // live document; a violation is a store error.
 func (s *Store) LiveForRun(runID string) (*Doc, error) {

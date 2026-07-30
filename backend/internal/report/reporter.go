@@ -17,6 +17,14 @@ type Executions interface {
 	List() ([]runs.Result, error)
 }
 
+// PausedExecutions names the executions that stand on the ONE pause right now, by execution id.
+// The pause lives on the state document, not on the result, so the Reporter reads it through this
+// seam instead of guessing from an unfinished result. nil is allowed: the report then names no
+// pause rather than an invented one.
+type PausedExecutions interface {
+	PausedIDs() (map[string]bool, error)
+}
+
 // Sender delivers a composed report to a recipient. The production implementation wraps the mailer
 // (maild); tests substitute a fake. It is the single seam through which mail leaves the Reporter, so
 // a send failure is observed in exactly one place.
@@ -36,6 +44,7 @@ type Sender interface {
 type Reporter struct {
 	recipient string
 	execs     Executions
+	paused    PausedExecutions
 	notices   Notices
 	ledger    *Ledger
 	sender    Sender
@@ -53,14 +62,16 @@ type Reporter struct {
 type Config struct {
 	Recipient string
 	Execs     Executions
-	Notices   Notices
-	Ledger    *Ledger
-	Sender    Sender
-	Now       func() time.Time
-	Loc       *time.Location
-	Lookback  int
-	LinkBase  string
-	Logf      func(string, ...any)
+	// Paused names the currently paused executions (optional — nil ⇒ no pause is claimed).
+	Paused   PausedExecutions
+	Notices  Notices
+	Ledger   *Ledger
+	Sender   Sender
+	Now      func() time.Time
+	Loc      *time.Location
+	Lookback int
+	LinkBase string
+	Logf     func(string, ...any)
 }
 
 // NewReporter builds a Reporter, filling sensible defaults (real clock, server-local timezone, a
@@ -69,6 +80,7 @@ func NewReporter(c Config) *Reporter {
 	rp := &Reporter{
 		recipient: strings.TrimSpace(c.Recipient),
 		execs:     c.Execs,
+		paused:    c.Paused,
 		notices:   c.Notices,
 		ledger:    c.Ledger,
 		sender:    c.Sender,
@@ -206,10 +218,21 @@ func (rp *Reporter) rubrics(day string) []Rubric {
 }
 
 // buildItems turns a day's results (oldest first) into report items — each result already
-// carries its per-repo stage array (the one source of stage truth).
+// carries its per-repo stage array (the one source of stage truth). Whether an unfinished
+// execution merely runs or STANDS on the shared pause is read off the state documents, never
+// guessed from the missing end stamp.
 func (rp *Reporter) buildItems(summaries []runs.Result) []Item {
 	ordered := append([]runs.Result(nil), summaries...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].StartedAt.Before(ordered[j].StartedAt) })
+
+	paused := map[string]bool{}
+	if rp.paused != nil {
+		if ids, err := rp.paused.PausedIDs(); err == nil {
+			paused = ids
+		} else {
+			rp.logf("devlabd: daily-report pause lookup: %v", err)
+		}
+	}
 
 	items := make([]Item, 0, len(ordered))
 	for _, s := range ordered {
@@ -219,6 +242,7 @@ func (rp *Reporter) buildItems(summaries []runs.Result) []Item {
 			StartedAt: s.StartedAt,
 			Finished:  s.EndedAt != nil,
 			OK:        resultOK(s),
+			Paused:    s.EndedAt == nil && paused[s.ID],
 			InTokens:  int(s.Usage.InputTokens),
 			OutTokens: int(s.Usage.OutputTokens),
 			CostUSD:   s.Usage.CostUSD,

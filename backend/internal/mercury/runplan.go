@@ -67,19 +67,19 @@ func ValidateRunPlan(p *RunPlan, knownAxiomIDs []string) error {
 		r := &p.Runs[i]
 		r.Name = strings.TrimSpace(r.Name)
 		if r.Name == "" {
-			return fmt.Errorf("%w: ein Lauf hat keinen Namen", ErrInvalidPlacement)
+			return fmt.Errorf("%w: a run has no name", ErrInvalidPlacement)
 		}
 		low := strings.ToLower(r.Name)
 		if names[low] {
-			return fmt.Errorf("%w: doppelter Lauf-Name %q", ErrInvalidPlacement, r.Name)
+			return fmt.Errorf("%w: duplicate run name %q", ErrInvalidPlacement, r.Name)
 		}
 		names[low] = true
 		if len(r.AxiomIDs) == 0 {
-			return fmt.Errorf("%w: Lauf %q hat keine Axiome", ErrInvalidPlacement, r.Name)
+			return fmt.Errorf("%w: run %q has no axioms", ErrInvalidPlacement, r.Name)
 		}
 		for _, id := range r.AxiomIDs {
 			if !known[id] {
-				return fmt.Errorf("%w: Lauf %q referenziert unbekanntes Axiom %q", ErrInvalidPlacement, r.Name, id)
+				return fmt.Errorf("%w: run %q references the unknown axiom %q", ErrInvalidPlacement, r.Name, id)
 			}
 		}
 		if err := validatePlanSchedule(r.Name, r.Schedule); err != nil {

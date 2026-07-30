@@ -13,7 +13,6 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -213,15 +212,18 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 	return e
 }
 
-// stop shuts the composed system down the way SIGTERM does: release every blocked agent, cancel
-// the root context, drain. No goroutine may outlive its test — it would write into a state root
-// that no longer exists.
+// stop shuts the composed system down the way SIGTERM does, IN THAT ORDER: close the root context
+// (the ticks stop), then drain — which cancels each running execution and persists it interrupted.
+// A held agent must EXPERIENCE the kill; releasing it first would let it finish its repo, and the
+// test's "killed mid-work" premise would silently become "finished just in time". The release
+// afterwards is only the safety net for a fake that ignores its context, so that no goroutine
+// outlives its test and writes into a state root that no longer exists.
 func (e *env) stop() {
-	e.deps.releaseAll()
 	e.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = e.sch.DrainAndPersist(ctx)
+	e.deps.releaseAll()
 }
 
 // firstGroupOf returns a group the account really belongs to — the suite makes THAT the admin
@@ -449,152 +451,23 @@ func (e *env) activeList() (active []model.ExecutionView, restart model.RestartS
 
 // ── the execution seam: the motor plus the result recorder ────────────────────────────────────
 
-// execute is the ExecFunc the scheduler drives: it resolves the tuning, composes the sink out of
-// the document-progress sink (sched) and the result recorder, and runs the REAL motor.
-//
-// NOTE for the seam audit: the result recorder below is the piece cmd/devlabd is supposed to
-// compose (ARCHITEKTUR §3.8 "Motor/Recorder"). The daemon does not compose it yet, so it lives
-// here as the suite's stand-in — see the boot-wiring test.
+// execute is the ExecFunc the scheduler drives — the very composition cmd/devlabd performs: the
+// effective tuning, the sink composed out of the document-progress half (sched) and the result
+// recorder (api), and the REAL motor. Only the DEPS are substituted (no GitHub, no agent process,
+// no root); recorder, sink composition and motor are the shipped implementations, so the live
+// transcript and the live consumption are PROVEN here rather than simulated by a stand-in.
 func (e *env) execute(ctx context.Context, doc execstate.Doc, run runs.Run) error {
 	set, err := e.settings.Get()
 	if err != nil {
 		return err
 	}
-	rec := e.recorder(doc, run)
-	sink := teeSink{doc: e.sch.DocSink(doc.ID), rec: rec}
+	rec := e.srv.NewResultRecorder(doc, run)
 	err = executor.Execute(ctx, e.deps, executor.Request{
 		Run: run, Doc: doc, Budget: runs.EffectiveTuning(run, set),
-	}, sink)
-	rec.finish(err)
+	}, api.ExecutionSink(e.sch.DocSink(doc.ID), rec))
+	rec.Finish(err)
 	return err
 }
-
-// resultRecorder mirrors the motor's progress into the ONE result document and the transcript
-// journal — written live, so the history and the live follow read the same file.
-type resultRecorder struct {
-	e   *env
-	mu  sync.Mutex
-	res runs.Result
-}
-
-func (e *env) recorder(doc execstate.Doc, run runs.Run) *resultRecorder {
-	r := &resultRecorder{e: e, res: runs.Result{
-		ID: doc.ID, RunID: run.ID, RunTitle: run.Title, Kind: run.Kind,
-		Model: run.Tuning.Model, StartedAt: time.Now().UTC(), Prompt: run.PromptSnapshot,
-		Requested: doc.Requested, Repos: []model.RepoPipeline{},
-	}}
-	r.flush()
-	return r
-}
-
-func (r *resultRecorder) flush() {
-	if err := r.e.results.Put(r.res); err != nil {
-		r.e.t.Errorf("record result: %v", err)
-	}
-	r.e.broker.Publish(live.TopicProgress)
-}
-
-func (r *resultRecorder) repo(repo string) *model.RepoPipeline {
-	for i := range r.res.Repos {
-		if r.res.Repos[i].Repo == repo {
-			return &r.res.Repos[i]
-		}
-	}
-	r.res.Repos = append(r.res.Repos, model.RepoPipeline{Repo: repo})
-	return &r.res.Repos[len(r.res.Repos)-1]
-}
-
-func (r *resultRecorder) StageUpdate(repo string, sv model.StageView) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rp := r.repo(repo)
-	replaced := false
-	for i := range rp.Stages {
-		if rp.Stages[i].Stage == sv.Stage {
-			rp.Stages[i] = sv
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		rp.Stages = append(rp.Stages, sv)
-	}
-	r.flush()
-}
-
-func (r *resultRecorder) Transcript(_ string, line []byte) {
-	if err := r.e.results.AppendTranscript(r.res.ID, line); err != nil {
-		r.e.t.Errorf("append transcript: %v", err)
-	}
-}
-
-func (r *resultRecorder) Usage(u model.UsageView) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.res.Usage = u
-	r.flush()
-}
-
-func (r *resultRecorder) RepoDone(rp model.RepoPipeline) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	cur := r.repo(rp.Repo)
-	*cur = rp
-	r.flush()
-}
-
-func (r *resultRecorder) Continuation(model.ContinuationView) {}
-
-func (r *resultRecorder) Notice(n executor.NoticeEvent) {
-	_ = r.e.notices.Add(runs.Notice{Kind: n.Kind, Repo: n.Repo, Reason: n.Text, NextStep: n.NextStep})
-	r.e.broker.Publish(live.TopicNotices)
-}
-
-// finish stamps the end of the execution and the honest report.
-func (r *resultRecorder) finish(execErr error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	now := time.Now().UTC()
-	r.res.EndedAt = &now
-	if execErr != nil {
-		r.res.Report = "## not implemented\n\n" + execErr.Error()
-	} else {
-		r.res.Report = "## implemented\n\nevery target repository completed."
-	}
-	r.flush()
-}
-
-// teeSink is the composed sink of the two halves the architecture names: the document-progress
-// sink (sched, so admission and resume read the truth) and the result recorder (so the history
-// and the live follow read one file). Notices belong to the recorder half — the document holds
-// no operator findings. sched.DocSink deliberately implements only the progress half, so the
-// composition — this type — is what cmd/devlabd has to supply.
-type teeSink struct {
-	doc *sched.DocSink
-	rec *resultRecorder
-}
-
-func (t teeSink) StageUpdate(repo string, sv model.StageView) {
-	t.doc.StageUpdate(repo, sv)
-	t.rec.StageUpdate(repo, sv)
-}
-func (t teeSink) Transcript(repo string, line []byte) {
-	t.doc.Transcript(repo, line)
-	t.rec.Transcript(repo, line)
-}
-func (t teeSink) Usage(u model.UsageView) {
-	t.doc.Usage(u)
-	t.rec.Usage(u)
-}
-func (t teeSink) RepoDone(rp model.RepoPipeline) {
-	t.doc.RepoDone(rp)
-	t.rec.RepoDone(rp)
-}
-func (t teeSink) Continuation(c model.ContinuationView) {
-	t.doc.Continuation(c)
-	t.rec.Continuation(c)
-}
-func (t teeSink) Notice(n executor.NoticeEvent) { t.rec.Notice(n) }
 
 // ── stage-array helpers the assertions share ─────────────────────────────────────────────────
 

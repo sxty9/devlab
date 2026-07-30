@@ -99,6 +99,10 @@ export interface StartPlacement {
 
 export interface DataSource {
   init(): Promise<InitResult>;
+  /** Re-mints the short-lived access credential, resolving to whether the session is usable again.
+   *  The ONE refresh access point: every caller (including the live stream's reconnect, C F5) rides
+   *  it instead of opening a second path to the same entity. */
+  refreshSession(): Promise<boolean>;
   getUser(): Promise<User>;
   repos(): Promise<Repo[]>;
   repoData(id: string, branch?: string): Promise<RepoData>;

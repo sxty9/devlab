@@ -3,10 +3,10 @@ package runs
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/statepath"
 )
 
@@ -89,15 +89,6 @@ func (a *AxiomChecks) Record(repo string, ids []string, commit string, at time.T
 			f.Repos[repo][id] = AxiomCheck{Commit: commit, At: at.UTC()}
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(a.path), 0o700); err != nil {
-		return
-	}
-	b, err := json.MarshalIndent(f, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := a.path + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, a.path)
-	}
+	// Persisted through the ONE atomic write path (fsatomic) — no pool re-derives tmp+rename (B-11).
+	_ = fsatomic.WriteJSON(a.path, f)
 }

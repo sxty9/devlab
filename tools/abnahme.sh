@@ -391,6 +391,60 @@ else
   fail "B-45b" "no concrete instance domain in the repository" "$stray_hosts"
 fi
 
+# REQ-030.5 / brand integrity: Tailwind's /opacity modifier only works on a token whose value is a
+# colour CHANNEL (rgb(var(--x) / <alpha-value>)). On a token that is a plain var() Tailwind DROPS
+# the whole declaration without a word — the mark then renders NOTHING, which is exactly how a
+# state badge silently disappears. The forbidden token set is DERIVED from the theme preset, so it
+# cannot drift: every colour written as v('…') instead of rgb('…'), in the spelling Tailwind gives
+# it (a nested member reads <group>-<member>, DEFAULT reads as the group alone).
+var_tokens="$(
+  awk '
+    /colors: \{/      { inside = 1; next }
+    /borderRadius: \{/ { inside = 0 }
+    !inside { next }
+    {
+      line = $0
+      opens = (line ~ /:[[:space:]]*\{/)
+      closes = (line ~ /\}/)
+      grp = cur
+      if (opens) {
+        name = line
+        sub(/:[[:space:]]*\{.*$/, "", name)
+        gsub(/[^A-Za-z0-9_-]/, "", name)
+        grp = name
+        if (!closes) { cur = name; next }
+      } else if (closes && line !~ /v\(/) {
+        cur = ""
+        next
+      }
+      rest = line
+      while (match(rest, /[A-Za-z0-9_]+:[[:space:]]*v\(/)) {
+        member = substr(rest, RSTART, RLENGTH)
+        sub(/:.*$/, "", member)
+        if (grp == "")            print member
+        else if (member == "DEFAULT") print grp
+        else                      print grp "-" member
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+    }
+  ' src/theme/tailwind-preset.ts 2>/dev/null | sort -u
+)"
+opacity_on_var=""
+while read -r token; do
+  [[ -z ${token:-} ]] && continue
+  hit="$(grep -nIE "[a-z-]+-${token}/" "${F_TS_SRC[@]}" 2>/dev/null || true)"
+  [[ -n $hit ]] && opacity_on_var+="$hit"$'\n'
+done <<<"$var_tokens"
+if [[ $(grep -c . <<<"$var_tokens") -lt 5 ]]; then
+  fail "B-46" "no /opacity modifier on a var()-valued theme token" \
+    "the theme preset could not be read — the forbidden token set would be unknown"
+elif [[ -z $opacity_on_var ]]; then
+  pass "B-46" "no /opacity modifier on a var()-valued theme token (Tailwind drops it silently)"
+else
+  fail "B-46" "no /opacity modifier on a var()-valued theme token (Tailwind drops it silently)" \
+    "$(sort -u <<<"$opacity_on_var")"
+fi
+
 # REQ-007.2 / B-41: every upload point offers the clipboard as an equal input path.
 upload_files="$(grep -lIE 'uploadVision\(|mercuryUploadAttachment\(' "${F_TS_SRC[@]}" 2>/dev/null | grep -v '^src/data/' || true)"
 missing_paste=""

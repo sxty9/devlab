@@ -43,21 +43,31 @@ func (p *fakePub) has(t live.Topic) bool {
 // fakeExec is a controllable ExecFunc: it signals each start and blocks until released (or the
 // context ends). ignoreCtx simulates a stuck agent that outlives its cancellation.
 type fakeExec struct {
-	mu        sync.Mutex
-	starts    []string // execution ids in start order
-	docs      map[string]execstate.Doc
+	mu     sync.Mutex
+	starts []string // execution ids in start order
+	// docs holds EVERY handover per execution id, in order — a resume is a second handover of the
+	// same id, and a test that asks what the executor received must be able to name which one.
+	docs      map[string][]execstate.Doc
 	release   map[string]chan struct{}
 	ignoreCtx bool
+	// drained latches "release everything, now and from now on" — the teardown. Without the latch a
+	// goroutine that has not yet ENTERED fn would create a fresh, open channel afterwards and block
+	// past its test.
+	drained bool
 }
 
 func newFakeExec() *fakeExec {
-	return &fakeExec{docs: map[string]execstate.Doc{}, release: map[string]chan struct{}{}}
+	return &fakeExec{docs: map[string][]execstate.Doc{}, release: map[string]chan struct{}{}}
 }
 
 func (f *fakeExec) fn(ctx context.Context, doc execstate.Doc, run runs.Run) error {
 	f.mu.Lock()
 	f.starts = append(f.starts, doc.ID)
-	f.docs[doc.ID] = doc
+	f.docs[doc.ID] = append(f.docs[doc.ID], doc)
+	if f.drained {
+		f.mu.Unlock()
+		return nil // teardown: a start that arrives now finishes at once
+	}
 	ch, ok := f.release[doc.ID]
 	if !ok {
 		ch = make(chan struct{})
@@ -91,17 +101,36 @@ func (f *fakeExec) releaseExec(id string) {
 	}
 }
 
+// releaseAll releases every execution the fake is holding AND latches the release, so a start that
+// only reaches the fake afterwards finishes immediately — the shutdown a test cleanup performs.
+func (f *fakeExec) releaseAll() {
+	f.mu.Lock()
+	f.drained = true
+	ids := make([]string, 0, len(f.release))
+	for id := range f.release {
+		ids = append(ids, id)
+	}
+	f.mu.Unlock()
+	for _, id := range ids {
+		f.releaseExec(id)
+	}
+}
+
 func (f *fakeExec) startCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.starts)
 }
 
-func (f *fakeExec) startedDoc(id string) (execstate.Doc, bool) {
+// startedDoc returns the nth (1-based) document the executor was handed for id.
+func (f *fakeExec) startedDoc(id string, nth int) (execstate.Doc, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	d, ok := f.docs[id]
-	return d, ok
+	list := f.docs[id]
+	if nth < 1 || len(list) < nth {
+		return execstate.Doc{}, false
+	}
+	return list[nth-1], true
 }
 
 type harness struct {
@@ -144,6 +173,23 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	h.sch.settings = func() (runs.Settings, error) {
 		return runs.Settings{MaxConcurrency: int(h.cap.Load())}, nil
 	}
+	// No execution goroutine may outlive its test: it would still be writing documents while Go
+	// removes the temporary state root ("directory not empty"). Release every blocked fake and wait
+	// for the goroutines to wind down — the same order SIGTERM uses.
+	t.Cleanup(func() {
+		h.exec.releaseAll()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			h.sch.mu.Lock()
+			n := len(h.sch.running)
+			h.sch.mu.Unlock()
+			if n == 0 {
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		t.Error("execution goroutines outlived their test — the state root is torn down under them")
+	})
 	return h
 }
 
@@ -183,6 +229,24 @@ func (h *harness) waitPhase(execID string, want model.ExecPhase) execstate.Doc {
 	}
 	d, _, _ := h.docs.Get(execID)
 	h.t.Fatalf("execution %s never reached %s (is %s)", execID, want, d.Phase)
+	return execstate.Doc{}
+}
+
+// waitStarted waits until the EXECUTOR was handed this execution for the nth time, and returns the
+// document it received then. The document's phase flips to running BEFORE the goroutine launches (the
+// document is the truth, the goroutine follows it), so a test that inspects what the executor got
+// must wait for the executor — waiting for the phase alone is a race, and after a resume the FIRST
+// handover is the stale one.
+func (h *harness) waitStarted(execID string, nth int) execstate.Doc {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if d, ok := h.exec.startedDoc(execID, nth); ok {
+			return d
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	h.t.Fatalf("the executor never received handover %d of execution %s", nth, execID)
 	return execstate.Doc{}
 }
 
@@ -408,8 +472,17 @@ func TestAutoRunClaimsOnlyItsActiveRepo(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A live handle without a goroutine: the auto run is "being worked" as far as admission is
+	// concerned. Written under the admission mutex — the scheduler reads that map from its own
+	// goroutines.
+	h.sch.mu.Lock()
 	h.sch.running[doc.ID] = &liveExec{runID: "run_auto", cancel: func(error) {}, done: make(chan struct{})}
-	defer delete(h.sch.running, doc.ID)
+	h.sch.mu.Unlock()
+	defer func() {
+		h.sch.mu.Lock()
+		delete(h.sch.running, doc.ID)
+		h.sch.mu.Unlock()
+	}()
 	h.cap.Store(3)
 
 	// A todo on the auto run's PENDING repo (beta) is admitted — beta is not claimed.
@@ -485,10 +558,7 @@ func TestDeferKeepsProgressAndResumeContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.waitPhase(out.ExecutionID, model.PhaseRunning)
-	got, ok := h.exec.startedDoc(out.ExecutionID)
-	if !ok {
-		t.Fatal("executor never saw the resumed doc")
-	}
+	got := h.waitStarted(out.ExecutionID, 2) // the resume is the SECOND handover of this id
 	if got.Repo("alpha") == nil || got.Repo("alpha").State != execstate.RepoDone {
 		t.Fatal("finished repository must STAY finished across defer/resume")
 	}

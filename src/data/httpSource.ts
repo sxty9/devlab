@@ -97,6 +97,10 @@ export const httpSource: DataSource = {
     }
   },
 
+  // The seam's refresh IS the single-flight refresh every request already rides, so a caller that
+  // needs to re-mint before retrying by itself (the live stream, C F5) uses one and the same path.
+  refreshSession,
+
   async getUser(): Promise<User> {
     return json(await request('/api/user'));
   },
@@ -385,9 +389,6 @@ function post(path: string, body?: unknown, method = 'POST'): Promise<Response> 
 }
 
 /** Builds a power-op request init with the CSRF header (for mutating calls). */
-export function withCsrf(init: RequestInit = {}): RequestInit {
+function withCsrf(init: RequestInit = {}): RequestInit {
   return { ...init, headers: { ...(init.headers ?? {}), 'X-CSRF-Token': csrfToken() } };
 }
-
-/** Exposed so Slice 2/3 mutating sources can reuse the refresh-aware fetch. */
-export { request as apiFetch, json as apiJson };

@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"devlab/backend/internal/deliver"
+	"devlab/backend/internal/deploy"
 	"devlab/backend/internal/discover"
+	"devlab/backend/internal/executor"
 	"devlab/backend/internal/github"
 	"devlab/backend/internal/live"
 	"devlab/backend/internal/model"
@@ -338,10 +340,42 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	return res, nil
 }
 
-// RedeliverDev re-ships the dev state after a counter-booking. The deploy wiring arrives with
-// the deploy package's runtime composition; until then the gap is NAMED, never silent.
-func (g runnerGitSide) RedeliverDev(_ context.Context, repo string) error {
-	return errors.New("re-deliver " + repoShort(repo) + " through the delivery chain (automatic re-delivery is wired with the deploy composition)")
+// RedeliverDev re-ships the dev state after a counter-booking (REQ-025.5): the counter-booked
+// workbench is what must be running, so the rollback rides the SAME delivery composition the chain
+// rides — detect, build as the user, install-only as root, honest gate. There is no second deploy
+// path; a repository that is not a service (or is excluded) is honestly nothing to re-deliver, and
+// any other failure is NAMED in the rollback outcome, never silent.
+func (g runnerGitSide) RedeliverDev(ctx context.Context, repo string) error {
+	deps := g.s.ChainDeps(ChainHooks{})
+	defer deps.Close()
+	return redeliverOutcome(deps.Deploy().DeliverDev(ctx, repoShort(repo)))
+}
+
+// redeliverOutcome reads one re-delivery honestly: a repository that is not a service (excluded,
+// library, template) has NOTHING to re-deliver and says so by succeeding; an install that did not
+// come up is a named failure, never a quiet success. The self repo is the one exception to the port
+// probe — its proof is the handover plus the next boot (B-2).
+func redeliverOutcome(out executor.DeployOutcome, err error) error {
+	switch {
+	case errors.Is(err, deploy.ErrNotAService), errors.Is(err, deploy.ErrExcluded), errors.Is(err, deploy.ErrTemplateRepo):
+		return nil
+	case err != nil:
+		return err
+	case out.Self:
+		return nil
+	case !out.Running:
+		return errors.New("installed, but the service is not running: " + nonEmptyDetail(out.Detail))
+	default:
+		return nil
+	}
+}
+
+// nonEmptyDetail keeps a failure from reading as an empty sentence.
+func nonEmptyDetail(detail string) string {
+	if strings.TrimSpace(detail) == "" {
+		return "the honest running gate reported no proof"
+	}
+	return detail
 }
 
 // runnerIdentity resolves the commit identity of the runner's linked account (best-effort —

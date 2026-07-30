@@ -1932,6 +1932,10 @@
       "reason": "Bootstrap probe of the web surface (liveness plus identity); its substance is user_get."
     },
     {
+      "subject": "refreshSession",
+      "reason": "Re-mints the browser's short-lived cookie session; an agent authenticates per request with its own bearer token, so it has no session to refresh."
+    },
+    {
       "subject": "githubAuthorizeUrl",
       "reason": "Builds the address that starts the browser's GitHub consent flow — an interactive redirect, not a request/response capability."
     },

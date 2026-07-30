@@ -1,5 +1,6 @@
-// Package workspace manages per-user git working trees: /var/lib/devlab/workspaces/<user>/<repo>
-// (env DEVLAB_WORKSPACES). Each user gets their own full clone per repo, cloned on first access
+// Package workspace manages per-user git working trees at <state root>/workspaces/<user>/<repo>
+// (statepath.Workspaces; env override DEVLAB_WORKSPACES). The state root is runtime configuration —
+// no instance path is baked in. Each user gets their own full clone per repo, cloned on first access
 // with that user's GitHub token. A per-user-per-repo mutex serializes mutating ops so concurrent
 // browser tabs cannot race the index.
 //

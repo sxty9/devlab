@@ -210,3 +210,41 @@ func trim(b []byte) string {
 	}
 	return s
 }
+
+// D 34 / B-03: the CSRF double submit is waived ONLY on the bearer path — and the waiver cannot be
+// borrowed. Both decisions (does CSRF apply, and whose identity is this) read the SAME predicate, so
+// a page that sends a fake Authorization header alongside the victim's cookies waives the check and
+// loses the session in the same move: the request is refused, never executed.
+func TestCSRFWaiverBelongsToTheBearerPathAlone(t *testing.T) {
+	e := newEnv(t, sched.Config{Tick: time.Hour})
+	e.addTodo("run_csrf", "a mutating target", "alpha")
+	const path = "/api/mercury/runs/run_csrf/cancel"
+
+	// (a) the cookie path without the double submit is refused, naming CSRF.
+	req := e.request(http.MethodPost, path, map[string]any{})
+	req.Header.Del("X-CSRF-Token")
+	if code, body := e.do(req); code != http.StatusForbidden || !strings.Contains(string(body), "CSRF") {
+		t.Errorf("cookie path without the header: %d %s — want 403 naming CSRF", code, trim(body))
+	}
+
+	// (b) a token-SHAPED but invalid bearer header waives the CSRF check — and then fails identity:
+	// 401, never a performed mutation.
+	req = e.request(http.MethodPost, path, map[string]any{})
+	req.Header.Del("X-CSRF-Token")
+	req.Header.Set("Authorization", "Bearer not.a.real.token")
+	if code, body := e.do(req); code != http.StatusUnauthorized {
+		t.Errorf("a forged bearer beside the cookies: %d %s — want 401 (the waiver cannot be borrowed)", code, trim(body))
+	}
+
+	// (c) a VALID bearer needs no double submit at all — the header cannot be sent cross-site.
+	req = e.request(http.MethodPost, path, map[string]any{})
+	req.Header.Del("X-CSRF-Token")
+	req.Header.Set("Authorization", "Bearer "+e.token(e.user, 15*time.Minute))
+	code, body := e.do(req)
+	if code == http.StatusForbidden && strings.Contains(string(body), "CSRF") {
+		t.Errorf("a valid bearer was asked for a CSRF token: %d %s", code, trim(body))
+	}
+	if code == http.StatusUnauthorized {
+		t.Errorf("a valid bearer was not accepted as a session: %d %s", code, trim(body))
+	}
+}
