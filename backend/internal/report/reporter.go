@@ -226,7 +226,18 @@ func (rp *Reporter) deliverDay(ctx context.Context, day string, summaries []runs
 		return // sealed, blocked, or waiting out its backoff interval — the ONE gate, see due()
 	}
 	if len(summaries) == 0 {
-		return // a day without any execution produces no message
+		// A day that never had a record simply produces no message — correct silence.
+		//
+		// A day whose record is still UNDELIVERED is a different case: its executions are no longer
+		// in the results pool, so the report can never be composed again. Returning silently here
+		// left such a record pending for ever while the resume told the operator "the next pass
+		// tries again" — a promise the pass could not keep. It is settled with that exact reason
+		// instead (measured 2026-07-30 on the record of the 26th, 51 attempts, executions long
+		// archived).
+		if rec.Status != "" && rec.Status != StatusSent {
+			rp.settleWithoutMaterial(rec, day, now)
+		}
+		return
 	}
 
 	items := rp.buildItems(summaries)
@@ -491,4 +502,19 @@ func runName(s runs.Result) string {
 		return "Run " + s.RunID
 	}
 	return "Run"
+}
+
+// settleWithoutMaterial closes an undelivered day whose executions have left the results pool. The
+// report can no longer be composed from anything, so there is no attempt left to make: the record is
+// blocked with exactly that reason and no next attempt. Blocked, not failed, because failed means
+// "will be tried again" — and it will not. A resume puts the day back in front of the pass, which
+// blocks it again with the same sentence: one pass, one named outcome, never a silent loop.
+func (rp *Reporter) settleWithoutMaterial(rec Record, day string, now time.Time) {
+	reason := "the executions of this day are no longer in the results pool — the report can no longer be composed"
+	rp.put(Record{
+		Recipient: rp.recipient, Day: day, Status: StatusBlocked, Executions: rec.Executions,
+		Attempts: rec.Attempts, LastAttempt: &now, LastError: reason,
+		Backoff: &model.Backoff{Reason: reason, Class: "permanent", Attempts: rec.Attempts},
+	})
+	rp.logf("devlabd: daily report %s for %s BLOCKED — %s", day, rp.recipient, reason)
 }

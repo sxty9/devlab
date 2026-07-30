@@ -668,3 +668,67 @@ func TestPausedIsReadOffTheDocumentsNotGuessed(t *testing.T) {
 		t.Errorf("a finished execution must not read as paused")
 	}
 }
+
+// A day whose report never went out and whose executions have since left the results pool cannot be
+// composed from anything. It used to be skipped SILENTLY on every pass — the record stayed
+// undelivered for ever while the resume told the operator "the next pass tries again", a promise the
+// pass could not keep. Measured on the live record of 2026-07-26 (51 attempts, executions archived).
+func TestADayWhoseExecutionsAreGoneIsSettledInsteadOfSkippedSilently(t *testing.T) {
+	// A first pass with material, and a sender that refuses: the day ends up undelivered.
+	sender := &fakeSender{failAll: true, failWith: errors.New("mailer: 400 Bad Request: A from user is required")}
+	h := newHarness(t, sender, at(28, 9), summary("run_a", "A", at(27, 12)))
+	h.pass()
+	rec, _, err := h.ledger.Get("owner", "2026-07-27")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != StatusFailed {
+		t.Fatalf("the day must be undelivered first, is %q", rec.Status)
+	}
+
+	// Now the material is gone (the results pool no longer holds that day) and the day is due again.
+	h.rp = NewReporter(Config{
+		Recipient: "owner", Execs: &fakeExecs{}, Notices: h.pool, Ledger: h.ledger,
+		Sender: sender, Now: h.clk.now, Loc: time.UTC, Lookback: 3, Logf: h.logs.logf,
+	})
+	h.clk.t = at(28, 23)
+	h.pass()
+
+	rec, _, err = h.ledger.Get("owner", "2026-07-27")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Status != StatusBlocked {
+		t.Fatalf("status = %q, want blocked — a day that can never be composed is not pending work", rec.Status)
+	}
+	if !strings.Contains(rec.LastError, "no longer in the results pool") {
+		t.Fatalf("the reason is not named: %q", rec.LastError)
+	}
+	if rec.Backoff == nil || rec.Backoff.Class != "permanent" || !rec.Backoff.NextAt.IsZero() {
+		t.Fatalf("a next attempt is promised that will never come: %+v", rec.Backoff)
+	}
+	if len(h.logs.containing("no longer in the results pool")) == 0 {
+		t.Fatalf("the outcome was silent:\n%s", strings.Join(h.logs.lines, "\n"))
+	}
+
+	// And it does not loop: a further pass adds no second outcome.
+	before := len(h.logs.lines)
+	h.clk.t = at(29, 9)
+	h.pass()
+	if got := len(h.logs.lines) - before; got != 0 {
+		t.Fatalf("the blocked day speaks again on the next pass (%d lines) — that is the loop it replaces", got)
+	}
+}
+
+// A day that never had a record and has no executions stays correctly silent — the fix above must not
+// turn ordinary quiet days into blocked records.
+func TestADayWithoutAnyRecordStaysSilent(t *testing.T) {
+	h := newHarness(t, &fakeSender{}, at(28, 9))
+	h.pass()
+	if _, ok, _ := h.ledger.Get("owner", "2026-07-27"); ok {
+		t.Fatal("a day nobody ever reported on grew a record")
+	}
+	if len(h.logs.lines) != 0 {
+		t.Fatalf("an empty day was not silent:\n%s", strings.Join(h.logs.lines, "\n"))
+	}
+}

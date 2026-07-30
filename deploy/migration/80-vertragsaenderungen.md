@@ -722,7 +722,7 @@ constitution store resolves its token through the same runner identity.
 **Proof:** the readability precondition and the staging removal are probes in the step itself; the
 three pool rows were measured against the real state directory (shape comparison against
 `report.Record`, `runs.AxiomChecks`, `axiomauthors.Author` and the attachment path layout), and the
-"due again" claim is the shipped `due()` in `report/reporter.go:251 due`, which returns true for a failed
+"due again" claim is the shipped `due()` in `report/reporter.go:262 due`, which returns true for a failed
 record with no backoff.
 
 ### `deploy/migration/20-sichtpruefung.md` — the inspection kinds are the matrix's own, and the open work is one list
