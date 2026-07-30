@@ -40,6 +40,7 @@ import type {
   RunNotice,
   RunPlan,
   RunProposal,
+  RunProposalAction,
   RunResult,
   RunSnapshotMeta,
   ServiceConfig,
@@ -186,8 +187,17 @@ export interface DataSource {
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;
-  mercuryRunAiFill(): Promise<RunProposal>;
-  mercuryRunAiFinetune(): Promise<RunProposal>;
+  /** Start the automatic axiom→run assignment for everything no run carries yet (REQ-004). The
+   *  same pass an axiom write kicks; answers with the honest immediate outcome (how many are
+   *  uncovered, whether a pass started) — the result itself arrives as a notice. */
+  mercuryRunAssign(): Promise<{ uncovered: number; started: boolean }>;
+  /** The ONE access point of the fill proposal — request it, read it, abandon it (default:
+   *  request). It NEVER waits for the model: a model call over the whole constitution takes
+   *  minutes, so the access takes the work on and answers with its state at once. The finished
+   *  proposal announces itself on the live stream (topic `runs`) and is read back through here. */
+  mercuryRunAiFill(action?: RunProposalAction): Promise<RunProposal>;
+  /** The same access point for the regrouping proposal — identical shape and rules. */
+  mercuryRunAiFinetune(action?: RunProposalAction): Promise<RunProposal>;
   mercuryApplyRunProposal(mode: 'fill' | 'replace', plan: RunPlan): Promise<void>;
   mercuryRunHistory(): Promise<{ snapshots: RunSnapshotMeta[] }>;
   mercuryRestoreRunHistory(ts: string): Promise<void>;

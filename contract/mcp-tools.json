@@ -1310,7 +1310,7 @@
     },
     {
       "name": "run_ai_fill",
-      "description": "Propose automatic runs for the constitution records that have none. Proposes only; nothing is written.",
+      "description": "Propose automatic runs for the constitution records that have none. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
       "dataSourceOp": "mercuryRunAiFill",
       "method": "POST",
       "route": "POST /api/mercury/runs/ai-fill",
@@ -1318,16 +1318,50 @@
       "readOnly": false,
       "inputSchema": {
         "additionalProperties": false,
-        "properties": {},
+        "properties": {
+          "action": {
+            "description": "request starts an analysis of the uncovered records when none exists and otherwise reports the existing one unchanged; read reports the state without ever starting a model pass; cancel puts a running, finished or failed analysis aside. Starting over after a failure is cancel, then request. Default: request.",
+            "enum": [
+              "request",
+              "read",
+              "cancel"
+            ],
+            "type": "string"
+          }
+        },
         "type": "object"
       }
     },
     {
       "name": "run_ai_finetune",
-      "description": "Propose a reshaped run plan for the whole constitution. Proposes only; nothing is written.",
+      "description": "Propose a reshaped run plan for the whole constitution. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
       "dataSourceOp": "mercuryRunAiFinetune",
       "method": "POST",
       "route": "POST /api/mercury/runs/ai-finetune",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "request starts a regrouping analysis of the whole run plan when none exists and otherwise reports the existing one unchanged; read reports the state without ever starting a model pass; cancel puts a running, finished or failed analysis aside. Starting over after a failure is cancel, then request. Default: request.",
+            "enum": [
+              "request",
+              "read",
+              "cancel"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_assign",
+      "description": "Assign every constitution record that no run carries yet: a fitting run is extended, otherwise one is created. Answers with how many were uncovered and whether a pass started; the outcome arrives as a notice.",
+      "dataSourceOp": "mercuryRunAssign",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/assign",
       "tier": "csrf",
       "readOnly": false,
       "inputSchema": {

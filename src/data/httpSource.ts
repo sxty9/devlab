@@ -276,11 +276,16 @@ export const httpSource: DataSource = {
   async mercuryDeleteRun(id) {
     await json<void>(await request(`/api/mercury/runs/${enc(id)}`, withCsrf({ method: 'DELETE' })));
   },
-  async mercuryRunAiFill() {
-    return json(await post('/api/mercury/runs/ai-fill', {}));
+  async mercuryRunAssign() {
+    return json(await post('/api/mercury/runs/assign', {}));
   },
-  async mercuryRunAiFinetune() {
-    return json(await post('/api/mercury/runs/ai-finetune', {}));
+  // The action rides in the body of the one access point, so requesting, reading and abandoning a
+  // proposal never become three parallel paths to the same entity.
+  async mercuryRunAiFill(action) {
+    return json(await post('/api/mercury/runs/ai-fill', { action: action ?? 'request' }));
+  },
+  async mercuryRunAiFinetune(action) {
+    return json(await post('/api/mercury/runs/ai-finetune', { action: action ?? 'request' }));
   },
   async mercuryApplyRunProposal(mode, plan) {
     await json<void>(await post('/api/mercury/runs/apply-proposal', { mode, plan }));

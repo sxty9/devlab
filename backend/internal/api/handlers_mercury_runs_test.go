@@ -70,6 +70,11 @@ func newRunsTestServer(t *testing.T, axiomCount int) (*Server, []string) {
 	return s, ids
 }
 
+// doJSON drives one handler the way the guards leave a request: an authenticated user in the
+// context AND the session cookie the guard validated. The cookie is not decoration — handlers hand
+// it on to everything that acts on the caller's behalf (the axiom store session, the aigentic
+// planning behind the assignment), so a fixture without one would exercise a request shape that
+// cannot reach a handler in production.
 func doJSON(t *testing.T, h http.HandlerFunc, method, target, user, pathID string, body any) *httptest.ResponseRecorder {
 	t.Helper()
 	var buf bytes.Buffer
@@ -79,6 +84,7 @@ func doJSON(t *testing.T, h http.HandlerFunc, method, target, user, pathID strin
 		}
 	}
 	req := httptest.NewRequest(method, target, &buf)
+	req.Header.Set("Cookie", accessCookie+"=test-session; "+csrfCookie+"=test-csrf")
 	req = req.WithContext(context.WithValue(req.Context(), userCtxKey, &auth.User{Username: user}))
 	if pathID != "" {
 		req.SetPathValue("id", pathID)
@@ -149,31 +155,41 @@ func TestValidateRunInput(t *testing.T) {
 	neg := model.Duration(-time.Hour)
 	zero := model.Duration(0)
 
+	yes, no := true, false
+
 	cases := []struct {
-		name string
-		in   runs.RunInput
-		code int // 0 = valid
+		name      string
+		in        runs.RunInput
+		activeNow bool // the run's CURRENT Active flag; true is the create default
+		code      int  // 0 = valid
 	}{
-		{"auto ok", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, AxiomIDs: []string{"ax_a"}}, 0},
-		{"kind defaults to auto", runs.RunInput{Title: "A", Schedule: sched, AxiomIDs: []string{"ax_a"}}, 0},
-		{"todo ok", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}}, 0},
-		{"title required", runs.RunInput{Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}}, http.StatusBadRequest},
-		{"todo needs a task", runs.RunInput{Title: "T", Kind: model.KindTodo, Targets: []runs.Target{{Repo: "svc"}}}, http.StatusBadRequest},
-		{"todo needs a target", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do"}, http.StatusBadRequest},
-		{"auto needs a schedule", runs.RunInput{Title: "A", Kind: model.KindAuto, AxiomIDs: []string{"ax_a"}}, http.StatusBadRequest},
-		{"auto needs an axiom", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched}, http.StatusBadRequest},
-		{"unknown axiom refused", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, AxiomIDs: []string{"ax_ghost"}}, http.StatusBadRequest},
-		{"bogus kind refused", runs.RunInput{Title: "A", Kind: "cron", Schedule: sched, AxiomIDs: []string{"ax_a"}}, http.StatusBadRequest},
-		{"ultracode allowed", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Effort: "ultracode"}}, 0},
-		{"foreign effort refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Effort: "extreme"}}, http.StatusBadRequest},
-		{"model smuggle refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Model: "opus --dangerously"}}, http.StatusBadRequest},
-		{"negative budget refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{TimeBudget: &neg}}, http.StatusBadRequest},
-		{"zero budget (no budget) allowed", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{TimeBudget: &zero}}, 0},
+		{"auto ok", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, AxiomIDs: []string{"ax_a"}}, true, 0},
+		{"kind defaults to auto", runs.RunInput{Title: "A", Schedule: sched, AxiomIDs: []string{"ax_a"}}, true, 0},
+		{"todo ok", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}}, true, 0},
+		{"title required", runs.RunInput{Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}}, true, http.StatusBadRequest},
+		{"todo needs a task", runs.RunInput{Title: "T", Kind: model.KindTodo, Targets: []runs.Target{{Repo: "svc"}}}, true, http.StatusBadRequest},
+		{"todo needs a target", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do"}, true, http.StatusBadRequest},
+		{"auto needs a schedule", runs.RunInput{Title: "A", Kind: model.KindAuto, AxiomIDs: []string{"ax_a"}}, true, http.StatusBadRequest},
+		{"an ACTIVE auto run needs an axiom", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched}, true, http.StatusBadRequest},
+		// The takeover state: a run that arrived without axioms. It is INACTIVE, so it is storable —
+		// the whole exit out of the dead end depends on this line.
+		{"an inactive auto run may be stored without axioms", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched}, false, 0},
+		{"deactivating an axiom-less run is allowed", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, Active: &no}, true, 0},
+		{"activating an axiom-less run is refused", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, Active: &yes}, false, http.StatusBadRequest},
+		{"activating with an axiom is allowed", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, Active: &yes, AxiomIDs: []string{"ax_a"}}, false, 0},
+		{"unknown axiom refused", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, AxiomIDs: []string{"ax_ghost"}}, true, http.StatusBadRequest},
+		{"unknown axiom refused on an inactive run too", runs.RunInput{Title: "A", Kind: model.KindAuto, Schedule: sched, AxiomIDs: []string{"ax_ghost"}}, false, http.StatusBadRequest},
+		{"bogus kind refused", runs.RunInput{Title: "A", Kind: "cron", Schedule: sched, AxiomIDs: []string{"ax_a"}}, true, http.StatusBadRequest},
+		{"ultracode allowed", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Effort: "ultracode"}}, true, 0},
+		{"foreign effort refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Effort: "extreme"}}, true, http.StatusBadRequest},
+		{"model smuggle refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{Model: "opus --dangerously"}}, true, http.StatusBadRequest},
+		{"negative budget refused", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{TimeBudget: &neg}}, true, http.StatusBadRequest},
+		{"zero budget (no budget) allowed", runs.RunInput{Title: "T", Kind: model.KindTodo, Task: "do", Targets: []runs.Target{{Repo: "svc"}}, Tuning: &runs.Tuning{TimeBudget: &zero}}, true, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			in := c.in
-			code, msg := validateRunInput(&in, cat)
+			code, msg := validateRunInput(&in, cat, c.activeNow)
 			if code != c.code {
 				t.Fatalf("code = %d (%s), want %d", code, msg, c.code)
 			}

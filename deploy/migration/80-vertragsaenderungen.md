@@ -966,3 +966,139 @@ modes were provoked once before the check was kept.
   would re-inject exactly the records the takeover converted, so the protocol now names each one and
   how many still hold pre-rebuild records — which makes keeping or deleting them a decision instead
   of a surprise. Proof: `TestHandMadeRunPoolCopiesAreReportedAndLeftAlone`.
+
+## Repair wave 6
+
+### `backend/internal/api/api.go`, `src/data/source.ts`, `src/data/httpSource.ts` — the assignment has an access of its own
+
+**Who:** repair wave 6 (the assignment dead end).
+
+**Reason:** the automatic axiom→run assignment (REQ-004) was reachable from exactly ONE place —
+`addAxiom` kicking it after a NEW axiom was created. Every other route into the same state existed
+without a trigger, and the takeover produced precisely such a state: seven recurring runs imported
+WITHOUT axioms while no run carried any axiom. From there the surface was closed: the runs needed
+axioms, the axioms arrived only through the assignment, and the assignment started only from an
+axiom nobody wanted to write. The coverage view said "assignment in progress…" and offered nothing
+to press, which is the button-into-the-void case REQ-040.3 forbids read from the other side — an
+access with no caller is one fault, a state with no access is the other.
+
+**What changed:**
+
+* `api.go` gains ONE route, `POST /api/mercury/runs/assign` (`guardCSRF`, handler
+  `runsAssign`). It is not a second assignment path: it starts the SAME pass the axiom writes kick,
+  on the caller's session, and answers with the immediate honest outcome (how many axioms are
+  uncovered, whether a pass was armed) rather than a claimed success — the result itself arrives in
+  the notice feed.
+* `source.ts` declares `mercuryRunAssign()`, `httpSource.ts` calls the route. The caller in the UI is
+  the button in the coverage view, which is the one surface that names the uncovered set.
+
+**Consequence for operation:** none for existing callers; the route is additive. The MCP tool table
+carries `run_assign` for it, so the REQ-043 parity list stays complete in both directions
+(`contract/mcp-tools.json` is regenerated, not hand-edited).
+
+**State of record:**
+
+- `backend/internal/api/api.go@58028eec98d5`
+- `src/data/source.ts@e366711a086d`
+- `src/data/httpSource.ts@9ab108023c5f`
+
+**Diff hint:** `git diff eae031b -- backend/internal/api/api.go src/data/source.ts src/data/httpSource.ts`.
+**Proof:** `TestExplicitAssignmentLeavesTheDeadEnd` and
+`TestExplicitAssignmentIsHonestWhenThereIsNothingToDo` (backend/internal/api), plus the standing
+list-shaped suites: `backend/it/surface_test.go` (every route has a caller and every caller a route)
+and `src/parity.test.ts` (every UI capability is reachable over MCP).
+
+### `src/types.ts`, `src/data/source.ts`, `src/data/httpSource.ts` — an AI proposal is taken on, not waited for
+
+**Who:** repair wave 6 (the AI call that broke off).
+
+**Reason (measured):** `POST /api/mercury/runs/ai-fill` answered correctly — after 109 s. A model
+call over the whole constitution is minutes of work, and the plan loop may re-ask the model, while
+the hop in front of devlabd drops a connection that has been silent for about 100 s. The browser
+therefore reported "failed" for work the server had finished cleanly, and the finished proposal was
+lost with the connection. The seam made that inevitable: `mercuryRunAiFill()` was a request whose
+ANSWER was the result, so the result could only ever travel on a connection nobody could keep
+alive long enough.
+
+**What changed:**
+
+* `types.ts`: `RunProposal` is no longer "the plan plus its legend" but the STATE of one analysis —
+  `none` / `running` / `completed` / `failed` (the contract's own words), with `id`, `startedAt`,
+  `endedAt`, the named `reason` of a failure and the reviewable `proposal` only in `completed`. New
+  `RunProposalAction` (`request` | `read` | `cancel`) names what may be done at the access point,
+  and `RunProposalKind` (`fill` | `finetune`) is the one word for which analysis is meant.
+* `source.ts` / `httpSource.ts`: `mercuryRunAiFill(action?)` and `mercuryRunAiFinetune(action?)`
+  carry the action in the body of the SAME route. No route was added and no operation was renamed,
+  so both list-shaped suites stay complete; requesting, reading and abandoning a proposal do not
+  become three parallel paths to one entity.
+* The result now arrives over the one live stream (topic `runs`, S12) like every other change of
+  state, and the surface reads it back through the same access point — one mechanism (REQ-034).
+
+**Consequence for operation:** the two accesses answer `202 Accepted` with `state: running` instead
+of blocking; a caller that wants the plan asks again — `read` reports the state and starts nothing —
+or waits for the `runs` tick. A call that meets an analysis which is running, finished OR FAILED
+reports THAT one, a failure with its named reason, and asks no model. Starting over is the
+deliberate `cancel`, then `request`. An MCP agent has the same three acts (next entry), so it is
+never left with a state it can neither read nor end.
+
+**State of record:**
+
+- `src/types.ts@65d770d9f4d4`
+- `src/data/source.ts@dc18e32e7d13`
+- `src/data/httpSource.ts@28768ec2ba26`
+
+**Diff hint:** `git diff eae031b -- src/types.ts src/data/source.ts src/data/httpSource.ts`.
+**Proof:** `backend/internal/api/handlers_mercury_runs_ai_test.go`
+(`TestAiFillAnswersWhileTheModelIsStillThinking` drives a model stand-in that answers only after
+the test releases it — a handler that waits for the answer cannot return there at all;
+`TestAiProposalFailureCarriesANamedReason`, `TestReadingNeverStartsAnAnalysisAndAReloadLosesNothing`,
+`TestCancelAbandonsTheAnalysisAndItsLateAnswer`, `TestApplyingAProposalConsumesIt`), plus
+`src/views/mercury/tasks/logic.test.ts` for what the surface may claim at each moment.
+
+### `contract/mcp-tools.json`, `backend/internal/api/mcp_tools.go` — an agent may read and cancel a proposal, not only ask for one
+
+**Who:** repair wave 6 (the agent that could only ask).
+
+**Reason (measured):** `run_ai_fill` was called five times over MCP with empty arguments — the only
+shape its schema allowed, `additionalProperties: false` and no argument at all — while aigentic
+answered 403. All five answered `state: running`, none ever answered `failed`, the reason was never
+delivered, and five full constitution prompts went to the model. Two faults met there. The access
+point treated a repeat over a FAILED analysis as a fresh start, so every round began a new model
+pass; and the tool table offered no way to read or to cancel one, so the surface had three acts
+where an agent had one. That is a REQ-043 parity gap in the direction that is easy to miss: the
+capability existed, but only one of the two ways in could reach it — and a caller that can only ask
+has no way out of the loop it is in.
+
+**What changed:**
+
+* `mcp_tools.go`: both planning rows carry the optional `action` argument (`request` | `read` |
+  `cancel`), worded once in `proposalActionArg` so the two rows cannot drift apart. The plain call
+  is still the request, so no existing caller changes.
+* `aiProposalAccess` (`handlers_mercury_runs.go`) reports whatever analysis exists — running,
+  completed, or failed WITH its named reason — and never restarts by itself. Starting over is the
+  deliberate two-step `cancel`, then `request`; that is exactly what pressing the button on a
+  failure does.
+* `contract/mcp-tools.json` is regenerated from the table
+  (`UPDATE_FIXTURES=1 go test ./internal/api -run MCPToolTable`), never hand-edited.
+
+**Consequence for operation:** an agent reads a proposal without starting one, ends one it no longer
+wants, and meets a failure by its name over both ways in. The claim of the entry above — that an
+agent "learns the outcome by calling again" — held for the successful case only and is corrected
+there.
+
+**State of record:**
+
+- `contract/mcp-tools.json@a2d85070626a`
+- `backend/internal/api/mcp_tools.go@52c076c54a64`
+- `backend/internal/api/handlers_mercury_runs.go@b404af88e789`
+
+**Diff hint:**
+`git diff eae031b -- contract/mcp-tools.json backend/internal/api/mcp_tools.go backend/internal/api/handlers_mercury_runs.go`.
+**Proof:** `backend/internal/api/handlers_mercury_runs_ai_test.go`:
+`TestFivePlainAgentCallsCostExactlyOneModelPass` drives the measured loop itself — five plain tool
+calls against a refusing model stand-in — and holds it to ONE model pass with the reason delivered;
+`TestReadingAFailureOverMCPDeliversItsReasonAndAsksNoModel`, `TestCancelOverMCPAbandonsTheAnalysis`
+and `TestBothPlanningToolsOfferRequestReadAndCancel` hold the agent's three acts;
+`TestAiProposalFailureCarriesANamedReason` holds the deliberate two-step restart. Parity itself stays
+list-shaped: `TestToolTableMirrorsTheDataSource` and `TestEveryRouteHasAToolOrAStatedReason`
+(backend/internal/api), `backend/it/surface_test.go` and `src/parity.test.ts`.

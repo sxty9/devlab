@@ -4,6 +4,7 @@ import {
   BUDGET_CHOICES,
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
+  anyProposalBusy,
   budgetLabel,
   defaultDueLocalInput,
   initialExecutionMode,
@@ -13,7 +14,10 @@ import {
   nowLocalInput,
   parseGoDuration,
   planAttachmentIngest,
+  presentProposal,
+  readProposals,
   repoOptions,
+  runLacksRequiredAxioms,
   scheduleInvalid,
   scheduleSummary,
   storedBudgetLabel,
@@ -21,7 +25,7 @@ import {
   toRunTargets,
   tuningChips,
 } from './logic.ts';
-import type { Repo } from '../../../types';
+import type { Repo, RunPlan, RunProposal, RunProposalAction } from '../../../types';
 
 // A fixed clock (REQ-008 tests must not depend on when they run).
 const FIXED = new Date(2026, 6, 26, 14, 23, 0); // local time: 26 Jul 2026, 14:23
@@ -50,6 +54,17 @@ test('past moments are not schedulable; the boundary and the future pass', () =>
   // Only "scheduled" needs a moment at all.
   assert.equal(scheduleInvalid('now', past, min), false);
   assert.equal(scheduleInvalid('ondemand', '', min), false);
+});
+
+// The form asks the SAME question the server answers. It used to demand an axiom of every
+// recurring run, active or not — stricter than the server, which stores an inactive one without
+// any. A run imported that way was then unsaveable in the only surface that could edit it, while
+// its axioms could only arrive through the assignment.
+test('the axiom rule binds to activation, exactly as the server does', () => {
+  assert.equal(runLacksRequiredAxioms(true, []), true, 'an active run with no axiom runs against nothing');
+  assert.equal(runLacksRequiredAxioms(true, ['ax_01']), false);
+  assert.equal(runLacksRequiredAxioms(false, []), false, 'an inactive run without axioms must stay saveable');
+  assert.equal(runLacksRequiredAxioms(false, ['ax_01']), false);
 });
 
 test('datetime-local round-trips through ISO', () => {
@@ -169,4 +184,95 @@ test('schedule summaries render the stored plan', () => {
   assert.equal(scheduleSummary({ kind: 'daily', timeOfDay: '03:00' }), 'daily 03:00');
   assert.equal(scheduleSummary({ kind: 'weekly', timeOfDay: '03:00', weekdays: [1, 4] }), 'weekly Mon, Thu · 03:00');
   assert.equal(scheduleSummary(undefined), '—');
+});
+
+// ── AI proposals: the surface never waits for the model, and never lies about it ─────────────
+//
+// The defect these hold shut: the AI call hung on the request connection, the connection was
+// dropped after ~100 s, and the surface said "failed" for work the server had finished. The call
+// is now taken on and answered at once, the outcome arrives over the live stream, and the surface
+// may say only what is actually true at that moment.
+
+const PLAN: RunPlan = {
+  runs: [{ name: 'Architecture', axiomIds: ['ax_01'], schedule: { kind: 'daily', timeOfDay: '03:00' } }],
+};
+
+const proposal = (p: Partial<RunProposal>): RunProposal => ({ kind: 'fill', state: 'none', ...p });
+
+test('an analysis that outlives the connection ends in a visible result, never in "failed"', () => {
+  // The sequence the surface really sees: taken on, still running while the connection dies and
+  // the page comes back, then the result over the live stream.
+  const seen = [
+    proposal({ id: 'p1', state: 'running', startedAt: '2026-07-30T10:00:00Z' }),
+    proposal({ id: 'p1', state: 'running', startedAt: '2026-07-30T10:00:00Z' }),
+    proposal({ id: 'p1', state: 'completed', proposal: PLAN }),
+  ].map(presentProposal);
+
+  assert.deepEqual(
+    seen.map((s) => s.failure),
+    [null, null, null],
+    'nothing along the way may be presented as a failure',
+  );
+  assert.deepEqual(
+    seen.map((s) => s.ready),
+    [null, null, PLAN],
+    'a proposal may only be shown once it is really there',
+  );
+  assert.deepEqual(seen.map((s) => s.busy), [true, true, false]);
+});
+
+test('a failed analysis reaches the surface with its NAMED reason', () => {
+  const named = presentProposal(
+    proposal({ state: 'failed', reason: 'AI access is missing: grant hp_aigentic_run and link a key in aigentic' }),
+  );
+  assert.equal(named.busy, false);
+  assert.equal(named.ready, null);
+  assert.match(named.failure ?? '', /aigentic/);
+  assert.notEqual(named.failure, 'failed');
+
+  // Even a reason-less failure is stated as a sentence, never as the bare word.
+  const bare = presentProposal(proposal({ state: 'failed' }));
+  assert.ok((bare.failure ?? '').length > 'failed'.length);
+});
+
+test('"completed" without a plan is never presented as ready', () => {
+  const p = presentProposal(proposal({ state: 'completed' }));
+  assert.equal(p.ready, null, 'nothing may claim to be finished while no result is there');
+  assert.ok(p.failure, 'and the surface says so instead of showing an empty review');
+});
+
+test('nothing is claimed when no analysis exists', () => {
+  for (const p of [null, undefined, proposal({ state: 'none' })]) {
+    assert.deepEqual(presentProposal(p), { busy: false, ready: null, failure: null });
+  }
+  assert.equal(anyProposalBusy({ fill: null, finetune: null }), false);
+  assert.equal(anyProposalBusy({ fill: proposal({ state: 'running' }), finetune: null }), true);
+});
+
+test('a reload during the work loses nothing — and starts nothing', async () => {
+  const asked: string[] = [];
+  const server: Record<'fill' | 'finetune', RunProposal> = {
+    fill: proposal({ id: 'p1', state: 'running', startedAt: '2026-07-30T10:00:00Z' }),
+    finetune: proposal({ kind: 'finetune', state: 'none' }),
+  };
+  const source = {
+    async mercuryRunAiFill(action?: RunProposalAction) {
+      asked.push(`fill:${action ?? 'request'}`);
+      return server.fill;
+    },
+    async mercuryRunAiFinetune(action?: RunProposalAction) {
+      asked.push(`finetune:${action ?? 'request'}`);
+      return server.finetune;
+    },
+  };
+
+  // The surface comes up again (reload): it asks, and what was running is still there.
+  const afterReload = await readProposals(source);
+  assert.deepEqual(asked, ['fill:read', 'finetune:read'], 'a reload must never request an analysis');
+  assert.equal(presentProposal(afterReload.fill).busy, true, 'the running analysis survives the reload');
+
+  // The model answers while nobody was connected; the next read carries the result.
+  server.fill = proposal({ id: 'p1', state: 'completed', proposal: PLAN });
+  const afterAnswer = await readProposals(source);
+  assert.deepEqual(presentProposal(afterAnswer.fill).ready, PLAN);
 });

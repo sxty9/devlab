@@ -648,9 +648,31 @@ export interface RunPlan {
   runs: PlannedRun[];
 }
 
+/** What one may do with a proposal at its single access point: ask for it, look at it, put it
+ *  aside. `request` starts an analysis when none is in flight and otherwise reports that one;
+ *  `read` never starts anything (a returning or reloaded surface asks this way); `cancel` abandons
+ *  work in flight as well as a finished or failed proposal. */
+export type RunProposalAction = 'request' | 'read' | 'cancel';
+
+/** The two AI planning kinds: filling the axioms no run carries, and regrouping the whole set. */
+export type RunProposalKind = 'fill' | 'finetune';
+
+/** One AI planning analysis. It is never waited for: the access takes the work on and answers at
+ *  once, and the outcome arrives over the live stream (topic `runs`). The states are the contract's
+ *  own words; `none` means nothing is in flight and nothing waits for review. */
 export interface RunProposal {
-  proposal: RunPlan;
-  axioms: Record<string, string>;
+  kind: RunProposalKind;
+  state: 'none' | 'running' | 'completed' | 'failed';
+  /** Identifies ONE analysis, so a surface can tell a new outcome from one it has already shown. */
+  id?: string;
+  startedAt?: string;
+  endedAt?: string;
+  /** Why it failed, in words the user can act on — never a bare "failed". */
+  reason?: string;
+  /** The reviewable plan — present ONLY in state `completed`. */
+  proposal?: RunPlan;
+  /** id → title legend for the axioms the plan names (arrives with the plan). */
+  axioms?: Record<string, string>;
 }
 
 export interface RunSnapshotMeta {

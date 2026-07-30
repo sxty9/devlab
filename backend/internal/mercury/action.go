@@ -103,7 +103,9 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 		if a.Name == "" {
 			return fmt.Errorf("%w: create_run needs name", ErrInvalidAction)
 		}
-		if len(a.AxiomIDs) == 0 {
+		// create_run creates an ACTIVE run, so the one rule applies in that state; the wording is
+		// the model's retry correction, the rule itself is not restated here.
+		if RunLacksRequiredAxioms(true, a.AxiomIDs) {
 			return fmt.Errorf("%w: create_run needs at least one axiom (axiomIds)", ErrInvalidAction)
 		}
 		for _, id := range a.AxiomIDs {

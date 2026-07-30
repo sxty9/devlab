@@ -20,7 +20,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -490,6 +492,10 @@ type leftoverBackups struct {
 	dir    string
 	names  []string
 	legacy int
+	// unreadable are the copies we could list but not open — a hand-made copy owned by another
+	// account. They are named so the operator knows they exist and that their shape is UNKNOWN,
+	// which is the honest statement; guessing it from the file name would not be.
+	unreadable []string
 }
 
 // readLeftoverBackups lists them, classifying each by the same shape test the config snapshots use.
@@ -511,6 +517,16 @@ func readLeftoverBackups(dir string) (*leftoverBackups, error) {
 		}
 		legacy, err := snapshotIsLegacy(filepath.Join(dir, e.Name()))
 		if err != nil {
+			// These copies are REPORTED, never read for their content and never written. One we
+			// cannot open therefore says nothing about whether the takeover may proceed — a
+			// hand-made copy left by root is unreadable to the service account by construction,
+			// and aborting the whole import over a file we only wanted to name would be the tail
+			// wagging the dog. So it is named as unreadable and the import goes on.
+			if errors.Is(err, fs.ErrPermission) {
+				lb.unreadable = append(lb.unreadable, e.Name())
+				lb.names = append(lb.names, e.Name())
+				continue
+			}
 			return nil, err
 		}
 		if legacy {
@@ -519,6 +535,7 @@ func readLeftoverBackups(dir string) (*leftoverBackups, error) {
 		lb.names = append(lb.names, e.Name())
 	}
 	sort.Strings(lb.names)
+	sort.Strings(lb.unreadable)
 	return lb, nil
 }
 

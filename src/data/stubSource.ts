@@ -101,6 +101,7 @@ export const stubSource: DataSource = {
   mercuryCreateRun: offline,
   mercuryUpdateRun: offline,
   mercuryDeleteRun: offline,
+  mercuryRunAssign: offline,
   mercuryRunAiFill: offline,
   mercuryRunAiFinetune: offline,
   mercuryApplyRunProposal: offline,

@@ -160,6 +160,11 @@ func writeTakeover(w io.Writer, p *plan) {
 		fmt.Fprintf(w, "  operator's own copies %s — %d beside the pool, %d of them in the pre-rebuild form\n",
 			filepath.Join(p.backups.dir, backupPrefix+"*"), len(p.backups.names), p.backups.legacy)
 		fmt.Fprintf(w, "    %s\n", strings.Join(p.backups.names, ", "))
+		if len(p.backups.unreadable) > 0 {
+			fmt.Fprintf(w, "    of those, %d could not be opened (owned by another account) — their shape is UNKNOWN,\n",
+				len(p.backups.unreadable))
+			fmt.Fprintf(w, "    not assumed: %s\n", strings.Join(p.backups.unreadable, ", "))
+		}
 		fmt.Fprintln(w, "    left exactly as they are: nothing writes them, nothing reads them, and no surface offers")
 		fmt.Fprintln(w, "    them as a restore point — only a human copying one over runs.json would bring them back,")
 		fmt.Fprintln(w, "    and that would re-inject the very records this takeover converted. Naming them here makes")

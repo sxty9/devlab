@@ -83,15 +83,22 @@ func assignDelay() time.Duration {
 }
 
 // kick records the latest credentials and (re)arms the debounce. Cheap and non-blocking — the write
-// handler calls it and returns immediately.
-func (a *autoAssigner) kick(cookie, csrf, actor string) {
-	if a == nil {
-		return
+// handler calls it and returns immediately. It reports whether a pass was actually scheduled, so an
+// EXPLICIT trigger can answer with the honest outcome instead of a claimed one.
+//
+// A kick without a session is refused rather than scheduled: the pass plans through aigentic, which
+// authenticates as the caller, so without a cookie there is nothing it could do (runPass would skip
+// it). Refusing here also keeps the last usable session instead of overwriting it with an empty one,
+// and stops the coverage view from announcing an assignment that can never happen.
+func (a *autoAssigner) kick(cookie, csrf, actor string) bool {
+	if a == nil || strings.TrimSpace(cookie) == "" {
+		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cookie, a.csrf, a.actor = cookie, csrf, actor
 	a.schedule()
+	return true
 }
 
 // schedule arms (or pushes out) the debounce timer. The caller holds a.mu. While a pass runs, it only
@@ -175,27 +182,11 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 		log.Printf("devlabd: auto-assign runs list: %v", err)
 		return
 	}
-	covered := map[string]bool{}
-	existing := make([]string, 0, len(all))
-	for _, run := range all {
-		if run.Kind != "todo" {
-			existing = append(existing, run.Title) // only auto runs carry axioms and may be extended
-		}
-		for _, id := range run.AxiomIDs {
-			covered[id] = true
-		}
-	}
-	uncovered := make([]mercury.RunAxiom, 0)
-	for id, ax := range cat.ByID {
-		if !covered[id] {
-			uncovered = append(uncovered, ax)
-		}
-	}
+	uncovered := uncoveredAxioms(cat, all)
 	if len(uncovered) == 0 {
 		return // idempotent: everything is already covered
 	}
-	// Map iteration is random; sort for a stable prompt and stable notices.
-	sort.Slice(uncovered, func(i, j int) bool { return uncovered[i].ID < uncovered[j].ID })
+	existing := extendableRunTitles(all)
 
 	plan, err := a.plan(ctx, cookie, csrf, uncovered, existing, keysOf(cat.ByID))
 	if err != nil {
@@ -314,15 +305,95 @@ func (a *autoAssigner) record(n runs.Notice) {
 	a.s.publish(live.TopicNotices)
 }
 
+// --- the uncovered set ---------------------------------------------------------
+//
+// ONE definition of "uncovered", read by every surface that acts on it: the background pass, the
+// reviewable AI fill and the explicit trigger. A second copy of this loop would let two of them
+// disagree about which axioms still need a run.
+
+// uncoveredAxioms lists the axioms no run carries yet, sorted by id — map iteration is random, and a
+// prompt (and the notices derived from it) must not depend on it.
+func uncoveredAxioms(cat runs.Catalog, all []runs.Run) []mercury.RunAxiom {
+	covered := map[string]bool{}
+	for _, run := range all {
+		for _, id := range run.AxiomIDs {
+			covered[id] = true
+		}
+	}
+	out := make([]mercury.RunAxiom, 0, len(cat.ByID))
+	for id, ax := range cat.ByID {
+		if !covered[id] {
+			out = append(out, ax)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// extendableRunTitles names the runs a plan may extend: the automatic ones. A todo carries no axioms,
+// so it is never a candidate (UpsertPlannedRun refuses it too).
+func extendableRunTitles(all []runs.Run) []string {
+	out := make([]string, 0, len(all))
+	for _, run := range all {
+		if run.Kind != model.KindTodo {
+			out = append(out, run.Title)
+		}
+	}
+	return out
+}
+
 // --- server-side glue ---------------------------------------------------------
 
 // kickAutoAssign hands the assigner the caller's session (cookie + CSRF) and identity, then returns at
-// once. The pass runs on the user's behalf, exactly as the interactive AI-fill does.
-func (s *Server) kickAutoAssign(r *http.Request) {
+// once. The pass runs on the user's behalf, exactly as the interactive AI-fill does. It reports
+// whether a pass was scheduled at all — nothing but the explicit trigger reads that, but the answer
+// exists so the trigger never claims an assignment that was never armed.
+func (s *Server) kickAutoAssign(r *http.Request) bool {
 	if s.assigner == nil {
+		return false
+	}
+	return s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actorOf(r).User)
+}
+
+// runsAssign is the EXPLICIT trigger for the very pass the axiom writes kick — the same machinery, on
+// demand. It exists because every automatic kick hangs off a write: once a state arrives that the
+// write paths never saw (a takeover importing runs without axioms), uncovered axioms and axiom-less
+// runs sit there with nothing left to kick, and the only remaining way to start an assignment would
+// be to create an axiom nobody wants.
+//
+// The pass runs on the CALLER's session (cookie + CSRF), exactly as the write-kicked one does: the
+// planning goes through aigentic, which authenticates as the caller.
+//
+// The answer is the immediate, honest outcome — how many axioms are uncovered right now and whether a
+// pass was started for them — never a claimed success. The pass itself reports through the notice
+// feed; the coverage view follows it live.
+func (s *Server) runsAssign(w http.ResponseWriter, r *http.Request) {
+	if s.runs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actorOf(r).User)
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	if err != nil {
+		mercuryError(w, err)
+		return
+	}
+	all, err := s.runs.List()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
+		return
+	}
+	uncovered := uncoveredAxioms(cat, all)
+	if len(uncovered) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"uncovered": 0, "started": false})
+		return
+	}
+	started := s.kickAutoAssign(r)
+	if started {
+		// The pending state is part of the coverage answer, so every open surface learns that an
+		// assignment is under way — not just the one that pressed.
+		s.publish(live.TopicRuns)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uncovered": len(uncovered), "started": started})
 }
 
 // assignPending reports whether an automatic assignment is scheduled or in flight.

@@ -1,7 +1,17 @@
 // Pure task/run logic shared by the RunsView and TodosView surfaces (one machinery, REQ-005)
 // and by ui/RunTuning. No React, no DOM, no data source — everything here is unit-tested with
 // node --test (logic.test.ts). Time-dependent helpers take the clock as an argument.
-import type { Repo, Run, RunSchedule, RunTarget, RunTuning } from '../../../types';
+import type {
+  Repo,
+  Run,
+  RunPlan,
+  RunProposal,
+  RunProposalAction,
+  RunProposalKind,
+  RunSchedule,
+  RunTarget,
+  RunTuning,
+} from '../../../types';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 export const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
@@ -93,6 +103,16 @@ export function initialExecutionMode(base: Pick<Run, 'dueAt'> | null): Execution
 export function scheduleInvalid(mode: ExecutionMode, due: string, min: string): boolean {
   if (mode !== 'scheduled') return false;
   return due === '' || due < min;
+}
+
+/** The one axiom rule of a recurring run, as the server states it (mercury.RunLacksRequiredAxioms):
+ *  a run that will be ACTIVE must carry at least one axiom — it would otherwise execute the
+ *  constitution against nothing — while an INACTIVE one is a definition that never fires and is
+ *  therefore storable without any. A form stricter than the server refuses to save what the server
+ *  accepts, and that is how a run imported without axioms becomes uneditable: axioms reach it only
+ *  through the assignment, so run and assignment would wait for each other forever. */
+export function runLacksRequiredAxioms(active: boolean, axiomIds: string[]): boolean {
+  return active && axiomIds.length === 0;
 }
 
 // ── Targets (REQ-006) ─────────────────────────────────────────────────────────
@@ -273,4 +293,88 @@ export function tuningChips(t: RunTuning | undefined): string[] {
   if (t.effort) chips.push(t.effort);
   if (t.timeBudget !== undefined && t.timeBudget !== '') chips.push(storedBudgetLabel(t.timeBudget));
   return chips;
+}
+
+// ── AI proposals (S6): what the surface may say about an analysis it did not wait for ────────
+
+/** The proposals the surface currently knows about, one per kind. */
+export type ProposalStates = Record<RunProposalKind, RunProposal | null>;
+
+/** The subset of the data seam this logic needs — the two access points of the proposals. */
+export interface ProposalAccess {
+  mercuryRunAiFill(action?: RunProposalAction): Promise<RunProposal>;
+  mercuryRunAiFinetune(action?: RunProposalAction): Promise<RunProposal>;
+}
+
+/** What the surface may show for one analysis. Deliberately three separate answers, because the
+ *  three claims must never blur into each other: work is under way (and can be abandoned), a
+ *  proposal is really there to review, or it failed FOR A NAMED REASON. */
+export interface ProposalPresentation {
+  /** Work is under way — say so, offer to abandon it, and claim nothing else. */
+  busy: boolean;
+  /** The plan to review — set ONLY when a result really is there. */
+  ready: RunPlan | null;
+  /** The named reason of a failure; never set while work is under way. */
+  failure: string | null;
+}
+
+const NO_PROPOSAL: ProposalPresentation = { busy: false, ready: null, failure: null };
+
+/** Reads one analysis into what the surface may claim about it. An analysis that says `completed`
+ *  without carrying a plan is NOT reported as ready — "finished" without a result is exactly the
+ *  claim that must never be made. */
+export function presentProposal(p: RunProposal | null | undefined): ProposalPresentation {
+  if (!p) return NO_PROPOSAL;
+  switch (p.state) {
+    case 'running':
+      return { busy: true, ready: null, failure: null };
+    case 'completed':
+      return p.proposal ?
+          { busy: false, ready: p.proposal, failure: null }
+        : { busy: false, ready: null, failure: 'The analysis ended without a proposal.' };
+    case 'failed':
+      return { busy: false, ready: null, failure: p.reason?.trim() || 'The AI analysis ended without a stated reason.' };
+    default:
+      return NO_PROPOSAL;
+  }
+}
+
+/** Whether ANY analysis is under way (both buttons wait for the one model call in flight). */
+export function anyProposalBusy(states: ProposalStates): boolean {
+  return presentProposal(states.fill).busy || presentProposal(states.finetune).busy;
+}
+
+/** The one access of one kind. The kind→operation dispatch lives HERE, once, so no surface has to
+ *  spell it out again for each of the three things one may do with a proposal. */
+export function accessProposal(
+  source: ProposalAccess,
+  kind: RunProposalKind,
+  action: RunProposalAction,
+): Promise<RunProposal> {
+  return kind === 'fill' ? source.mercuryRunAiFill(action) : source.mercuryRunAiFinetune(action);
+}
+
+/** Reads both analyses WITHOUT starting one. This is what a surface does when it mounts — after a
+ *  reload, after coming back from another view, and on every live tick: it must show what is
+ *  running or waiting for review, and must never set a model call off by itself. */
+export async function readProposals(source: ProposalAccess): Promise<ProposalStates> {
+  const [fill, finetune] = await Promise.all([
+    accessProposal(source, 'fill', 'read'),
+    accessProposal(source, 'finetune', 'read'),
+  ]);
+  return { fill, finetune };
+}
+
+/** Ask for an analysis of this kind. The access point never restarts by itself: a request that
+ *  meets a failed analysis reports THAT failure, so a caller which can only ask can never set off
+ *  model pass after model pass while being told "running" every time. Starting over is therefore a
+ *  deliberate act of two steps — put the failure aside, then ask — and pressing the button while a
+ *  failure is on screen IS that act. `current` is what the surface last knew about this kind. */
+export async function requestProposal(
+  source: ProposalAccess,
+  kind: RunProposalKind,
+  current: RunProposal | null,
+): Promise<RunProposal> {
+  if (presentProposal(current).failure !== null) await accessProposal(source, kind, 'cancel');
+  return accessProposal(source, kind, 'request');
 }

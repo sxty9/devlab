@@ -3,11 +3,13 @@ package api
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"devlab/backend/internal/aigentic"
@@ -226,8 +228,20 @@ func normalizeTargets(in []runs.Target) ([]runs.Target, int, string) {
 	return out, 0, ""
 }
 
+// activeAfter resolves the Active flag the run will carry once the input is applied — the same rule
+// applyInput follows: an input that omits `active` REFERS to the current value (for a create that is
+// "active", the default a new run gets).
+func activeAfter(b runs.RunInput, activeNow bool) bool {
+	if b.Active != nil {
+		return *b.Active
+	}
+	return activeNow
+}
+
 // validateRunInput normalizes and validates a create/update payload against the axiom catalog.
-func validateRunInput(b *runs.RunInput, cat runs.Catalog) (int, string) {
+// activeNow is the run's CURRENT Active flag (true for a create): the axiom rule below binds to the
+// state the run will be in, not to the field the request happened to send.
+func validateRunInput(b *runs.RunInput, cat runs.Catalog, activeNow bool) (int, string) {
 	b.Title = strings.TrimSpace(b.Title)
 	if b.Title == "" {
 		return http.StatusBadRequest, "title is required"
@@ -260,8 +274,13 @@ func validateRunInput(b *runs.RunInput, cat runs.Catalog) (int, string) {
 			return http.StatusBadRequest, "Invalid schedule: " + err.Error()
 		}
 		b.AxiomIDs = runs.DedupStrings(b.AxiomIDs)
-		if len(b.AxiomIDs) == 0 {
-			return http.StatusBadRequest, "An auto run needs at least one axiom"
+		// The one rule (mercury.RunLacksRequiredAxioms) binds to ACTIVATION, not to storage: it is
+		// asked about the state the run will be IN, not about the field this request happened to
+		// send. An inactive run that arrives without axioms (a takeover imports them that way) must
+		// stay saveable — axioms reach it only through the assignment, so run and assignment would
+		// otherwise wait for each other forever.
+		if mercury.RunLacksRequiredAxioms(activeAfter(*b, activeNow), b.AxiomIDs) {
+			return http.StatusBadRequest, "An active auto run needs at least one axiom — save it inactive and assign axioms to it first"
 		}
 		for _, id := range b.AxiomIDs {
 			if _, ok := cat.ByID[id]; !ok {
@@ -305,7 +324,9 @@ func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	if code, msg := validateRunInput(&body, cat); code != 0 {
+	// A brand-new run is active unless the input says otherwise — that is the state the axiom rule
+	// is measured against.
+	if code, msg := validateRunInput(&body, cat, true); code != 0 {
 		writeErr(w, code, msg)
 		return
 	}
@@ -348,7 +369,7 @@ func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	if code, msg := validateRunInput(&body, cat); code != 0 {
+	if code, msg := validateRunInput(&body, cat, run.Active); code != 0 {
 		writeErr(w, code, msg)
 		return
 	}
@@ -391,57 +412,266 @@ func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// ── AI proposals: taken on, never waited on ──────────────────────────────────────────────────
+//
+// A run proposal is a model call over the WHOLE constitution — minutes of work, not seconds, and
+// the planning loop may re-ask the model on an unusable answer. A call whose duration nobody can
+// predict must not hang on an open connection: a hop in front of devlabd drops a connection that
+// has been silent for a while, and the surface then says "failed" for work the server finished
+// cleanly.
+//
+// So these two accesses TAKE THE WORK ON and answer at once. The finished proposal announces
+// itself over the ONE live stream (S12, topic `runs`) like every other change of state, and the
+// surface reads it back through this very access point — one mechanism (REQ-034), one access point
+// per entity. It is the shape the auto-assigner already has (kick → detached pass → visible
+// outcome), with the difference that a proposal is REVIEWED before anything is written.
+//
+// One analysis per kind at a time: a second request while one is in flight reports THAT one
+// instead of starting a rival. Nothing is written here; only apply-proposal writes.
+
+// aiProposalKind is one of the two reviewable planning kinds.
+type aiProposalKind string
+
+const (
+	aiFill     aiProposalKind = "fill"
+	aiFinetune aiProposalKind = "finetune"
+)
+
+// The states one analysis passes through — the contract's own words, so the surface reads the same
+// vocabulary here as everywhere else. `none` means: nothing in flight, nothing waiting for review.
+const (
+	aiStateNone      = "none"
+	aiStateRunning   = string(model.PhaseRunning)
+	aiStateCompleted = string(model.PhaseCompleted)
+	aiStateFailed    = string(model.PhaseFailed)
+)
+
+// aiProposalTimeout bounds one detached analysis. Generous, because the loop may re-ask the model
+// (each call is bounded on its own); it exists so a wedged call ends in a NAMED failure instead of
+// an analysis that claims to be running forever.
+const aiProposalTimeout = 10 * time.Minute
+
+// aiProposal is one detached analysis: its state, what it produced and — on failure — the named
+// reason. There is no state in which the surface would have to say "failed" without saying why.
+type aiProposal struct {
+	ID        string
+	Kind      aiProposalKind
+	State     string
+	StartedAt time.Time
+	EndedAt   time.Time
+	Reason    string
+	Plan      mercury.RunPlan
+	Axioms    map[string]string
+	cancel    context.CancelFunc
+}
+
+// aiProposals holds the analysis in flight (or the one just finished) per server and kind. It is a
+// package-level registry rather than a Server field because the composition root is frozen contract
+// (api.go, BAUPLAN §0.2); keying it by the server keeps two servers in one process — every test
+// builds its own — strictly apart. At most two entries exist per server.
+var aiProposals = struct {
+	mu sync.Mutex
+	by map[aiProposalKey]*aiProposal
+}{by: map[aiProposalKey]*aiProposal{}}
+
+type aiProposalKey struct {
+	s    *Server
+	kind aiProposalKind
+}
+
+// aiProposalCurrent snapshots this kind's analysis (a copy — the detached pass keeps writing).
+func aiProposalCurrent(s *Server, kind aiProposalKind) (aiProposal, bool) {
+	aiProposals.mu.Lock()
+	defer aiProposals.mu.Unlock()
+	p, ok := aiProposals.by[aiProposalKey{s, kind}]
+	if !ok {
+		return aiProposal{}, false
+	}
+	return *p, true
+}
+
+// aiProposalAbandon drops this kind's analysis: work in flight is cancelled, a finished proposal is
+// discarded. It is the ONE way a proposal ends without being applied — closing the review, pressing
+// cancel while it runs and dismissing a failure are the same act — so a returning user never meets
+// a proposal they already put aside.
+func aiProposalAbandon(s *Server, kind aiProposalKind) {
+	aiProposals.mu.Lock()
+	key := aiProposalKey{s, kind}
+	p, ok := aiProposals.by[key]
+	delete(aiProposals.by, key)
+	aiProposals.mu.Unlock()
+	if ok && p.cancel != nil {
+		p.cancel()
+	}
+}
+
+// aiProposalStart registers a running analysis and performs `work` detached from the request. The
+// caller gets the freshly registered state back at once — it never waits for the model.
+func (s *Server) aiProposalStart(kind aiProposalKind, work func(context.Context) (mercury.RunPlan, error), legend map[string]string) aiProposal {
+	ctx, cancel := context.WithTimeout(context.Background(), aiProposalTimeout)
+	// The id names WHICH analysis this is — kind and the moment it began. It borrows no other
+	// entity's id shape (a proposal is not a run) and needs no second id generator.
+	begun := time.Now().UTC()
+	p := &aiProposal{
+		ID: string(kind) + "@" + begun.Format(time.RFC3339Nano), Kind: kind,
+		State: aiStateRunning, StartedAt: begun, cancel: cancel,
+	}
+	key := aiProposalKey{s, kind}
+	aiProposals.mu.Lock()
+	if old := aiProposals.by[key]; old != nil && old.cancel != nil {
+		old.cancel() // a superseded predecessor is stopped, never left running in the background
+	}
+	aiProposals.by[key] = p
+	// The answer to THIS request is taken here, under the lock: from the moment the pass is
+	// launched the record belongs to it, and reading it afterwards would race its outcome.
+	started := *p
+	aiProposals.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		// Contained: a detached task must never take devlabd down — and its failure must still be
+		// visible instead of leaving an analysis that claims to run forever.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("devlabd: AI proposal panicked (contained): %v", rec)
+				s.aiProposalFinish(key, p, mercury.RunPlan{}, nil, "The AI planning stopped unexpectedly")
+			}
+		}()
+		plan, err := work(ctx)
+		if err != nil {
+			s.aiProposalFinish(key, p, mercury.RunPlan{}, nil, aiFailureReason(ctx, err))
+			return
+		}
+		s.aiProposalFinish(key, p, plan, legend, "")
+	}()
+	return started
+}
+
+// aiProposalFinish records an outcome and announces it on the one live stream. The late answer of
+// an analysis that was meanwhile abandoned or superseded is dropped: it must not resurrect a
+// proposal the user has already put aside.
+func (s *Server) aiProposalFinish(key aiProposalKey, p *aiProposal, plan mercury.RunPlan, legend map[string]string, reason string) {
+	aiProposals.mu.Lock()
+	if aiProposals.by[key] != p {
+		aiProposals.mu.Unlock()
+		return
+	}
+	p.EndedAt = time.Now().UTC()
+	if reason != "" {
+		p.State, p.Reason = aiStateFailed, reason
+	} else {
+		p.State, p.Plan, p.Axioms = aiStateCompleted, plan, legend
+	}
+	aiProposals.mu.Unlock()
+	s.publish(live.TopicRuns)
+}
+
+// aiFailureReason turns a planning failure into a sentence the user can act on. aigentic names what
+// it knows (unreachable, refused, usage window, no answer in time); a failure it does not recognise
+// after the loop's retries is the ANSWER being unusable — a statement about the model, not a
+// transport error — so it is named here instead of shown as a raw error line.
+func aiFailureReason(ctx context.Context, err error) string {
+	reason := aigentic.Reason(err)
+	if reason == "" && ctx != nil && ctx.Err() != nil {
+		return "The AI analysis was stopped after " + aiProposalTimeout.String() + " without a usable answer"
+	}
+	if reason != "" {
+		return reason
+	}
+	return "The AI did not answer in the required form: " + err.Error()
+}
+
+// aiProposalView is the wire shape of one kind's analysis — the SAME document in every state, so
+// the surface never has to guess: `none` (nothing in flight), `running` (work under way, with the
+// moment it began), `completed` (with the reviewable proposal) or `failed` WITH its reason.
+func aiProposalView(p *aiProposal, kind aiProposalKind) map[string]any {
+	if p == nil {
+		return map[string]any{"kind": string(kind), "state": aiStateNone}
+	}
+	out := map[string]any{
+		"kind": string(p.Kind), "state": p.State, "id": p.ID,
+		"startedAt": p.StartedAt.UTC().Format(time.RFC3339),
+	}
+	if !p.EndedAt.IsZero() {
+		out["endedAt"] = p.EndedAt.UTC().Format(time.RFC3339)
+	}
+	if p.Reason != "" {
+		out["reason"] = p.Reason
+	}
+	if p.State == aiStateCompleted {
+		out["proposal"] = p.Plan
+		out["axioms"] = p.Axioms
+	}
+	return out
+}
+
 // runsAiFill proposes runs for the not-yet-covered axioms (reviewable; writes nothing).
 func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
-	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
-		return
-	}
-	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	cat, _, err := s.runCatalog(r.Context(), cookie)
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	all, err := s.runs.List()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not read runs")
-		return
-	}
-	covered := map[string]bool{}
-	names := make([]string, 0, len(all))
-	for _, run := range all {
-		names = append(names, run.Title)
-		for _, id := range run.AxiomIDs {
-			covered[id] = true
-		}
-	}
-	var uncovered []mercury.RunAxiom
-	for id, a := range cat.ByID {
-		if !covered[id] {
-			uncovered = append(uncovered, a)
-		}
-	}
-	if len(uncovered) == 0 {
-		writeErr(w, http.StatusBadRequest, "Every axiom is already covered by a run")
-		return
-	}
-	plan, err := s.planRuns(r.Context(), cookie, csrf, keysOf(cat.ByID), func(correction string) string {
-		return mercury.RunPlanFillPrompt(uncovered, names, correction)
-	})
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(cat)})
+	s.aiProposalAccess(w, r, aiFill)
 }
 
 // runsAiFinetune proposes a cleaner regrouping of all current runs (reviewable; writes nothing).
 func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
+	s.aiProposalAccess(w, r, aiFinetune)
+}
+
+// aiProposalAccess is the ONE access point of one proposal kind — request it, read it, abandon it.
+// The body names which (`action`; the default is the request, so an agent that simply calls the
+// tool gets an analysis):
+//
+//	request  start an analysis when none exists — otherwise report the one that does, whatever
+//	         state it is in (never a second of a kind, and never a silent restart)
+//	read     report the state only — starts nothing, so returning to the surface (or reloading it)
+//	         shows what is running or waiting instead of setting off work nobody asked for
+//	cancel   abandon: stop work in flight, discard a finished or failed proposal
+//
+// The answer is always the state, never a claimed success — the proposal itself arrives over the
+// live stream.
+//
+// STARTING OVER IS A DELIBERATE ACT — first put the failure aside (`cancel`), then ask again. A
+// request that met a failure and quietly began the next analysis looked identical to one that
+// merely asked: the caller was answered `running` every single time, never learnt WHY the last
+// attempt failed, and paid for one model pass per round. That is the loop a caller who can only
+// ask — an agent — cannot get out of, so the access point refuses to restart by itself.
+func (s *Server) aiProposalAccess(w http.ResponseWriter, r *http.Request, kind aiProposalKind) {
 	if s.runs == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
+	var body struct {
+		Action string `json:"action"`
+	}
+	// An empty body is a request — the MCP tool and a plain button press both send one.
+	if r.ContentLength != 0 && !decodeJSON(w, r, &body) {
+		return
+	}
+	switch strings.TrimSpace(body.Action) {
+	case "cancel":
+		aiProposalAbandon(s, kind)
+		s.publish(live.TopicRuns) // every open surface learns it, not just the one that pressed
+		writeJSON(w, http.StatusOK, aiProposalView(nil, kind))
+		return
+	case "read":
+		cur, ok := aiProposalCurrent(s, kind)
+		if !ok {
+			writeJSON(w, http.StatusOK, aiProposalView(nil, kind))
+			return
+		}
+		writeJSON(w, http.StatusOK, aiProposalView(&cur, kind))
+		return
+	case "", "request":
+	default:
+		writeErr(w, http.StatusBadRequest, "action must be request, read or cancel")
+		return
+	}
+	// Whatever is already there is REPORTED, never overwritten: work in flight is not doubled, a
+	// finished proposal is not computed again, and a failure is handed back WITH ITS REASON instead
+	// of setting off the next model pass. So asking twice costs nothing and always tells the truth.
+	if cur, ok := aiProposalCurrent(s, kind); ok {
+		writeJSON(w, http.StatusOK, aiProposalView(&cur, kind))
+		return
+	}
+
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
 	cat, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
@@ -453,18 +683,33 @@ func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
-	if len(all) == 0 {
-		writeErr(w, http.StatusBadRequest, "No runs to fine-tune — create some first or use AI fill")
-		return
+	var build func(correction string) string
+	switch kind {
+	case aiFill:
+		uncovered := uncoveredAxioms(cat, all)
+		if len(uncovered) == 0 {
+			writeErr(w, http.StatusBadRequest, "Every axiom is already covered by a run")
+			return
+		}
+		names := extendableRunTitles(all)
+		build = func(correction string) string { return mercury.RunPlanFillPrompt(uncovered, names, correction) }
+	default:
+		if len(all) == 0 {
+			writeErr(w, http.StatusBadRequest, "No runs to fine-tune — create some first or use AI fill")
+			return
+		}
+		build = func(correction string) string {
+			return mercury.RunPlanFinetunePrompt(catalogSlice(cat), plannedRunsFrom(all), correction)
+		}
 	}
-	plan, err := s.planRuns(r.Context(), cookie, csrf, keysOf(cat.ByID), func(correction string) string {
-		return mercury.RunPlanFinetunePrompt(catalogSlice(cat), plannedRunsFrom(all), correction)
-	})
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(cat)})
+	known := keysOf(cat.ByID)
+	// The pass runs on the CALLER's session, exactly as the auto-assigner's does: the planning goes
+	// through aigentic, which authenticates as the caller.
+	started := s.aiProposalStart(kind, func(ctx context.Context) (mercury.RunPlan, error) {
+		return s.planRuns(ctx, cookie, csrf, known, build)
+	}, titleLegend(cat))
+	s.publish(live.TopicRuns)
+	writeJSON(w, http.StatusAccepted, aiProposalView(&started, kind))
 }
 
 // planRuns runs the aigentic classification loop for a run plan.
@@ -527,6 +772,14 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 	if err := s.runs.ReplaceAll(next, "apply-"+body.Mode, who); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save the proposal")
 		return
+	}
+	// An applied proposal is consumed: it must not be waiting for review again after a reload,
+	// where applying it a second time would undo what has happened since. `fill` is what the fill
+	// analysis proposes, `replace` what the fine-tuning proposes.
+	if body.Mode == "fill" {
+		aiProposalAbandon(s, aiFill)
+	} else {
+		aiProposalAbandon(s, aiFinetune)
 	}
 	s.kickAutoAssign(r)
 	s.publish(live.TopicRuns)

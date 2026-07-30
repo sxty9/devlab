@@ -24,7 +24,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -944,5 +946,55 @@ func TestHandMadeRunPoolCopiesAreReportedAndLeftAlone(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(p.Mercury(), name+asideSuffix)); err == nil {
 			t.Errorf("%s was set aside; it is the operator's own copy and stays where they put it", name)
 		}
+	}
+}
+
+// An operator's own copy owned by ANOTHER account cannot be opened by the service account. It is
+// only ever REPORTED — never read for content, never written — so failing the whole import over it
+// is the tail wagging the dog. It happened on the real host: the cutover died at
+// "runs.json.bak-20260720: permission denied", with the daemon already stopped.
+func TestUnreadableHandMadeCopyIsNamedInsteadOfStoppingTheImport(t *testing.T) {
+	p := stateRoot(t)
+	installLegacyRunPool(t, p)
+	installLegacyState(t, p)
+
+	locked := filepath.Join(p.Mercury(), "runs.json.bak-20260720")
+	if err := os.WriteFile(locked, []byte(`{"runs":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o600) })
+	if _, err := os.ReadFile(locked); !errors.Is(err, fs.ErrPermission) {
+		t.Skip("this environment ignores file modes (running as root?)")
+	}
+
+	lb, err := readLeftoverBackups(p.Mercury())
+	if err != nil {
+		t.Fatalf("a copy we only wanted to name must not fail the scan: %v", err)
+	}
+	if len(lb.unreadable) != 1 || lb.unreadable[0] != "runs.json.bak-20260720" {
+		t.Fatalf("the unreadable copy must be named as unreadable, got %v", lb.unreadable)
+	}
+	var listed bool
+	for _, n := range lb.names {
+		if n == "runs.json.bak-20260720" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Error("it still exists, so it must appear in the list of copies")
+	}
+
+	// And the import as a whole goes through, which is the point.
+	pl := migrate(t, p)
+	if pl.backups == nil || len(pl.backups.unreadable) != 1 {
+		t.Fatalf("the plan must carry the unreadable copy, got %+v", pl.backups)
+	}
+	var buf bytes.Buffer
+	writeProtocol(&buf, pl, false)
+	if out := buf.String(); !strings.Contains(out, "could not be opened") || !strings.Contains(out, "runs.json.bak-20260720") {
+		t.Errorf("the protocol must name it as unreadable:\n%s", out)
 	}
 }

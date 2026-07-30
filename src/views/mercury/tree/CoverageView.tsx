@@ -2,10 +2,16 @@
 // it; the UNCOVERED ones first and unmistakable. While the automatic assignment is scheduled or
 // running, uncovered axioms are marked as "assignment in progress" — transient, not permanent —
 // and a failed assignment leaves them visibly uncovered (the notice feed carries the reason).
+//
+// The view is also where the assignment is STARTED. Every automatic kick hangs off an axiom write,
+// so a set of uncovered axioms that never passed a write path (a takeover imports runs that way)
+// would sit here forever with no way to move it. The button next to the uncovered list is that way:
+// it triggers the same pass, and the line beneath it says what will happen next.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useLiveTopic } from '@/state/live';
 import { cn } from '@/lib/cn';
+import { Button } from '@/ui/Button';
 import { CheckIcon, MercuryIcon } from '@/ui/icons';
 import type { Run, RunCoverage } from '@/types';
 
@@ -16,6 +22,8 @@ export function CoverageView() {
   const [cov, setCov] = useState<RunCoverage | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
   const [failed, setFailed] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const [outcome, setOutcome] = useState<string | null>(null);
 
   const reload = useCallback(() => {
     return Promise.all([source.mercuryRunCoverage(), source.mercuryRuns()])
@@ -26,6 +34,28 @@ export function CoverageView() {
       })
       .catch((e: unknown) => setFailed(msg(e)));
   }, [source]);
+
+  // Start the assignment for everything that has no run. A started pass shows up as the pending
+  // state below and clears itself when the pass lands, so only the answers the state cannot show —
+  // nothing to do, or nothing started — are kept as a line.
+  const assign = useCallback(() => {
+    setStarting(true);
+    setOutcome(null);
+    source
+      .mercuryRunAssign()
+      .then((r) => {
+        if (!r.started) {
+          setOutcome(
+            r.uncovered === 0
+              ? 'Nothing to assign — every axiom is already carried by a run.'
+              : `${r.uncovered} uncovered, but no assignment could be started.`,
+          );
+        }
+        return reload();
+      })
+      .catch((e: unknown) => setOutcome(msg(e)))
+      .finally(() => setStarting(false));
+  }, [source, reload]);
 
   useEffect(() => {
     void reload();
@@ -61,7 +91,19 @@ export function CoverageView() {
 
         {uncovered.length > 0 ? (
           <section className="mt-5">
-            <h2 className="text-caption font-semibold uppercase tracking-wide text-warning">Uncovered ({uncovered.length})</h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-caption font-semibold uppercase tracking-wide text-warning">Uncovered ({uncovered.length})</h2>
+              <Button variant="primary" size="sm" onClick={assign} disabled={starting || cov.pending}>
+                {starting || cov.pending ? 'Assigning…' : `Assign ${uncovered.length} to runs`}
+              </Button>
+            </div>
+            {cov.pending ? (
+              <p className="mt-1.5 text-caption text-text-secondary">
+                Each one joins a fitting run, or a new one is created for it; the result arrives as a notice.
+              </p>
+            ) : (
+              outcome && <p className="mt-1.5 text-caption text-text-secondary">{outcome}</p>
+            )}
             <ul className="mt-2 flex flex-col gap-1.5">
               {uncovered.map((id) => (
                 <li key={id} className="rounded-md border border-warning/30 bg-warning/[0.06] px-3 py-2">

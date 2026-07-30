@@ -18,6 +18,26 @@ import (
 // category, rename it, or delete it — and rename a whole category. Everything rides the store
 // primitives (put/move/delete): a move carries a record's content with its path, so a re-file or
 // rename never rewrites the axiom, and the front-matter id stays stable across it.
+//
+// Coverage (REQ-004) and these paths. Run coverage is keyed by the front-matter ID of a record in the
+// AXIOME namespace — nothing else enters the catalog. So each write path is judged by one question:
+// can it put an id into that catalog that no run carries?
+//
+//	editAxiom      YES, in one case: a record written before ids existed is minted one here, which
+//	               makes it a catalog member for the first time. A normal edit keeps the id (and the
+//	               namespace), so coverage is untouched — only the composed prompts are, and
+//	               reconcileAfterWrite already does that.
+//	moveAxiom      YES, when the record crosses INTO the axiome namespace: its id enters the catalog.
+//	               A move within axiome carries the id along and changes nothing about coverage; a
+//	               move OUT only removes a member, which leaves nothing uncovered.
+//	moveCategory   the same question for a whole category, and the same answer — it is moveAxiom over
+//	               every record beneath the category.
+//	deleteAxiom    NO. Deleting removes a catalog member; the uncovered set can only shrink. The run
+//	               that carried the id keeps a reference the catalog no longer resolves, which the
+//	               composition drops on the next recompose — there is nothing to assign.
+//
+// A kick that cannot change coverage is not free: it makes the coverage view announce an assignment
+// that has nothing to do, so the paths above kick precisely, not defensively.
 
 // editAxiom replaces an axiom's title and body, preserving its id and quelle. The leaf slug is
 // re-derived from the new title so the heading always matches the path — a title change renames the
@@ -55,7 +75,8 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	prev := mercury.ParseAxiom(string(data))
 
 	ax := mercury.Axiom{ID: prev.ID, Titel: body.Titel, Quelle: prev.Quelle, Body: body.Body}
-	if ax.ID == "" {
+	minted := ax.ID == ""
+	if minted {
 		ax.ID = mintID() // a record that predates ids gets one now
 	}
 	content := []byte(mercury.Render(ax))
@@ -79,6 +100,11 @@ func (s *Server) editAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	s.reconcileAfterWrite(r.Context(), cookie)
 	s.publish(live.TopicAxioms)
+	// The one coverage-changing edit: minting an id here made this record a catalog member for the
+	// first time, so it is an axiom no run carries yet.
+	if minted && inAxiomNamespace(newPath) {
+		s.kickAutoAssign(r)
+	}
 	// Record the editor in DevLab's local pool. An axiom that predates authorship tracking keeps an
 	// empty (unknown) creator — only the editor is stamped, never a back-filled creator.
 	now := time.Now().UTC()
@@ -121,10 +147,26 @@ func (s *Server) moveAxiom(w http.ResponseWriter, r *http.Request) {
 	}
 	s.reconcileAfterWrite(r.Context(), cookie)
 	s.publish(live.TopicAxioms)
+	if enteredAxiomNamespace(body.From, body.To) {
+		s.kickAutoAssign(r)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"path": body.To})
 }
 
-// deleteAxiom removes an axiom. Idempotent.
+// inAxiomNamespace reports whether a record path belongs to the namespace run coverage is computed
+// over. Records outside it (Regeln, Laufregeln, meta) never enter the catalog.
+func inAxiomNamespace(path string) bool {
+	return strings.HasPrefix(strings.TrimSpace(path), mercury.NsAxiome+"/")
+}
+
+// enteredAxiomNamespace reports whether a move brings a record INTO the axiom namespace from outside
+// it — the only direction that can leave an axiom uncovered.
+func enteredAxiomNamespace(from, to string) bool {
+	return inAxiomNamespace(to) && !inAxiomNamespace(from)
+}
+
+// deleteAxiom removes an axiom. Idempotent. It does NOT kick the assignment: removing a catalog
+// member can only shrink the uncovered set (see the coverage note at the top of this file).
 func (s *Server) deleteAxiom(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	if !mercury.ValidRecordPath(path) {
@@ -186,6 +228,11 @@ func (s *Server) moveCategory(w http.ResponseWriter, r *http.Request) {
 	if moved > 0 {
 		s.reconcileAfterWrite(r.Context(), cookie)
 		s.publish(live.TopicAxioms)
+		// Same rule as the single move, applied to the whole category: only a category that crossed
+		// INTO the axiom namespace adds catalog members.
+		if enteredAxiomNamespace(body.From, body.To) {
+			s.kickAutoAssign(r)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"moved": moved})
 }

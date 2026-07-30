@@ -285,6 +285,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/{id}/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/defer", s.guardCSRF(s.runDefer))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/resume", s.guardCSRF(s.runResume))
+	// The EXPLICIT trigger of the automatic assignment (REQ-004): the same pass an axiom write kicks,
+	// startable on demand — a state that never passed a write path has nothing left to kick it.
+	mux.HandleFunc("POST /api/mercury/runs/assign", s.guardCSRF(s.runsAssign))
 	mux.HandleFunc("POST /api/mercury/runs/ai-fill", s.guardCSRF(s.runsAiFill))
 	mux.HandleFunc("POST /api/mercury/runs/ai-finetune", s.guardCSRF(s.runsAiFinetune))
 	mux.HandleFunc("POST /api/mercury/runs/apply-proposal", s.guardCSRF(s.runsApplyProposal))

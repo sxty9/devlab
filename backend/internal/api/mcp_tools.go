@@ -124,11 +124,23 @@ func bodyEnum(name string, enum []string, required bool, desc string) mcpParam {
 
 // Argument vocabularies that must not drift from the domain constants.
 var (
-	runKinds       = []string{string(model.KindTodo), string(model.KindAuto)}
-	placementKinds = []string{sched.PlacementQueue, sched.PlacementDefer, sched.PlacementOverload}
-	proposalModes  = []string{"fill", "replace"}
-	chatRoles      = []string{"user", "assistant"}
+	runKinds        = []string{string(model.KindTodo), string(model.KindAuto)}
+	placementKinds  = []string{sched.PlacementQueue, sched.PlacementDefer, sched.PlacementOverload}
+	proposalModes   = []string{"fill", "replace"}
+	proposalActions = []string{"request", "read", "cancel"}
+	chatRoles       = []string{"user", "assistant"}
 )
+
+// proposalActionArg is the argument both AI planning tools carry. An analysis is never waited for,
+// so asking for one, looking at it and putting it aside are three different acts — and a caller
+// that could only ask would keep starting model passes while never learning why the last one
+// failed. Optional, because the plain call IS the request.
+func proposalActionArg(what string) mcpParam {
+	return bodyEnum("action", proposalActions, false,
+		"request starts "+what+" when none exists and otherwise reports the existing one unchanged; "+
+			"read reports the state without ever starting a model pass; cancel puts a running, finished or failed analysis aside. "+
+			"Starting over after a failure is cancel, then request. Default: request.")
+}
 
 const repoIDDesc = "Repository id."
 const runIDDesc = "Run id (a ToDo or an automatic run)."
@@ -543,14 +555,21 @@ func mcpToolRows() []mcpTool {
 			Params: []mcpParam{pathArg("id", "", runIDDesc)},
 		},
 		{
-			Name: "run_ai_fill", Desc: "Propose automatic runs for the constitution records that have none. Proposes only; nothing is written.",
-			Op: "mercuryRunAiFill", Method: http.MethodPost, Path: "/api/mercury/runs/ai-fill", Tier: tierCSRF,
-			Handler: (*Server).runsAiFill,
+			Name: "run_assign", Desc: "Assign every constitution record that no run carries yet: a fitting run is extended, otherwise one is created. Answers with how many were uncovered and whether a pass started; the outcome arrives as a notice.",
+			Op: "mercuryRunAssign", Method: http.MethodPost, Path: "/api/mercury/runs/assign", Tier: tierCSRF,
+			Handler: (*Server).runsAssign,
 		},
 		{
-			Name: "run_ai_finetune", Desc: "Propose a reshaped run plan for the whole constitution. Proposes only; nothing is written.",
+			Name: "run_ai_fill", Desc: "Propose automatic runs for the constitution records that have none. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
+			Op: "mercuryRunAiFill", Method: http.MethodPost, Path: "/api/mercury/runs/ai-fill", Tier: tierCSRF,
+			Handler: (*Server).runsAiFill,
+			Params:  []mcpParam{proposalActionArg("an analysis of the uncovered records")},
+		},
+		{
+			Name: "run_ai_finetune", Desc: "Propose a reshaped run plan for the whole constitution. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
 			Op: "mercuryRunAiFinetune", Method: http.MethodPost, Path: "/api/mercury/runs/ai-finetune", Tier: tierCSRF,
 			Handler: (*Server).runsAiFinetune,
+			Params:  []mcpParam{proposalActionArg("a regrouping analysis of the whole run plan")},
 		},
 		{
 			Name: "run_proposal_apply", Desc: "Apply a proposed run plan: fill the gaps, or replace the automatic runs entirely.",

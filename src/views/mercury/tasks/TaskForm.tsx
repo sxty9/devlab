@@ -30,6 +30,7 @@ import {
   nowLocalInput,
   planAttachmentIngest,
   repoOptions,
+  runLacksRequiredAxioms,
   scheduleInvalid,
   targetRowValid,
   toRunTargets,
@@ -138,9 +139,12 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
   const targetsOk = !isTodo || (rows.length > 0 && rows.every(targetRowValid));
   const weeklyOk = isTodo || schedule.kind !== 'weekly' || (schedule.weekdays?.length ?? 0) > 0;
   const scheduleBad = isTodo && scheduleInvalid(mode, due, minDue);
+  // The axiom rule binds to ACTIVATION and is ASKED here, not restated, so this form can never
+  // become stricter than the server that stores the run.
+  const axiomsOk = !runLacksRequiredAxioms(active, axiomIds);
   const valid =
     title.trim().length > 0 &&
-    (isTodo ? task.trim().length > 0 && targetsOk && !scheduleBad : axiomIds.length > 0 && weeklyOk);
+    (isTodo ? task.trim().length > 0 && targetsOk && !scheduleBad : axiomsOk && weeklyOk);
 
   const save = async () => {
     if (!valid || busy) return;
@@ -370,7 +374,9 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
             ) : (
               <p className="text-footnote text-text-tertiary">Loading the axiom catalog…</p>
             )}
-            {axiomIds.length === 0 && <p className="mt-1.5 text-caption text-danger">Pick at least one axiom.</p>}
+            {!axiomsOk && (
+              <p className="mt-1.5 text-caption text-danger">Pick at least one axiom, or save the run inactive.</p>
+            )}
           </div>
         </>
       )}

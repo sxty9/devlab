@@ -35,6 +35,18 @@ type PlanSchedule struct {
 
 var runTimeOfDayRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
 
+// RunLacksRequiredAxioms is the ONE axiom rule of a recurring run, stated once: a run that will be
+// ACTIVE must carry at least one axiom — it would otherwise execute the constitution against
+// nothing — while an INACTIVE one is a definition that never fires and is therefore storable
+// without any. Every place that accepts a recurring run asks THIS question: the endpoint that
+// stores one, the plan the model proposes and the chat action that creates one (the latter two
+// arrive active). The rule exists once, so the sites cannot drift into three slightly different
+// rules; only the wording of the refusal belongs to each site, because one addresses a person and
+// the others correct a model.
+func RunLacksRequiredAxioms(active bool, axiomIDs []string) bool {
+	return active && len(axiomIDs) == 0
+}
+
 // ParseRunPlan extracts the model's JSON for a run plan and validates it. knownAxiomIDs is the set the
 // plan may reference. The returned error message doubles as a retry correction (as in ParsePlacement).
 func ParseRunPlan(output string, knownAxiomIDs []string) (RunPlan, error) {
@@ -74,7 +86,8 @@ func ValidateRunPlan(p *RunPlan, knownAxiomIDs []string) error {
 			return fmt.Errorf("%w: duplicate run name %q", ErrInvalidPlacement, r.Name)
 		}
 		names[low] = true
-		if len(r.AxiomIDs) == 0 {
+		// A proposed run is applied as an ACTIVE run, so the one rule applies in that state.
+		if RunLacksRequiredAxioms(true, r.AxiomIDs) {
 			return fmt.Errorf("%w: run %q has no axioms", ErrInvalidPlacement, r.Name)
 		}
 		for _, id := range r.AxiomIDs {
