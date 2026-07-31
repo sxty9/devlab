@@ -799,8 +799,17 @@ func startAgentStreamWith(ctx context.Context, run streamFunc) *agentStream {
 	go func() {
 		defer close(a.done)
 		a.err = run(runCtx, func(line []byte) {
+			// The callback hands over ONE line WITHOUT its terminator (workspace.runAgentCmd trims it),
+			// while the compaction on the other end splits the stream on '\n'. The terminator therefore
+			// has to be put back HERE. Without it every event of an invocation is glued into a single
+			// unparsable blob: no transcript line is ever emitted and the token counters stay at zero,
+			// while the agent works perfectly normally and the stage still succeeds. That is exactly
+			// how it stayed unnoticed — nothing fails, the numbers are just silently absent.
+			buf := make([]byte, 0, len(line)+1)
+			buf = append(buf, line...)
+			buf = append(buf, '\n')
 			// A write error means the reader is gone; the invocation is then stopped by the context.
-			if _, werr := pw.Write(line); werr != nil {
+			if _, werr := pw.Write(buf); werr != nil {
 				cancel()
 			}
 		})

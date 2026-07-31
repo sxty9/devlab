@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -349,6 +350,20 @@ func TestAgentStreamAdapter(t *testing.T) {
 	if !strings.Contains(string(out), `"assistant"`) || !strings.Contains(string(out), `"result"`) {
 		t.Errorf("the stream lost lines: %q", out)
 	}
+	// The stream must arrive as LINES, one event per line. Asserting only that the text is somewhere
+	// in there passed happily while every event was glued into one blob — and a blob parses as
+	// nothing, so the transcript stayed empty and the token counters stayed at zero on the running
+	// service, with no stage ever failing. Count the lines, do not search the text.
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 separate lines, got %d: %q", len(lines), out)
+	}
+	for i, l := range lines {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(l), &ev); err != nil {
+			t.Errorf("line %d is not a parsable event (%v): %q", i, err, l)
+		}
+	}
 	if err := a.Wait(); err != nil {
 		t.Errorf("Wait: %v", err)
 	}
@@ -388,9 +403,12 @@ type fakeStreamer struct {
 	block bool
 }
 
+// run mirrors the REAL primitive (workspace.runAgentCmd): it hands over one line WITHOUT its
+// terminator. The fake used to append "\n" itself — so the adapter looked correct here while it
+// dropped every separator in production, and the whole live transcript came out as one blob.
 func (f fakeStreamer) run(ctx context.Context, onStdout func([]byte)) error {
 	for _, l := range f.lines {
-		onStdout([]byte(l + "\n"))
+		onStdout([]byte(l))
 	}
 	if f.block {
 		<-ctx.Done()
