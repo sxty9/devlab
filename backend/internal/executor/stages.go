@@ -532,8 +532,27 @@ func prBody(rc *RepoCtx) string {
 	b.WriteString(rc.Doc.ID)
 	b.WriteString(" (" + string(rc.Run.Kind) + " \"" + rc.Run.Title + "\").\n\n")
 	b.WriteString("Span " + short(rc.deliveryBase) + ".." + short(rc.head) + " on " + workbenchBranch + ".\n")
+
+	// What the CHAIN itself did, stated by the chain. Without this line the reader is left with
+	// the agent's account alone — and the agent writes it at the END OF IMPLEMENT, from a sandbox
+	// that has neither sudo nor push rights. Its honest "built, but not live — I may not deploy"
+	// then stands unqualified next to a deployment that DID happen two stages later, and the pull
+	// request reads as a failure that never occurred. Measured 2026-07-31 on presentr #7: the
+	// service was installed and running at 18:59 while its own pull request said "NOT live".
+	b.WriteString("\n**Dev delivery:** ")
+	if rc.deliveredCommit != "" {
+		b.WriteString("installed and running at " + short(rc.deliveredCommit) +
+			" — performed by this pipeline AFTER the report below was written.\n")
+	} else {
+		b.WriteString("not performed in this run.\n")
+	}
+
 	if rc.report != "" {
-		b.WriteString("\n" + clip(rc.report) + "\n")
+		b.WriteString("\n---\n\n**The agent's own report**, written at the end of the implement stage — " +
+			"before delivery, deployment and this pull request existed. Where it says the agent could not " +
+			"deploy, push or open a pull request, that describes the agent's sandbox, not the outcome: the " +
+			"line above states the outcome.\n\n")
+		b.WriteString(clip(rc.report) + "\n")
 	}
 	return b.String()
 }
