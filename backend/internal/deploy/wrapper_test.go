@@ -284,6 +284,65 @@ func TestInstallCheckUIConfiguredPlansWireInAndBuild(t *testing.T) {
 	}
 }
 
+// The class of break that shipped green because DevLab itself carries no ui/: a service ui carries a
+// tsconfig that extends the dashboard base by a path valid only where the repo sits BESIDE holistic
+// (../../holistic/frontend/tsconfig.base.json). Copied into <frontend>/external/<repo> that path
+// escapes into nothing and vite dies. This check stands a ui-bearing service against the REAL
+// dashboard layout and proves the relocation neutralises the editor tsconfig instead of copying it —
+// exactly what a green delivery of the copy-not-symlink change failed to exercise.
+func TestInstallCheckUINeutralisesEditorTsconfig(t *testing.T) {
+	// presentr was only where it was NOTICED — the identical line lives in every ui-bearing service, so
+	// the proof spans more than one. A shared dashboard checkout with the base where a service tsconfig
+	// canNOT reach it from external/<repo> is the same asymmetry that broke the real delivery.
+	holistic := filepath.Join(t.TempDir(), "holistic")
+	if err := os.MkdirAll(filepath.Join(holistic, "frontend", "external"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(holistic, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(holistic, "frontend", "tsconfig.base.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The exact hazard, verbatim from a real service ui: an extends that climbs out of the tree.
+	badTs := `{"extends":"../../holistic/frontend/tsconfig.base.json","include":["src"]}`
+
+	for _, repo := range []string{"presentr", "contax"} {
+		t.Run(repo, func(t *testing.T) {
+			state := t.TempDir()
+			workRoot := filepath.Join(state, "workspaces")
+			artifact := filepath.Join(workRoot, "runner", repo, ".mercury-artifact")
+			uiSrc := filepath.Join(artifact, "ui", "src")
+			if err := os.MkdirAll(uiSrc, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(artifact, repo+"d"), []byte("bin"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(artifact, "ui", "tsconfig.json"), []byte(badTs), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(uiSrc, "index.tsx"), []byte("export const x = 1\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeOrigin(t, filepath.Dir(artifact), testOwner, repo)
+			env := map[string]string{
+				"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner, "DEVLAB_HOLISTIC_REPO": holistic,
+			}
+			res := runWrapper(t, "deploy/devlab-install", env, repo, artifact, "dev", "--check", "--port", "8772")
+			if res.exit != 0 {
+				t.Fatalf("the neutralised ui of %q must plan cleanly, got exit %d\n%s", repo, res.exit, res.out)
+			}
+			if !strings.Contains(res.out, "neutralised") || !strings.Contains(res.out, "MERCURY-UI: planned") {
+				t.Errorf("%q: the plan must report the editor tsconfig neutralised and plan the build: %s", repo, res.out)
+			}
+			if strings.Contains(res.out, "MERCURY-UI: would-fail") {
+				t.Errorf("%q: the editor tsconfig was NOT neutralised — the copy still carries the outside-tree extends: %s", repo, res.out)
+			}
+		})
+	}
+}
+
 // The self artifact must be complete (binary + web) — honest config-state refusal otherwise.
 func TestInstallCheckSelfArtifactComplete(t *testing.T) {
 	env, workRoot, _ := installEnv(t)

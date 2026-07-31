@@ -29,12 +29,13 @@ type RootInstaller interface {
 type UIState string
 
 const (
-	UINone     UIState = "none"            // the service ships no ui/ — the half is absent, said so
-	UIBuilt    UIState = "built"           // ui wired into the dashboard and the shared build passed
-	UIForeign  UIState = "foreign-blocked" // this ui verified, but another service blocks the shared build
-	UIFailed   UIState = "failed"          // this service's ui does not build — a named stage failure
-	UIUnconfig UIState = "unconfigured"    // ui present but no dashboard checkout configured — a deficiency
-	UIPlanned  UIState = "planned"         // --check dry-run reached the ui step
+	UINone      UIState = "none"            // the service ships no ui/ — the half is absent, said so
+	UIBuilt     UIState = "built"           // ui wired into the dashboard and the shared build passed
+	UIForeign   UIState = "foreign-blocked" // this ui verified, but another service blocks the shared build
+	UIFailed    UIState = "failed"          // this service's ui does not build — a named stage failure
+	UIUnconfig  UIState = "unconfigured"    // ui present but no dashboard checkout configured — a deficiency
+	UIPlanned   UIState = "planned"         // --check dry-run reached the ui step
+	UIWouldFail UIState = "would-fail"      // --check only: the relocation would carry an outside-tree config into the dashboard
 )
 
 // InstallResult is what the wrapper reports beyond the raw error: the UI half's outcome, parsed off

@@ -324,14 +324,21 @@ func TestChainEffortAndPreamble(t *testing.T) {
 			t.Errorf("chainEffort(%q) = %q, want %q", in, got, want)
 		}
 	}
-	plain := chainPreamble("alpha", "high")
-	if !strings.Contains(plain, "alpha") || !strings.Contains(plain, "mercury-dev") {
-		t.Errorf("the preamble names neither the repository nor the working branch: %q", plain)
+	plain := chainPreamble("alpha", "fix/some-order-branch", "high")
+	if !strings.Contains(plain, "alpha") || !strings.Contains(plain, "fix/some-order-branch") {
+		t.Errorf("the preamble names neither the repository nor the ACTUAL order branch: %q", plain)
+	}
+	if strings.Contains(plain, "mercury-dev") {
+		t.Errorf("the preamble hardcodes the workbench constant instead of the measured branch: %q", plain)
+	}
+	// An empty measurement falls back to the workbench constant rather than an empty branch name.
+	if !strings.Contains(chainPreamble("alpha", "", "high"), "mercury-dev") {
+		t.Errorf("an unmeasurable branch should fall back to the workbench constant")
 	}
 	if strings.Contains(plain, "most thorough") {
 		t.Errorf("the ultracode directive leaked into an ordinary run: %q", plain)
 	}
-	if !strings.Contains(chainPreamble("alpha", "ultracode"), "most thorough") {
+	if !strings.Contains(chainPreamble("alpha", "mercury-dev", "ultracode"), "most thorough") {
 		t.Errorf("the ultracode tier carries no directive")
 	}
 }

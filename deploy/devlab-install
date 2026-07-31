@@ -37,7 +37,9 @@
 #     (<holistic>/<frontend>/external/<repo>) and the SHARED dashboard is rebuilt — that build is the
 #     UI's check. The dashboard path is instance configuration (DEVLAB_HOLISTIC_REPO / a root-owned
 #     file); absent config is a NAMED deficiency, never a silent skip. The half's outcome is reported
-#     on a single `MERCURY-UI: <none|built|unconfigured|failed|foreign-blocked|planned>` line
+#     on a single `MERCURY-UI: <none|built|unconfigured|failed|foreign-blocked|planned|would-fail>` line
+#     (would-fail is --check-only: the dry-run predicts the relocation would carry an outside-tree config
+#     into the dashboard and break the build — a regression guard, never a production outcome)
 #   * first-time setup of template-conforming services generates unit/route/rights from
 #     root-owned INLINE templates with validated values (port via the atlas proposal, --port)
 #   * --handover (self-repo only): install + `systemd-run --unit=devlab-restart-<ts> --collect
@@ -440,8 +442,40 @@ EXT="$FRONT/external/$REPO"
   || die "configured holistic checkout '$HOLISTIC_REPO' is not a git repository — cannot wire the UI of '$REPO' in" 5
 [ -d "$FRONT" ] || die "holistic frontend '$FRONT' not found under the configured checkout — cannot wire the UI of '$REPO' in" 5
 
+# ── the ONE rule for relocating a service ui into the dashboard ──────────────────────────────────
+# The delivery MOVES a tree whose editor configuration knows its ORIGINAL place. A service
+# ui/tsconfig.json extends the dashboard base by a path that resolves only where the service repo sits
+# BESIDE holistic (../../holistic/frontend/tsconfig.base.json); once copied into
+# <frontend>/external/<repo> that path climbs out of the tree into nothing, and the vite build dies
+# before it starts — for EVERY ui-bearing service, since they all carry that same line. The
+# AUTHORITATIVE build is the dashboard's OWN (this very rebuild); the tsconfig inside a service is
+# editor convenience, by its own header. So the relocation NEUTRALISES it: the editor-only TS project
+# configs are NOT copied into the dashboard, and the dashboard's own config governs external/<repo>/src.
+# The fault is straightened at the SINGLE point where the tree changes location — the service sources
+# are copied verbatim and never rewritten. Both the real wire-in and the --check simulation call THIS
+# one function, so the acceptance guards exactly the behaviour that ships. Never a symlink: a link into
+# the user-writable workspace would let the checkout mutate what the dashboard builds after vetting.
+wire_ui_copy() {  # <src> <dst>
+  install -d -m 0755 "$2"
+  rsync -a --delete --exclude='/tsconfig.json' --exclude='/tsconfig.*.json' "$1/" "$2/"
+}
+
 if [ "$CHECK" = 1 ]; then
   echo "PLAN: rsync the service ui source $UI_SRC -> $EXT (validated copy, never a symlink into the workspace)"
+  # Prove the relocation against the REAL dashboard layout WITHOUT touching it: copy into a throwaway
+  # directory with the very function the real wire-in uses, then assert the editor-only TS project
+  # configs did NOT ride along — the location-dependent `extends` that used to break every ui-bearing
+  # delivery is gone. Nothing persistent is written, so --check still changes nothing observable.
+  sim="$(mktemp -d)"
+  wire_ui_copy "$UI_SRC" "$sim/ext"
+  leaked="$(cd "$sim/ext" && ls tsconfig.json tsconfig.*.json 2>/dev/null || true)"
+  rm -rf -- "$sim"
+  if [ -n "$leaked" ]; then
+    echo "PLAN: FAULT — an editor tsconfig would be copied into external/$REPO and break the dashboard build: $leaked"
+    echo "MERCURY-UI: would-fail"
+    exit 2
+  fi
+  echo "PLAN: editor-only tsconfig is neutralised (not copied) — the dashboard's own build config governs external/$REPO"
   echo "PLAN: rebuild the shared dashboard in $FRONT (npm run build — lint + typecheck + vite)"
   echo "PLAN: a build failure naming external/$REPO removes $EXT and fails with the real error (MERCURY-UI: failed)"
   echo "PLAN: a build failure naming ANOTHER service keeps $EXT and is reported, not charged to '$REPO' (MERCURY-UI: foreign-blocked)"
@@ -449,11 +483,12 @@ if [ "$CHECK" = 1 ]; then
   exit 0
 fi
 
-# Copy (never symlink) the vetted ui source into the dashboard: a symlink into the user-writable
-# workspace would let the checkout mutate what the dashboard builds after this wrapper vetted it.
+# Copy (never symlink) the vetted ui source into the dashboard, neutralising the editor-only tsconfig
+# on the way (see wire_ui_copy). rm -rf first for a guaranteed clean slate — a half-wired tree from an
+# aborted predecessor leaves nothing behind.
 install -d -m 0755 "$FRONT/external"
 rm -rf -- "$EXT"
-rsync -a --delete "$UI_SRC/" "$EXT/"
+wire_ui_copy "$UI_SRC" "$EXT"
 
 # The shared dashboard build is EXPENSIVE and compiles every wired-in service at once. It runs ONCE per
 # UI-bearing delivery — the minimal cadence that still proves "the user sees it". A service without a
