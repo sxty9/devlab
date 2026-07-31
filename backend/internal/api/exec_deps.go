@@ -417,6 +417,12 @@ func (d *ChainDeps) RunDeliveries(runID, repo string) ([]runs.Delivery, error) {
 //
 // executed AND failed both count: the agent commits its own work, so an implement that ended in a
 // failure can still have left commits on the workbench. not-executed and not-applicable never ran.
+//
+// An implement that took the REST PATH does NOT count, however green it looks. It creates nothing by
+// definition — its own log says "already implemented — nothing new created" — so counting it would
+// let one wrong observation carry itself forward for ever: the run would keep finding "I implemented
+// here" in a record that only ever restated the same skip. The rest path is recognised by the
+// observation the pipeline recorded (implemented-undelivered), not by parsing its log.
 func (d *ChainDeps) PriorImplementAt(runID, repo string) (bool, error) {
 	if d.s.results == nil {
 		return false, errors.New("the execution archive is not available")
@@ -436,7 +442,7 @@ func (d *ChainDeps) PriorImplementAt(runID, repo string) (bool, error) {
 			continue
 		}
 		for _, rp := range res.Repos {
-			if !sameRepo(rp.Repo, repo) {
+			if !sameRepo(rp.Repo, repo) || rp.TaskState == model.TaskImplementedUndelivered {
 				continue
 			}
 			for _, st := range rp.Stages {

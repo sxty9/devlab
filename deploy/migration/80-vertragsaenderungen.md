@@ -1189,7 +1189,7 @@ retired vocabulary and never wrote into today's ledger.
 **State of record:**
 
 - `backend/internal/preflight/preflight.go@4e806dc4522e`
-- `backend/internal/api/exec_deps.go@bcf33917e207`
+- `backend/internal/api/exec_deps.go@9baa7e5eddbd`
 - `backend/internal/api/handlers_mercury_prs.go@fa5ab380dc71`
 - `src/data/source.ts@a04b0b6b865f`
 - `src/views/mercury/NoticesPanel.tsx@e9fae0d92d0a`

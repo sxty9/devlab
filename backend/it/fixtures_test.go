@@ -608,7 +608,9 @@ func (d *fixtureDeps) PriorImplementAt(runID, repo string) (bool, error) {
 	}
 	for _, res := range prior {
 		for _, rp := range res.Repos {
-			if rp.Repo != repo {
+			// A rest-path implement created nothing and must not count itself as work — same
+			// reading as production.
+			if rp.Repo != repo || rp.TaskState == model.TaskImplementedUndelivered {
 				continue
 			}
 			for _, st := range rp.Stages {
