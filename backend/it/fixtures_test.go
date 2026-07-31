@@ -566,13 +566,17 @@ func (d *fixtureDeps) Now() time.Time       { return time.Now().UTC() }
 // does not — a git fact, not a fixture claim. The remote refs are refreshed best-effort first, the
 // way the production observation adapter does: an observation against a stale default branch would
 // report work as undelivered long after it was merged.
-func (d *fixtureDeps) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (d *fixtureDeps) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
 	gr, err := d.world.get(repo)
 	if err != nil {
 		return false, "", err
 	}
 	d.refreshRefs(ctx, gr)
-	return gr.bench.AheadOfDefault(ctx)
+	on, err := gr.bench.On(branch)
+	if err != nil {
+		return false, "", err
+	}
+	return on.AheadOfDefault(ctx)
 }
 
 // refreshRefs updates the remote-tracking refs of the observation clone (best-effort: an
@@ -600,30 +604,6 @@ func (d *fixtureDeps) RunDeliveries(runID, repo string) ([]runs.Delivery, error)
 		out = append(out, del)
 	}
 	return out, nil
-}
-
-// PriorImplementAt answers from the SHIPPED execution archive — the run-scoped reading of the
-// shared workbench, resolved exactly the way production resolves it.
-func (d *fixtureDeps) PriorImplementAt(runID, repo string) (bool, error) {
-	prior, err := d.e.results.ForRun(runID)
-	if err != nil {
-		return false, err
-	}
-	for _, res := range prior {
-		for _, rp := range res.Repos {
-			// A rest-path implement created nothing and must not count itself as work — same
-			// reading as production.
-			if rp.Repo != repo || rp.TaskState == model.TaskImplementedUndelivered {
-				continue
-			}
-			for _, st := range rp.Stages {
-				if st.Stage == model.StageImplement && (st.State == model.StepExecuted || st.State == model.StepFailed) {
-					return true, nil
-				}
-			}
-		}
-	}
-	return false, nil
 }
 
 func (d *fixtureDeps) OpenPRByHead(_ context.Context, repo, head string) (*model.PRRef, error) {

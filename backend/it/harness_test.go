@@ -576,3 +576,23 @@ func stageNames(stages []model.StageView) string {
 	}
 	return strings.Join(parts, " ")
 }
+
+// taskBranchOf is the branch ONE task works on in every repository it targets — the same name the
+// chain derives, asked of the same helper, so a test can never assert against a branch the chain
+// does not actually use. There is no shared working branch any more: the ref name carries the run
+// id, which is what makes "whose work is this?" answerable at all.
+func (e *env) taskBranchOf(runID string) string {
+	e.t.Helper()
+	r, ok, err := e.runStore.Get(runID)
+	if err != nil || !ok {
+		e.t.Fatalf("run %s: ok=%v err=%v", runID, ok, err)
+	}
+	create := false
+	for _, tg := range r.Targets {
+		if tg.Create {
+			create = true
+			break
+		}
+	}
+	return runs.TaskBranch(create, r.Title, r.ID)
+}

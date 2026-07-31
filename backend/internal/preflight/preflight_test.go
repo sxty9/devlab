@@ -23,11 +23,13 @@ type fakeSources struct {
 	prErr      error
 	contained  map[string]bool // commit → contained
 	containErr error
-	implAt     map[string]bool // key runID+"/"+repo — this run already ran implement there
-	implErr    error
+	// askedBranch records WHICH branch the observation asked about — the whole model rests on it
+	// being the task's own, never one shared with another task.
+	askedBranch string
 }
 
-func (f *fakeSources) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (f *fakeSources) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
+	f.askedBranch = branch
 	return f.ahead, f.head, f.wbErr
 }
 func (f *fakeSources) RunDeliveries(runID, repo string) ([]runs.Delivery, error) {
@@ -35,12 +37,6 @@ func (f *fakeSources) RunDeliveries(runID, repo string) ([]runs.Delivery, error)
 		return nil, f.ledgerErr
 	}
 	return f.deliveries[runID+"/"+repo], nil
-}
-func (f *fakeSources) PriorImplementAt(runID, repo string) (bool, error) {
-	if f.implErr != nil {
-		return false, f.implErr
-	}
-	return f.implAt[runID+"/"+repo], nil
 }
 func (f *fakeSources) OpenPRByHead(ctx context.Context, repo, head string) (*model.PRRef, error) {
 	return f.openPR, f.prErr
@@ -111,11 +107,11 @@ func TestDeriveThreeStates(t *testing.T) {
 		}
 	})
 
-	t.Run("implemented-undelivered via workbench ahead after this run's own implement", func(t *testing.T) {
-		// The crash between the agent's commit and the ledger record: this run ran implement
-		// here, the workbench carries the commits, the ledger knows nothing. Only THEN is the
-		// rest path the truth.
-		src := &fakeSources{ahead: true, head: "cccc3333", implAt: map[string]bool{"run_x/org/app": true}}
+	t.Run("implemented-undelivered via this task's own branch being ahead", func(t *testing.T) {
+		// Commits on the task's OWN branch, no ledger record — the crash between the agent's
+		// commit and the ledger write. Whose commits they are is not a question: the branch
+		// belongs to this run.
+		src := &fakeSources{ahead: true, head: "cccc3333"}
 		f, err := Derive(ctx, src, "org/app", run)
 		if err != nil {
 			t.Fatal(err)
@@ -157,44 +153,36 @@ func TestDeriveStateless(t *testing.T) {
 	if f1.State != f2.State || f1.State != model.TaskNotImplemented {
 		t.Fatalf("derivation not stable: %s vs %s", f1.State, f2.State)
 	}
-	// The repo truth changes — and so does the run's own history, because a shared workbench
-	// running ahead is only this task's work once this run has implemented here.
-	src.ahead = true
-	src.implAt = map[string]bool{"run_y/org/app": true}
+	src.ahead = true // the repo truth changes …
 	f3, _ := Derive(ctx, src, "org/app", run)
 	if f3.State != model.TaskImplementedUndelivered {
 		t.Fatalf("… and the derived state must follow: %s", f3.State)
 	}
 }
 
-// THE fault this rule exists against (measured 2026-07-31): mercury-dev is shared, so a workbench
-// running ahead with ANOTHER run's undelivered work must never make a fresh task look implemented.
-// It did, on all 23 repositories at once — implement then created nothing, every stage reported
-// executed, and the requested work never came into existence.
-func TestDeriveForeignWorkOnSharedWorkbenchIsNotThisTask(t *testing.T) {
-	ctx := context.Background()
-	run := mkRun("run_fresh", "org/app")
-
-	// Another run's commit sits on the workbench; this run has never run here.
-	src := &fakeSources{ahead: true, head: "eeee5555"}
-	f, err := Derive(ctx, src, "org/app", run)
-	if err != nil {
+// The whole model rests on WHICH branch is observed: one named after the run, never one shared. If
+// the observation ever asked about a shared branch again, a fresh task would see another task's
+// commits and be declared done — the fault measured 2026-07-31 across all 23 repositories.
+func TestDeriveObservesTheTasksOwnBranch(t *testing.T) {
+	run := mkRun("run_own", "org/app")
+	src := &fakeSources{}
+	if _, err := Derive(context.Background(), src, "org/app", run); err != nil {
 		t.Fatal(err)
 	}
-	if f.State != model.TaskNotImplemented {
-		t.Fatalf("foreign undelivered work was read as this task's own: state = %s", f.State)
+	want := runs.TaskBranch(false, run.Title, run.ID)
+	if src.askedBranch != want {
+		t.Fatalf("observed %q, want this task's own branch %q", src.askedBranch, want)
 	}
-	if len(f.Evidence) == 0 || !strings.Contains(f.Evidence[0], "another run") {
-		t.Fatalf("the evidence must name whose work it is: %q", f.Evidence)
+	if !strings.Contains(src.askedBranch, run.ID) {
+		t.Fatalf("the observed branch does not name its owner: %q", src.askedBranch)
 	}
 }
 
-// A delivery of this run that merged stays delivered even while the shared workbench runs ahead —
-// the foreign work is named, not counted as a reason to re-derive the state.
-func TestDeriveMergedWinsOverForeignAhead(t *testing.T) {
+// A delivery of this run that merged is delivered.
+func TestDeriveMergedIsDelivered(t *testing.T) {
 	run := mkRun("run_m", "org/app")
 	src := &fakeSources{
-		ahead: true, head: "ffff6666",
+		head: "ffff6666",
 		deliveries: map[string][]runs.Delivery{"run_m/org/app": {{
 			ID: "dlv_9", Repo: "org/app", ToCommit: "ffff", MergedAt: ts("2026-07-30T09:00:00Z"),
 		}}},
@@ -205,15 +193,6 @@ func TestDeriveMergedWinsOverForeignAhead(t *testing.T) {
 	}
 	if f.State != model.TaskDelivered {
 		t.Fatalf("state = %s", f.State)
-	}
-}
-
-// The execution history is a source like any other: unreachable ⇒ unknown, named, never guessed.
-func TestDeriveUnknownOnUnreachableHistory(t *testing.T) {
-	src := &fakeSources{ahead: true, head: "aaaa", implErr: errors.New("archive unreadable")}
-	f, err := Derive(context.Background(), src, "org/app", mkRun("run_h", "org/app"))
-	if err == nil || f.State != model.TaskUnknown || f.Err == "" {
-		t.Fatalf("history unreachable not honest: state=%s err=%q derr=%v", f.State, f.Err, err)
 	}
 }
 

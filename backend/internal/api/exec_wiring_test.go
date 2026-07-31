@@ -281,7 +281,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 	if _, err := deps.Agent(ctx, "alpha", "do it", runs.ResolvedTuning{}, executor.AgentSession{}); err == nil {
 		t.Errorf("the agent must refuse without a runner account")
 	}
-	if _, _, err := deps.WorkbenchState(ctx, "alpha"); err == nil {
+	if _, _, err := deps.WorkbenchState(ctx, "alpha", "fix/probe-run_x"); err == nil {
 		t.Errorf("the observation must refuse without a runner account")
 	}
 	// The hooks are optional in the observation form, and their absence is NAMED, not ignored.

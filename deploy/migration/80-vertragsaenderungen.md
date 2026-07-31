@@ -1204,3 +1204,53 @@ holds the one case the rest path exists for; `TestDeriveMergedWinsOverForeignAhe
 precedence; `TestDeriveUnknownOnUnreachableHistory` holds the honest unknown. End to end,
 `backend/it/race_test.go:TestRepositoryExclusivityQueuesInsteadOfSkipping` now counts two agent runs
 at the shared repository, one per task, where it previously counted one.
+
+---
+
+## One branch per task — the shared working branch is retired
+
+**What changed:** there is no `mercury-dev` any more. Every task works on a branch of its own,
+`runs.TaskBranch(create, title, runID)`, cut from the TOP OF THE STACK — the branch of the task
+before it in that repository, or the default branch when none is open. The delivery branch IS that
+branch; no snapshot is cut. `workbench.Bench` carries the branch it operates (`On`, and `Prepare`
+establishes it), `preflight.Sources.WorkbenchState` takes the branch to observe, and
+`PriorImplementAt` is gone — it existed only to work around the shared branch.
+
+**Why:** one branch per repository meant every task committed onto the same ref, so what lay there
+never said WHOSE work it was. A fresh task on a repository carrying anyone's undelivered commit was
+declared already implemented: implement created nothing, every stage still reported `executed`, a
+delivery of the OTHER task's commits opened a pull request, and the requested work never came into
+existence. Measured 2026-07-31: all 23 workbenches were ahead, so it applied to every new task on
+every repository. The run-scoped patch of the same day narrowed the fault; it did not remove its
+cause. A branch named after its owner removes the question instead of answering it.
+
+**What it does and does not do:** the stack is preserved and is now explicit — task B branches from
+task A, so B's pull request shows only B's change and can only merge after A. Merge order therefore
+follows the order the tasks ran, with each pull request waiting out its own window. The prune ends a
+task's branch with its merge; there is no shared branch left over to spare. Nothing that lies on a
+`mercury-dev` today is lost: the newest open delivery branch of each repository carries it, and that
+is exactly what the next task branches from. The name survives as `workbench.LegacyShared` — to
+recognise, never to write.
+
+**State of record:**
+
+- `backend/internal/runs/branch.go@a8d06df9b6d4`
+- `backend/internal/workbench/workbench.go@6c786ab53ed6`
+- `backend/internal/workbench/prepare.go@af1036149886`
+- `backend/internal/executor/executor.go@e1aa5246a94a`
+- `backend/internal/executor/stages.go@90415b583e0c`
+- `backend/internal/preflight/preflight.go@b34bb15d84c3`
+- `backend/internal/api/exec_deps.go@2f248d512f65`
+
+**Diff hint:** `git diff 1ed73d3 -- backend/internal/runs/branch.go backend/internal/workbench
+backend/internal/executor backend/internal/preflight backend/internal/api/exec_deps.go`.
+**Proof:** `backend/internal/runs/branch_task_test.go:TestTaskBranchIsStablePerRunAndDistinctBetweenRuns`
+holds the two properties the name must have — stable across firings of one task, distinct between
+tasks. `backend/internal/preflight/preflight_test.go:TestDeriveObservesTheTasksOwnBranch` holds that
+the observation asks about the task's OWN branch and that the ref names its owner. End to end,
+`backend/it/boot_test.go:TestBootChainEndToEnd` asserts the work is published on the task's branch
+AND that the retired shared branch was never written;
+`backend/it/invariants_test.go:TestChainKeepsUnpublishedCommitsOfAnInterruptedRun` holds K-1 on the
+task's own branch (an interrupted run's unpublished commit survives and is secured);
+`TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault` holds that the merge prunes the task's
+branch and that no shared branch exists.

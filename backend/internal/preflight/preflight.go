@@ -17,16 +17,13 @@ import (
 // in cmd/devlabd composes them from the workbench (git), the delivery ledger, the result pool
 // and the GitHub client; fixtures substitute the whole interface.
 type Sources interface {
-	// WorkbenchState reports whether the workbench branch (mercury-dev) is ahead of the
-	// default branch, and its head commit.
-	WorkbenchState(ctx context.Context, repo string) (aheadOfDefault bool, headCommit string, err error)
+	// WorkbenchState reports whether ONE named branch is ahead of the default branch, and its
+	// head commit. The branch asked about is the task's own — a branch that does not exist yet
+	// is not an error, it is "nothing here".
+	WorkbenchState(ctx context.Context, repo, branch string) (aheadOfDefault bool, headCommit string, err error)
 	// RunDeliveries returns every ledger delivery this run produced at repo (joined via the
 	// run's executions), oldest first. Empty when the run never delivered there.
 	RunDeliveries(runID, repo string) ([]runs.Delivery, error)
-	// PriorImplementAt reports whether an earlier execution of THIS run already ran the
-	// implement stage at repo. The shared workbench cannot say whose commits it carries; the
-	// execution history can, and that is the only run-scoped reading of "ahead".
-	PriorImplementAt(runID, repo string) (bool, error)
 	// OpenPRByHead returns the open PR with the given head branch, nil when none.
 	OpenPRByHead(ctx context.Context, repo, head string) (*model.PRRef, error)
 	// ContainedInDefault reports whether commit is contained in the default branch.
@@ -49,18 +46,25 @@ type Finding struct {
 // unknown, each with evidence — NEVER from a stored flag (K-3). Pure over what Sources report;
 // an unreachable source yields unknown plus the error (never a guess).
 //
-// Rules (REQ-020, D 50). Every rule is RUN-SCOPED: mercury-dev is a branch all runs share, so
-// what lies on it is never by itself an answer about THIS task.
-//   - an OPEN ledger delivery of this run at repo                      ⇒ implemented-undelivered
-//   - the workbench ahead, no delivery of this run recorded, and this
-//     run already ran implement here (the delivery was lost, not the
-//     work)                                                            ⇒ implemented-undelivered
-//   - ≥ 1 delivery of this run merged, none open                       ⇒ delivered
-//   - otherwise                                                        ⇒ not-implemented
+// Rules (REQ-020, D 50). Every rule reads THIS task's own branch — one branch per run, named after
+// it — so commits on it are this task's by construction and no rule has to ask whose they are.
+//   - an OPEN ledger delivery of this run at repo   ⇒ implemented-undelivered
+//   - this task's branch ahead of the default one   ⇒ implemented-undelivered
+//   - ≥ 1 delivery of this run merged, none open    ⇒ delivered
+//   - otherwise                                     ⇒ not-implemented
 func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Finding, error) {
 	f := Finding{State: model.TaskUnknown, ObservedAt: time.Now().UTC()}
 
-	ahead, head, err := src.WorkbenchState(ctx, repo)
+	// The branch this task owns in this repository — derived, never looked up, so the observation
+	// and the chain can never disagree about which branch is being talked about.
+	create := false
+	for _, t := range run.Targets {
+		if t.Repo == repo {
+			create = t.Create
+			break
+		}
+	}
+	ahead, head, err := src.WorkbenchState(ctx, repo, runs.TaskBranch(create, run.Title, run.ID))
 	if err != nil {
 		f.Err = "workbench state unreachable: " + err.Error()
 		f.Evidence = append(f.Evidence, f.Err)
@@ -86,26 +90,6 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 		}
 	}
 
-	// "Ahead" attests that undelivered work EXISTS on mercury-dev — never whose it is. Reading it
-	// as this task's work is how a fresh task is silently skipped: implement creates nothing, every
-	// stage still reports executed, a delivery of another run's commits opens a pull request, and
-	// the work that was asked for never comes into existence. Measured 2026-07-31: all 23
-	// workbenches were ahead, so EVERY new task on EVERY repo would have been skipped.
-	//
-	// There is exactly one reading under which those commits are this task's own: this run already
-	// ran implement here and the ledger never received the delivery — the crash between the agent's
-	// commit and the ledger record. That is the case the rest path exists for, and it is asked for
-	// only when the ledger holds nothing for this run at all.
-	restOfThisRun := false
-	if ahead && open == nil && merged == nil {
-		restOfThisRun, err = src.PriorImplementAt(run.ID, repo)
-		if err != nil {
-			f.Err = "execution history unreachable: " + err.Error()
-			f.Evidence = append(f.Evidence, f.Err)
-			return f, fmt.Errorf("preflight %s: %w", repo, err)
-		}
-	}
-
 	switch {
 	case open != nil:
 		f.State = model.TaskImplementedUndelivered
@@ -122,26 +106,20 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 		} else {
 			f.Evidence = append(f.Evidence, "no open PR for the delivery branch yet")
 		}
-	case restOfThisRun:
+	case ahead:
+		// This task's OWN branch carries commits the default branch does not. Whose they are is
+		// not a question any more: the branch belongs to this run and to no other.
 		f.State = model.TaskImplementedUndelivered
 		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s and this run already ran implement here; the ledger holds no delivery for it — the delivery was lost, the work was not", short(head)))
+			fmt.Sprintf("this task's branch is ahead of the default branch @%s; no delivery of it is recorded", short(head)))
 	case merged != nil:
 		f.State = model.TaskDelivered
 		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s",
 			merged.ID, merged.MergedAt.UTC().Format(time.RFC3339)))
-		if ahead {
-			f.Evidence = append(f.Evidence,
-				fmt.Sprintf("workbench mercury-dev is ahead @%s — undelivered work of another run, not this task's", short(head)))
-		}
-	case ahead:
-		f.State = model.TaskNotImplemented
-		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s, but this run never ran implement here — that work belongs to another run", short(head)))
 	default:
 		f.State = model.TaskNotImplemented
 		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench equals the default branch @%s; no delivery recorded for this run", short(head)))
+			fmt.Sprintf("this task's branch carries nothing beyond the default branch @%s; no delivery recorded", short(head)))
 	}
 	return f, nil
 }

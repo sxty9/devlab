@@ -29,30 +29,34 @@ import (
 // could publish, so the local branch is AHEAD of the remote. The next run must fold the remote in
 // and keep the local commits.
 //
-// Catches: replacing the fold in workbench.Prepare with a reset onto origin/mercury-dev (any form of
-// re-pointing the branch at the remote) — the unpublished commit would vanish here.
+// Catches: replacing the fold in workbench.Prepare with a reset onto the task branch's remote (any
+// form of re-pointing the branch at the remote) — the unpublished commit would vanish here.
 func TestChainKeepsUnpublishedCommitsOfAnInterruptedRun(t *testing.T) {
 	e := newEnv(t, sched.Config{Tick: 20 * time.Millisecond})
 	ctx := e.ctx
 	gr := e.deps.git("alpha")
 	e.boot(ctx)
 
-	// The state an interrupted run leaves: the working branch exists locally AND on the remote, and
-	// carries one more commit than the remote knows about.
-	mustGit(t, gr.wt, "checkout", "--quiet", "-b", workbench.LegacyShared)
+	// The task exists first, because the branch that carries its work is NAMED after it — the
+	// interrupted run left its commits on its OWN branch, not on a branch shared with anyone.
+	e.addTodo("run_after_crash", "continue after the crash", "alpha")
+	branch := e.taskBranchOf("run_after_crash")
+
+	// The state an interrupted run leaves: its branch exists locally AND on the remote, and carries
+	// one more commit than the remote knows about.
+	mustGit(t, gr.wt, "checkout", "--quiet", "-b", branch)
 	writeInto(t, gr.wt, "work/published.txt", "secured by the previous run\n")
 	mustGit(t, gr.wt, "add", "-A")
 	mustGit(t, gr.wt, "commit", "--quiet", "-m", "previous run, published")
-	mustGit(t, gr.wt, "push", "--quiet", "origin", workbench.LegacyShared)
+	mustGit(t, gr.wt, "push", "--quiet", "origin", branch)
 	writeInto(t, gr.wt, "work/unpublished.txt", "committed, never pushed — the interrupted run\n")
 	mustGit(t, gr.wt, "add", "-A")
 	mustGit(t, gr.wt, "commit", "--quiet", "-m", "interrupted before publish")
 	unpublishedTip := gitAt(t, gr.wt, "rev-parse", "HEAD")
-	if remote := gr.originHead("refs/heads/" + workbench.LegacyShared); remote == unpublishedTip {
+	if remote := gr.originHead("refs/heads/" + branch); remote == unpublishedTip {
 		t.Fatalf("the premise failed: the remote already carries the unpublished commit")
 	}
 
-	e.addTodo("run_after_crash", "continue after the crash", "alpha")
 	code, body := e.post("/api/mercury/runs/run_after_crash/run", map[string]any{})
 	if code != http.StatusOK {
 		t.Fatalf("POST run: %d %s", code, body)
@@ -68,12 +72,12 @@ func TestChainKeepsUnpublishedCommitsOfAnInterruptedRun(t *testing.T) {
 	if !fileIn(gr.wt, "work/published.txt") {
 		t.Error("previously published work disappeared from the working state")
 	}
-	if !ancestorOf(t, gr.wt, unpublishedTip, "refs/heads/"+workbench.LegacyShared) {
-		t.Errorf("commit %s is no longer reachable from %s — it was discarded", unpublishedTip, workbench.LegacyShared)
+	if !ancestorOf(t, gr.wt, unpublishedTip, "refs/heads/"+branch) {
+		t.Errorf("commit %s is no longer reachable from %s — it was discarded", unpublishedTip, branch)
 	}
 	// And it is now secured on the remote: publish-after-commit reaches back over what the crashed
 	// run could not push.
-	if !ancestorOfIn(t, gr.origin, unpublishedTip, "refs/heads/"+workbench.LegacyShared) {
+	if !ancestorOfIn(t, gr.origin, unpublishedTip, "refs/heads/"+branch) {
 		t.Error("the recovered commit was never published — an abort would lose it again")
 	}
 }
@@ -378,7 +382,9 @@ func TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault(t *testing.T) {
 		t.Fatalf("maintenance: %v", err)
 	}
 
-	// Merged, mirrored, pruned — and the workbench branch is NEVER pruned.
+	// Merged, mirrored, pruned. The delivery branch IS the task's branch, so the prune ends the
+	// task's ref with the merge — there is no shared working branch left over to spare, and none
+	// was ever written.
 	after, err := e.deliveries.All()
 	if err != nil {
 		t.Fatal(err)
@@ -389,8 +395,9 @@ func TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault(t *testing.T) {
 	if gr.originHead("refs/heads/"+branch) != "" {
 		t.Errorf("the delivery branch %s survived its merge — merge and prune are the same place", branch)
 	}
-	if gr.originHead("refs/heads/"+workbench.LegacyShared) == "" {
-		t.Errorf("the working branch %s was pruned — it never falls under the prune", workbench.LegacyShared)
+	if stale := gr.originHead("refs/heads/" + workbench.LegacyShared); stale != "" {
+		t.Errorf("the retired shared branch %s exists (%s) — no task may commit onto it",
+			workbench.LegacyShared, stale)
 	}
 	if left, err := e.prs.List(); err != nil || len(left) != 0 {
 		t.Errorf("the merged pull request is still tracked: %+v (%v)", left, err)
