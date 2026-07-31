@@ -145,6 +145,7 @@ export const stubSource: DataSource = {
     return [];
   },
   mercuryRollbackDelivery: offline,
+  mercuryResumeDelivery: offline,
   mercuryRepoReset: offline,
   mercuryUploadAttachment: offline,
   mercuryDeleteAttachment: offline,

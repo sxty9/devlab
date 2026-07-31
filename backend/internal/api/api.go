@@ -298,6 +298,8 @@ func (s *Server) Handler() http.Handler {
 	// Mercury: deliveries (S10).
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))
 	mux.HandleFunc("POST /api/mercury/runs/deliveries/{id}/rollback", s.guardCSRF(s.runDeliveryRollback))
+	// The explicit resume a blocked pull request waits for (K-5) — the state existed, the way out did not.
+	mux.HandleFunc("POST /api/mercury/runs/deliveries/resume", s.guardCSRF(s.runPRResume))
 	mux.HandleFunc("POST /api/mercury/runs/reset", s.guardCSRF(s.runRepoReset))
 
 	// Todo media.

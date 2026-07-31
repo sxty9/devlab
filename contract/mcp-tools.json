@@ -866,6 +866,29 @@
       }
     },
     {
+      "name": "delivery_resume",
+      "description": "Release the blockade of a blocked pull request so the maintenance evaluates it again. Merges nothing; safe to repeat. Without arguments it releases every blocked one.",
+      "dataSourceOp": "mercuryResumeDelivery",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/deliveries/resume",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "number": {
+            "description": "Its pull request number; required together with repo.",
+            "type": "number"
+          },
+          "repo": {
+            "description": "owner/name of ONE blocked pull request; omit to release all.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
       "name": "delivery_rollback",
       "description": "Reverse one delivery by counter-committing it. History is never rewritten; a conflict becomes a ToDo.",
       "dataSourceOp": "mercuryRollbackDelivery",
