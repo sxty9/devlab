@@ -411,6 +411,44 @@ func (d *ChainDeps) RunDeliveries(runID, repo string) ([]runs.Delivery, error) {
 	return out, nil
 }
 
+// PriorImplementAt reports whether an earlier execution of this run already ran the implement stage
+// at repo. It is the run-scoped counterpart to the repo-global "workbench ahead": mercury-dev is
+// shared, so it cannot say whose commits it carries — the execution archive can.
+//
+// executed AND failed both count: the agent commits its own work, so an implement that ended in a
+// failure can still have left commits on the workbench. not-executed and not-applicable never ran.
+func (d *ChainDeps) PriorImplementAt(runID, repo string) (bool, error) {
+	if d.s.results == nil {
+		return false, errors.New("the execution archive is not available")
+	}
+	prior, err := d.s.results.ForRun(runID)
+	if err != nil {
+		return false, err
+	}
+	for _, res := range prior {
+		// stage-vocabulary: an archived pre-rebuild document carries the RETIRED stage names
+		// verbatim, and its execution never wrote into today's delivery ledger. It can therefore
+		// neither be compared here nor attest that commits on today's workbench are this run's —
+		// it is skipped by its PROVENANCE, not by a name comparison, so nothing is guessed. The
+		// skip errs towards "not implemented", which makes the agent run; the opposite error is
+		// the silent skip this whole rule exists against.
+		if res.Legacy {
+			continue
+		}
+		for _, rp := range res.Repos {
+			if !sameRepo(rp.Repo, repo) {
+				continue
+			}
+			for _, st := range rp.Stages {
+				if st.Stage == model.StageImplement && (st.State == model.StepExecuted || st.State == model.StepFailed) {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
 // runIDOf resolves the run behind an execution id through the state documents (and the result
 // archive, so an execution whose document was pruned still joins).
 func (d *ChainDeps) runIDOf(execID string) string {

@@ -599,6 +599,28 @@ func (d *fixtureDeps) RunDeliveries(runID, repo string) ([]runs.Delivery, error)
 	return out, nil
 }
 
+// PriorImplementAt answers from the SHIPPED execution archive — the run-scoped reading of the
+// shared workbench, resolved exactly the way production resolves it.
+func (d *fixtureDeps) PriorImplementAt(runID, repo string) (bool, error) {
+	prior, err := d.e.results.ForRun(runID)
+	if err != nil {
+		return false, err
+	}
+	for _, res := range prior {
+		for _, rp := range res.Repos {
+			if rp.Repo != repo {
+				continue
+			}
+			for _, st := range rp.Stages {
+				if st.Stage == model.StageImplement && (st.State == model.StepExecuted || st.State == model.StepFailed) {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
 func (d *fixtureDeps) OpenPRByHead(_ context.Context, repo, head string) (*model.PRRef, error) {
 	gh := d.world.gh
 	gh.mu.Lock()

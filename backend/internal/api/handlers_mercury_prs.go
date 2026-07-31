@@ -38,7 +38,7 @@ func (s *Server) runPRResume(w http.ResponseWriter, r *http.Request) {
 
 	freed, err := s.runPRs.ResumeBlocked(body.Repo, body.Number)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "The blockade could not be released: "+err.Error())
+		writeErr(w, http.StatusInternalServerError, "The blockade could not be resumed: "+err.Error())
 		return
 	}
 	if len(freed) > 0 {
@@ -49,5 +49,5 @@ func (s *Server) runPRResume(w http.ResponseWriter, r *http.Request) {
 	for _, p := range freed {
 		out = append(out, map[string]any{"repo": p.Repo, "number": p.Number, "url": p.URL})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"released": len(freed), "pullRequests": out})
+	writeJSON(w, http.StatusOK, map[string]any{"resumed": len(freed), "pullRequests": out})
 }

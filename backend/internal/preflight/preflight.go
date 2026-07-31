@@ -23,6 +23,10 @@ type Sources interface {
 	// RunDeliveries returns every ledger delivery this run produced at repo (joined via the
 	// run's executions), oldest first. Empty when the run never delivered there.
 	RunDeliveries(runID, repo string) ([]runs.Delivery, error)
+	// PriorImplementAt reports whether an earlier execution of THIS run already ran the
+	// implement stage at repo. The shared workbench cannot say whose commits it carries; the
+	// execution history can, and that is the only run-scoped reading of "ahead".
+	PriorImplementAt(runID, repo string) (bool, error)
 	// OpenPRByHead returns the open PR with the given head branch, nil when none.
 	OpenPRByHead(ctx context.Context, repo, head string) (*model.PRRef, error)
 	// ContainedInDefault reports whether commit is contained in the default branch.
@@ -45,11 +49,14 @@ type Finding struct {
 // unknown, each with evidence — NEVER from a stored flag (K-3). Pure over what Sources report;
 // an unreachable source yields unknown plus the error (never a guess).
 //
-// Rules (REQ-020, D 50):
-//   - an OPEN ledger delivery of this run at repo            ⇒ implemented-undelivered
-//   - the workbench ahead of the default branch              ⇒ implemented-undelivered
-//   - ≥ 1 delivery of this run merged, none open, not ahead  ⇒ delivered
-//   - otherwise                                              ⇒ not-implemented
+// Rules (REQ-020, D 50). Every rule is RUN-SCOPED: mercury-dev is a branch all runs share, so
+// what lies on it is never by itself an answer about THIS task.
+//   - an OPEN ledger delivery of this run at repo                      ⇒ implemented-undelivered
+//   - the workbench ahead, no delivery of this run recorded, and this
+//     run already ran implement here (the delivery was lost, not the
+//     work)                                                            ⇒ implemented-undelivered
+//   - ≥ 1 delivery of this run merged, none open                       ⇒ delivered
+//   - otherwise                                                        ⇒ not-implemented
 func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Finding, error) {
 	f := Finding{State: model.TaskUnknown, ObservedAt: time.Now().UTC()}
 
@@ -79,6 +86,26 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 		}
 	}
 
+	// "Ahead" attests that undelivered work EXISTS on mercury-dev — never whose it is. Reading it
+	// as this task's work is how a fresh task is silently skipped: implement creates nothing, every
+	// stage still reports executed, a delivery of another run's commits opens a pull request, and
+	// the work that was asked for never comes into existence. Measured 2026-07-31: all 23
+	// workbenches were ahead, so EVERY new task on EVERY repo would have been skipped.
+	//
+	// There is exactly one reading under which those commits are this task's own: this run already
+	// ran implement here and the ledger never received the delivery — the crash between the agent's
+	// commit and the ledger record. That is the case the rest path exists for, and it is asked for
+	// only when the ledger holds nothing for this run at all.
+	restOfThisRun := false
+	if ahead && open == nil && merged == nil {
+		restOfThisRun, err = src.PriorImplementAt(run.ID, repo)
+		if err != nil {
+			f.Err = "execution history unreachable: " + err.Error()
+			f.Evidence = append(f.Evidence, f.Err)
+			return f, fmt.Errorf("preflight %s: %w", repo, err)
+		}
+	}
+
 	switch {
 	case open != nil:
 		f.State = model.TaskImplementedUndelivered
@@ -95,14 +122,22 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 		} else {
 			f.Evidence = append(f.Evidence, "no open PR for the delivery branch yet")
 		}
-	case ahead:
+	case restOfThisRun:
 		f.State = model.TaskImplementedUndelivered
 		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s; no open delivery recorded", short(head)))
+			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s and this run already ran implement here; the ledger holds no delivery for it — the delivery was lost, the work was not", short(head)))
 	case merged != nil:
 		f.State = model.TaskDelivered
-		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s; workbench not ahead of the default branch",
+		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s",
 			merged.ID, merged.MergedAt.UTC().Format(time.RFC3339)))
+		if ahead {
+			f.Evidence = append(f.Evidence,
+				fmt.Sprintf("workbench mercury-dev is ahead @%s — undelivered work of another run, not this task's", short(head)))
+		}
+	case ahead:
+		f.State = model.TaskNotImplemented
+		f.Evidence = append(f.Evidence,
+			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s, but this run never ran implement here — that work belongs to another run", short(head)))
 	default:
 		f.State = model.TaskNotImplemented
 		f.Evidence = append(f.Evidence,

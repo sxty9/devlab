@@ -71,12 +71,12 @@ export function NoticesPanel() {
     try {
       const out = await source.mercuryResumeDelivery();
       toast({
-        title: out.released > 0 ? `${out.released} blocked deliveries released` : 'Nothing was blocked',
-        description: out.released > 0 ? 'The next maintenance pass evaluates them again.' : undefined,
+        title: out.resumed > 0 ? `${out.resumed} blocked deliveries resumed` : 'Nothing was blocked',
+        description: out.resumed > 0 ? 'The next maintenance pass evaluates them again.' : undefined,
       });
       await reload();
     } catch (e) {
-      toast({ title: 'The blockade could not be released', description: errMsg(e), variant: 'danger' });
+      toast({ title: 'The blockade could not be resumed', description: errMsg(e), variant: 'danger' });
     } finally {
       setBusy(false);
     }

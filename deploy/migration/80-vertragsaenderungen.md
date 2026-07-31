@@ -1151,3 +1151,56 @@ goes with the blockade, nothing is merged or removed, and a second press frees n
 `TestResumingAnUnknownPullRequestChangesNothing` holds that naming an untracked pull request invents
 none. Parity stays list-shaped as before: `TestToolTableMirrorsTheDataSource` and
 `TestEveryRouteHasAToolOrAStatedReason`.
+
+---
+
+## The task state is derived per RUN, not per workbench
+
+**What changed:** `preflight.Sources` gains one observation point, `PriorImplementAt(runID, repo)`,
+and `preflight.Derive` uses it. The rule "the workbench is ahead of the default branch ⇒
+implemented-undelivered" is no longer a rule on its own; it holds only where THIS run already ran
+the implement stage at that repository and the ledger holds no delivery for it. A merged delivery of
+this run now outranks an ahead workbench instead of the other way round.
+
+Alongside it, the wire key of the resume answer is `resumed`, not `released` — the contract's word
+for `delivered` may not be reused for something else, and its sibling `mercuryResumeReportDelivery`
+already answered with `resumed`.
+
+**Why:** `mercury-dev` is a branch every run shares. That it runs ahead attests that undelivered
+work EXISTS — never whose it is. The old rule read it as the current task's own work, so a fresh
+task on a repository carrying anyone's undelivered commit took the rest path: implement created
+nothing, every stage still reported `executed`, a delivery of the OTHER run's commits opened a pull
+request, and the work that had been asked for never came into existence. Nothing looked wrong
+anywhere.
+
+Measured on 2026-07-31 on the running instance: all 23 workbenches were ahead — from 1 commit
+(presentr, remshel, scheme, …) to 34 (devlab). Every new task on every repository would have been
+skipped this way. It was found because the todo "Presentr: Dateien hochladen als Raumwissen" reported
+`implement: already implemented — nothing new created` at a token consumption of 0.
+
+**What it does and does not do:** the second run at a shared repository now implements its own task
+instead of being declared done. It is not re-implementing anything — a second agent run over the SAME
+task stays fenced, by the same rule, now run-scoped: an open ledger delivery of this run, or this
+run's own earlier implement, still take the rest path. The execution archive is read as a source like
+any other: unreachable ⇒ `unknown`, named, never guessed. An archived pre-rebuild document is skipped
+by its provenance (`Result.Legacy`) rather than by a stage-name comparison, because it carries the
+retired vocabulary and never wrote into today's ledger.
+
+**State of record:**
+
+- `backend/internal/preflight/preflight.go@4e806dc4522e`
+- `backend/internal/api/exec_deps.go@bcf33917e207`
+- `backend/internal/api/handlers_mercury_prs.go@fa5ab380dc71`
+- `src/data/source.ts@a04b0b6b865f`
+- `src/views/mercury/NoticesPanel.tsx@e9fae0d92d0a`
+
+**Diff hint:**
+`git diff b6ed499 -- backend/internal/preflight backend/internal/api/exec_deps.go backend/internal/api/handlers_mercury_prs.go src/data/source.ts src/views/mercury/NoticesPanel.tsx`.
+**Proof:** `backend/internal/preflight/preflight_test.go`:
+`TestDeriveForeignWorkOnSharedWorkbenchIsNotThisTask` holds the fault itself — an ahead workbench
+without this run's own implement is `not-implemented`, and the evidence names whose work it is;
+`TestDeriveThreeStates/implemented-undelivered via workbench ahead after this run's own implement`
+holds the one case the rest path exists for; `TestDeriveMergedWinsOverForeignAhead` holds the new
+precedence; `TestDeriveUnknownOnUnreachableHistory` holds the honest unknown. End to end,
+`backend/it/race_test.go:TestRepositoryExclusivityQueuesInsteadOfSkipping` now counts two agent runs
+at the shared repository, one per task, where it previously counted one.
