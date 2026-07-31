@@ -4,6 +4,9 @@ import { getDataSource } from '@/data';
 import { currentView, parseHash, toHash, type View } from './route';
 import { SignInGate, AccessDenied } from '@/shell/LoginGate';
 import { GitHubLinkGate } from '@/shell/GitHubLinkGate';
+
+/** Uniform error-to-string — the same shape the rest of the surface uses. */
+const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
 import { Splash } from '@/shell/Splash';
 
 type Phase = 'boot' | 'login' | 'denied' | 'github-link' | 'ready';
@@ -36,7 +39,8 @@ interface SessionContextValue {
   user: User;
   repos: Repo[];
   /** The repo listing failed (GitHub unreachable). The dashboard offers a retry. */
-  reposError: boolean;
+  /** Why the repository list could not be read — the MEASURED reason, null when it could. */
+  reposError: string | null;
   reloadRepos: () => void;
 
   view: View;
@@ -66,7 +70,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const [phase, setPhase] = useState<Phase>('boot');
   const [user, setUser] = useState<User>(FALLBACK_USER);
   const [repos, setRepos] = useState<Repo[]>([]);
-  const [reposError, setReposError] = useState(false);
+  const [reposError, setReposError] = useState<string | null>(null);
 
   const [view, setView] = useState<View>(currentView);
   const [openedRepo, setOpenedRepo] = useState<string | null>(null);
@@ -94,11 +98,14 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     try {
       const rs = await source.repos();
       setRepos(rs);
-      setReposError(false);
+      setReposError(null);
       return rs;
-    } catch {
-      // A GitHub outage must not look like a signed-out session — surface it on the dashboard.
-      setReposError(true);
+    } catch (e) {
+      // A failed read must not look like a signed-out session — it is surfaced on the dashboard.
+      // The REASON is kept: throwing it away is what made the dashboard blame GitHub for a fault it
+      // had never measured (the browser inspection saw our OWN server answer 502 while the surface
+      // said "GitHub is unreachable").
+      setReposError(errMsg(e));
       setRepos([]);
       return [];
     }
