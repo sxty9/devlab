@@ -413,7 +413,7 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 	case "", "none":
 		rc.logf("interface: none — this service ships no dashboard face")
 	case "built":
-		rc.logf("interface: built and wired into the shared dashboard")
+		rc.logf("interface: built and delivered to the serve root the browser reads — the new dashboard is what users now fetch")
 	case "foreign-blocked":
 		rc.logf("interface: verified and wired in, but the shared dashboard build is blocked by another service: %s", clip(out.UIDetail))
 	default:

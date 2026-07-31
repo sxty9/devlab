@@ -255,9 +255,11 @@ func TestInstallCheckUIUnconfiguredIsNamed(t *testing.T) {
 	}
 }
 
-// A ui-bearing service WITH a configured dashboard plans the wire-in + shared rebuild, and names the
-// isolation rule (own failure fails the stage; a foreign failure is reported, not charged here).
-func TestInstallCheckUIConfiguredPlansWireInAndBuild(t *testing.T) {
+// A ui-bearing service WITH a configured dashboard plans the wire-in, the OWNER-run rebuild (root
+// never builds) AND the delivery to the serve root the browser reads — and it makes explicit that
+// `built` is gated on ARRIVAL there, not on the build. This is the checkpoint pulled from "was it
+// built?" onto "did it arrive?" (the confusion that let a rebuilt-but-undelivered dashboard read green).
+func TestInstallCheckUIConfiguredPlansWireInBuildAndServe(t *testing.T) {
 	env, workRoot, _ := installEnv(t)
 	artifact := filepath.Join(workRoot, "runner", "svc-a", ".mercury-artifact")
 	if err := os.MkdirAll(filepath.Join(artifact, "ui"), 0o755); err != nil {
@@ -270,17 +272,29 @@ func TestInstallCheckUIConfiguredPlansWireInAndBuild(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(holistic, "frontend", "external"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	www := filepath.Join(t.TempDir(), "www") // the serve root the browser reads — named in the plan
 	env["DEVLAB_HOLISTIC_REPO"] = holistic
+	env["DEVLAB_HOLISTIC_WWW"] = www
 	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
 	if res.exit != 0 {
 		t.Fatalf("a configured ui check must exit 0, got %d\n%s", res.exit, res.out)
 	}
 	for _, want := range []string{
-		"external/svc-a", "npm run build", "MERCURY-UI: planned", "foreign-blocked",
+		"external/svc-a",           // (1) the wire-in
+		"AS THE CHECKOUT OWNER",    // (2) the rebuild runs unprivileged — root never builds
+		"DELIVER the built bundle", // (3) the delivery step that was missing
+		www,                        // …to the serve root the browser fetches from
+		"ARRIVED",                  // built is gated on arrival, not on the build
+		"MERCURY-UI: planned", "foreign-blocked",
 	} {
 		if !strings.Contains(res.out, want) {
 			t.Errorf("the ui plan should mention %q: %s", want, res.out)
 		}
+	}
+	// The old confusion, guarded against: the plan must NOT stop at the build as the last word on the
+	// ui half — the serve root has to be the measure.
+	if !strings.Contains(res.out, "serve root") {
+		t.Errorf("the plan must make the serve root the measure of the ui half: %s", res.out)
 	}
 }
 
@@ -326,8 +340,10 @@ func TestInstallCheckUINeutralisesEditorTsconfig(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeOrigin(t, filepath.Dir(artifact), testOwner, repo)
+			www := filepath.Join(state, "www") // a distinct serve root per service — the browser's source
 			env := map[string]string{
 				"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner, "DEVLAB_HOLISTIC_REPO": holistic,
+				"DEVLAB_HOLISTIC_WWW": www,
 			}
 			res := runWrapper(t, "deploy/devlab-install", env, repo, artifact, "dev", "--check", "--port", "8772")
 			if res.exit != 0 {
@@ -337,7 +353,17 @@ func TestInstallCheckUINeutralisesEditorTsconfig(t *testing.T) {
 				t.Errorf("%q: the plan must report the editor tsconfig neutralised and plan the build: %s", repo, res.out)
 			}
 			if strings.Contains(res.out, "MERCURY-UI: would-fail") {
-				t.Errorf("%q: the editor tsconfig was NOT neutralised — the copy still carries the outside-tree extends: %s", repo, res.out)
+				t.Errorf("%q: the editor tsconfig was NOT neutralised or the serve step did not deliver: %s", repo, res.out)
+			}
+			// Point 4: a ui change reaches the browser for MORE THAN ONE service. Each of presentr and
+			// contax must plan the delivery of its built bundle to ITS OWN serve root — proven here, and
+			// (b) the serve step itself is simulated on a throwaway pair inside --check, so a green plan
+			// means the copy that ships actually moves the bundle, not merely that it was built.
+			if !strings.Contains(res.out, "DELIVER the built bundle") || !strings.Contains(res.out, www) {
+				t.Errorf("%q: the plan must deliver the built bundle to the serve root %s: %s", repo, www, res.out)
+			}
+			if !strings.Contains(res.out, "ARRIVED at "+www) {
+				t.Errorf("%q: built must be gated on arrival at the serve root, not on the build: %s", repo, res.out)
 			}
 		})
 	}

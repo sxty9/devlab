@@ -1167,6 +1167,7 @@ existing caller of a program-only service (no `ui/`) changes; its half-report re
 **Proof:** `backend/internal/deploy/deploy_test.go` (`TestDeliverDevReportsUIHalf`,
 `TestDeliverDevUIFailureFailsStageButNamesProgram`, `TestDeliverDevForeignBlockedUIStillDelivers`,
 `TestParseUILine`) and `backend/internal/deploy/wrapper_test.go` (`TestInstallCheckNoUIReportsNone`,
-`TestInstallCheckUIUnconfiguredIsNamed`, `TestInstallCheckUIConfiguredPlansWireInAndBuild`) — the
+`TestInstallCheckUIUnconfiguredIsNamed`, `TestInstallCheckUIConfiguredPlansWireInBuildAndServe`) — the
 wrapper tests run the real `deploy/devlab-install` under `--check`, so the security cascade still
-precedes the UI step.
+precedes the UI step, and the plan now covers the wire-in, the owner-run rebuild AND the delivery to
+the serve root the browser reads (`built` is gated on arrival there, not on the build).
