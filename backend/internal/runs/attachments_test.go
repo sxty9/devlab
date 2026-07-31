@@ -10,7 +10,7 @@ import (
 func TestAttachmentStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_ATTACHMENTS", dir)
-	a := NewAttachmentStore()
+	a := NewAttachmentStore(nil)
 
 	runID, attID := NewID(), NewAttachmentID()
 	data := []byte("\x89PNG\r\n\x1a\n not really a png")
@@ -43,7 +43,7 @@ func TestAttachmentStoreRoundTrip(t *testing.T) {
 func TestAttachmentStoreDeleteAll(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_ATTACHMENTS", dir)
-	a := NewAttachmentStore()
+	a := NewAttachmentStore(nil)
 
 	runID := NewID()
 	for i := 0; i < 3; i++ {
@@ -66,7 +66,7 @@ func TestAttachmentStoreDeleteAll(t *testing.T) {
 func TestAttachmentStoreRejectsCraftedIDs(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("DEVLAB_MERCURY_ATTACHMENTS", dir)
-	a := NewAttachmentStore()
+	a := NewAttachmentStore(nil)
 
 	bad := []struct{ run, att string }{
 		{"../escape", "att_ok"},

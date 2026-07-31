@@ -1,6 +1,12 @@
-const { chromium } = await import('/home/nanu/devlab/node_modules/playwright/index.mjs');
-const OUT = '/home/nanu/devlab/brand';
+// Regenerates the brand marks next to this script. Both playwright and the output directory are
+// resolved RELATIVE to this file, so the script carries no machine- or user-specific path
+// (universality: instance specifics live in the runtime, never in the repo).
 import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const OUT = dirname(fileURLToPath(import.meta.url));
+const { chromium } = await import('playwright');
 mkdirSync(OUT, { recursive: true });
 
 // A DevLab OAuth-app logo, faithful to the in-app brand: the code-brackets glyph (icons.tsx CodeIcon,

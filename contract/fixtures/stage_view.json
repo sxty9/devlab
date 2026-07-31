@@ -1,0 +1,8 @@
+{
+  "stage": "deliver-dev",
+  "state": "not-applicable",
+  "reason": "library — nothing to deploy",
+  "evidence": "no service CLI, no cmd/\u003cid\u003ed",
+  "startedAt": "2026-07-28T03:00:00Z",
+  "endedAt": "2026-07-28T03:10:00Z"
+}

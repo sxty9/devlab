@@ -2,9 +2,9 @@ import { useCallback, useRef } from 'react';
 import Editor, { type OnMount } from '@monaco-editor/react';
 import { useWorkspace } from '@/state/workspace';
 import { useToast } from '@/ui/Toast';
-import { ensureDevlabTheme } from './monacoTheme';
+import { devlabThemeName, ensureDevlabTheme } from './monacoTheme';
 import { PathBreadcrumb } from '@/ui/PathBreadcrumb';
-import { CopyIcon, SplitIcon } from '@/ui/icons';
+import { CopyIcon } from '@/ui/icons';
 
 /** Monaco editor surface with a path breadcrumb. Fully editable: edits are held as per-tab drafts
  *  in the workspace, Cmd/Ctrl-S writes them to the backend working tree. Read-only repos (GitHub
@@ -42,28 +42,20 @@ export function EditorView({ repoId, path, lang }: { repoId: string; path: strin
         <div className="dl-scroll flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
           <PathBreadcrumb path={path} interactive />
           {!canWrite && (
-            <span className="ml-1.5 shrink-0 rounded-sm bg-fill/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-text-tertiary" title="Read-only access on GitHub">
+            <span className="ml-1.5 shrink-0 rounded-sm bg-fill/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-text-tertiary">
               read-only
             </span>
           )}
         </div>
+        {/* Only actions that really do something belong here: a control that merely announces a
+            future feature asserts a capability the service does not have (B 1.4). */}
         <button
           type="button"
           onClick={copyPath}
           aria-label="Copy path"
-          title="Copy path"
           className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-text-tertiary transition hover:bg-fill/10 hover:text-text-secondary"
         >
           <CopyIcon className="h-3.5 w-3.5" />
-        </button>
-        <button
-          type="button"
-          onClick={() => toast({ title: 'Split editor', description: 'Side-by-side editing arrives with the backend.' })}
-          aria-label="Split editor"
-          title="Split editor (phase 2)"
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-text-tertiary transition hover:bg-fill/10 hover:text-text-secondary"
-        >
-          <SplitIcon className="h-3.5 w-3.5" />
         </button>
       </div>
       <div className="min-h-0 flex-1">
@@ -71,7 +63,7 @@ export function EditorView({ repoId, path, lang }: { repoId: string; path: strin
           path={`${repoId}/${path}`}
           language={lang}
           value={code}
-          theme="devlab-dark"
+          theme={devlabThemeName()}
           onMount={onMount}
           onChange={(v) => onEdit(path, v ?? '')}
           loading={<div className="p-4 text-footnote text-text-tertiary">Loading editor…</div>}

@@ -346,24 +346,6 @@ func ClosePullRequest(ctx context.Context, token, fullName string, number int) e
 	return err
 }
 
-// DeleteBranch deletes a branch ref (DELETE /git/refs/heads/<branch>). It is idempotent: a branch that is
-// already gone (404) is treated as success, so a caller can prune a merged delivery branch without first
-// checking whether it still exists. Deleting a merged PR's head branch also makes GitHub auto-retarget any
-// PR stacked on it to that branch's base — which is exactly how the stacked delivery chain collapses onto
-// the default branch as each predecessor merges.
-func DeleteBranch(ctx context.Context, token, fullName, branch string) error {
-	owner, name, ok := strings.Cut(fullName, "/")
-	if !ok || owner == "" || name == "" {
-		return fmt.Errorf("github: bad repo %q", fullName)
-	}
-	res, err := doMethod(ctx, http.MethodDelete, token,
-		fmt.Sprintf("%s/repos/%s/%s/git/refs/heads/%s", apiBase, owner, name, url.PathEscape(branch)), nil, nil)
-	if res != nil && res.StatusCode == http.StatusNotFound {
-		return nil // already gone — pruning is idempotent
-	}
-	return err
-}
-
 // AddPullRequestComment posts a comment on a PR (via the issues endpoint — a PR is an issue). Used to
 // record the justification for closing a rolled-back PR before it is closed.
 func AddPullRequestComment(ctx context.Context, token, fullName string, number int, body string) error {

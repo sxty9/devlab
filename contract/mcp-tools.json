@@ -1,0 +1,2038 @@
+{
+  "protocolVersion": "2025-06-18",
+  "tools": [
+    {
+      "name": "agent_ask",
+      "description": "Run an agentic AI turn that may edit the workspace; answers the refreshed change set.",
+      "dataSourceOp": "askAgent",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/agent",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "effort": {
+            "description": "Reasoning effort the engine supports.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "How far the agent may act on its own.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Model id from assistant_model_list.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The task.",
+            "type": "string"
+          },
+          "resume": {
+            "description": "Prior session id, to continue that conversation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "prompt"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "ai_usage_get",
+      "description": "Read the aggregated AI token and cost use.",
+      "dataSourceOp": "serviceAiUsage",
+      "method": "GET",
+      "route": "GET /api/service/ai-usage",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "assistant_ask",
+      "description": "Ask one read-only AI turn about the repository. The answer names the model that produced it.",
+      "dataSourceOp": "askAssistant",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/assistant",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "contextPaths": {
+            "description": "Repository-relative files to put in context.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "effort": {
+            "description": "Reasoning effort the engine supports.",
+            "type": "string"
+          },
+          "history": {
+            "description": "Prior turns as {role, content} messages.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Engine choice; omitted lets the service choose.",
+            "type": "string"
+          },
+          "model": {
+            "description": "Model id from assistant_model_list.",
+            "type": "string"
+          },
+          "prompt": {
+            "description": "The question.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "prompt"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "assistant_history_get",
+      "description": "Read the stored assistant conversation for a repository.",
+      "dataSourceOp": "getAssistantHistory",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/assistant/history",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "assistant_history_set",
+      "description": "Replace the stored assistant conversation for a repository.",
+      "dataSourceOp": "saveAssistantHistory",
+      "method": "PUT",
+      "route": "PUT /api/repos/{id}/assistant/history",
+      "tier": "write",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "messages": {
+            "description": "The full conversation as {role, content} messages.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "messages"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "assistant_model_list",
+      "description": "List the AI models and engines available to the caller.",
+      "dataSourceOp": "assistantModels",
+      "method": "GET",
+      "route": "GET /api/assistant/models",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "atlas_get",
+      "description": "Read the service landscape graph.",
+      "dataSourceOp": "atlas",
+      "method": "GET",
+      "route": "GET /api/atlas",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "attachment_delete",
+      "description": "Remove one attachment from a ToDo and answer the refreshed list.",
+      "dataSourceOp": "mercuryDeleteAttachment",
+      "method": "DELETE",
+      "route": "DELETE /api/mercury/runs/{id}/attachments/{aid}",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachmentId": {
+            "description": "Attachment id.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentId",
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "attachment_read",
+      "description": "Read one ToDo attachment's bytes.",
+      "dataSourceOp": "mercuryAttachmentRawUrl",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}/attachments/{aid}/raw",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "attachmentId": {
+            "description": "Attachment id.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachmentId",
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "attachment_upload",
+      "description": "Attach a base64 file to a ToDo and answer the refreshed attachment list.",
+      "dataSourceOp": "mercuryUploadAttachment",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/attachments",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "contentB64": {
+            "description": "File content, base64-encoded.",
+            "type": "string"
+          },
+          "filename": {
+            "description": "File name to store it under.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contentB64",
+          "filename",
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_conform",
+      "description": "Check a record draft against the constitution's own form rules.",
+      "dataSourceOp": "mercuryConform",
+      "method": "POST",
+      "route": "POST /api/mercury/conform",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Draft text.",
+            "type": "string"
+          },
+          "titel": {
+            "description": "Draft title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "titel"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_create",
+      "description": "Add a constitution record. Answers a duplicate or a conformance objection instead of writing when one applies.",
+      "dataSourceOp": "mercuryAddAxiom",
+      "method": "POST",
+      "route": "POST /api/mercury/axiom",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Record text.",
+            "type": "string"
+          },
+          "force": {
+            "description": "Write even though a similar record exists.",
+            "type": "boolean"
+          },
+          "section": {
+            "description": "Target category; omitted lets the service classify.",
+            "type": "string"
+          },
+          "titel": {
+            "description": "Record title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "titel"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_delete",
+      "description": "Delete one constitution record.",
+      "dataSourceOp": "mercuryDeleteAxiom",
+      "method": "DELETE",
+      "route": "DELETE /api/mercury/axiom",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "Record path to delete.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_get",
+      "description": "Read one constitution record with its authorship.",
+      "dataSourceOp": "mercuryItem",
+      "method": "GET",
+      "route": "GET /api/mercury/item",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "Record path in the constitution tree.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_move",
+      "description": "Move one constitution record to another category.",
+      "dataSourceOp": "mercuryMoveAxiom",
+      "method": "POST",
+      "route": "POST /api/mercury/move",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "Current record path.",
+            "type": "string"
+          },
+          "to": {
+            "description": "Target record path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_optimize",
+      "description": "Answer a sharpened wording for a record draft without writing it.",
+      "dataSourceOp": "mercuryOptimize",
+      "method": "POST",
+      "route": "POST /api/mercury/optimize",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Draft text.",
+            "type": "string"
+          },
+          "section": {
+            "description": "Category the draft is meant for.",
+            "type": "string"
+          },
+          "titel": {
+            "description": "Draft title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "titel"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_tree",
+      "description": "Read the constitution tree: categories with their records.",
+      "dataSourceOp": "mercuryTree",
+      "method": "GET",
+      "route": "GET /api/mercury/tree",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "axiom_update",
+      "description": "Replace one constitution record's title and text.",
+      "dataSourceOp": "mercuryEditAxiom",
+      "method": "PUT",
+      "route": "PUT /api/mercury/axiom",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "New text.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Record path to edit.",
+            "type": "string"
+          },
+          "titel": {
+            "description": "New title.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "path",
+          "titel"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "branch_checkout",
+      "description": "Switch the workspace to an existing branch.",
+      "dataSourceOp": "checkout",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/checkout",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Branch to check out.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "branch_create",
+      "description": "Create a branch and switch to it.",
+      "dataSourceOp": "createBranch",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/branch",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "Branch to start from; omitted uses the current one.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "name": {
+            "description": "New branch name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "calendar_get",
+      "description": "Read the due dates and executions on the calendar.",
+      "dataSourceOp": "mercuryRunCalendar",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/calendar",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "days": {
+            "description": "How many days ahead to include.",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "Narrow to one kind of run.",
+            "enum": [
+              "todo",
+              "auto"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "category_move",
+      "description": "Move a whole constitution category, records included.",
+      "dataSourceOp": "mercuryMoveCategory",
+      "method": "POST",
+      "route": "POST /api/mercury/move-category",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "description": "Current category path.",
+            "type": "string"
+          },
+          "to": {
+            "description": "Target category path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "category_reorder",
+      "description": "Set the display order of the records inside one category.",
+      "dataSourceOp": "mercuryReorder",
+      "method": "POST",
+      "route": "POST /api/mercury/reorder",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "category": {
+            "description": "Category path.",
+            "type": "string"
+          },
+          "order": {
+            "description": "Record ids in the wanted order.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "category",
+          "order"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "change_stage",
+      "description": "Stage one changed path for the next commit.",
+      "dataSourceOp": "stage",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/stage",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative path to stage.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "change_unstage",
+      "description": "Unstage one path again.",
+      "dataSourceOp": "unstage",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/unstage",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative path to unstage.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "comment_create",
+      "description": "Add a comment to a file, optionally as a reply.",
+      "dataSourceOp": "addComment",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/comments",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Comment text.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "parentId": {
+            "description": "Comment to reply to; omitted starts a thread.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative path the comment belongs to.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body",
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "comment_delete",
+      "description": "Delete one comment the caller is allowed to remove.",
+      "dataSourceOp": "deleteComment",
+      "method": "DELETE",
+      "route": "DELETE /api/repos/{id}/comments/{cid}",
+      "tier": "write",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "commentId": {
+            "description": "Comment id.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commentId",
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "comment_list",
+      "description": "List the comment threads on one file.",
+      "dataSourceOp": "listComments",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/comments",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative path the thread hangs on.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "commit_create",
+      "description": "Commit the staged changes on the current branch.",
+      "dataSourceOp": "commit",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/commit",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Commit message.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "message"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "config_get",
+      "description": "Read the service configuration.",
+      "dataSourceOp": "serviceConfig",
+      "method": "GET",
+      "route": "GET /api/service/config",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "config_set",
+      "description": "Replace the service configuration. It takes effect at once — a smaller capacity lets running executions finish, a larger one starts what waits.",
+      "note": "The UI deliberately does not write configuration: it is maintained centrally, so this tool is the named caller of the configuration-write route.",
+      "method": "PUT",
+      "route": "PUT /api/service/config",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "automergeWindow": {
+            "description": "How long a delivery may wait for automatic merge, as a duration.",
+            "type": "string"
+          },
+          "defaultTimeBudget": {
+            "description": "Default time budget per execution, as a duration (for example 3h).",
+            "type": "string"
+          },
+          "maxConcurrency": {
+            "description": "How many executions may run at once.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "automergeWindow",
+          "defaultTimeBudget",
+          "maxConcurrency"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "delivery_list",
+      "description": "List the deliveries: what was delivered where, in which state.",
+      "dataSourceOp": "mercuryDeliveries",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/deliveries",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "delivery_rollback",
+      "description": "Reverse one delivery by counter-committing it. History is never rewritten; a conflict becomes a ToDo.",
+      "dataSourceOp": "mercuryRollbackDelivery",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/deliveries/{id}/rollback",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "deliveryId": {
+            "description": "Delivery id from delivery_list.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "deliveryId"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "execution_active_list",
+      "description": "List the executions running right now, plus the restart state.",
+      "dataSourceOp": "mercuryRunActive",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/active",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "execution_list",
+      "description": "List stored executions (the history), newest first.",
+      "dataSourceOp": "mercuryRunExecutions",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/executions",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "description": "Narrow to one kind of run.",
+            "enum": [
+              "todo",
+              "auto"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_diff",
+      "description": "Read one file's working-tree diff as before/after text.",
+      "dataSourceOp": "fileDiff",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/diff",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative file path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_read",
+      "description": "Read one file from the repository workspace.",
+      "dataSourceOp": "fileContent",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/file",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative file path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "file_write",
+      "description": "Write file content in the workspace and answer the refreshed change set.",
+      "dataSourceOp": "saveFile",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/file",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "Full new file content.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative file path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "github_unlink",
+      "description": "Remove the caller's GitHub link.",
+      "dataSourceOp": "unlinkGitHub",
+      "method": "POST",
+      "route": "POST /api/github/unlink",
+      "tier": "write",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "mercury_chat",
+      "description": "Talk to the planning assistant about the constitution and the run plan; it answers with proposed actions.",
+      "dataSourceOp": "mercuryChat",
+      "method": "POST",
+      "route": "POST /api/mercury/chat",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "messages": {
+            "description": "The conversation as {role, content} messages; role is one of: user, assistant.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "notice_clear",
+      "description": "Mark every notice as read.",
+      "dataSourceOp": "mercuryClearRunNotices",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/notices/clear",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "notice_dismiss",
+      "description": "Mark one notice as read.",
+      "dataSourceOp": "mercuryDismissRunNotice",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/notices/dismiss",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Notice id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "notice_list",
+      "description": "List the standing notices the service raised about itself.",
+      "dataSourceOp": "mercuryRunNotices",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/notices",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "port_list",
+      "description": "Read the port ledger derived from the observed host state, including double bookings.",
+      "dataSourceOp": "atlasPorts",
+      "method": "GET",
+      "route": "GET /api/atlas/ports",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "pr_open",
+      "description": "Push the current branch and open (or adopt) its pull request into the default branch.",
+      "dataSourceOp": "openPR",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/pr",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "description": "Pull-request description.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Pull-request title; omitted uses the branch name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_ensure",
+      "description": "Prepare the caller's workspace for a repository (clone if absent). Idempotent.",
+      "dataSourceOp": "ensureRepo",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/ensure",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_get",
+      "description": "Read one repository: file tree, changes, branches and tracking state.",
+      "dataSourceOp": "repoData",
+      "method": "GET",
+      "route": "GET /api/repos/{id}",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "branch": {
+            "description": "Branch to read; omitted reads the checked-out one.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_list",
+      "description": "List the repositories the caller may work on.",
+      "dataSourceOp": "repos",
+      "method": "GET",
+      "route": "GET /api/repos",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_pull",
+      "description": "Pull the current branch from its remote.",
+      "dataSourceOp": "pull",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/pull",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_push",
+      "description": "Push the current branch to its remote.",
+      "dataSourceOp": "push",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/push",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "repo_reset",
+      "description": "Discard the development branch of one repository and start it again from the default branch.",
+      "dataSourceOp": "mercuryRepoReset",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/reset",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "repo": {
+            "description": "Repository to reset.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repo"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "report_resume",
+      "description": "Resume a blocked daily report so it is attempted again. A blocked report waits for this: it never resumes itself.",
+      "dataSourceOp": "mercuryResumeReportDelivery",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/report-status",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "day": {
+            "description": "The day (YYYY-MM-DD) to resume; omit to resume every blocked day.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "report_status_get",
+      "description": "Read which daily reports were sent, to whom, and what failed.",
+      "dataSourceOp": "mercuryReportStatus",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/report-status",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_ai_fill",
+      "description": "Propose automatic runs for the constitution records that have none. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
+      "dataSourceOp": "mercuryRunAiFill",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/ai-fill",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "request starts an analysis of the uncovered records when none exists and otherwise reports the existing one unchanged; read reports the state without ever starting a model pass; cancel puts a running, finished or failed analysis aside. Starting over after a failure is cancel, then request. Default: request.",
+            "enum": [
+              "request",
+              "read",
+              "cancel"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_ai_finetune",
+      "description": "Propose a reshaped run plan for the whole constitution. Proposes only; nothing is written. The analysis is not waited for: every call answers with its state — running, completed with the proposal, or failed with the reason.",
+      "dataSourceOp": "mercuryRunAiFinetune",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/ai-finetune",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "request starts a regrouping analysis of the whole run plan when none exists and otherwise reports the existing one unchanged; read reports the state without ever starting a model pass; cancel puts a running, finished or failed analysis aside. Starting over after a failure is cancel, then request. Default: request.",
+            "enum": [
+              "request",
+              "read",
+              "cancel"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_assign",
+      "description": "Assign every constitution record that no run carries yet: a fitting run is extended, otherwise one is created. Answers with how many were uncovered and whether a pass started; the outcome arrives as a notice.",
+      "dataSourceOp": "mercuryRunAssign",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/assign",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_cancel",
+      "description": "Abort one run's live execution. Its transcript and result stay.",
+      "dataSourceOp": "mercuryCancelRun",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/cancel",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_coverage_get",
+      "description": "Read which constitution records are covered by a run and which are not.",
+      "dataSourceOp": "mercuryRunCoverage",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/coverage",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_create",
+      "description": "Create a run: a one-off ToDo or a scheduled automatic run.",
+      "dataSourceOp": "mercuryCreateRun",
+      "method": "POST",
+      "route": "POST /api/mercury/runs",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "description": "Whether the schedule is armed.",
+            "type": "boolean"
+          },
+          "axiomIds": {
+            "description": "Constitution records this run enforces (automatic runs).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dueAt": {
+            "description": "Due date as an RFC 3339 timestamp.",
+            "type": "string"
+          },
+          "kind": {
+            "description": "todo is a one-off task, auto a scheduled run.",
+            "enum": [
+              "todo",
+              "auto"
+            ],
+            "type": "string"
+          },
+          "schedule": {
+            "description": "When it runs, as answered by run_get.",
+            "type": "object"
+          },
+          "targets": {
+            "description": "Target repositories as {repo} or {newRepo} entries.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "task": {
+            "description": "The task text (ToDos).",
+            "type": "string"
+          },
+          "title": {
+            "description": "What the run is called.",
+            "type": "string"
+          },
+          "tuning": {
+            "description": "Per-run time budget and model settings, as answered by run_get.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_defer",
+      "description": "Free the slot but keep the progress: the execution pauses and can be resumed.",
+      "dataSourceOp": "mercuryDeferRun",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/defer",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_delete",
+      "description": "Delete one run. Its execution results stay readable.",
+      "dataSourceOp": "mercuryDeleteRun",
+      "method": "DELETE",
+      "route": "DELETE /api/mercury/runs/{id}",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_get",
+      "description": "Read one run with the axioms it references.",
+      "dataSourceOp": "mercuryRun",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_list",
+      "description": "List all runs with the axiom titles they reference.",
+      "dataSourceOp": "mercuryRuns",
+      "method": "GET",
+      "route": "GET /api/mercury/runs",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_prompt_get",
+      "description": "Read the prompt a run would execute with, as it stands now.",
+      "dataSourceOp": "mercuryRunPrompt",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}/prompt",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_proposal_apply",
+      "description": "Apply a proposed run plan: fill the gaps, or replace the automatic runs entirely.",
+      "dataSourceOp": "mercuryApplyRunProposal",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/apply-proposal",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "description": "fill keeps existing runs; replace discards them.",
+            "enum": [
+              "fill",
+              "replace"
+            ],
+            "type": "string"
+          },
+          "plan": {
+            "description": "The proposal as answered by run_ai_fill or run_ai_finetune.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "mode",
+          "plan"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_result_get",
+      "description": "Read one execution result document with its per-repository stage array.",
+      "dataSourceOp": "mercuryRunResult",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}/results/{rid}",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          },
+          "resultId": {
+            "description": "Result document id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resultId"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_result_list",
+      "description": "List one run's execution result documents, newest first.",
+      "dataSourceOp": "mercuryRunResults",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}/results",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_resume",
+      "description": "Resume a deferred or blocked execution where it stopped.",
+      "dataSourceOp": "mercuryResumeRun",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/resume",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_snapshot_list",
+      "description": "List the snapshots of the run plan, newest first.",
+      "dataSourceOp": "mercuryRunHistory",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/history",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_snapshot_restore",
+      "description": "Restore the run plan from one snapshot. The current plan is snapshotted first.",
+      "dataSourceOp": "mercuryRestoreRunHistory",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/history/restore",
+      "tier": "csrf",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ts": {
+            "description": "Snapshot timestamp from run_snapshot_list.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ts"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_start",
+      "description": "Start or resume a run. The answer is the honest outcome: started, queued, resumed, or a named reason.",
+      "dataSourceOp": "mercuryRunNow",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/run",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "fresh": {
+            "description": "Start over instead of resuming what is left.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          },
+          "placement": {
+            "description": "What to do when no slot is free: {kind, deferExecutionId} with kind one of: queue, defer, overload.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_update",
+      "description": "Replace one run's definition. Omitted fields are cleared — send the whole document.",
+      "dataSourceOp": "mercuryUpdateRun",
+      "method": "PUT",
+      "route": "PUT /api/mercury/runs/{id}",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "description": "Whether the schedule is armed.",
+            "type": "boolean"
+          },
+          "axiomIds": {
+            "description": "Constitution records this run enforces (automatic runs).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dueAt": {
+            "description": "Due date as an RFC 3339 timestamp.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          },
+          "kind": {
+            "description": "todo is a one-off task, auto a scheduled run.",
+            "enum": [
+              "todo",
+              "auto"
+            ],
+            "type": "string"
+          },
+          "schedule": {
+            "description": "When it runs, as answered by run_get.",
+            "type": "object"
+          },
+          "targets": {
+            "description": "Target repositories as {repo} or {newRepo} entries.",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "task": {
+            "description": "The task text (ToDos).",
+            "type": "string"
+          },
+          "title": {
+            "description": "What the run is called.",
+            "type": "string"
+          },
+          "tuning": {
+            "description": "Per-run time budget and model settings, as answered by run_get.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "slot_overview_get",
+      "description": "Read the execution slots: capacity, occupancy, deferred work and queued starts.",
+      "dataSourceOp": "mercurySlots",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/slots",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "storage_get",
+      "description": "Read how much data the service holds, per pool.",
+      "dataSourceOp": "serviceStorage",
+      "method": "GET",
+      "route": "GET /api/service/storage",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "telemetry_get",
+      "description": "Read the service's own resource use.",
+      "dataSourceOp": "serviceTelemetry",
+      "method": "GET",
+      "route": "GET /api/service/telemetry",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "user_get",
+      "description": "Read the calling identity: display name, DevLab access and GitHub-link state.",
+      "dataSourceOp": "getUser",
+      "method": "GET",
+      "route": "GET /api/user",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "vision_delete",
+      "description": "Delete one vision asset and answer the refreshed listing.",
+      "dataSourceOp": "deleteVision",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/vision/delete",
+      "tier": "write",
+      "readOnly": false,
+      "destructive": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Path inside the vision catalog.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "vision_list",
+      "description": "List the repository's vision assets.",
+      "dataSourceOp": "vision",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/vision",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "vision_read",
+      "description": "Read one vision asset's bytes (image, document or text).",
+      "dataSourceOp": "rawUrl",
+      "method": "GET",
+      "route": "GET /api/repos/{id}/raw",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Repository-relative path inside the vision catalog.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "vision_upload",
+      "description": "Upload a base64 asset into the vision catalog and answer the refreshed listing.",
+      "dataSourceOp": "uploadVision",
+      "method": "POST",
+      "route": "POST /api/repos/{id}/vision/upload",
+      "tier": "write",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "contentB64": {
+            "description": "File content, base64-encoded.",
+            "type": "string"
+          },
+          "id": {
+            "description": "Repository id.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Target path inside the vision catalog.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contentB64",
+          "id",
+          "path"
+        ],
+        "type": "object"
+      }
+    }
+  ],
+  "omittedDataSourceOps": [
+    {
+      "subject": "init",
+      "reason": "Bootstrap probe of the web surface (liveness plus identity); its substance is user_get."
+    },
+    {
+      "subject": "refreshSession",
+      "reason": "Re-mints the browser's short-lived cookie session; an agent authenticates per request with its own bearer token, so it has no session to refresh."
+    },
+    {
+      "subject": "githubAuthorizeUrl",
+      "reason": "Builds the address that starts the browser's GitHub consent flow — an interactive redirect, not a request/response capability."
+    },
+    {
+      "subject": "terminalUrl",
+      "reason": "Builds the WebSocket address of a shell session — a bidirectional stream with no request/response shape."
+    },
+    {
+      "subject": "events",
+      "reason": "Opens the one live-update stream; MCP carries its own notification channel, so a second stream would be a parallel path."
+    }
+  ],
+  "untooledRoutes": [
+    {
+      "subject": "GET /api/health",
+      "reason": "Public liveness probe, deliberately minimal; not a user capability."
+    },
+    {
+      "subject": "POST /api/auth/refresh",
+      "reason": "Cookie-session plumbing of the browser surface; an MCP caller authenticates per call."
+    },
+    {
+      "subject": "GET /api/github/authorize",
+      "reason": "Starts the browser's GitHub consent flow."
+    },
+    {
+      "subject": "GET /api/github/callback",
+      "reason": "Receives the browser's GitHub consent redirect."
+    },
+    {
+      "subject": "GET /api/repos/{id}/pty",
+      "reason": "Bidirectional terminal stream (WebSocket)."
+    },
+    {
+      "subject": "GET /api/events",
+      "reason": "The one live-update stream (server-sent events)."
+    },
+    {
+      "subject": "POST /api/mcp",
+      "reason": "The MCP endpoint itself — a tool for it would be a loop."
+    },
+    {
+      "subject": "/",
+      "reason": "Delivery of the web surface."
+    }
+  ]
+}

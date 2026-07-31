@@ -21,46 +21,27 @@
 # run an arbitrary command as this host's ssh user, never escape the staging/prod paths.
 #
 # Exit codes: 0 ok · 2 bad/blocked request · 3 no staged artifact / no mapping · 5 rrsync missing ·
-#             10 staged input missing · 12 service not running after install (failed deploy).
+#             10 staged input missing.
 #
 # Install (on the VPS): sudo install -o root -g root -m 0755 devlab-deploy-recv /usr/local/sbin/devlab-deploy-recv
 set -euo pipefail
 
-STAGING_ROOT="/var/lib/devlab/staging"
-CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
-HEALTH_WAIT="${DEVLAB_DEPLOY_HEALTH_WAIT:-15}"   # seconds to wait for a restarted unit to come up
+# The ONE state-root derivation shared by every DevLab wrapper (devlab-install, devlab-exec,
+# devlab-mkworkspace carry it verbatim): every path this receiver touches DERIVES from the state root,
+# so an instance with a different root does not end up with a receiver staging in one place and a
+# daemon serving from another. This host has no per-user workspaces — it is install-only — so what it
+# derives are the staging root the forced command receives into and the web root it serves from
+# (mirroring statepath.Www()).
+#
+# The overrides are a DIRECT-INVOCATION seam, never an input of the forced command: sshd hands the
+# client no environment (AcceptEnv does not list these names, and the key's `restrict` option disables
+# user-rc), so a client cannot move the staging boundary it is confined to.
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
+WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
-
-port_of() {  # the routed port in a caddy drop-in, or nothing
-  sed -n 's/.*reverse_proxy[[:space:]]\{1,\}127\.0\.0\.1:\([0-9]\{1,\}\).*/\1/p' "$1" 2>/dev/null | head -n1
-}
-
-port_listening() {  # 0 when something is in LISTEN on port $1
-  if command -v ss >/dev/null 2>&1; then
-    [[ -n "$(ss -ltnH "sport = :$1" 2>/dev/null)" ]]
-    return
-  fi
-  local hex; hex="$(printf '%04X' "$1")"
-  awk -v h="$hex" 'NR>1 && $4=="0A" { split($2,a,":"); if (a[2]==h) { print "y"; exit } }' \
-    /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q y
-}
-
-# assert_started <unit> <port>: a restart is not a start (Kein stummes Ausbleiben). Prod never reports
-# "done" for a service that did not actually come up — a crash-looping unit fails the deploy instead.
-assert_started() {
-  local unit="$1" port="$2" i
-  for (( i = 0; i < HEALTH_WAIT; i++ )); do
-    if systemctl is-active --quiet "$unit"; then
-      if [[ -z "$port" ]] || port_listening "$port"; then
-        return 0
-      fi
-    fi
-    sleep 1
-  done
-  die "'$unit' is not running after install${port:+ (:$port)} — failed deploy" 12
-}
 
 mkdir -p "$STAGING_ROOT"
 
@@ -102,18 +83,18 @@ case "$real/" in "$rootreal"/*) : ;; *) die "staged path escapes staging root" 2
 
 log "install-only prod deploy of '$REPO' from $real"
 
-# Per-repo prod install: map the prebuilt artifact to concrete prod paths + unit. NO build. Add a
-# case per deployable repo (mirrors the dev-side per-repo install).
+# Install the prebuilt artifact into concrete prod paths + unit. NO build, and no per-repo
+# scripts (B-44): every uniform service takes the ONE generic branch below; only the self repo
+# has a different artifact shape (daemon + web SPA) and therefore its own layout.
 case "$REPO" in
   devlab)
     BIN="$real/devlabd"; WEB="$real/web"
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
     install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
-    mkdir -p /var/lib/devlab/www
-    rsync -a --delete "$WEB"/ /var/lib/devlab/www/
+    mkdir -p "$WWW_DIR"
+    rsync -a --delete "$WEB"/ "$WWW_DIR"/
     systemctl restart devlabd
-    assert_started devlabd ""   # devlab is routed via sxgate, not a conf.d port — assert it is active
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
@@ -124,7 +105,6 @@ case "$REPO" in
     install -d -o root -g root -m 0755 "/opt/$REPO/bin"
     install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
     systemctl restart "$REPO"
-    assert_started "$REPO" "$(port_of "$CADDY_CONF/$REPO.caddy" || true)"
     ;;
 esac
 

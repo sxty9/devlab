@@ -1,0 +1,30 @@
+{
+  "notices": [
+    {
+      "id": "ntc_legacy1",
+      "at": "2026-07-28T10:50:43.480479964Z",
+      "kind": "assigned",
+      "runId": "run_auto2",
+      "runName": "Repository structure and hygiene",
+      "axiomIds": [
+        "ax_structure"
+      ],
+      "axioms": [
+        "Uniform code structure"
+      ]
+    },
+    {
+      "id": "ntc_legacy2",
+      "at": "2026-07-27T19:10:46.938203989Z",
+      "kind": "assigned",
+      "runId": "run_auto2",
+      "runName": "Repository structure and hygiene",
+      "axiomIds": [
+        "ax_branches"
+      ],
+      "axioms": [
+        "Tended branches"
+      ]
+    }
+  ]
+}

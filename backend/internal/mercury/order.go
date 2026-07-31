@@ -3,8 +3,9 @@ package mercury
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sort"
+
+	"devlab/backend/internal/fsatomic"
 )
 
 // A path-addressed store sorts each level by name, so Mercury has no inherent manual order. To let
@@ -32,18 +33,7 @@ func LoadOrder(path string) Order {
 
 // SaveOrder writes the order map to path atomically (tmp + rename), 0600.
 func SaveOrder(path string, o Order) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(o, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return fsatomic.WriteJSON(path, o)
 }
 
 // applyOrder sorts one node's children by the saved order for its path: named children first in the

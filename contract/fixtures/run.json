@@ -1,0 +1,45 @@
+{
+  "id": "run_x",
+  "kind": "todo",
+  "title": "Ship it",
+  "task": "Do the thing.",
+  "targets": [
+    {
+      "repo": "svc-a"
+    },
+    {
+      "repo": "new-svc",
+      "create": true
+    }
+  ],
+  "dueAt": "2026-07-28T04:00:00Z",
+  "tuning": {
+    "model": "opus",
+    "effort": "max",
+    "timeBudget": "3h0m0s"
+  },
+  "promptSnapshot": "# Task\n\nDo the thing.",
+  "attachments": [
+    {
+      "id": "att_1",
+      "filename": "sketch.png",
+      "mime": "image/png",
+      "size": 123,
+      "sha256": "ab12",
+      "uploadedAt": "2026-07-28T03:00:00Z",
+      "uploadedBy": "alice"
+    }
+  ],
+  "authorship": {
+    "created": {
+      "user": "alice"
+    },
+    "createdAt": "2026-07-28T03:00:00Z",
+    "updated": {
+      "user": "",
+      "autonomous": true,
+      "onBehalfOf": "alice"
+    },
+    "updatedAt": "2026-07-28T03:10:00Z"
+  }
+}

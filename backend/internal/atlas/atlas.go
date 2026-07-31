@@ -183,21 +183,11 @@ func stem(name, suffix string) (string, bool) {
 // holds facts, and every judgement about them is made here, outside it.
 func findings(nodes []Node, catalogKnown bool) []Finding {
 	var out []Finding
-	lo, hi := band()
 
 	byPort := map[int][]string{}
 	for _, n := range nodes {
 		if n.Port != 0 {
 			byPort[n.Port] = append(byPort[n.Port], n.ID)
-			// A port outside the managed band weicht von der zentralen Vergabe ab: it was set by hand
-			// rather than drawn from the band, so it cannot be reasoned about as free/taken.
-			if n.Port < lo || n.Port > hi {
-				out = append(out, Finding{
-					Severity: "warn",
-					Message:  n.ID + " läuft auf Port " + strconv.Itoa(n.Port) + " außerhalb des verwalteten Bands " + bandStr(lo, hi) + ".",
-					Nodes:    []string{n.ID},
-				})
-			}
 		}
 		switch {
 		case n.HasRoute && !n.HasManifest:

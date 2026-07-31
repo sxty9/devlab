@@ -447,42 +447,11 @@ func (e Executor) Fetch(ctx context.Context, wt, token string) error {
 	return err
 }
 
-// ResetToRemote materializes <branch> at origin/<branch> and checks it out, dropping untracked
-// leftovers. For the AUTONOMOUS RUNNER only — Manager.Ensure clones once and then returns the existing
-// checkout forever, so without this a build reads whatever was cloned the first time, silently working
-// against stale code. It is used to materialize the MERGED default branch for a prod build.
+// ─── Fold-in primitive ──────────────────────────────────────────────────────
 //
-// Destructive to <branch> and the working tree by design (a stale checkout must not leak into a build),
-// but it operates on the NAMED branch only: it force-moves <branch> and never touches any OTHER local
-// branch. Crucially it must not clobber the persistent dev branch (mercury-dev) — an interrupted run's
-// committed-but-unpublished dev commits live ONLY on that local ref, so re-pointing whatever happens to be
-// checked out (the old `reset --hard`) could destroy them (req 4). Checking out <branch> explicitly leaves
-// mercury-dev's ref exactly where it was.
-func (e Executor) ResetToRemote(ctx context.Context, wt, token, branch string) error {
-	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
-		return fmt.Errorf("invalid branch name %q", branch)
-	}
-	if err := e.Fetch(ctx, wt, token); err != nil {
-		return fmt.Errorf("fetch: %w", err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", "-B", branch, "origin/"+branch)); err != nil {
-		return fmt.Errorf("checkout %s: %w", branch, err)
-	}
-	// -x also removes ignored files (build artefacts, node_modules): a stale artefact can make an
-	// agent's verification pass for the wrong reason.
-	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
-		return fmt.Errorf("clean: %w", err)
-	}
-	return nil
-}
-
-// ─── Growing dev integration branch (the autonomous runner) ─────────────────
-//
-// The runner no longer RECONSTRUCTS each run's state from "default branch + a hand-picked set of open
-// PRs" (which silently dropped finished work whenever the pick missed a PR). Instead a single
-// persistent dev branch per repo (mercury-dev) GROWS: every run sits on the accumulated state, folds
-// the default branch INTO it, and adds its work on top. The remote mercury-dev is the durable, nameable
-// record of exactly what dev serves. See EnsureDevBranch / FoldInBranch / CleanWorktree.
+// The growing working-state machinery itself lives in package workbench (S9, K-1): it FOLDS
+// IN and grows, and no reset primitive exists on the automated path. This file keeps only the
+// neutral git primitives workbench composes.
 
 // ErrMergeConflict is returned by FoldInBranch when folding the default branch conflicts with the
 // accumulated dev state. It is NON-fatal by design: the caller records a step and proceeds on the dev
@@ -490,141 +459,12 @@ func (e Executor) ResetToRemote(ctx context.Context, wt, token, branch string) e
 // never sunk by it.
 var ErrMergeConflict = errors.New("merge conflict")
 
-// remoteRefExists reports whether origin/<branch> exists in the local remote-tracking refs. Call after
-// a Fetch so the answer reflects the real remote. A bad branch name is reported as "does not exist"
-// rather than reaching git.
-func (e Executor) remoteRefExists(ctx context.Context, wt, branch string) bool {
-	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
-		return false
-	}
-	_, err := runGit(e.gitIn(ctx, wt, "", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch))
-	return err == nil
-}
-
-// localRefExists reports whether a LOCAL branch exists (refs/heads/<branch>) in this workspace — the
-// signal that a previous run already established the dev branch here and its committed work must be
-// protected. A bad name is reported as absent rather than reaching git.
-func (e Executor) localRefExists(ctx context.Context, wt, branch string) bool {
-	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
-		return false
-	}
-	_, err := runGit(e.gitIn(ctx, wt, "", "rev-parse", "--verify", "--quiet", "refs/heads/"+branch))
-	return err == nil
-}
-
-// unpublishedCount counts commits reachable from HEAD but from NEITHER the default branch NOR (when it
-// exists) the pushed dev branch — the committed work an interrupted run left that no remote yet carries.
-// Best-effort: a git error yields 0 (the caller only uses it to report, never to gate work).
-func (e Executor) unpublishedCount(ctx context.Context, wt, defaultBranch, devBranch string, remoteDev bool) int {
-	args := []string{"rev-list", "--count", "HEAD", "--not", "origin/" + defaultBranch}
-	if remoteDev {
-		args = append(args, "origin/"+devBranch)
-	}
-	out, err := runGit(e.gitIn(ctx, wt, "", args...))
-	if err != nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(strings.TrimSpace(out))
-	return n
-}
-
-// DevBranchPrep reports what preparing the dev branch found, so the caller records it honestly. Its whole
-// point is that the committed dev history is NEVER reset onto a remote: whatever an interrupted prior run
-// committed locally is always retained.
-type DevBranchPrep struct {
-	Created        bool // devBranch existed NEITHER locally nor on the remote and was created from the default branch
-	RemoteConflict bool // folding the pushed dev state into the kept local state conflicted; local retained unchanged
-	Recovered      int  // committed-but-unpublished commits an interrupted prior run left in this workspace, retained here
-}
-
-// EnsureDevBranch puts the workspace on the persistent dev integration branch, so a run builds on the
-// ACCUMULATED work of previous runs instead of a fresh default-branch checkout.
-//
-// The local dev branch is NEVER reset onto a remote (req 1). When it already exists in this workspace —
-// possibly carrying commits an interrupted run made but never pushed — its committed history is kept and
-// the pushed dev state is FOLDED IN (a merge, the same direction the default branch is folded in), never
-// checked out over it. Only when no local dev branch exists is one created: from the pushed dev state if
-// there is one (grow), or from the default branch the very first time (Created=true). A fold conflict is
-// non-fatal (req 2): the local state is left exactly as it was, RemoteConflict is reported, and the run
-// decides whether to proceed on it. Getting onto the branch drops only an aborted run's uncommitted edits
-// and untracked leftovers (req 4) — committed work is untouched. Contrast ResetDevToDefault, the explicit,
-// deliberate way back.
-func (e Executor) EnsureDevBranch(ctx context.Context, wt, token, defaultBranch, devBranch string) (prep DevBranchPrep, err error) {
-	for _, b := range []string{defaultBranch, devBranch} {
-		if !branchRe.MatchString(b) || strings.HasPrefix(b, "-") {
-			return prep, fmt.Errorf("invalid branch name %q", b)
-		}
-	}
-	if err := e.Fetch(ctx, wt, token); err != nil {
-		return prep, fmt.Errorf("fetch: %w", err)
-	}
-	remoteExists := e.remoteRefExists(ctx, wt, devBranch)
-
-	// No local dev branch in THIS workspace yet → nothing committed here to protect. Create it: from the
-	// pushed dev state when one exists (grow onto it), else from the default branch (first run → Created).
-	if !e.localRefExists(ctx, wt, devBranch) {
-		start := "origin/" + devBranch
-		if !remoteExists {
-			start, prep.Created = "origin/"+defaultBranch, true
-		}
-		if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", "-B", devBranch, start)); err != nil {
-			return prep, fmt.Errorf("checkout %s: %w", devBranch, err)
-		}
-		return prep, nil
-	}
-
-	// The local dev branch already exists — an interrupted prior run may have left UNPUBLISHED commits on
-	// it. Get pristine ONTO it without re-pointing it at any remote: checkout keeps its committed history,
-	// reset --hard drops uncommitted tracked edits, clean removes untracked/ignored leftovers (req 4).
-	if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", devBranch)); err != nil {
-		return prep, fmt.Errorf("checkout %s: %w", devBranch, err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "HEAD")); err != nil {
-		return prep, fmt.Errorf("reset %s: %w", devBranch, err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
-		return prep, fmt.Errorf("clean: %w", err)
-	}
-	// Recovered work: commits reachable from HEAD but from NEITHER the pushed dev state NOR the default
-	// branch — exactly what a reset onto the remote would have destroyed. They are already in HEAD (kept);
-	// the caller reports the count and the dev push publishes them.
-	prep.Recovered = e.unpublishedCount(ctx, wt, defaultBranch, devBranch, remoteExists)
-	// Fold the pushed dev state IN — never reset onto it (req 1/2). "Already up to date" (local is ahead of
-	// or equal to the remote, the interrupted-run case) is a clean no-op that keeps the local commits. A
-	// conflict aborts the merge, leaves the local state untouched, and is reported as non-fatal (req 2).
-	if remoteExists {
-		if ferr := e.FoldInBranch(ctx, wt, devBranch); ferr != nil {
-			if errors.Is(ferr, ErrMergeConflict) {
-				prep.RemoteConflict = true
-			} else {
-				return prep, fmt.Errorf("fold %s: %w", devBranch, ferr)
-			}
-		}
-	}
-	return prep, nil
-}
-
-// CleanWorktree frees the working tree of unversioned remnants so an aborted run leaves no half-changes,
-// WITHOUT touching history: it hard-resets to HEAD (dropping uncommitted edits to tracked files) and
-// removes untracked and ignored files. The current branch pointer is untouched — this is hygiene, not a
-// reset of the accumulated state. Contrast ResetToRemote, which moves the branch onto a remote tip.
-func (e Executor) CleanWorktree(ctx context.Context, wt string) error {
-	if _, err := runGit(e.gitIn(ctx, wt, "", "reset", "--hard", "HEAD")); err != nil {
-		return fmt.Errorf("reset: %w", err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
-		return fmt.Errorf("clean: %w", err)
-	}
-	return nil
-}
-
-// FoldInBranch merges origin/<branch> INTO the current branch — the "fold it in, do not reset onto it"
-// rule. It serves both folds a run performs: the default branch into the dev state, and (when preparing a
-// reused workspace) the pushed dev state into the kept local dev branch. "Already up to date" (origin/
-// <branch> is an ancestor of the current state — the common case, including a local dev branch ahead of
-// its unpushed remote) is a clean success with no new commit and no pollution of any delivery diff. A
-// CONFLICT aborts the merge, leaves the branch exactly as before, and returns ErrMergeConflict (non-fatal
-// — the caller notes it and proceeds). A merge that succeeds is authored as the neutral mercury-run identity.
+// FoldInBranch merges origin/<branch> (the default branch) INTO the current dev branch — the "fold the
+// default branch in, do not reset onto it" rule. "Already up to date" (the default branch is an
+// ancestor of the dev state — the common case) is a clean success with no new commit and no pollution
+// of any delivery diff. A CONFLICT aborts the merge, leaves the branch exactly as before, and returns
+// ErrMergeConflict (non-fatal — the caller notes it and proceeds). A merge that succeeds is authored as
+// the neutral mercury-run identity.
 func (e Executor) FoldInBranch(ctx context.Context, wt, branch string) error {
 	if !branchRe.MatchString(branch) || strings.HasPrefix(branch, "-") {
 		return fmt.Errorf("invalid branch name %q", branch)
@@ -634,28 +474,6 @@ func (e Executor) FoldInBranch(ctx context.Context, wt, branch string) error {
 		"merge", "--no-edit", "origin/"+branch)); err != nil {
 		_, _ = runGit(e.gitIn(ctx, wt, "", "merge", "--abort"))
 		return ErrMergeConflict
-	}
-	return nil
-}
-
-// ResetDevToDefault is the EXPLICIT way back: it deliberately discards the accumulated dev state and
-// moves the dev branch back onto the default branch (fetch → force-checkout devBranch at
-// origin/defaultBranch → clean). Destructive by design and ONLY ever invoked on an explicit request,
-// never as a side effect of a run. The caller force-pushes devBranch afterwards to publish the reset.
-func (e Executor) ResetDevToDefault(ctx context.Context, wt, token, defaultBranch, devBranch string) error {
-	for _, b := range []string{defaultBranch, devBranch} {
-		if !branchRe.MatchString(b) || strings.HasPrefix(b, "-") {
-			return fmt.Errorf("invalid branch name %q", b)
-		}
-	}
-	if err := e.Fetch(ctx, wt, token); err != nil {
-		return fmt.Errorf("fetch: %w", err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "checkout", "-f", "-B", devBranch, "origin/"+defaultBranch)); err != nil {
-		return fmt.Errorf("reset %s to %s: %w", devBranch, defaultBranch, err)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "", "clean", "-fdx")); err != nil {
-		return fmt.Errorf("clean: %w", err)
 	}
 	return nil
 }
@@ -833,33 +651,6 @@ func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) 
 	}
 	s, err := runGit(e.gitIn(ctx, wt, "", "rev-parse", ref))
 	return strings.TrimSpace(s), err
-}
-
-// mergeRefRe restricts MergeRef to a well-formed origin/ branch ref — the shape the autonomous runner
-// folds into a run's base (the still-open pending Mercury PRs, whose heads now follow the human
-// <kind>/<description> convention rather than a fixed prefix). The caller has already vetted these as
-// Mercury's OWN PRs (hidden body marker); this regex is the structural safety net: it demands the origin/
-// prefix and an alphanumeric first segment character, so a hostile or malformed branch name cannot reach
-// git (path traversal is additionally blocked by the ".." check in MergeRef).
-var mergeRefRe = regexp.MustCompile(`^origin/[A-Za-z0-9][A-Za-z0-9._/-]*$`)
-
-// MergeRef merges ref into the current branch (default merge; a merge commit is authored as the runner
-// identity when the histories diverge). On conflict it ABORTS the merge and returns an error, leaving the
-// branch exactly as before — the caller then proceeds without that pending PR in the base. Restricted to
-// well-formed origin/* refs (see mergeRefRe). This is how the runner bases a run on "main + pending PRs"
-// so it never redoes not-yet-merged work while still implementing what a (possibly different-axiom) run
-// still needs.
-func (e Executor) MergeRef(ctx context.Context, wt, ref string) error {
-	if strings.Contains(ref, "..") || !mergeRefRe.MatchString(ref) {
-		return fmt.Errorf("invalid merge ref %q", ref)
-	}
-	if _, err := runGit(e.gitIn(ctx, wt, "",
-		"-c", "user.name=mercury-run", "-c", "user.email=mercury-run@local",
-		"merge", "--no-edit", ref)); err != nil {
-		_, _ = runGit(e.gitIn(ctx, wt, "", "merge", "--abort"))
-		return fmt.Errorf("merge %s: %w", ref, err)
-	}
-	return nil
 }
 
 // Changes / Branches are read-only re-exports (run directly with safe.directory in package git).

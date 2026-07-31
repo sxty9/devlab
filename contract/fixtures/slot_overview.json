@@ -1,0 +1,84 @@
+{
+  "capacity": 3,
+  "occupied": 1,
+  "overloadActive": false,
+  "restartPending": false,
+  "active": [
+    {
+      "id": "exec_1",
+      "runId": "run_x",
+      "runTitle": "Ship it",
+      "kind": "todo",
+      "phase": "running",
+      "continuation": {
+        "repo": "svc-a",
+        "stage": "implement"
+      },
+      "repos": [
+        {
+          "repo": "svc-a",
+          "stages": [
+            {
+              "stage": "preflight",
+              "state": "executed",
+              "startedAt": "2026-07-28T03:00:00Z",
+              "endedAt": "2026-07-28T03:00:00Z"
+            },
+            {
+              "stage": "implement",
+              "state": "running",
+              "startedAt": "2026-07-28T03:00:00Z"
+            },
+            {
+              "stage": "deliver-dev",
+              "state": "pending"
+            },
+            {
+              "stage": "publish",
+              "state": "pending"
+            },
+            {
+              "stage": "pull-request",
+              "state": "pending"
+            }
+          ],
+          "taskState": "not-implemented",
+          "done": false,
+          "succeeded": false
+        }
+      ],
+      "usage": {
+        "inputTokens": 1000,
+        "outputTokens": 200,
+        "costUsd": 0.05
+      },
+      "requested": {
+        "created": {
+          "user": "alice"
+        },
+        "createdAt": "2026-07-28T03:00:00Z",
+        "updated": {
+          "user": "",
+          "autonomous": true,
+          "onBehalfOf": "alice"
+        },
+        "updatedAt": "2026-07-28T03:10:00Z"
+      },
+      "createdAt": "2026-07-28T03:00:00Z",
+      "startedAt": "2026-07-28T03:00:00Z",
+      "updatedAt": "2026-07-28T03:10:00Z",
+      "deliveredCommit": "abc1234"
+    }
+  ],
+  "deferred": [],
+  "queuedStarts": [
+    {
+      "runId": "run_y",
+      "title": "Later run",
+      "by": {
+        "user": "alice"
+      },
+      "at": "2026-07-28T03:10:00Z"
+    }
+  ]
+}

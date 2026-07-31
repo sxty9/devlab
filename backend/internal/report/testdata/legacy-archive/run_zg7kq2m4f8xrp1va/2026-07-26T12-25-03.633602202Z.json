@@ -1,0 +1,34 @@
+{
+  "runId": "run_zg7kq2m4f8xrp1va",
+  "resultId": "2026-07-26T12-25-03.633602202Z",
+  "runName": "Konkretes ToDo",
+  "type": "todo",
+  "startedAt": "2026-07-26T12:25:03.633602202Z",
+  "updatedAt": "2026-07-26T12:51:14.634660688Z",
+  "finishedAt": "2026-07-26T12:51:14.634660398Z",
+  "prompt": "# Konkretes ToDo\n\nprompt snapshot",
+  "mode": "full",
+  "ok": true,
+  "repos": [
+    {
+      "repo": "service-a",
+      "ok": true,
+      "deployed": false,
+      "prUrl": "https://example.invalid/service-a/pull/17",
+      "steps": [
+        { "name": "implement", "ok": true, "log": "built, tested, committed", "at": "2026-07-26T12:25:05.840784858Z" },
+        { "name": "dev-deploy", "ok": true, "log": "installed and running", "at": "2026-07-26T12:51:12.263222419Z" },
+        { "name": "push", "ok": true, "log": "mercury-run/run_zg7kq2m4f8xrp1va/2026-07-26T12-25-05Z", "at": "2026-07-26T12:51:13.673315656Z" },
+        { "name": "pr", "ok": true, "log": "https://example.invalid/service-a/pull/17", "at": "2026-07-26T12:51:14.63253881Z" }
+      ],
+      "inputTokens": 11590058,
+      "outputTokens": 113049,
+      "costUsd": 11.857164500000003,
+      "numTurns": 97
+    }
+  ],
+  "inputTokens": 11590058,
+  "outputTokens": 113049,
+  "costUsd": 11.857164500000003,
+  "numTurns": 97
+}

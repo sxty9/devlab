@@ -20,7 +20,8 @@ const (
 // cookieSecure reports whether cookies should carry the Secure attribute (prod over TLS).
 func cookieSecure() bool { return os.Getenv("DEVLAB_COOKIE_SECURE") == "1" }
 
-// cookieDomain returns the shared parent domain (e.g. .henrysoase.org) so the re-minted cookies
+// cookieDomain returns the shared parent domain of the instance (a leading-dot value such as
+// .example.org) so the re-minted cookies
 // overwrite holistic's domain-scoped variants rather than creating parallel host-only ones.
 func cookieDomain() string { return os.Getenv("DEVLAB_COOKIE_DOMAIN") }
 

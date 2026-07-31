@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
 
@@ -20,7 +22,7 @@ import (
 // of that guarantee: the write handler only *kicks* the assigner and returns at once; the assigner
 // coalesces bursts of kicks, then runs ONE assignment pass on the caller's behalf.
 //
-// It adds no second planning path: it reuses the very machinery behind the "Mit KI auffüllen" button —
+// It adds no second planning path: it reuses the very machinery behind the interactive AI-fill button —
 // s.runCatalog (the axiom set), s.planRuns + mercury.RunPlanFillPrompt (the plan, validated against the
 // known axiom ids), composeInto (the snapshot) and upsertPlannedRun (extend-or-create) — the difference
 // being only that it runs detached and debounced instead of returning a reviewable proposal. The plan
@@ -29,7 +31,7 @@ import (
 // The pass is idempotent: it acts only on the CURRENTLY uncovered axioms (re-checked under the store
 // lock), so an already-covered axiom is never reassigned and overlapping passes never double-assign.
 // Every outcome — success or failure — is recorded as a portioned notice so the user is informed and can
-// adjust the assignment afterwards. A failure (e.g. the KI-Planung is unreachable) leaves the axiom
+// adjust the assignment afterwards. A failure (e.g. the AI planning is unreachable) leaves the axiom
 // uncovered and visible; it blocks neither the axiom write nor the running scheduler.
 type autoAssigner struct {
 	s     *Server
@@ -38,7 +40,7 @@ type autoAssigner struct {
 	// Network seams (the only I/O), injected so tests drive the pass deterministically without aigentic.
 	// catalog returns the current axiom set (by id) and all Laufregeln; plan turns the uncovered axioms
 	// into a validated run plan.
-	catalog func(ctx context.Context, cookie string) (map[string]mercury.RunAxiom, []mercury.RunAxiom, error)
+	catalog func(ctx context.Context, cookie string) (runs.Catalog, error)
 	plan    func(ctx context.Context, cookie, csrf string, uncovered []mercury.RunAxiom, existing, known []string) (mercury.RunPlan, error)
 
 	mu      sync.Mutex
@@ -57,9 +59,9 @@ const assignPassTimeout = 10 * time.Minute
 // newAutoAssigner builds the assigner with the production seams wired to the reused machinery.
 func newAutoAssigner(s *Server) *autoAssigner {
 	a := &autoAssigner{s: s, delay: assignDelay()}
-	a.catalog = func(ctx context.Context, cookie string) (map[string]mercury.RunAxiom, []mercury.RunAxiom, error) {
-		byID, _, laufregeln, err := s.runCatalog(ctx, cookie)
-		return byID, laufregeln, err
+	a.catalog = func(ctx context.Context, cookie string) (runs.Catalog, error) {
+		cat, _, err := s.runCatalog(ctx, cookie)
+		return cat, err
 	}
 	a.plan = func(ctx context.Context, cookie, csrf string, uncovered []mercury.RunAxiom, existing, known []string) (mercury.RunPlan, error) {
 		return s.planRuns(ctx, cookie, csrf, known, func(correction string) string {
@@ -81,15 +83,22 @@ func assignDelay() time.Duration {
 }
 
 // kick records the latest credentials and (re)arms the debounce. Cheap and non-blocking — the write
-// handler calls it and returns immediately.
-func (a *autoAssigner) kick(cookie, csrf, actor string) {
-	if a == nil {
-		return
+// handler calls it and returns immediately. It reports whether a pass was actually scheduled, so an
+// EXPLICIT trigger can answer with the honest outcome instead of a claimed one.
+//
+// A kick without a session is refused rather than scheduled: the pass plans through aigentic, which
+// authenticates as the caller, so without a cookie there is nothing it could do (runPass would skip
+// it). Refusing here also keeps the last usable session instead of overwriting it with an empty one,
+// and stops the coverage view from announcing an assignment that can never happen.
+func (a *autoAssigner) kick(cookie, csrf, actor string) bool {
+	if a == nil || strings.TrimSpace(cookie) == "" {
+		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.cookie, a.csrf, a.actor = cookie, csrf, actor
 	a.schedule()
+	return true
 }
 
 // schedule arms (or pushes out) the debounce timer. The caller holds a.mu. While a pass runs, it only
@@ -160,7 +169,7 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 	ctx, cancel := context.WithTimeout(context.Background(), assignPassTimeout)
 	defer cancel()
 
-	byID, laufregeln, err := a.catalog(ctx, cookie)
+	cat, err := a.catalog(ctx, cookie)
 	if err != nil {
 		// The scheme store is unreachable: the whole Mercury surface is down and we cannot even tell which
 		// axioms exist. Nothing known to assign — stay quiet (the outage is visible elsewhere) and retry on
@@ -173,35 +182,19 @@ func (a *autoAssigner) runPass(cookie, csrf, actor string) {
 		log.Printf("devlabd: auto-assign runs list: %v", err)
 		return
 	}
-	covered := map[string]bool{}
-	existing := make([]string, 0, len(all))
-	for _, run := range all {
-		if !run.IsTodo() {
-			existing = append(existing, run.Name) // only auto runs carry axioms and may be extended
-		}
-		for _, id := range run.AxiomIDs {
-			covered[id] = true
-		}
-	}
-	uncovered := make([]mercury.RunAxiom, 0)
-	for id, ax := range byID {
-		if !covered[id] {
-			uncovered = append(uncovered, ax)
-		}
-	}
+	uncovered := uncoveredAxioms(cat, all)
 	if len(uncovered) == 0 {
 		return // idempotent: everything is already covered
 	}
-	// Map iteration is random; sort for a stable prompt and stable notices.
-	sort.Slice(uncovered, func(i, j int) bool { return uncovered[i].ID < uncovered[j].ID })
+	existing := extendableRunTitles(all)
 
-	plan, err := a.plan(ctx, cookie, csrf, uncovered, existing, keysOf(byID))
+	plan, err := a.plan(ctx, cookie, csrf, uncovered, existing, keysOf(cat.ByID))
 	if err != nil {
 		log.Printf("devlabd: auto-assign planning failed: %v", err)
-		a.recordFailure(uncovered, "KI-Planung nicht erreichbar")
+		a.recordFailure(uncovered, "AI planning unreachable")
 		return
 	}
-	a.applyPlan(actor, plan, byID, laufregeln, uncovered)
+	a.applyPlan(actor, plan, cat, uncovered)
 }
 
 // errNoAssignment aborts the apply Mutate when the plan, re-filtered against the live covered set, leaves
@@ -221,10 +214,15 @@ type assignOutcome struct {
 // STILL uncovered and known (re-checked under the lock), then extends a matching auto run or creates a
 // new one, recomposing the affected snapshot in the same step. On success it records one notice per
 // affected run; on a store error it records a single failure notice.
-func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, tried []mercury.RunAxiom) {
+func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, cat runs.Catalog, tried []mercury.RunAxiom) {
 	now := time.Now().UTC()
+	by := model.Actor{User: actor, Autonomous: actor == "", OnBehalfOf: ""}
 	var outcomes []assignOutcome
-	_, err := a.s.runs.Mutate("auto-assign", actor, func(cur []runs.Run) ([]runs.Run, error) {
+	err := func() error {
+		cur, err := a.s.runs.List()
+		if err != nil {
+			return err
+		}
 		covered := map[string]bool{}
 		for _, run := range cur {
 			for _, id := range run.AxiomIDs {
@@ -236,46 +234,46 @@ func (a *autoAssigner) applyPlan(actor string, plan mercury.RunPlan, byID map[st
 		for _, pr := range plan.Runs {
 			var ids []string
 			for _, id := range pr.AxiomIDs {
-				if _, known := byID[id]; known && !covered[id] {
+				if _, known := cat.ByID[id]; known && !covered[id] {
 					ids = append(ids, id)
 				}
 			}
-			ids = dedupStrings(ids)
+			ids = runs.DedupStrings(ids)
 			if len(ids) == 0 {
 				continue
 			}
 			np := runs.Run{
-				ID: runs.NewID(), Name: strings.TrimSpace(pr.Name), Enabled: true,
+				ID: runs.NewID(), Kind: "auto", Title: strings.TrimSpace(pr.Name), Active: true,
 				Schedule: toSchedule(pr.Schedule), AxiomIDs: ids,
-				CreatedAt: now, UpdatedAt: now,
+				Authorship: model.Authorship{Created: by, CreatedAt: now, Updated: by, UpdatedAt: now},
 			}
-			composeInto(&np, byID, laufregeln, now)
-			if nf, e := np.Schedule.Next(now); e == nil {
-				np.NextFireAt = &nf
-			}
+			runs.ComposeInto(&np, cat)
 			var affected runs.Run
 			var created bool
-			out, affected, created = upsertPlannedRun(out, np, byID, laufregeln, now)
+			out, affected, created = runs.UpsertPlannedRun(out, np, cat, now, by)
 			titles := make([]string, 0, len(ids))
 			for _, id := range ids {
-				titles = append(titles, mercury.RunAxiomTitle(byID[id]))
+				titles = append(titles, mercury.RunAxiomTitle(cat.ByID[id]))
 				covered[id] = true // a later plan entry must not re-grab the same axiom
 			}
-			oc = append(oc, assignOutcome{runID: affected.ID, runName: affected.Name, newRun: created, axiomIDs: ids, titles: titles})
+			oc = append(oc, assignOutcome{runID: affected.ID, runName: affected.Title, newRun: created, axiomIDs: ids, titles: titles})
 		}
 		if len(oc) == 0 {
-			return nil, errNoAssignment
+			return errNoAssignment
 		}
 		outcomes = oc
-		return out, nil
-	})
+		return a.s.runs.ReplaceAll(out, "auto-assign", by)
+	}()
 	if errors.Is(err, errNoAssignment) {
 		return // the plan named only already-covered axioms → genuine no-op, no notice
 	}
 	if err != nil {
 		log.Printf("devlabd: auto-assign save failed: %v", err)
-		a.recordFailure(tried, "Zuordnung konnte nicht gespeichert werden")
+		a.recordFailure(tried, "Assignment could not be saved")
 		return
+	}
+	if a.s != nil {
+		a.s.publish(live.TopicRuns) // the background write is a caller too — it announces itself
 	}
 	for _, o := range outcomes {
 		a.record(runs.Notice{
@@ -302,18 +300,100 @@ func (a *autoAssigner) record(n runs.Notice) {
 	}
 	if err := a.s.runNotices.Add(n); err != nil {
 		log.Printf("devlabd: auto-assign notice write failed: %v", err)
+		return
 	}
+	a.s.publish(live.TopicNotices)
+}
+
+// --- the uncovered set ---------------------------------------------------------
+//
+// ONE definition of "uncovered", read by every surface that acts on it: the background pass, the
+// reviewable AI fill and the explicit trigger. A second copy of this loop would let two of them
+// disagree about which axioms still need a run.
+
+// uncoveredAxioms lists the axioms no run carries yet, sorted by id — map iteration is random, and a
+// prompt (and the notices derived from it) must not depend on it.
+func uncoveredAxioms(cat runs.Catalog, all []runs.Run) []mercury.RunAxiom {
+	covered := map[string]bool{}
+	for _, run := range all {
+		for _, id := range run.AxiomIDs {
+			covered[id] = true
+		}
+	}
+	out := make([]mercury.RunAxiom, 0, len(cat.ByID))
+	for id, ax := range cat.ByID {
+		if !covered[id] {
+			out = append(out, ax)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// extendableRunTitles names the runs a plan may extend: the automatic ones. A todo carries no axioms,
+// so it is never a candidate (UpsertPlannedRun refuses it too).
+func extendableRunTitles(all []runs.Run) []string {
+	out := make([]string, 0, len(all))
+	for _, run := range all {
+		if run.Kind != model.KindTodo {
+			out = append(out, run.Title)
+		}
+	}
+	return out
 }
 
 // --- server-side glue ---------------------------------------------------------
 
 // kickAutoAssign hands the assigner the caller's session (cookie + CSRF) and identity, then returns at
-// once. The pass runs on the user's behalf, exactly as the interactive "Mit KI auffüllen" does.
-func (s *Server) kickAutoAssign(r *http.Request) {
+// once. The pass runs on the user's behalf, exactly as the interactive AI-fill does. It reports
+// whether a pass was scheduled at all — nothing but the explicit trigger reads that, but the answer
+// exists so the trigger never claims an assignment that was never armed.
+func (s *Server) kickAutoAssign(r *http.Request) bool {
 	if s.assigner == nil {
+		return false
+	}
+	return s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actorOf(r).User)
+}
+
+// runsAssign is the EXPLICIT trigger for the very pass the axiom writes kick — the same machinery, on
+// demand. It exists because every automatic kick hangs off a write: once a state arrives that the
+// write paths never saw (a takeover importing runs without axioms), uncovered axioms and axiom-less
+// runs sit there with nothing left to kick, and the only remaining way to start an assignment would
+// be to create an axiom nobody wants.
+//
+// The pass runs on the CALLER's session (cookie + CSRF), exactly as the write-kicked one does: the
+// planning goes through aigentic, which authenticates as the caller.
+//
+// The answer is the immediate, honest outcome — how many axioms are uncovered right now and whether a
+// pass was started for them — never a claimed success. The pass itself reports through the notice
+// feed; the coverage view follows it live.
+func (s *Server) runsAssign(w http.ResponseWriter, r *http.Request) {
+	if s.runs == nil {
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	s.assigner.kick(r.Header.Get("Cookie"), csrfFrom(r), actor(r))
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	if err != nil {
+		mercuryError(w, err)
+		return
+	}
+	all, err := s.runs.List()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
+		return
+	}
+	uncovered := uncoveredAxioms(cat, all)
+	if len(uncovered) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"uncovered": 0, "started": false})
+		return
+	}
+	started := s.kickAutoAssign(r)
+	if started {
+		// The pending state is part of the coverage answer, so every open surface learns that an
+		// assignment is under way — not just the one that pressed.
+		s.publish(live.TopicRuns)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"uncovered": len(uncovered), "started": started})
 }
 
 // assignPending reports whether an automatic assignment is scheduled or in flight.
@@ -327,7 +407,7 @@ func (s *Server) runsNoticesList(w http.ResponseWriter, _ *http.Request) {
 	}
 	list, err := s.runNotices.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweise konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the notices")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"notices": list})
@@ -346,13 +426,14 @@ func (s *Server) runsNoticeDismiss(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(body.ID) == "" {
-		writeErr(w, http.StatusBadRequest, "id ist erforderlich")
+		writeErr(w, http.StatusBadRequest, "id is required")
 		return
 	}
 	if err := s.runNotices.Dismiss(body.ID); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweis konnte nicht entfernt werden")
+		writeErr(w, http.StatusInternalServerError, "Could not dismiss the notice")
 		return
 	}
+	s.publish(live.TopicNotices)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -363,8 +444,9 @@ func (s *Server) runsNoticesClear(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	if err := s.runNotices.Clear(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Hinweise konnten nicht entfernt werden")
+		writeErr(w, http.StatusInternalServerError, "Could not clear the notices")
 		return
 	}
+	s.publish(live.TopicNotices)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

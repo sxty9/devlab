@@ -3,22 +3,11 @@ import { useWorkspace } from '@/state/workspace';
 import { getDataSource } from '@/data';
 import { useToast } from '@/ui/Toast';
 import { SendIcon, XIcon } from '@/ui/icons';
+import { Person } from '@/ui/Person';
 import { renderMarkdown } from '@/lib/markdown';
+import { fmtDateTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { Comment } from '@/types';
-
-/** Two-letter initials for an avatar chip. */
-function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return '?';
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-}
-
-function when(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
 
 /** A compact comment composer (top-level or reply). */
 function Composer({ onSubmit, onCancel, placeholder }: { onSubmit: (body: string) => Promise<void>; onCancel?: () => void; placeholder: string }) {
@@ -129,13 +118,13 @@ export function CommentsThread({ repoId, path }: { repoId: string; path: string 
     return (
       <div key={c.id} className={cn(depth > 0 && 'ml-4 border-l border-separator pl-3')}>
         <div className="flex gap-2 py-2">
-          <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-gpu/20 text-[10px] font-semibold text-gpu" title={c.authorName}>
-            {initials(c.authorName || c.author)}
+          <span className="mt-0.5">
+            <Person avatarOnly username={c.author} displayName={c.authorName} />
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="text-footnote font-medium text-text-primary">{c.authorName || c.author}</span>
-              <span className="text-caption text-text-tertiary">{when(c.createdAt)}</span>
+              <span className="text-caption text-text-tertiary">{fmtDateTime(c.createdAt)}</span>
               {mine && (
                 <button type="button" onClick={() => void del(c.id)} aria-label="Delete comment" className="ml-auto flex h-5 w-5 items-center justify-center rounded-sm text-text-tertiary opacity-0 transition hover:bg-fill/15 hover:text-danger group-hover:opacity-100">
                   <XIcon className="h-3.5 w-3.5" />

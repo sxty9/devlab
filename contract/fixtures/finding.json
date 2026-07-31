@@ -1,0 +1,13 @@
+{
+  "state": "implemented-undelivered",
+  "evidence": [
+    "mercury-dev ahead of main @abc1234",
+    "no open delivery"
+  ],
+  "observedAt": "2026-07-28T03:00:00Z",
+  "openPr": {
+    "number": 41,
+    "url": "https://example.invalid/pr/41",
+    "headBranch": "fix/login-flow"
+  }
+}

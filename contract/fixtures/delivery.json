@@ -1,0 +1,12 @@
+{
+  "id": "dlv_1",
+  "repo": "svc-a",
+  "branch": "fix/login-flow",
+  "fromCommit": "a1",
+  "toCommit": "a2",
+  "prNumber": 41,
+  "prUrl": "https://example.invalid/pr/41",
+  "createdAt": "2026-07-28T03:00:00Z",
+  "mergedAt": "2026-07-28T04:00:00Z",
+  "stage": "merged"
+}

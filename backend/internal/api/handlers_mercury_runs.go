@@ -3,157 +3,109 @@ package api
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 )
 
-// Automatische Läufe — run instances. A run bundles Axioms (only axioms, never Implementierungsregeln)
-// and a recurring schedule; its Claude prompt is composed from those axioms + all global Laufregeln
-// and stored as a snapshot. This file is the management layer (CRUD, coverage, prompt preview, the two
-// AI-planning buttons with review/apply, config history). Execution (the scheduler) is a separate,
-// gated phase; the stored results are read here but written there.
+// Tasks & runs — the THIN management layer (B 1.4): parse → validate → the runs pools and the
+// planning core in package runs → answer. Both kinds (auto runs and todos) ride ONE machinery.
+// Execution belongs to sched/executor (handlers_slots.go); results are read here, written
+// there.
 
-// runCatalog scans the scheme store once: every axiom by its stable id (as the RunAxiom shape used for
-// composition), the id→path index (coverage badges), and all global Laufregeln. Mirrors
-// buildRolloutBlock's scan; reuses fetchRecord.
-func (s *Server) runCatalog(ctx context.Context, cookie string) (byID map[string]mercury.RunAxiom, idPath map[string]string, laufregeln []mercury.RunAxiom, err error) {
+// runCatalog scans the constitution store once — the ONE scan behind every composition: every axiom
+// by its stable id (as the RunAxiom composition shape), the id→path index (coverage badges), every
+// Implementierungsregel and every global Laufregel. The Implementierungsregeln are part of the
+// binding wording every execution prompt carries (REQ-002.1), so they are read here, not somewhere
+// else.
+func (s *Server) runCatalog(ctx context.Context, cookie string) (cat runs.Catalog, idPath map[string]string, err error) {
 	paths, err := s.axioms.List(ctx, "")
 	if err != nil {
-		return nil, nil, nil, err
+		return runs.Catalog{}, nil, err
 	}
-	byID = map[string]mercury.RunAxiom{}
+	cat.ByID = map[string]mercury.RunAxiom{}
 	idPath = map[string]string{}
 	for _, p := range paths {
+		if !strings.HasSuffix(p, ".md") {
+			continue
+		}
+		rule := func() (mercury.RunAxiom, bool) {
+			rec, ok := s.fetchRecord(ctx, cookie, p)
+			return mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}, ok
+		}
 		switch {
-		case strings.HasPrefix(p, mercury.NsAxiome+"/") && strings.HasSuffix(p, ".md"):
+		case strings.HasPrefix(p, mercury.NsAxiome+"/"):
 			if rec, ok := s.fetchRecord(ctx, cookie, p); ok && rec.Axiom.ID != "" {
-				byID[rec.Axiom.ID] = mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}
+				cat.ByID[rec.Axiom.ID] = mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body}
 				idPath[rec.Axiom.ID] = p
 			}
-		case strings.HasPrefix(p, mercury.NsLaeufe+"/") && strings.HasSuffix(p, ".md"):
-			if rec, ok := s.fetchRecord(ctx, cookie, p); ok {
-				laufregeln = append(laufregeln, mercury.RunAxiom{ID: rec.Axiom.ID, Titel: rec.Axiom.Titel, Body: rec.Axiom.Body})
+		case strings.HasPrefix(p, mercury.NsRegeln+"/"):
+			if r, ok := rule(); ok {
+				cat.Regeln = append(cat.Regeln, r)
+			}
+		case strings.HasPrefix(p, mercury.NsLaeufe+"/"):
+			if r, ok := rule(); ok {
+				cat.Laufregeln = append(cat.Laufregeln, r)
 			}
 		}
 	}
-	return byID, idPath, laufregeln, nil
+	return cat, idPath, nil
 }
 
-// todoAttachmentDescriptors maps a ToDo's stored attachment metadata to the lean descriptors the prompt
-// references (filename + type, never bytes). Shared by snapshot composition (composeInto) and the media
-// handlers so the prompt's view of the attachments has one definition.
-func todoAttachmentDescriptors(atts []runs.Attachment) []mercury.TodoAttachment {
-	out := make([]mercury.TodoAttachment, 0, len(atts))
-	for _, a := range atts {
-		out = append(out, mercury.TodoAttachment{Filename: a.Filename, MIME: a.MIME})
-	}
-	return out
-}
-
-func axiomsFor(ids []string, byID map[string]mercury.RunAxiom) []mercury.RunAxiom {
-	out := make([]mercury.RunAxiom, 0, len(ids))
-	for _, id := range ids {
-		if a, ok := byID[id]; ok {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
-func titleLegend(byID map[string]mercury.RunAxiom) map[string]string {
-	m := make(map[string]string, len(byID))
-	for id, a := range byID {
+func titleLegend(cat runs.Catalog) map[string]string {
+	m := make(map[string]string, len(cat.ByID))
+	for id, a := range cat.ByID {
 		m[id] = mercury.RunAxiomTitle(a)
 	}
 	return m
 }
 
-// composeInto (re)composes a run's prompt snapshot. An auto run folds in its axioms + all Laufregeln;
-// a ToDo's prompt is just its task (the constitution reaches the agent via the repo's CLAUDE.md), so
-// it has no scheme inputs and therefore no staleness.
-func composeInto(run *runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) {
-	run.PromptAt = now
-	if run.IsTodo() {
-		// The stored snapshot is the target-agnostic base (the task itself plus its attachments, which are
-		// the same across targets). A ToDo can reach several repos at once, some newly created, so the
-		// "this repo is new — scaffold it" note is per-target and is composed at execution time (see the
-		// executor), not baked into one shared snapshot.
-		run.Prompt = mercury.ComposeTodoPrompt(run.Name, run.Task, "", todoAttachmentDescriptors(run.Attachments))
-		run.PromptHash = ""
-		return
-	}
-	axs := axiomsFor(run.AxiomIDs, byID)
-	run.Prompt = mercury.ComposeRunPrompt(run.Name, axs, laufregeln)
-	run.PromptHash = mercury.RunInputsHash(axs, laufregeln)
-}
-
-// upsertPlannedRun folds one planned auto run into out: if an auto run of the same name (case-insensitive)
-// already exists, its axioms are extended (deduped), its snapshot recomposed and its schedule re-armed;
-// otherwise np is appended as a new run. It returns the resulting list, a copy of the affected run (so the
-// caller can name it / link to it) and whether a new run was created. Only auto runs are matched — a ToDo
-// that happens to share a name is never turned into an axiom carrier. Shared by the interactive
-// fill-apply and the background auto-assigner so the merge semantics have a single definition.
-func upsertPlannedRun(out []runs.Run, np runs.Run, byID map[string]mercury.RunAxiom, laufregeln []mercury.RunAxiom, now time.Time) ([]runs.Run, runs.Run, bool) {
-	for i := range out {
-		if out[i].IsTodo() || !strings.EqualFold(out[i].Name, np.Name) {
-			continue
-		}
-		out[i].AxiomIDs = dedupStrings(append(out[i].AxiomIDs, np.AxiomIDs...))
-		out[i].UpdatedAt = now
-		composeInto(&out[i], byID, laufregeln, now)
-		if out[i].Enabled {
-			if nf, e := out[i].Schedule.Next(now); e == nil {
-				out[i].NextFireAt = &nf
-			}
-		}
-		return out, out[i], false
-	}
-	return append(out, np), np, true
-}
-
-// runsList returns every run plus an id→title legend for the axioms in play. Snapshots are kept current
-// by every scheme write (reconcileAfterWrite), so there is no staleness flag to compute or surface.
+// runsList returns every run plus an id→title legend for the axioms in play. Snapshots are
+// kept current by every constitution write (reconcileAfterWrite).
 func (s *Server) runsList(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"runs": orEmptyRuns(all), "axioms": titleLegend(byID)})
+	writeJSON(w, http.StatusOK, map[string]any{"runs": orEmptyRuns(all), "axioms": titleLegend(cat)})
 }
 
-// runsCoverage reports which axioms are already backed by a run (badges in the picker) + the id→path
-// index and an id→title legend.
+// runsCoverage reports which axioms are already backed by a run (badges in the picker) + the
+// id→path index and an id→title legend. `pending` marks a scheduled/running auto-assignment.
 func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	byID, idPath, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	cat, idPath, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
 	covered := map[string][]string{}
@@ -162,86 +114,59 @@ func (s *Server) runsCoverage(w http.ResponseWriter, r *http.Request) {
 			covered[id] = append(covered[id], run.ID)
 		}
 	}
-	// pending: an automatic assignment is scheduled or running, so a currently-uncovered axiom is only
-	// TEMPORARILY uncovered. Coverage stays honest (the axiom is reported uncovered until the assignment
-	// actually lands); pending merely lets the UI show the state as transient rather than permanent.
-	writeJSON(w, http.StatusOK, map[string]any{
-		"covered": covered, "index": idPath, "axioms": titleLegend(byID), "pending": s.assignPending(),
+	writeJSON(w, http.StatusOK, model.RunCoverage{
+		Covered: covered, Index: idPath, Axioms: titleLegend(cat), Pending: s.assignPending(),
 	})
 }
 
 func (s *Server) runGet(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	run, ok, err := s.runs.Get(r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the run")
 		return
 	}
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
+		writeErr(w, http.StatusNotFound, "No run with this id")
 		return
 	}
-	byID, _, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"run":    run,
-		"axioms": titleLegend(byID),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"run": run, "axioms": titleLegend(cat)})
 }
 
-// runPromptPreview composes the prompt LIVE from the current scheme (does not persist) — the "so
-// würde der Lauf aussehen"-Vorschau.
+// runPromptPreview composes the prompt LIVE from the current constitution (does not persist).
 func (s *Server) runPromptPreview(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	run, ok, err := s.runs.Get(r.PathValue("id"))
 	if err != nil || !ok {
-		writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
+		writeErr(w, http.StatusNotFound, "No run with this id")
 		return
 	}
-	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	axs := axiomsFor(run.AxiomIDs, byID)
-	writeJSON(w, http.StatusOK, map[string]any{"prompt": mercury.ComposeRunPrompt(run.Name, axs, laufregeln)})
+	preview := run
+	runs.ComposeInto(&preview, cat)
+	writeJSON(w, http.StatusOK, map[string]any{"prompt": preview.PromptSnapshot})
 }
 
-type runBody struct {
-	Name       string        `json:"name"`
-	Type       runs.Type     `json:"type"` // "" = auto
-	Enabled    bool          `json:"enabled"`
-	Model      string        `json:"model"`      // Claude model id/alias; "" = runner default (opus)
-	Effort     string        `json:"effort"`     // low|medium|high|xhigh|max|ultracode; "" = runner default (max)
-	TimeBudget string        `json:"timeBudget"` // per-repo cap: "" = service default, a duration ("2h"), or "off" = no cap
-	Schedule   runs.Schedule `json:"schedule"`
-	AxiomIDs   []string      `json:"axiomIds"`
-	// todo only
-	Task    string        `json:"task"`
-	Targets []runs.Target `json:"targets"`
-	DueAt   *time.Time    `json:"dueAt"`
-	// Deprecated: a single existing/new repo. Folded into Targets when a client still sends it, so an
-	// older ToDo form keeps working.
-	Repo    string `json:"repo"`
-	NewRepo string `json:"newRepo"`
-}
-
-// repoNameRe bounds a new repo's name (it becomes a GitHub repo and a deploy-allowlist key).
+// repoNameRe bounds a new repo's name (it becomes a GitHub repo and an install-allowlist key).
 var repoNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,100}$`)
 
-// runEffortAllowed is the effort ladder a run/todo may pick: the native claude CLI --effort levels
-// (effortAllowed — the very set the KI tab uses) PLUS "ultracode", Holistic's maximal tier, which the
-// executor translates to max effort plus multi-agent orchestration (see agentTuning.resolve). Derived
-// from the one native set so the two can never drift. Empty selects the runner default (max).
+// runEffortAllowed is the effort ladder a run/todo may pick: the native claude CLI --effort
+// levels (the very set the AI tab uses) plus "ultracode", the maximal tier.
 var runEffortAllowed = func() map[string]bool {
 	m := map[string]bool{"ultracode": true}
 	for k := range effortAllowed {
@@ -250,407 +175,554 @@ var runEffortAllowed = func() map[string]bool {
 	return m
 }()
 
-// runModelRe bounds a selected model to the shape a CLI model alias or id takes (opus, claude-opus-4-8,
-// claude-fable-5, …) so a stored value can never smuggle extra arguments into the executor's CLI call.
-// Empty selects the runner default (opus). The offerable set itself is the aigentic model catalog
-// (GET /api/assistant/models) — the single source the KI tab already reads — so this is only a guard.
+// runModelRe bounds a selected model to the shape a CLI model alias or id takes, so a stored
+// value can never smuggle extra arguments into the executor's CLI call.
 var runModelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
-// validateTuning trims and guards the model + effort + time budget a run/todo carries. All three are
-// shared by auto and todo and all optional (empty = the service default), so it runs before the per-type
-// branch. The time budget is canonicalized to "off" for any no-cap spelling so the stored value is always
-// one the editor round-trips; an unparseable non-"off" value is rejected rather than silently defaulted.
-func validateTuning(b *runBody) (int, string) {
-	b.Model = strings.TrimSpace(b.Model)
-	if b.Model != "" && !runModelRe.MatchString(b.Model) {
-		return http.StatusBadRequest, "ungültiges Modell"
+// validateTuning trims and guards the tuning a run/todo carries (all optional; empty REFERS to
+// the service default, REQ-010.2). The time budget is the third tunable at the same access
+// point: absent = the default reference, 0 = explicitly "no budget" (REQ-010.3), negative is
+// refused rather than silently corrected.
+func validateTuning(t *runs.Tuning) (int, string) {
+	t.Model = strings.TrimSpace(t.Model)
+	if t.Model != "" && !runModelRe.MatchString(t.Model) {
+		return http.StatusBadRequest, "Invalid model"
 	}
-	b.Effort = strings.TrimSpace(b.Effort)
-	if b.Effort != "" && !runEffortAllowed[b.Effort] {
-		return http.StatusBadRequest, "ungültiger Effort (erlaubt: low, medium, high, xhigh, max, ultracode)"
+	t.ModelVersion = strings.TrimSpace(t.ModelVersion)
+	if t.ModelVersion != "" && !runModelRe.MatchString(t.ModelVersion) {
+		return http.StatusBadRequest, "Invalid model version"
 	}
-	b.TimeBudget = strings.TrimSpace(b.TimeBudget)
-	if b.TimeBudget != "" {
-		if isNoBudget(b.TimeBudget) {
-			b.TimeBudget = "off" // canonical no-cap
-		} else if d, err := time.ParseDuration(b.TimeBudget); err != nil || d <= 0 {
-			return http.StatusBadRequest, "ungültiges Zeitbudget (z. B. 2h, 90m — oder „off“ für kein Limit)"
-		}
+	t.Effort = strings.TrimSpace(t.Effort)
+	if t.Effort != "" && !runEffortAllowed[t.Effort] {
+		return http.StatusBadRequest, "Invalid effort (allowed: low, medium, high, xhigh, max, ultracode)"
+	}
+	if t.TimeBudget != nil && *t.TimeBudget < 0 {
+		return http.StatusBadRequest, "Invalid time budget (0 means no budget; omit it to use the default)"
 	}
 	return 0, ""
 }
 
-// normalizeTargets validates and cleans a ToDo's target list: at least one target, each being exactly
-// one existing repo OR one new-repo name (bounded like a GitHub repo), with duplicates collapsed and
-// order preserved. On success it returns the cleaned list and a zero status; otherwise an HTTP status
-// and a German message. It is the single gate a ToDo's destinations pass through.
+// normalizeTargets validates and cleans a todo's target list: at least one target, each naming
+// a repo (Create marks a repo to be created first, REQ-006.2), duplicates collapsed, order
+// preserved.
 func normalizeTargets(in []runs.Target) ([]runs.Target, int, string) {
 	if len(in) == 0 {
-		return nil, http.StatusBadRequest, "ein ToDo braucht mindestens ein Ziel: ein vorhandenes Repo oder ein neues"
+		return nil, http.StatusBadRequest, "A todo needs at least one target repository"
 	}
 	out := make([]runs.Target, 0, len(in))
 	seen := map[string]bool{}
 	for _, t := range in {
 		repo := strings.TrimSpace(t.Repo)
-		newRepo := strings.TrimSpace(t.NewRepo)
-		if (repo == "") == (newRepo == "") {
-			return nil, http.StatusBadRequest, "jedes Ziel ist genau ein vorhandenes Repo ODER ein neues"
+		if repo == "" {
+			return nil, http.StatusBadRequest, "Each target names exactly one repository"
 		}
-		if newRepo != "" && !repoNameRe.MatchString(newRepo) {
-			return nil, http.StatusBadRequest, "ungültiger Repo-Name (erlaubt: Buchstaben, Ziffern, Punkt, Unterstrich, Bindestrich)"
+		if t.Create && !repoNameRe.MatchString(repo) {
+			return nil, http.StatusBadRequest, "Invalid new-repository name (allowed: letters, digits, dot, underscore, hyphen)"
 		}
-		key := "r:" + repo
-		if newRepo != "" {
-			key = "n:" + newRepo
+		if seen[repo] {
+			continue
 		}
-		if seen[key] {
-			continue // the same repo listed twice reaches it once
-		}
-		seen[key] = true
-		out = append(out, runs.Target{Repo: repo, NewRepo: newRepo})
+		seen[repo] = true
+		out = append(out, runs.Target{Repo: repo, Create: t.Create})
 	}
 	return out, 0, ""
 }
 
-func validateRunBody(b *runBody, byID map[string]mercury.RunAxiom) (int, string) {
-	b.Name = strings.TrimSpace(b.Name)
-	if b.Name == "" {
-		return http.StatusBadRequest, "name ist erforderlich"
+// activeAfter resolves the Active flag the run will carry once the input is applied — the same rule
+// applyInput follows: an input that omits `active` REFERS to the current value (for a create that is
+// "active", the default a new run gets).
+func activeAfter(b runs.RunInput, activeNow bool) bool {
+	if b.Active != nil {
+		return *b.Active
 	}
-	if code, msg := validateTuning(b); code != 0 {
-		return code, msg
+	return activeNow
+}
+
+// validateRunInput normalizes and validates a create/update payload against the axiom catalog.
+// activeNow is the run's CURRENT Active flag (true for a create): the axiom rule below binds to the
+// state the run will be in, not to the field the request happened to send.
+func validateRunInput(b *runs.RunInput, cat runs.Catalog, activeNow bool) (int, string) {
+	b.Title = strings.TrimSpace(b.Title)
+	if b.Title == "" {
+		return http.StatusBadRequest, "title is required"
 	}
-	if b.Type == "" {
-		b.Type = runs.TypeAuto
+	if b.Tuning != nil {
+		if code, msg := validateTuning(b.Tuning); code != 0 {
+			return code, msg
+		}
 	}
-	switch b.Type {
-	case runs.TypeTodo:
+	if b.Kind == "" {
+		b.Kind = model.KindAuto
+	}
+	switch b.Kind {
+	case model.KindTodo:
 		b.Task = strings.TrimSpace(b.Task)
 		if b.Task == "" {
-			return http.StatusBadRequest, "ein ToDo braucht eine Aufgabenbeschreibung"
+			return http.StatusBadRequest, "A todo needs a task description"
 		}
-		// Fold a legacy single-target payload (repo/newRepo) into the target list so an older client
-		// keeps working; from here on Targets is the single source of truth.
-		if len(b.Targets) == 0 && (strings.TrimSpace(b.Repo) != "" || strings.TrimSpace(b.NewRepo) != "") {
-			b.Targets = []runs.Target{{Repo: b.Repo, NewRepo: b.NewRepo}}
-		}
-		b.Repo, b.NewRepo = "", ""
 		targets, code, msg := normalizeTargets(b.Targets)
 		if code != 0 {
 			return code, msg
 		}
 		b.Targets = targets
 		return 0, ""
-	case runs.TypeAuto:
-		if err := b.Schedule.Valid(); err != nil {
-			return http.StatusBadRequest, "Zeitplan ungültig: " + err.Error()
+	case model.KindAuto:
+		if b.Schedule == nil {
+			return http.StatusBadRequest, "An auto run needs a schedule"
 		}
-		b.AxiomIDs = dedupStrings(b.AxiomIDs)
-		if len(b.AxiomIDs) == 0 {
-			return http.StatusBadRequest, "ein Lauf braucht mindestens ein Axiom"
+		if err := b.Schedule.Valid(); err != nil {
+			return http.StatusBadRequest, "Invalid schedule: " + err.Error()
+		}
+		b.AxiomIDs = runs.DedupStrings(b.AxiomIDs)
+		// The one rule (mercury.RunLacksRequiredAxioms) binds to ACTIVATION, not to storage: it is
+		// asked about the state the run will be IN, not about the field this request happened to
+		// send. An inactive run that arrives without axioms (a takeover imports them that way) must
+		// stay saveable — axioms reach it only through the assignment, so run and assignment would
+		// otherwise wait for each other forever.
+		if mercury.RunLacksRequiredAxioms(activeAfter(*b, activeNow), b.AxiomIDs) {
+			return http.StatusBadRequest, "An active auto run needs at least one axiom — save it inactive and assign axioms to it first"
 		}
 		for _, id := range b.AxiomIDs {
-			if _, ok := byID[id]; !ok {
-				return http.StatusBadRequest, "unbekanntes Axiom: " + id
+			if _, ok := cat.ByID[id]; !ok {
+				return http.StatusBadRequest, "Unknown axiom: " + id
 			}
 		}
 		return 0, ""
 	default:
-		return http.StatusBadRequest, "type muss auto oder todo sein"
+		return http.StatusBadRequest, "kind must be auto or todo"
+	}
+}
+
+// applyInput maps a validated input onto a run.
+func applyInput(run *runs.Run, b runs.RunInput) {
+	run.Kind = b.Kind
+	run.Title = b.Title
+	run.Task = b.Task
+	run.AxiomIDs = b.AxiomIDs
+	run.Schedule = b.Schedule
+	if b.Active != nil {
+		run.Active = *b.Active
+	}
+	run.Targets = b.Targets
+	run.DueAt = b.DueAt
+	if b.Tuning != nil {
+		run.Tuning = *b.Tuning
 	}
 }
 
 func (s *Server) runCreate(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	var body runBody
+	var body runs.RunInput
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	if code, msg := validateRunBody(&body, byID); code != 0 {
+	// A brand-new run is active unless the input says otherwise — that is the state the axiom rule
+	// is measured against.
+	if code, msg := validateRunInput(&body, cat, true); code != 0 {
 		writeErr(w, code, msg)
 		return
 	}
-	now := time.Now()
-	run := runs.Run{
-		ID: runs.NewID(), Name: body.Name, Type: body.Type, Enabled: body.Enabled, Schedule: body.Schedule,
-		Model: body.Model, Effort: body.Effort, TimeBudget: body.TimeBudget,
-		AxiomIDs: body.AxiomIDs, Task: body.Task, Targets: body.Targets, DueAt: body.DueAt,
-		CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+	now := time.Now().UTC()
+	who := actorOf(r)
+	run := runs.Run{ID: runs.NewID(), Authorship: model.Authorship{Created: who, CreatedAt: now, Updated: who, UpdatedAt: now}}
+	if body.Active == nil {
+		run.Active = true
 	}
-	composeInto(&run, byID, laufregeln, now.UTC())
-	// Optimise the branch description with AI only when the raw name is too thin to slugify; best-effort,
-	// so a miss just leaves the executor to slug the name itself. Done here (outside Mutate) so the store
-	// lock is never held across the aigentic round-trip.
-	run.BranchDesc = s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), run.Name, run.Task)
-	// Only a recurring auto run has a NextFireAt; a ToDo fires once at its optional DueAt (or manually).
-	if run.Enabled && !run.IsTodo() {
-		if nf, err := run.Schedule.Next(now); err == nil {
-			run.NextFireAt = &nf
-		}
-	}
-	if _, err := s.runs.Mutate("create", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
-		return append(cur, run), nil
-	}); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gespeichert werden")
+	applyInput(&run, body)
+	runs.ComposeInto(&run, cat)
+	if err := s.runs.Put(run); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the run")
 		return
 	}
+	s.publish(live.TopicRuns)
 	writeJSON(w, http.StatusOK, run)
 }
 
 func (s *Server) runUpdate(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
-	id := r.PathValue("id")
-	var body runBody
+	var body runs.RunInput
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
+	run, ok, err := s.runs.Get(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read the run")
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No run with this id")
+		return
+	}
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	if code, msg := validateRunBody(&body, byID); code != 0 {
+	if code, msg := validateRunInput(&body, cat, run.Active); code != 0 {
 		writeErr(w, code, msg)
 		return
 	}
-	now := time.Now()
-	// Recompute the AI-optimized branch description for the edited name (outside Mutate so the store lock
-	// is never held across the aigentic round-trip). Recomputing on every edit keeps it consistent: a name
-	// that is now good enough clears it (""), a still-thin one refreshes it.
-	branchDesc := s.aiBranchDesc(r.Context(), cookie, csrfFrom(r), body.Name, body.Task)
-	var updated runs.Run
-	if _, err := s.runs.Mutate("update", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
-		idx := indexOfRun(cur, id)
-		if idx < 0 {
-			return nil, runs.ErrNotFound // abort before any write; no spurious save/snapshot
-		}
-		cur[idx].Name = body.Name
-		cur[idx].Type = body.Type
-		cur[idx].Enabled = body.Enabled
-		cur[idx].Model = body.Model
-		cur[idx].Effort = body.Effort
-		cur[idx].TimeBudget = body.TimeBudget
-		cur[idx].Schedule = body.Schedule
-		cur[idx].AxiomIDs = body.AxiomIDs
-		cur[idx].Task = body.Task
-		cur[idx].Targets = body.Targets
-		cur[idx].BranchDesc = branchDesc
-		// Drop any legacy single-target fields so a record edited after the upgrade keeps Targets as its
-		// only source of truth (TodoTargets prefers Targets, but leaving stale fields is untidy).
-		cur[idx].Repo, cur[idx].NewRepo = "", ""
-		cur[idx].DueAt = body.DueAt
-		cur[idx].UpdatedAt = now.UTC()
-		composeInto(&cur[idx], byID, laufregeln, now.UTC())
-		if cur[idx].Enabled && !cur[idx].IsTodo() {
-			if nf, e := cur[idx].Schedule.Next(now); e == nil {
-				cur[idx].NextFireAt = &nf
-			}
-		} else {
-			cur[idx].NextFireAt = nil // ToDos fire once at DueAt, never on a recurring schedule
-		}
-		updated = cur[idx]
-		return cur, nil
-	}); err != nil {
-		if errors.Is(err, runs.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
-			return
-		}
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gespeichert werden")
+	applyInput(&run, body)
+	// The last editor changes; the original creator stays visible (REQ-041).
+	run.Authorship.Updated = actorOf(r)
+	run.Authorship.UpdatedAt = time.Now().UTC()
+	runs.ComposeInto(&run, cat)
+	if err := s.runs.Put(run); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the run")
 		return
 	}
-	// Editing a run may have removed axioms from it, leaving them uncovered; re-cover them in the background.
+	// Editing may have removed axioms, leaving them uncovered; re-cover in the background.
 	s.kickAutoAssign(r)
-	writeJSON(w, http.StatusOK, updated)
+	s.publish(live.TopicRuns)
+	writeJSON(w, http.StatusOK, run)
 }
 
 func (s *Server) runDelete(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	id := r.PathValue("id")
 	// Results/logs are intentionally NOT deleted — they are historized and persist past the run.
-	if _, err := s.runs.Mutate("delete", actor(r), func(cur []runs.Run) ([]runs.Run, error) {
-		if indexOfRun(cur, id) < 0 {
-			return nil, runs.ErrNotFound
-		}
-		out := make([]runs.Run, 0, len(cur)-1)
-		for _, run := range cur {
-			if run.ID != id {
-				out = append(out, run)
-			}
-		}
-		return out, nil
-	}); err != nil {
+	if err := s.runs.Delete(id); err != nil {
 		if errors.Is(err, runs.ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "Kein Lauf mit dieser id")
+			writeErr(w, http.StatusNotFound, "No run with this id")
 			return
 		}
-		writeErr(w, http.StatusInternalServerError, "Lauf konnte nicht gelöscht werden")
+		writeErr(w, http.StatusInternalServerError, "Could not delete the run")
 		return
 	}
-	// The ToDo is gone; drop its attachment blobs too so the passive pool keeps no orphans.
+	// The todo is gone; drop its attachment blobs too so the passive pool keeps no orphans.
 	if s.attachments != nil {
 		_ = s.attachments.DeleteAll(id)
 	}
-	// Deleting a run may have orphaned its axioms; re-cover them in the background.
 	s.kickAutoAssign(r)
+	s.publish(live.TopicRuns)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ── AI proposals: taken on, never waited on ──────────────────────────────────────────────────
+//
+// A run proposal is a model call over the WHOLE constitution — minutes of work, not seconds, and
+// the planning loop may re-ask the model on an unusable answer. A call whose duration nobody can
+// predict must not hang on an open connection: a hop in front of devlabd drops a connection that
+// has been silent for a while, and the surface then says "failed" for work the server finished
+// cleanly.
+//
+// So these two accesses TAKE THE WORK ON and answer at once. The finished proposal announces
+// itself over the ONE live stream (S12, topic `runs`) like every other change of state, and the
+// surface reads it back through this very access point — one mechanism (REQ-034), one access point
+// per entity. It is the shape the auto-assigner already has (kick → detached pass → visible
+// outcome), with the difference that a proposal is REVIEWED before anything is written.
+//
+// One analysis per kind at a time: a second request while one is in flight reports THAT one
+// instead of starting a rival. Nothing is written here; only apply-proposal writes.
+
+// aiProposalKind is one of the two reviewable planning kinds.
+type aiProposalKind string
+
+const (
+	aiFill     aiProposalKind = "fill"
+	aiFinetune aiProposalKind = "finetune"
+)
+
+// The states one analysis passes through — the contract's own words, so the surface reads the same
+// vocabulary here as everywhere else. `none` means: nothing in flight, nothing waiting for review.
+const (
+	aiStateNone      = "none"
+	aiStateRunning   = string(model.PhaseRunning)
+	aiStateCompleted = string(model.PhaseCompleted)
+	aiStateFailed    = string(model.PhaseFailed)
+)
+
+// aiProposalTimeout bounds one detached analysis. Generous, because the loop may re-ask the model
+// (each call is bounded on its own); it exists so a wedged call ends in a NAMED failure instead of
+// an analysis that claims to be running forever.
+const aiProposalTimeout = 10 * time.Minute
+
+// aiProposal is one detached analysis: its state, what it produced and — on failure — the named
+// reason. There is no state in which the surface would have to say "failed" without saying why.
+type aiProposal struct {
+	ID        string
+	Kind      aiProposalKind
+	State     string
+	StartedAt time.Time
+	EndedAt   time.Time
+	Reason    string
+	Plan      mercury.RunPlan
+	Axioms    map[string]string
+	cancel    context.CancelFunc
+}
+
+// aiProposals holds the analysis in flight (or the one just finished) per server and kind. It is a
+// package-level registry rather than a Server field because the composition root is frozen contract
+// (api.go, BAUPLAN §0.2); keying it by the server keeps two servers in one process — every test
+// builds its own — strictly apart. At most two entries exist per server.
+var aiProposals = struct {
+	mu sync.Mutex
+	by map[aiProposalKey]*aiProposal
+}{by: map[aiProposalKey]*aiProposal{}}
+
+type aiProposalKey struct {
+	s    *Server
+	kind aiProposalKind
+}
+
+// aiProposalCurrent snapshots this kind's analysis (a copy — the detached pass keeps writing).
+func aiProposalCurrent(s *Server, kind aiProposalKind) (aiProposal, bool) {
+	aiProposals.mu.Lock()
+	defer aiProposals.mu.Unlock()
+	p, ok := aiProposals.by[aiProposalKey{s, kind}]
+	if !ok {
+		return aiProposal{}, false
+	}
+	return *p, true
+}
+
+// aiProposalAbandon drops this kind's analysis: work in flight is cancelled, a finished proposal is
+// discarded. It is the ONE way a proposal ends without being applied — closing the review, pressing
+// cancel while it runs and dismissing a failure are the same act — so a returning user never meets
+// a proposal they already put aside.
+func aiProposalAbandon(s *Server, kind aiProposalKind) {
+	aiProposals.mu.Lock()
+	key := aiProposalKey{s, kind}
+	p, ok := aiProposals.by[key]
+	delete(aiProposals.by, key)
+	aiProposals.mu.Unlock()
+	if ok && p.cancel != nil {
+		p.cancel()
+	}
+}
+
+// aiProposalStart registers a running analysis and performs `work` detached from the request. The
+// caller gets the freshly registered state back at once — it never waits for the model.
+func (s *Server) aiProposalStart(kind aiProposalKind, work func(context.Context) (mercury.RunPlan, error), legend map[string]string) aiProposal {
+	ctx, cancel := context.WithTimeout(context.Background(), aiProposalTimeout)
+	// The id names WHICH analysis this is — kind and the moment it began. It borrows no other
+	// entity's id shape (a proposal is not a run) and needs no second id generator.
+	begun := time.Now().UTC()
+	p := &aiProposal{
+		ID: string(kind) + "@" + begun.Format(time.RFC3339Nano), Kind: kind,
+		State: aiStateRunning, StartedAt: begun, cancel: cancel,
+	}
+	key := aiProposalKey{s, kind}
+	aiProposals.mu.Lock()
+	if old := aiProposals.by[key]; old != nil && old.cancel != nil {
+		old.cancel() // a superseded predecessor is stopped, never left running in the background
+	}
+	aiProposals.by[key] = p
+	// The answer to THIS request is taken here, under the lock: from the moment the pass is
+	// launched the record belongs to it, and reading it afterwards would race its outcome.
+	started := *p
+	aiProposals.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		// Contained: a detached task must never take devlabd down — and its failure must still be
+		// visible instead of leaving an analysis that claims to run forever.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("devlabd: AI proposal panicked (contained): %v", rec)
+				s.aiProposalFinish(key, p, mercury.RunPlan{}, nil, "The AI planning stopped unexpectedly")
+			}
+		}()
+		plan, err := work(ctx)
+		if err != nil {
+			s.aiProposalFinish(key, p, mercury.RunPlan{}, nil, aiFailureReason(ctx, err))
+			return
+		}
+		s.aiProposalFinish(key, p, plan, legend, "")
+	}()
+	return started
+}
+
+// aiProposalFinish records an outcome and announces it on the one live stream. The late answer of
+// an analysis that was meanwhile abandoned or superseded is dropped: it must not resurrect a
+// proposal the user has already put aside.
+func (s *Server) aiProposalFinish(key aiProposalKey, p *aiProposal, plan mercury.RunPlan, legend map[string]string, reason string) {
+	aiProposals.mu.Lock()
+	if aiProposals.by[key] != p {
+		aiProposals.mu.Unlock()
+		return
+	}
+	p.EndedAt = time.Now().UTC()
+	if reason != "" {
+		p.State, p.Reason = aiStateFailed, reason
+	} else {
+		p.State, p.Plan, p.Axioms = aiStateCompleted, plan, legend
+	}
+	aiProposals.mu.Unlock()
+	s.publish(live.TopicRuns)
+}
+
+// aiFailureReason turns a planning failure into a sentence the user can act on. aigentic names what
+// it knows (unreachable, refused, usage window, no answer in time); a failure it does not recognise
+// after the loop's retries is the ANSWER being unusable — a statement about the model, not a
+// transport error — so it is named here instead of shown as a raw error line.
+func aiFailureReason(ctx context.Context, err error) string {
+	reason := aigentic.Reason(err)
+	if reason == "" && ctx != nil && ctx.Err() != nil {
+		return "The AI analysis was stopped after " + aiProposalTimeout.String() + " without a usable answer"
+	}
+	if reason != "" {
+		return reason
+	}
+	return "The AI did not answer in the required form: " + err.Error()
+}
+
+// aiProposalView is the wire shape of one kind's analysis — the SAME document in every state, so
+// the surface never has to guess: `none` (nothing in flight), `running` (work under way, with the
+// moment it began), `completed` (with the reviewable proposal) or `failed` WITH its reason.
+func aiProposalView(p *aiProposal, kind aiProposalKind) map[string]any {
+	if p == nil {
+		return map[string]any{"kind": string(kind), "state": aiStateNone}
+	}
+	out := map[string]any{
+		"kind": string(p.Kind), "state": p.State, "id": p.ID,
+		"startedAt": p.StartedAt.UTC().Format(time.RFC3339),
+	}
+	if !p.EndedAt.IsZero() {
+		out["endedAt"] = p.EndedAt.UTC().Format(time.RFC3339)
+	}
+	if p.Reason != "" {
+		out["reason"] = p.Reason
+	}
+	if p.State == aiStateCompleted {
+		out["proposal"] = p.Plan
+		out["axioms"] = p.Axioms
+	}
+	return out
 }
 
 // runsAiFill proposes runs for the not-yet-covered axioms (reviewable; writes nothing).
 func (s *Server) runsAiFill(w http.ResponseWriter, r *http.Request) {
-	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
-		return
-	}
-	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, err := s.runCatalog(r.Context(), cookie)
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	all, err := s.runs.List()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
-		return
-	}
-	covered := map[string]bool{}
-	names := make([]string, 0, len(all))
-	for _, run := range all {
-		names = append(names, run.Name)
-		for _, id := range run.AxiomIDs {
-			covered[id] = true
-		}
-	}
-	var uncovered []mercury.RunAxiom
-	for id, a := range byID {
-		if !covered[id] {
-			uncovered = append(uncovered, a)
-		}
-	}
-	if len(uncovered) == 0 {
-		writeErr(w, http.StatusBadRequest, "Alle Axiome sind bereits durch einen Lauf abgedeckt")
-		return
-	}
-	known := keysOf(byID)
-	plan, err := s.planRuns(r.Context(), cookie, csrf, known, func(correction string) string {
-		return mercury.RunPlanFillPrompt(uncovered, names, correction)
-	})
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
+	s.aiProposalAccess(w, r, aiFill)
 }
 
 // runsAiFinetune proposes a cleaner regrouping of all current runs (reviewable; writes nothing).
 func (s *Server) runsAiFinetune(w http.ResponseWriter, r *http.Request) {
+	s.aiProposalAccess(w, r, aiFinetune)
+}
+
+// aiProposalAccess is the ONE access point of one proposal kind — request it, read it, abandon it.
+// The body names which (`action`; the default is the request, so an agent that simply calls the
+// tool gets an analysis):
+//
+//	request  start an analysis when none exists — otherwise report the one that does, whatever
+//	         state it is in (never a second of a kind, and never a silent restart)
+//	read     report the state only — starts nothing, so returning to the surface (or reloading it)
+//	         shows what is running or waiting instead of setting off work nobody asked for
+//	cancel   abandon: stop work in flight, discard a finished or failed proposal
+//
+// The answer is always the state, never a claimed success — the proposal itself arrives over the
+// live stream.
+//
+// STARTING OVER IS A DELIBERATE ACT — first put the failure aside (`cancel`), then ask again. A
+// request that met a failure and quietly began the next analysis looked identical to one that
+// merely asked: the caller was answered `running` every single time, never learnt WHY the last
+// attempt failed, and paid for one model pass per round. That is the loop a caller who can only
+// ask — an agent — cannot get out of, so the access point refuses to restart by itself.
+func (s *Server) aiProposalAccess(w http.ResponseWriter, r *http.Request, kind aiProposalKind) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
+	var body struct {
+		Action string `json:"action"`
+	}
+	// An empty body is a request — the MCP tool and a plain button press both send one.
+	if r.ContentLength != 0 && !decodeJSON(w, r, &body) {
+		return
+	}
+	switch strings.TrimSpace(body.Action) {
+	case "cancel":
+		aiProposalAbandon(s, kind)
+		s.publish(live.TopicRuns) // every open surface learns it, not just the one that pressed
+		writeJSON(w, http.StatusOK, aiProposalView(nil, kind))
+		return
+	case "read":
+		cur, ok := aiProposalCurrent(s, kind)
+		if !ok {
+			writeJSON(w, http.StatusOK, aiProposalView(nil, kind))
+			return
+		}
+		writeJSON(w, http.StatusOK, aiProposalView(&cur, kind))
+		return
+	case "", "request":
+	default:
+		writeErr(w, http.StatusBadRequest, "action must be request, read or cancel")
+		return
+	}
+	// Whatever is already there is REPORTED, never overwritten: work in flight is not doubled, a
+	// finished proposal is not computed again, and a failure is handed back WITH ITS REASON instead
+	// of setting off the next model pass. So asking twice costs nothing and always tells the truth.
+	if cur, ok := aiProposalCurrent(s, kind); ok {
+		writeJSON(w, http.StatusOK, aiProposalView(&cur, kind))
+		return
+	}
+
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	byID, _, _, err := s.runCatalog(r.Context(), cookie)
+	cat, _, err := s.runCatalog(r.Context(), cookie)
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
 	all, err := s.runs.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
-	if len(all) == 0 {
-		writeErr(w, http.StatusBadRequest, "Keine Läufe zum Fine-tunen — zuerst welche anlegen oder „Mit KI auffüllen“")
-		return
+	var build func(correction string) string
+	switch kind {
+	case aiFill:
+		uncovered := uncoveredAxioms(cat, all)
+		if len(uncovered) == 0 {
+			writeErr(w, http.StatusBadRequest, "Every axiom is already covered by a run")
+			return
+		}
+		names := extendableRunTitles(all)
+		build = func(correction string) string { return mercury.RunPlanFillPrompt(uncovered, names, correction) }
+	default:
+		if len(all) == 0 {
+			writeErr(w, http.StatusBadRequest, "No runs to fine-tune — create some first or use AI fill")
+			return
+		}
+		build = func(correction string) string {
+			return mercury.RunPlanFinetunePrompt(catalogSlice(cat), plannedRunsFrom(all), correction)
+		}
 	}
-	current := plannedRunsFrom(all)
-	catalog := catalogSlice(byID)
-	known := keysOf(byID)
-	plan, err := s.planRuns(r.Context(), cookie, csrf, known, func(correction string) string {
-		return mercury.RunPlanFinetunePrompt(catalog, current, correction)
-	})
-	if err != nil {
-		mercuryError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"proposal": plan, "axioms": titleLegend(byID)})
+	known := keysOf(cat.ByID)
+	// The pass runs on the CALLER's session, exactly as the auto-assigner's does: the planning goes
+	// through aigentic, which authenticates as the caller.
+	started := s.aiProposalStart(kind, func(ctx context.Context) (mercury.RunPlan, error) {
+		return s.planRuns(ctx, cookie, csrf, known, build)
+	}, titleLegend(cat))
+	s.publish(live.TopicRuns)
+	writeJSON(w, http.StatusAccepted, aiProposalView(&started, kind))
 }
 
-// planRuns runs the aigentic classification loop for a run plan (mirrors s.classify).
+// planRuns runs the aigentic classification loop for a run plan.
 func (s *Server) planRuns(ctx context.Context, cookie, csrf string, knownIDs []string, build func(correction string) string) (mercury.RunPlan, error) {
-	correction := ""
-	var lastErr error
-	for i := 0; i < classifyAttempts; i++ {
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: build(correction), OutputFormat: "text"})
-		if err != nil {
-			return mercury.RunPlan{}, err
-		}
-		plan, perr := mercury.ParseRunPlan(result.Output, knownIDs)
-		if perr == nil {
-			return plan, nil
-		}
-		correction, lastErr = perr.Error(), perr
-	}
-	if lastErr == nil {
-		lastErr = mercury.ErrNoJSON
-	}
-	return mercury.RunPlan{}, lastErr
+	return aigenticRetry(ctx, cookie, csrf, build,
+		func(out string) (mercury.RunPlan, error) { return mercury.ParseRunPlan(out, knownIDs) })
 }
 
-// aiBranchDesc supplies the "otherwise optimise with ai" half of the run-branch naming convention: when a
-// run's own name is too thin to slugify into a readable branch (see runs.BranchDescGoodEnough), it asks
-// aigentic for a concise English description instead. It is deliberately best-effort and non-blocking —
-// a short timeout and ANY error (aigentic down, missing right/key, junk output) yield "", so creating or
-// editing a run never hangs on or fails because of the AI service; the executor then slugifies the name
-// (or its "change" fallback) directly. It returns "" without spending a round-trip when the name is
-// already good enough, and only ever runs in a request handler, where the caller's cookie authorises the
-// aigentic proxy — the background executor has no session and so relies on the deterministic slug.
-func (s *Server) aiBranchDesc(ctx context.Context, cookie, csrf, name, task string) string {
-	if runs.BranchDescGoodEnough(name) {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	prompt := "Name a git branch for the following software task. Reply with ONLY a concise English " +
-		"description of 2 to 5 words, all lowercase, words separated by single spaces, no punctuation and " +
-		"no surrounding quotes.\n\nTask title: " + name + "\n"
-	if strings.TrimSpace(task) != "" {
-		prompt += "Task detail: " + task + "\n"
-	}
-	result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
-	if err != nil || result == nil {
-		return ""
-	}
-	desc := strings.TrimSpace(result.Output)
-	if i := strings.IndexByte(desc, '\n'); i >= 0 {
-		desc = strings.TrimSpace(desc[:i]) // keep only the first line if the model added prose
-	}
-	if !runs.BranchDescGoodEnough(desc) {
-		return "" // unusable answer — fall back to the deterministic name slug
-	}
-	return desc
-}
-
-// runsApplyProposal persists a (possibly user-edited) reviewed proposal. mode "fill" creates/extends
-// named runs; mode "replace" replaces the whole set (fine-tune).
+// runsApplyProposal persists a (possibly user-edited) reviewed proposal. mode "fill"
+// creates/extends named runs; mode "replace" replaces the whole set.
 func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	var body struct {
@@ -661,69 +733,79 @@ func (s *Server) runsApplyProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Mode != "fill" && body.Mode != "replace" {
-		writeErr(w, http.StatusBadRequest, "mode muss fill oder replace sein")
+		writeErr(w, http.StatusBadRequest, "mode must be fill or replace")
 		return
 	}
-	cookie := r.Header.Get("Cookie")
-	byID, _, laufregeln, err := s.runCatalog(r.Context(), cookie)
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	// Re-validate the (possibly user-edited) plan against the current axiom set.
-	if err := mercury.ValidateRunPlan(&body.Plan, keysOf(byID)); err != nil {
-		writeErr(w, http.StatusBadRequest, "Vorschlag ungültig: "+err.Error())
+	if err := mercury.ValidateRunPlan(&body.Plan, keysOf(cat.ByID)); err != nil {
+		writeErr(w, http.StatusBadRequest, "Invalid proposal: "+err.Error())
 		return
 	}
-	now := time.Now()
+	now := time.Now().UTC()
+	who := actorOf(r)
 	planned := make([]runs.Run, 0, len(body.Plan.Runs))
 	for _, pr := range body.Plan.Runs {
 		run := runs.Run{
-			ID: runs.NewID(), Name: pr.Name, Enabled: true, Schedule: toSchedule(pr.Schedule),
-			AxiomIDs: dedupStrings(pr.AxiomIDs), CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
+			ID: runs.NewID(), Kind: model.KindAuto, Title: pr.Name, Active: true,
+			Schedule: toSchedule(pr.Schedule), AxiomIDs: runs.DedupStrings(pr.AxiomIDs),
+			Authorship: model.Authorship{Created: who, CreatedAt: now, Updated: who, UpdatedAt: now},
 		}
-		composeInto(&run, byID, laufregeln, now.UTC())
-		if nf, e := run.Schedule.Next(now); e == nil {
-			run.NextFireAt = &nf
-		}
+		runs.ComposeInto(&run, cat)
 		planned = append(planned, run)
 	}
-	action := "apply-" + body.Mode
-	if _, err := s.runs.Mutate(action, actor(r), func(cur []runs.Run) ([]runs.Run, error) {
-		if body.Mode == "replace" {
-			return planned, nil
-		}
-		// fill: extend an auto run of the same name (append axioms), else append the new run.
-		out := append([]runs.Run(nil), cur...)
-		for _, np := range planned {
-			out, _, _ = upsertPlannedRun(out, np, byID, laufregeln, now.UTC())
-		}
-		return out, nil
-	}); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Vorschlag konnte nicht gespeichert werden")
+	cur, err := s.runs.List()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
-	// A replace can strip coverage from axioms the new set omits; cover them again in the background.
+	next := planned
+	if body.Mode == "fill" {
+		next = append([]runs.Run(nil), cur...)
+		for _, np := range planned {
+			next, _, _ = runs.UpsertPlannedRun(next, np, cat, now, who)
+		}
+	}
+	if err := s.runs.ReplaceAll(next, "apply-"+body.Mode, who); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the proposal")
+		return
+	}
+	// An applied proposal is consumed: it must not be waiting for review again after a reload,
+	// where applying it a second time would undo what has happened since. `fill` is what the fill
+	// analysis proposes, `replace` what the fine-tuning proposes.
+	if body.Mode == "fill" {
+		aiProposalAbandon(s, aiFill)
+	} else {
+		aiProposalAbandon(s, aiFinetune)
+	}
 	s.kickAutoAssign(r)
+	s.publish(live.TopicRuns)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) runsHistoryList(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	snaps, err := s.runs.History().List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Verlauf konnte nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the history")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
 }
 
+// runHistoryTSRe pins a restore timestamp to the RFC3339Nano shape List() emits, so a crafted
+// ts cannot traverse out of the history directory.
+var runHistoryTSRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$`)
+
 func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	var body struct {
@@ -733,99 +815,82 @@ func (s *Server) runsHistoryRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !runHistoryTSRe.MatchString(body.TS) {
-		writeErr(w, http.StatusBadRequest, "ungültiger Zeitstempel")
+		writeErr(w, http.StatusBadRequest, "Invalid timestamp")
 		return
 	}
 	snap, ok, err := s.runs.History().Get(body.TS)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Snapshot konnte nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the snapshot")
 		return
 	}
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Kein Snapshot mit diesem Zeitstempel")
+		writeErr(w, http.StatusNotFound, "No snapshot with this timestamp")
 		return
 	}
-	// A snapshot carries each run's prompt as it was composed then; the axioms may have moved on since.
-	// Recompose from the CURRENT scheme so a restored config comes back correct, never stale (staleness
-	// is structurally unreachable — there is no longer a badge to surface it).
-	byID, _, laufregeln, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
+	// Recompose from the CURRENT constitution so a restored config comes back correct, never
+	// stale (REQ-003).
+	cat, _, err := s.runCatalog(r.Context(), r.Header.Get("Cookie"))
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	now := time.Now()
 	restored := make([]runs.Run, len(snap.Runs))
 	copy(restored, snap.Runs)
 	for i := range restored {
-		composeInto(&restored[i], byID, laufregeln, now.UTC())
-		if restored[i].Enabled { // recompute NextFireAt forward so a restore doesn't fire the past immediately
-			if nf, e := restored[i].Schedule.Next(now); e == nil {
-				restored[i].NextFireAt = &nf
-			}
-		} else {
-			restored[i].NextFireAt = nil
-		}
+		runs.ComposeInto(&restored[i], cat)
 	}
-	if _, err := s.runs.Mutate("restore", actor(r), func([]runs.Run) ([]runs.Run, error) {
-		return restored, nil
-	}); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Wiederherstellung fehlgeschlagen")
+	if err := s.runs.ReplaceAll(restored, "restore", actorOf(r)); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Restore failed")
 		return
 	}
-	// Restoring an older set can leave axioms added since then uncovered; re-cover them in the background.
 	s.kickAutoAssign(r)
+	s.publish(live.TopicRuns)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": len(restored)})
 }
 
 var resultIDRe = regexp.MustCompile(`^[0-9A-Za-z_.:-]{1,64}$`)
 
-// runHistoryTSRe pins a restore timestamp to the RFC3339Nano shape List() emits, so a crafted `ts`
-// cannot traverse out of the history directory (stem() does not escape "/" or "..").
-var runHistoryTSRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$`)
-
 func (s *Server) runResultsList(w http.ResponseWriter, r *http.Request) {
-	if s.runResults == nil {
+	if s.results == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"results": []any{}})
 		return
 	}
-	refs, err := s.runResults.ListForRun(r.PathValue("id"))
+	list, err := s.results.ForRun(r.PathValue("id"))
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Ergebnisse konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the results")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"results": refs})
+	writeJSON(w, http.StatusOK, map[string]any{"results": list})
 }
 
 func (s *Server) runResultGet(w http.ResponseWriter, r *http.Request) {
-	if s.runResults == nil {
-		writeErr(w, http.StatusNotFound, "Kein Ergebnis")
+	if s.results == nil {
+		writeErr(w, http.StatusNotFound, "No result")
 		return
 	}
 	rid := r.PathValue("rid")
 	if !resultIDRe.MatchString(rid) {
-		writeErr(w, http.StatusBadRequest, "ungültige Ergebnis-id")
+		writeErr(w, http.StatusBadRequest, "Invalid result id")
 		return
 	}
-	res, ok, err := s.runResults.Get(r.PathValue("id"), rid)
+	res, ok, err := s.results.Get(rid)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Ergebnis konnte nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read the result")
 		return
 	}
 	if !ok {
-		writeErr(w, http.StatusNotFound, "Kein Ergebnis mit dieser id")
+		writeErr(w, http.StatusNotFound, "No result with this id")
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
 }
 
-// runsCalendar returns the calendar for a window — the union of past executions and upcoming firings,
-// sorted chronologically. The upcoming side expands each enabled run's schedule up to `days` ahead
-// (default 30); the past side folds in every completed execution (all of history, so a run that fired
-// long ago stays reachable), each carrying its resultId and status so the calendar can show the outcome
-// and open the full report. This is the one calendar access point behind every Mercury calendar surface.
+// runsCalendar returns the calendar window — the union of past executions and upcoming
+// firings, chronological. The one calendar access point behind every calendar surface
+// (REQ-012); ?type=auto|todo scopes it.
 func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	if s.runs == nil {
-		writeErr(w, http.StatusServiceUnavailable, "Läufe-Store nicht verfügbar")
+		writeErr(w, http.StatusServiceUnavailable, "Run store unavailable")
 		return
 	}
 	days := 30
@@ -836,138 +901,124 @@ func (s *Server) runsCalendar(w http.ResponseWriter, r *http.Request) {
 	}
 	all, err := s.runs.List()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Läufe konnten nicht gelesen werden")
+		writeErr(w, http.StatusInternalServerError, "Could not read runs")
 		return
 	}
-	// ?type=auto|todo (default: both) — the Läufe and ToDos sections each show their own calendar,
-	// the global one unites them and tells them apart by `type`.
 	want := strings.TrimSpace(r.URL.Query().Get("type"))
 	now := time.Now()
 	horizon := now.Add(time.Duration(days) * 24 * time.Hour)
-	// One dot on the calendar. A FUTURE firing carries its schedule; a PAST execution carries its
-	// resultId and status instead (schedule empty) — the presence of resultId tells the two apart.
-	type occ struct {
-		RunID     string    `json:"runId"`
-		RunName   string    `json:"runName"`
-		Type      runs.Type `json:"type"` // auto | todo — drives the colour separation
-		At        time.Time `json:"at"`
-		Schedule  string    `json:"schedule,omitempty"`  // future firing: how it recurs
-		ResultID  string    `json:"resultId,omitempty"`  // past execution: opens its full report
-		OK        bool      `json:"ok,omitempty"`        // past execution: outcome
-		Suspended bool      `json:"suspended,omitempty"` // past execution: paused on the usage limit
-	}
-	occs := []occ{} // never nil: a nil slice marshals to JSON null and hangs the UI
+	occs := []model.RunOccurrence{} // never nil: null would blank the UI list
 	for _, run := range all {
-		kind := runs.TypeAuto
-		if run.IsTodo() {
-			kind = runs.TypeTodo
-		}
-		if !run.Enabled || (want != "" && want != "all" && string(kind) != want) {
+		if want != "" && want != "all" && string(run.Kind) != want {
 			continue
 		}
-		if run.IsTodo() {
-			// A ToDo is a single point in time; an overdue-but-unfinished one still belongs on the
-			// calendar. Without a due date it only ever runs manually — nothing to show. A done ToDo's
-			// outcome returns below as its past execution instead.
-			if run.Done || run.DueAt == nil || run.DueAt.After(horizon) {
+		if run.Kind == model.KindTodo {
+			// A todo is a single point in time; overdue-but-open still belongs on the calendar.
+			if run.DueAt == nil || run.DueAt.After(horizon) {
 				continue
 			}
-			occs = append(occs, occ{RunID: run.ID, RunName: run.Name, Type: kind, At: *run.DueAt, Schedule: "einmalig"})
+			occs = append(occs, model.RunOccurrence{
+				RunID: run.ID, RunTitle: run.Title, Kind: run.Kind,
+				At: run.DueAt.Format(time.RFC3339), Schedule: "once",
+			})
+			continue
+		}
+		if !run.Active || run.Schedule == nil {
 			continue
 		}
 		t := now
 		for i := 0; i < 400; i++ { // cap: a daily run over a year is ~366
-			next, err := run.Schedule.Next(t)
-			if err != nil || next.After(horizon) {
+			next := runs.NextFire(*run.Schedule, t)
+			if next.IsZero() || next.After(horizon) {
 				break
 			}
-			occs = append(occs, occ{RunID: run.ID, RunName: run.Name, Type: kind, At: next, Schedule: scheduleSummary(run.Schedule)})
+			occs = append(occs, model.RunOccurrence{
+				RunID: run.ID, RunTitle: run.Title, Kind: run.Kind,
+				At: next.Format(time.RFC3339), Schedule: scheduleSummary(*run.Schedule),
+			})
 			t = next
 		}
 	}
-	// Past side: every completed execution, type-resolved exactly like the History (the shared source),
-	// so the calendar is the union of done and upcoming runs and each past run's status is reachable from
-	// it. All of history is included, so the window's start stretches back to the earliest execution.
-	execs, err := s.resolvedExecutions(want)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
-		return
-	}
+	// Past side: every stored execution, kind-resolved exactly like the history (the shared
+	// source) so calendar and history can never diverge.
 	from := now
-	for _, e := range execs {
-		occs = append(occs, occ{
-			RunID: e.RunID, RunName: e.RunName, Type: e.Type, At: e.At,
-			ResultID: e.ResultID, OK: e.OK, Suspended: e.Suspended,
+	for _, e := range s.resolvedExecutions(want) {
+		at := e.StartedAt
+		succeeded := resultSucceeded(e)
+		occs = append(occs, model.RunOccurrence{
+			RunID: e.RunID, RunTitle: e.RunTitle, Kind: e.Kind,
+			At: at.Format(time.RFC3339), ResultID: e.ID, Succeeded: &succeeded,
 		})
-		if e.At.Before(from) {
-			from = e.At
+		if at.Before(from) {
+			from = at
 		}
 	}
-	sort.Slice(occs, func(i, j int) bool { return occs[i].At.Before(occs[j].At) })
-	writeJSON(w, http.StatusOK, map[string]any{"from": from, "to": horizon, "occurrences": occs})
+	sort.Slice(occs, func(i, j int) bool { return occs[i].At < occs[j].At })
+	writeJSON(w, http.StatusOK, model.RunCalendar{
+		From: from.Format(time.RFC3339), To: horizon.Format(time.RFC3339), Occurrences: occs,
+	})
 }
 
-// runsExecutions returns completed executions (newest first, with token/cost) — the execution history.
-// Includes executions of runs since deleted (persistent logs). ?type=auto|todo scopes it to one surface
-// (the Läufe and ToDos tabs each show their own history, symmetrically); default/all is the global log.
-// Kind resolution and type filtering live in the shared resolvedExecutions, which the calendar reuses.
+// resultSucceeded reads success off the server stage array — every repo pipeline done and
+// succeeded (the client never derives stages, B-17; neither does this projection invent them).
+func resultSucceeded(res runs.Result) bool {
+	if len(res.Repos) == 0 {
+		return false
+	}
+	for _, rp := range res.Repos {
+		done, ok := model.PipelineSucceeded(rp.Stages)
+		if !done || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// runsExecutions returns stored executions (newest first) — the execution history, including
+// runs since deleted. ?type=auto|todo scopes it per surface.
 func (s *Server) runsExecutions(w http.ResponseWriter, r *http.Request) {
-	out, err := s.resolvedExecutions(r.URL.Query().Get("type"))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Ausführungs-History konnte nicht gelesen werden")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": out})
+	writeJSON(w, http.StatusOK, map[string]any{"executions": s.resolvedExecutions(r.URL.Query().Get("type"))})
 }
 
-// resolvedExecutions returns every stored execution (newest first) with its kind resolved — a stamped
-// result is trusted, an unstamped one falls back to its still-existing run's kind, an orphan with
-// neither reads as auto — filtered to `typeParam` (auto|todo, or ""/all for both). It is the single
-// source of past-execution truth shared by the execution History (runsExecutions) and the calendar's
-// past side (runsCalendar), so the two can never diverge. Empty (never nil) when no result store is wired.
-func (s *Server) resolvedExecutions(typeParam string) ([]runs.ExecutionSummary, error) {
-	if s.runResults == nil {
-		return []runs.ExecutionSummary{}, nil
+// resolvedExecutions returns every stored execution (newest first) with its kind resolved — a
+// stamped result is trusted, an unstamped one falls back to its still-existing run's kind. The
+// single source of past-execution truth shared by history and calendar.
+func (s *Server) resolvedExecutions(typeParam string) []runs.Result {
+	if s.results == nil {
+		return []runs.Result{}
 	}
-	execs, err := s.runResults.All()
+	execs, err := s.results.List()
 	if err != nil {
-		return nil, err
+		return []runs.Result{}
 	}
-	// runID → kind, so an unstamped result inherits the type of its still-existing run.
-	kindByRun := map[string]runs.Type{}
+	kindByRun := map[string]model.RunKind{}
 	if s.runs != nil {
 		if all, listErr := s.runs.List(); listErr == nil {
 			for _, run := range all {
-				kindByRun[run.ID] = runs.NormalizeType(run.Type)
+				kindByRun[run.ID] = run.Kind
 			}
 		}
 	}
-	resolve := func(e runs.ExecutionSummary) runs.Type {
-		if e.Type != "" {
-			return runs.NormalizeType(e.Type)
-		}
-		if k, ok := kindByRun[e.RunID]; ok {
-			return k
-		}
-		return runs.TypeAuto
-	}
 	want := strings.TrimSpace(typeParam)
-	out := make([]runs.ExecutionSummary, 0, len(execs))
+	out := make([]runs.Result, 0, len(execs))
 	for _, e := range execs {
-		kind := resolve(e)
-		if want != "" && want != "all" && string(kind) != want {
+		if e.Kind == "" {
+			if k, ok := kindByRun[e.RunID]; ok {
+				e.Kind = k
+			} else {
+				e.Kind = model.KindAuto
+			}
+		}
+		if want != "" && want != "all" && string(e.Kind) != want {
 			continue
 		}
-		e.Type = kind // hand back the resolved kind, never an empty one
 		out = append(out, e)
 	}
-	return out, nil
+	return out
 }
 
-// mercuryChat is the Mercury-WIDE assistant (not run-specific): it sees the axioms, the implementation
-// rules, the Laufregeln, the meta-axioms, the runs and the ToDos, answers questions about any of them,
-// and — when asked to create/change something — embeds ONE action the caller surfaces as a reviewable
-// proposal (applied through the same access points the UI uses; see mercury/action.go).
+// mercuryChat is the Mercury-WIDE assistant: it sees the axioms, the implementation rules, the
+// run rules, the meta-axioms, the runs and the todos, and may embed ONE reviewable action.
 func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Messages []mercury.ChatMessage `json:"messages"`
@@ -976,33 +1027,30 @@ func (s *Server) mercuryChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(body.Messages) == 0 {
-		writeErr(w, http.StatusBadRequest, "messages ist erforderlich")
+		writeErr(w, http.StatusBadRequest, "messages is required")
 		return
 	}
 	cookie, csrf := r.Header.Get("Cookie"), csrfFrom(r)
-	ctx, err := s.chatContext(r, cookie)
+	cctx, err := s.chatContext(r, cookie)
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	prompt := mercury.MercuryChatPrompt(ctx, body.Messages)
+	prompt := mercury.MercuryChatPrompt(cctx, body.Messages)
 	result, _, err := aigentic.Run(r.Context(), cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
 	if err != nil {
 		mercuryError(w, err)
 		return
 	}
-	action, cleaned, ok := mercury.ExtractChatAction(result.Output, ctx.ActionContext())
-	resp := map[string]any{"reply": cleaned}
+	action, cleaned, ok := mercury.ExtractChatAction(result.Output, cctx.ActionContext())
+	resp := map[string]any{"reply": cleaned, "model": result.Model}
 	if ok {
 		resp["action"] = action
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// chatContext gathers everything the Mercury-wide assistant knows: one scheme scan (axioms, rules,
-// Laufregeln, meta-axioms — each with its path and id), the runs and ToDos (each with its id), and the
-// existing repos (as possible ToDo targets). Every actionable entity carries the addressing an action
-// needs, so a proposed action can only reference things that exist.
+// chatContext gathers everything the Mercury-wide assistant knows.
 func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContext, error) {
 	ctx := r.Context()
 	paths, err := s.axioms.List(ctx, "")
@@ -1029,19 +1077,21 @@ func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContex
 	if s.runs != nil {
 		if all, err := s.runs.List(); err == nil {
 			for _, run := range all {
-				cr := mercury.ChatRun{ID: run.ID, Name: run.Name, Todo: run.IsTodo()}
-				if run.IsTodo() {
+				cr := mercury.ChatRun{ID: run.ID, Name: run.Title, Todo: run.Kind == model.KindTodo}
+				if run.Kind == model.KindTodo {
 					cr.Task = run.Task
-					cr.Targets = chatTargets(run.TodoTargets())
+					cr.Targets = chatTargets(run.Targets)
 				} else {
-					cr.Schedule = fromSchedule(run.Schedule)
+					if run.Schedule != nil {
+						cr.Schedule = fromSchedule(*run.Schedule)
+					}
 					cr.AxiomIDs = run.AxiomIDs
 				}
 				c.Runs = append(c.Runs, cr)
 			}
 		}
 	}
-	// Existing repos as possible ToDo targets — best-effort: a GitHub hiccup must not break the chat.
+	// Existing repos as possible todo targets — best-effort: a GitHub hiccup must not break chat.
 	if repos, ok := s.userRepos(r); ok {
 		for _, rp := range repos {
 			c.Repos = append(c.Repos, mercury.ChatRepo{ID: rp.ID, Name: rp.Name})
@@ -1050,7 +1100,7 @@ func (s *Server) chatContext(r *http.Request, cookie string) (mercury.ChatContex
 	return c, nil
 }
 
-// chatSection maps a record path to its Mercury section, or "" if it is not under a known namespace.
+// chatSection maps a record path to its Mercury section, or "" outside the known namespaces.
 func chatSection(path string) string {
 	for _, ns := range []string{mercury.NsAxiome, mercury.NsRegeln, mercury.NsLaeufe, mercury.NsMeta} {
 		if strings.HasPrefix(path, ns+"/") {
@@ -1060,11 +1110,15 @@ func chatSection(path string) string {
 	return ""
 }
 
-// chatTargets converts a ToDo's stored targets to the chat action shape.
+// chatTargets converts stored targets to the chat action shape.
 func chatTargets(ts []runs.Target) []mercury.ActionTarget {
 	out := make([]mercury.ActionTarget, 0, len(ts))
 	for _, t := range ts {
-		out = append(out, mercury.ActionTarget{Repo: t.Repo, NewRepo: t.NewRepo})
+		at := mercury.ActionTarget{Repo: t.Repo}
+		if t.Create {
+			at.NewRepo, at.Repo = t.Repo, ""
+		}
+		out = append(out, at)
 	}
 	return out
 }
@@ -1074,43 +1128,46 @@ func chatTargets(ts []runs.Target) []mercury.ActionTarget {
 func plannedRunsFrom(all []runs.Run) []mercury.PlannedRun {
 	out := make([]mercury.PlannedRun, 0, len(all))
 	for _, run := range all {
-		out = append(out, mercury.PlannedRun{Name: run.Name, AxiomIDs: run.AxiomIDs, Schedule: fromSchedule(run.Schedule)})
+		pr := mercury.PlannedRun{Name: run.Title, AxiomIDs: run.AxiomIDs}
+		if run.Schedule != nil {
+			pr.Schedule = fromSchedule(*run.Schedule)
+		}
+		out = append(out, pr)
 	}
 	return out
 }
 
-func catalogSlice(byID map[string]mercury.RunAxiom) []mercury.RunAxiom {
-	out := make([]mercury.RunAxiom, 0, len(byID))
-	for _, a := range byID {
+func catalogSlice(cat runs.Catalog) []mercury.RunAxiom {
+	out := make([]mercury.RunAxiom, 0, len(cat.ByID))
+	for _, a := range cat.ByID {
 		out = append(out, a)
 	}
 	return out
 }
 
-// scheduleSummary is a compact German label for a schedule ("täglich 03:00", "wöchentlich Mo,Do 03:00").
-func scheduleSummary(sc runs.Schedule) string {
+// scheduleSummary is a compact label for a schedule ("daily 03:00", "weekly Mon,Thu 03:00").
+func scheduleSummary(sc runs.ScheduleSpec) string {
 	switch sc.Kind {
 	case runs.Daily:
-		return "täglich " + sc.TimeOfDay
+		return "daily " + sc.TimeOfDay
 	case runs.Weekly:
-		names := []string{"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"}
+		names := []string{"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
 		var days []string
 		for _, d := range sc.Weekdays {
 			if int(d) >= 0 && int(d) < 7 {
 				days = append(days, names[d])
 			}
 		}
-		return "wöchentlich " + strings.Join(days, ",") + " " + sc.TimeOfDay
+		return "weekly " + strings.Join(days, ",") + " " + sc.TimeOfDay
 	default:
 		return sc.TimeOfDay
 	}
 }
 
-func actor(r *http.Request) string {
-	if u := userFrom(r); u != nil {
-		return u.Username
-	}
-	return "?"
+// actorOf is the ONE mapping from the request to an authorship actor (REQ-041): a label,
+// never a barrier. No user on the request reads as unattributed, never fabricated.
+func actorOf(r *http.Request) model.Actor {
+	return model.Actor{User: strings.TrimSuffix(actor(r), "?")}
 }
 
 func indexOfRun(list []runs.Run, id string) int {
@@ -1122,27 +1179,12 @@ func indexOfRun(list []runs.Run, id string) int {
 	return -1
 }
 
-// orEmptyRuns guarantees a non-nil slice: a nil marshals to JSON null, and the client reads .length off
-// it and blanks the list. Every run list this API returns is a list.
+// orEmptyRuns guarantees a non-nil slice (nil marshals to JSON null and blanks the list).
 func orEmptyRuns(r []runs.Run) []runs.Run {
 	if r == nil {
 		return []runs.Run{}
 	}
 	return r
-}
-
-func dedupStrings(in []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		s = strings.TrimSpace(s)
-		if s == "" || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	return out
 }
 
 func keysOf(m map[string]mercury.RunAxiom) []string {
@@ -1153,15 +1195,15 @@ func keysOf(m map[string]mercury.RunAxiom) []string {
 	return out
 }
 
-func toSchedule(ps mercury.PlanSchedule) runs.Schedule {
+func toSchedule(ps mercury.PlanSchedule) *runs.ScheduleSpec {
 	wd := make([]time.Weekday, 0, len(ps.Weekdays))
 	for _, d := range ps.Weekdays {
 		wd = append(wd, time.Weekday(d))
 	}
-	return runs.Schedule{Kind: runs.Kind(ps.Kind), TimeOfDay: ps.TimeOfDay, Weekdays: wd}
+	return &runs.ScheduleSpec{Kind: runs.ScheduleKind(ps.Kind), TimeOfDay: ps.TimeOfDay, Weekdays: wd}
 }
 
-func fromSchedule(s runs.Schedule) mercury.PlanSchedule {
+func fromSchedule(s runs.ScheduleSpec) mercury.PlanSchedule {
 	wd := make([]int, 0, len(s.Weekdays))
 	for _, d := range s.Weekdays {
 		wd = append(wd, int(d))

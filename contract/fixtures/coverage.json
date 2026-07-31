@@ -1,0 +1,14 @@
+{
+  "covered": {
+    "ax_1": [
+      "run_a"
+    ]
+  },
+  "index": {
+    "ax_1": "axiome/architecture/minimalism.md"
+  },
+  "axioms": {
+    "ax_1": "Minimalism"
+  },
+  "pending": true
+}

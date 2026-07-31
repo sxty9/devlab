@@ -1,0 +1,15 @@
+{
+  "runs": [
+    {
+      "id": "run_auto1",
+      "name": "Reuse and shared building blocks",
+      "type": "",
+      "enabled": true,
+      "prompt": "# Automatic run: Reuse and shared building blocks\n\nold composed prompt including the constitution",
+      "promptHash": "sha256:0001",
+      "promptAt": "2026-06-01T05:00:00Z",
+      "createdAt": "2026-06-01T05:00:00Z",
+      "updatedAt": "2026-06-20T05:00:00Z"
+    }
+  ]
+}

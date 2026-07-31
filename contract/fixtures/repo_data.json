@@ -1,0 +1,59 @@
+{
+  "branches": [
+    {
+      "name": "main",
+      "isDefault": true,
+      "ahead": 0,
+      "behind": 0,
+      "updated": "2h ago"
+    }
+  ],
+  "tree": [
+    {
+      "id": "cmd",
+      "name": "cmd",
+      "kind": "dir"
+    }
+  ],
+  "files": {},
+  "changes": [
+    {
+      "path": "a.go",
+      "status": "modified",
+      "additions": 1,
+      "deletions": 2,
+      "staged": false
+    }
+  ],
+  "commits": [
+    {
+      "hash": "abc1234",
+      "message": "init",
+      "author": "alice",
+      "time": "1d",
+      "dotLane": 0,
+      "lines": []
+    }
+  ],
+  "worktrees": [],
+  "vision": [],
+  "claude": [],
+  "terminal": [],
+  "stages": [
+    {
+      "id": "code",
+      "label": "Code",
+      "state": "active",
+      "hint": "Uncommitted changes"
+    }
+  ],
+  "defaultTabs": [
+    {
+      "id": "structure:svc-a",
+      "title": "svc-a — structure",
+      "kind": "structure"
+    }
+  ],
+  "activeTabId": "structure:svc-a",
+  "structure": []
+}

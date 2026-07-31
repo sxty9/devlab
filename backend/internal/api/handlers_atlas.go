@@ -2,8 +2,6 @@ package api
 
 import (
 	"net/http"
-	"strconv"
-	"strings"
 
 	"devlab/backend/internal/atlas"
 	"devlab/backend/internal/model"
@@ -20,40 +18,23 @@ func (s *Server) atlasGraph(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, atlas.GraphFor(repoIDs(repos), ok))
 }
 
-// atlasPorts returns the central port ledger: which service holds which routed port, and which ports
-// in the managed band are free. Read-only — the same passive projection as the graph, scoped to ports,
-// so what the dashboard shows can never drift from what is actually deployed.
-func (s *Server) atlasPorts(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, atlas.AllocationNow())
-}
-
-// atlasProposePort answers "which port should service <id> take?" — the endpoint setup consults so a
-// new service draws a free port from the central allocation instead of copying a template default. It
-// never resolves silently: when the desired port is taken, the response names the holder and grants a
-// free port instead, so setup can report the clash rather than install a service that will not start.
-func (s *Server) atlasProposePort(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	id := strings.TrimSpace(q.Get("id"))
-	if id == "" || len(id) > 40 {
-		writeErr(w, http.StatusBadRequest, "id required")
-		return
-	}
-	desired := 0
-	if d := strings.TrimSpace(q.Get("desired")); d != "" {
-		n, err := strconv.Atoi(d)
-		if err != nil || n < 0 || n > 65535 {
-			writeErr(w, http.StatusBadRequest, "desired must be a port number")
-			return
-		}
-		desired = n
-	}
-	writeJSON(w, http.StatusOK, atlas.Propose(id, desired))
-}
-
 func repoIDs(repos []model.Repo) []string {
 	ids := make([]string, 0, len(repos))
 	for _, r := range repos {
 		ids = append(ids, r.ID)
 	}
 	return ids
+}
+
+// atlasPorts reports the observed port allocations (F9): the ledger is derived fresh from the
+// host's routes and bound sockets on EVERY call — no stored port state, so it cannot drift from
+// what is deployed (REQ-044.4). Conflicts arrive named on the entries themselves. An unreadable
+// route source is an honest error, never an empty green ledger.
+func (s *Server) atlasPorts(w http.ResponseWriter, _ *http.Request) {
+	allocs, err := atlas.AllocationsNow()
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "port ledger unavailable: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, allocs)
 }

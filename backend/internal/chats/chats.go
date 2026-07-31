@@ -1,6 +1,7 @@
 // Package chats persists the repo-scoped AI-assistant transcript per user+repo, so a conversation
 // survives a reload. Plain JSON (not secret), atomic tmp+rename, nested <user>/<repo>.json under
-// /var/lib/devlab/chats — mirroring the workspace layout. Mirrors package links minus encryption.
+// <state root>/chats (statepath.Chats) — mirroring the workspace layout. Mirrors package links
+// minus encryption. The state root itself is runtime configuration; no path is baked in here.
 package chats
 
 import (
@@ -11,7 +12,10 @@ import (
 	"regexp"
 	"sync"
 
+	"devlab/backend/internal/fsatomic"
 	"devlab/backend/internal/model"
+
+	"devlab/backend/internal/statepath"
 )
 
 var (
@@ -28,11 +32,14 @@ type Store struct {
 	locks map[string]*sync.Mutex
 }
 
-// NewStore builds the store from DEVLAB_CHATS (default /var/lib/devlab/chats), dir 0700.
-func NewStore() (*Store, error) {
+// NewStore builds the store below the state root (DEVLAB_CHATS overrides), dir 0700.
+func NewStore(p *statepath.Paths) (*Store, error) {
 	dir := os.Getenv("DEVLAB_CHATS")
+	if dir == "" && p != nil {
+		dir = p.Chats()
+	}
 	if dir == "" {
-		dir = "/var/lib/devlab/chats"
+		return nil, fmt.Errorf("chats: no directory configured (state root missing)")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("chats: mkdir %s: %w", dir, err)
@@ -100,20 +107,5 @@ func (s *Store) Put(user, repo string, msgs []model.AiMessage) error {
 	if len(msgs) > maxMessages {
 		msgs = msgs[len(msgs)-maxMessages:]
 	}
-	b, err := json.Marshal(file{Messages: msgs})
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return fsatomic.WriteJSON(p, file{Messages: msgs})
 }

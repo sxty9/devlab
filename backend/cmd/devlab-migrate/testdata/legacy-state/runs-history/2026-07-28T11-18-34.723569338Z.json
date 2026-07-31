@@ -1,0 +1,87 @@
+{
+  "ts": "2026-07-28T11:18:34.723569338Z",
+  "action": "update",
+  "actor": "operator",
+  "runs": [
+    {
+      "id": "run_auto1",
+      "name": "Reuse and shared building blocks",
+      "type": "auto",
+      "enabled": false,
+      "schedule": {
+        "kind": "weekly",
+        "timeOfDay": "07:00",
+        "weekdays": [
+          1
+        ]
+      },
+      "axiomIds": [
+        "ax_reuse",
+        "ax_no_redundancy"
+      ],
+      "prompt": "# Reuse and shared building blocks\n\nold composed prompt including the constitution",
+      "promptAt": "2026-07-28T11:18:34.588803095Z",
+      "promptHash": "1055977a8f980b9dc522490eb13807407bb2e045e04ebac91a95df0c2484b76c",
+      "createdAt": "2026-07-26T19:46:55.959317413Z",
+      "updatedAt": "2026-07-28T11:18:34.588803095Z",
+      "lastFiredAt": "2026-07-27T16:09:49.034883752+02:00",
+      "lastResult": {
+        "resultId": "2026-07-27T05-19-58.610413771Z",
+        "at": "2026-07-27T05:19:58.610413771Z",
+        "ok": true,
+        "repoCount": 20,
+        "inputTokens": 130065484,
+        "outputTokens": 1523392,
+        "costUsd": 155.27209145,
+        "deployed": true,
+        "prUrl": "https://github.com/acme/alpha/pull/8"
+      },
+      "nextFireAt": "2026-08-03T07:00:00Z"
+    },
+    {
+      "id": "run_foreign_open",
+      "name": "Switch the imports",
+      "type": "todo",
+      "enabled": true,
+      "schedule": {
+        "kind": "",
+        "timeOfDay": ""
+      },
+      "axiomIds": null,
+      "task": "Switch the imports and prove the check passes.",
+      "done": true,
+      "repo": "alpha",
+      "prompt": "# Switch the imports\n\nold composed prompt including the constitution",
+      "promptAt": "2026-07-23T13:08:18.884328908Z",
+      "createdAt": "2026-07-23T13:08:18.884328908Z",
+      "updatedAt": "2026-07-23T13:08:18.884328908Z",
+      "lastFiredAt": "2026-07-24T00:00:06.445199936+02:00",
+      "lastResult": {
+        "resultId": "2026-07-23T22-00-06.448849449Z",
+        "at": "2026-07-23T22:00:06.448849449Z",
+        "ok": true,
+        "repoCount": 1,
+        "inputTokens": 16593657,
+        "outputTokens": 142497,
+        "costUsd": 16.17025645,
+        "prUrl": "https://github.com/acme/alpha/pull/9"
+      },
+      "targets": [
+        {
+          "repo": "alpha"
+        }
+      ],
+      "attachments": [
+        {
+          "id": "att_legacy1",
+          "filename": "sketch.png",
+          "mime": "image/png",
+          "size": 4096,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "uploadedAt": "2026-07-23T13:08:18.884328908Z",
+          "uploadedBy": "operator"
+        }
+      ]
+    }
+  ]
+}

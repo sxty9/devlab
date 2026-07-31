@@ -1,0 +1,15 @@
+{
+  "kind": "auto",
+  "title": "Nightly sweep",
+  "axiomIds": [
+    "ax_1"
+  ],
+  "schedule": {
+    "kind": "daily",
+    "timeOfDay": "03:00"
+  },
+  "active": true,
+  "tuning": {
+    "effort": "max"
+  }
+}

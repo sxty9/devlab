@@ -5,7 +5,8 @@ import { IconCard } from '@/ui/IconCard';
 import { Splash } from '@/shell/Splash';
 import { SitemapIcon } from '@/ui/icons';
 import { cn } from '@/lib/cn';
-import type { AtlasAllocation, AtlasGraph, AtlasNode, Repo } from '@/types';
+import { AtlasPorts } from '@/views/AtlasPorts';
+import type { AtlasGraph, AtlasNode, Repo } from '@/types';
 
 /** A node's tint carries its state: fully declared, or missing a manifest or a route. */
 function tintOf(n: AtlasNode): Repo['tint'] {
@@ -14,7 +15,7 @@ function tintOf(n: AtlasNode): Repo['tint'] {
 }
 
 function subtitleOf(n: AtlasNode): string {
-  return n.port ? `:${n.port}` : 'nicht geroutet';
+  return n.port ? `:${n.port}` : 'not routed';
 }
 
 /** Atlas — the model of how Holistic services interact.
@@ -30,7 +31,6 @@ export function AtlasView() {
   const source = useMemo(() => getDataSource(), []);
 
   const [graph, setGraph] = useState<AtlasGraph | null>(null);
-  const [ports, setPorts] = useState<AtlasAllocation | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
@@ -39,11 +39,6 @@ export function AtlasView() {
       .atlas()
       .then((g) => !cancelled && setGraph(g))
       .catch(() => !cancelled && setFailed(true));
-    // The port ledger is a secondary panel: a read failure hides it rather than failing the whole view.
-    source
-      .atlasPorts()
-      .then((p) => !cancelled && setPorts(p))
-      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
@@ -52,7 +47,7 @@ export function AtlasView() {
   if (failed) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center bg-bg-base">
-        <p className="text-footnote text-text-secondary">Die Landschaft konnte nicht gelesen werden.</p>
+        <p className="text-footnote text-text-secondary">The landscape could not be read.</p>
       </div>
     );
   }
@@ -82,50 +77,6 @@ export function AtlasView() {
           </div>
         </section>
 
-        {ports && (
-          <section>
-            <h2 className="mb-2.5 flex items-baseline gap-2 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
-              Port allocation
-              <span className="font-mono text-footnote font-normal normal-case tracking-normal text-text-tertiary">
-                band {ports.band[0]}–{ports.band[1]}
-              </span>
-            </h2>
-            <ul className="flex flex-col gap-px overflow-hidden rounded-card border border-separator bg-surface shadow-elev-1">
-              {ports.held.map((h) => {
-                const doubled = h.ids.length > 1;
-                return (
-                  <li key={h.port} className="flex items-center gap-2.5 px-3.5 py-2.5">
-                    <span className="w-14 shrink-0 font-mono text-footnote text-text-secondary">:{h.port}</span>
-                    <span className={cn('text-footnote', doubled ? 'text-danger' : 'text-text-primary')}>
-                      {h.ids.join(', ')}
-                    </span>
-                    {doubled && (
-                      <span className="ml-auto rounded-full bg-danger/10 px-2 py-0.5 text-caption font-medium text-danger">
-                        double-booked
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-            <div className="mt-2.5 flex flex-wrap items-baseline gap-1.5">
-              <span className="mr-1 text-caption uppercase tracking-wide text-text-tertiary">Free</span>
-              {ports.free.length === 0 ? (
-                <span className="text-footnote text-text-secondary">none in band</span>
-              ) : (
-                ports.free.map((p) => (
-                  <span
-                    key={p}
-                    className="rounded-md px-1.5 py-0.5 font-mono text-caption text-text-secondary ring-1 ring-inset ring-separator"
-                  >
-                    {p}
-                  </span>
-                ))
-              )}
-            </div>
-          </section>
-        )}
-
         {graph.findings.length > 0 && (
           <section>
             <h2 className="mb-2.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
@@ -146,6 +97,13 @@ export function AtlasView() {
             </ul>
           </section>
         )}
+
+        <section>
+          <h2 className="mb-2.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary">
+            Ports
+          </h2>
+          <AtlasPorts />
+        </section>
       </div>
     </div>
   );

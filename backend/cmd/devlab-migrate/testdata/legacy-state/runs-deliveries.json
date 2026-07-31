@@ -1,0 +1,52 @@
+{
+  "deliveries": [
+    {
+      "id": "dlv_merged1",
+      "runId": "run_auto1",
+      "resultId": "2026-07-27T10-50-43.652124276Z",
+      "runName": "Reuse and shared building blocks",
+      "repo": "acme/alpha",
+      "branch": "mercury-run/run_auto1/dlv_merged1",
+      "devBranch": "mercury-dev",
+      "baseBranch": "main",
+      "fromCommit": "40b756ef80916a66da56a01e7d9df8e88b8767dd",
+      "toCommit": "a35927b63d85d08537e31085ca6564ff7c770e52",
+      "prNumber": 46,
+      "prUrl": "https://github.com/acme/alpha/pull/46",
+      "createdAt": "2026-07-27T11:30:17.113022882Z",
+      "status": "merged"
+    },
+    {
+      "id": "dlv_closed1",
+      "runId": "run_auto1",
+      "resultId": "2026-07-27T11-32-29.113195889Z",
+      "runName": "Reuse and shared building blocks",
+      "repo": "acme/alpha",
+      "branch": "mercury-run/run_auto1/dlv_closed1",
+      "devBranch": "mercury-dev",
+      "baseBranch": "mercury-run/run_5bkordkfc3ghcnyw/dlv_27ntazm46g4k7g6k",
+      "fromCommit": "a35927b63d85d08537e31085ca6564ff7c770e52",
+      "toCommit": "81972e57978339f5a011d6b1c21b474b70ad57c5",
+      "prNumber": 49,
+      "prUrl": "https://github.com/acme/alpha/pull/49",
+      "createdAt": "2026-07-27T12:11:47.337410823Z",
+      "status": "closed"
+    },
+    {
+      "id": "dlv_open1",
+      "runId": "run_auto2",
+      "resultId": "2026-07-27T05-19-58.610413771Z",
+      "runName": "Reuse and shared building blocks",
+      "repo": "acme/beta",
+      "branch": "mercury-run/run_auto2/dlv_open1",
+      "devBranch": "mercury-dev",
+      "baseBranch": "main",
+      "fromCommit": "f40cf277dc892c1110e86ace92334918e4ed736d",
+      "toCommit": "32c0422e10f386a7f473b2b685ba3d9b1265a8f8",
+      "prNumber": 5,
+      "prUrl": "https://github.com/acme/beta/pull/5",
+      "createdAt": "2026-07-27T14:25:42.914371752Z",
+      "status": "open"
+    }
+  ]
+}

@@ -12,7 +12,7 @@ import (
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	t.Setenv("DEVLAB_COMMENTS", t.TempDir())
-	s, err := NewStore()
+	s, err := NewStore(nil)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}

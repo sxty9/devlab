@@ -1,0 +1,12 @@
+{
+  "started": false,
+  "notStarted": "already delivered",
+  "taskStates": {
+    "svc-a": "delivered"
+  },
+  "suggestion": {
+    "executionId": "exec_2",
+    "reason": "longest idle",
+    "score": 7
+  }
+}

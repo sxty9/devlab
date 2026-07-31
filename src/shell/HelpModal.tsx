@@ -31,7 +31,7 @@ function Key({ children }: { children: React.ReactNode }) {
 
 export function HelpModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   return (
-    <Modal open={open} onClose={onClose} title="DevLab" description="Develop, maintain & ship Holistic services — from vision to preview to prod." size="lg">
+    <Modal open={open} onClose={onClose} title="DevLab" description="Develop, maintain and ship Holistic services — in one place." size="lg">
       <div className="grid gap-6 sm:grid-cols-2">
         <div>
           <h3 className="mb-2 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Keyboard</h3>
@@ -66,7 +66,8 @@ export function HelpModal({ open, onClose }: { open: boolean; onClose: () => voi
         </div>
       </div>
       <p className="mt-6 border-t border-separator pt-4 text-caption text-text-tertiary">
-        Phase 1 — UI shell with mock data, preview-deployed via sxgate. Git, Claude, terminal &amp; live preview arrive with the backend.
+        Every panel works on the real repository: the editor, git, the terminal and the AI session act on your own
+        working copy, and Mercury carries the same work through delivery.
       </p>
     </Modal>
   );

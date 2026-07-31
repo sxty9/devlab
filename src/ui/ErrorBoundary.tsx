@@ -59,9 +59,9 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
     return (
       <div className={cn('flex h-full min-h-0 flex-col items-center justify-center gap-3 bg-bg-base px-6 text-center', className)}>
-        <p className="max-w-md text-footnote text-text-secondary">Diese Ansicht konnte nicht angezeigt werden.</p>
+        <p className="max-w-md text-footnote text-text-secondary">This view could not be displayed.</p>
         <Button variant="secondary" size="sm" onClick={this.reset}>
-          <RefreshIcon className="h-4 w-4" /> Erneut versuchen
+          <RefreshIcon className="h-4 w-4" /> Try again
         </Button>
       </div>
     );

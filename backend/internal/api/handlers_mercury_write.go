@@ -9,8 +9,11 @@ import (
 	"encoding/base32"
 	"net/http"
 	"strings"
+	"time"
 
 	"devlab/backend/internal/aigentic"
+	"devlab/backend/internal/axiomauthors"
+	"devlab/backend/internal/live"
 	"devlab/backend/internal/mercury"
 )
 
@@ -28,7 +31,7 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		Titel   string `json:"titel"`
 		Body    string `json:"body"`
 		Section string `json:"section"`
-		Force   bool   `json:"force"` // create even though a similar record exists (user chose "trotzdem neu")
+		Force   bool   `json:"force"` // create even though a similar record exists (user chose "create anyway")
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -109,14 +112,24 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 		mercuryError(w, err)
 		return
 	}
-	// Recompose the affected run snapshots and, for a CLAUDE.md-carried namespace, trigger the rollout.
-	s.reconcileAfterWrite(r.Context(), cookie, ns == mercury.NsAxiome || ns == mercury.NsRegeln)
+	// Recompose the affected run snapshots in the same request (REQ-003). There is no rollout:
+	// the constitution reaches every repository through the prompt alone.
+	s.reconcileAfterWrite(r.Context(), cookie)
+	s.publish(live.TopicAxioms)
 	// A brand-new axiom belongs to no run yet. Assign it to one automatically in the background (the
 	// write does not wait) so it is enforced without a manual step. Only axioms drive run coverage —
 	// a new Laufregel or meta-axiom leaves the covered set unchanged, so it need not kick.
 	if ns == mercury.NsAxiome {
 		s.kickAutoAssign(r)
 	}
+	// Record who authored this axiom in DevLab's local pool (never in the shared axioms repo). A create
+	// stamps both the creator and the last-editor to the same person.
+	now := time.Now().UTC()
+	who := actor(r)
+	s.axiomAuthors.Mutate(ax.ID, func(a axiomauthors.Author) axiomauthors.Author {
+		a.CreatedBy, a.CreatedAt, a.UpdatedBy, a.UpdatedAt = who, now, who, now
+		return a
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"path":       placed,
 		"id":         ax.ID,
@@ -124,28 +137,46 @@ func (s *Server) addAxiom(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// aigenticRetry runs the shared aigentic claude-cli parse loop: it builds a prompt (folding the
+// previous attempt's parse error in as a correction line), runs it, and re-parses — up to
+// classifyAttempts times. It returns the first successful parse; the transport error verbatim if
+// aigentic is unreachable (no retry); or the last parse error once every attempt has failed. classify,
+// conform and planRuns are all this one loop with a different prompt builder and parser.
+func aigenticRetry[T any](ctx context.Context, cookie, csrf string, build func(correction string) string, parse func(output string) (T, error)) (T, error) {
+	var zero T
+	correction := ""
+	var lastErr error
+	for i := 0; i < classifyAttempts; i++ {
+		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: build(correction), OutputFormat: "text"})
+		if err != nil {
+			return zero, err
+		}
+		v, perr := parse(result.Output)
+		if perr == nil {
+			return v, nil
+		}
+		correction, lastErr = perr.Error(), perr
+	}
+	return zero, lastErr
+}
+
 // classify runs the classification loop for namespace ns: prompt aigentic (claude-cli), validate,
 // and retry with a correction line on any contract violation, up to classifyAttempts. ok is false
 // when every attempt failed (the caller parks the record).
 func (s *Server) classify(ctx context.Context, cookie, csrf string, categories []string, members map[string][]string, titel, body, hint, ns string) (mercury.Placement, bool) {
-	correction := ""
-	for i := 0; i < classifyAttempts; i++ {
-		prompt := mercury.ClassifyPrompt(categories, members, titel, body, hint, correction, ns)
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
-		if err != nil {
-			return mercury.Placement{}, false // aigentic unreachable / no subscription: park it
-		}
-		p, perr := mercury.ParsePlacement(result.Output, categories, ns)
-		if perr == nil {
-			return p, true
-		}
-		correction = perr.Error()
+	p, err := aigenticRetry(ctx, cookie, csrf,
+		func(correction string) string {
+			return mercury.ClassifyPrompt(categories, members, titel, body, hint, correction, ns)
+		},
+		func(out string) (mercury.Placement, error) { return mercury.ParsePlacement(out, categories, ns) })
+	if err != nil {
+		return mercury.Placement{}, false // aigentic unreachable or unparseable after retries: park it
 	}
-	return mercury.Placement{}, false
+	return p, true
 }
 
 // optimizeRecord polishes a record's title+body via aigentic (orthography, generalization, brevity)
-// WITHOUT persisting — the "Mit KI optimieren" button and the auto-optimize on add both use it. On
+// WITHOUT persisting — the "Polish with AI" button and the auto-optimize on add both use it. On
 // repeated model failure it returns the input unchanged (never worse than the original).
 func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -188,7 +219,7 @@ func (s *Server) optimizeRecord(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, mercury.Optimized{Titel: body.Titel, Body: body.Body})
 }
 
-// conformRecord checks an axiom strictly against every meta-axiom for the "Konformität"-panel. No
+// conformRecord checks an axiom strictly against every meta-axiom for the conformance panel. No
 // meta-axioms (or a model outage) ⇒ conforms:true (fail open) so the surface never blocks on infra.
 func (s *Server) conformRecord(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -247,20 +278,13 @@ func (s *Server) metaAxioms(ctx context.Context, cookie string, paths []string) 
 // classifyAttempts. ok is false when every attempt failed (model unreachable / unparseable) — the
 // caller then fails open (never block adding an axiom because the checker is down).
 func (s *Server) conform(ctx context.Context, cookie, csrf, titel, body string, metas []mercury.RunAxiom) (mercury.Conformance, bool) {
-	correction := ""
-	for i := 0; i < classifyAttempts; i++ {
-		prompt := mercury.ConformancePrompt(titel, body, metas, correction)
-		result, _, err := aigentic.Run(ctx, cookie, csrf, "claude-cli", aigentic.Request{Prompt: prompt, OutputFormat: "text"})
-		if err != nil {
-			return mercury.Conformance{}, false
-		}
-		c, perr := mercury.ParseConformance(result.Output)
-		if perr == nil {
-			return c, true
-		}
-		correction = perr.Error()
+	c, err := aigenticRetry(ctx, cookie, csrf,
+		func(correction string) string { return mercury.ConformancePrompt(titel, body, metas, correction) },
+		mercury.ParseConformance)
+	if err != nil {
+		return mercury.Conformance{}, false
 	}
-	return mercury.Conformance{}, false
+	return c, true
 }
 
 func orEmptyViolations(v []mercury.Violation) []mercury.Violation {

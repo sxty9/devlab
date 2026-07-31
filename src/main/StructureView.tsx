@@ -1,19 +1,15 @@
 import { useWorkspace } from '@/state/workspace';
-import { useToast } from '@/ui/Toast';
-import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon, RocketIcon } from '@/ui/icons';
-import { Button } from '@/ui/Button';
+import { ChevronRightIcon, FileTextIcon, FolderIcon, GitBranchIcon } from '@/ui/icons';
 import { tintSoftBg, tintText } from '@/ui/tint';
-import { PREVIEW_URL, previewHost } from '@/lib/constants';
 import { basename, guessLang } from '@/lib/lang';
 import { cn } from '@/lib/cn';
 import type { StructureSection } from '@/types';
 
-const QUICK_LINKS = ['README.md', 'package.json'];
-
-/** The repo "skeleton" overview — a navigable landing surface for structure & delivery. */
+/** The repo "skeleton" overview — a navigable landing surface for what the repo IS. Every row
+ *  comes from the server's derivation of real git state; nothing is asserted that could not be
+ *  observed (B 1.4). */
 export function StructureView() {
   const { data, activeRepo, activeBranch, openFile, setPanel } = useWorkspace();
-  const { toast } = useToast();
 
   const openPath = (path: string) => openFile({ id: path, name: basename(path), lang: guessLang(path) });
 
@@ -21,14 +17,6 @@ export function StructureView() {
     const looksLikePath = !/[ ()]/.test(e.name);
     if (e.kind === 'file' && looksLikePath) openPath(e.name);
     else setPanel('project');
-  };
-
-  const deploy = () => {
-    toast({ title: 'Building preview…', description: `${activeRepo.name} · sxgate · MODE=static` });
-    window.setTimeout(
-      () => toast({ title: 'Preview is live', description: previewHost(activeRepo.name), variant: 'success' }),
-      1500,
-    );
   };
 
   return (
@@ -56,66 +44,42 @@ export function StructureView() {
               </span>
             </div>
           </div>
-          <div className="ml-auto mt-1 flex shrink-0 items-center gap-1.5">
-            <Button variant="primary" size="sm" onClick={deploy} title="Simulate a sxgate preview deploy">
-              <RocketIcon className="h-3.5 w-3.5" />
-              Deploy preview
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => window.open(PREVIEW_URL, '_blank', 'noopener')} title="Open the live preview">
-              Open ↗
-            </Button>
-          </div>
         </div>
 
-        {/* Pipeline */}
-        <div className="mt-8 rounded-card border border-separator bg-surface p-4 shadow-elev-1">
-          <h2 className="mb-3 text-caption font-semibold uppercase tracking-wide text-text-tertiary">Delivery pipeline</h2>
-          <div className="flex flex-wrap items-center gap-2">
-            {data.stages.map((s, i) => (
-              <div key={s.id} className="flex items-center gap-2">
-                <div
+        {/* Repo state — ONLY the rows the server could attest from real git state (B 1.4). No row
+            is rendered for anything unknown, and each row shows its ground alongside its state, so
+            nothing has to be hovered to be understood. */}
+        {data.stages.length > 0 && (
+          <div className="mt-8 flex flex-wrap items-center gap-2">
+            {data.stages.map((s) => (
+              <div
+                key={s.id}
+                className={cn(
+                  'flex items-center gap-2 rounded-md px-2.5 py-1.5',
+                  s.state === 'active' && 'bg-accent/15 ring-1 ring-accent/30',
+                  s.state === 'done' && 'bg-success/10',
+                  s.state === 'pending' && 'bg-fill/[0.06]',
+                )}
+              >
+                <span
                   className={cn(
-                    'flex items-center gap-2 rounded-md px-2.5 py-1.5',
-                    s.state === 'active' && 'bg-accent/15 ring-1 ring-accent/30',
-                    s.state === 'done' && 'bg-success/10',
-                    s.state === 'pending' && 'bg-fill/[0.06]',
+                    'h-2 w-2 rounded-full',
+                    s.state === 'done' && 'bg-success',
+                    s.state === 'active' && 'bg-accent',
+                    s.state === 'pending' && 'bg-fill/30',
                   )}
-                  title={s.hint}
-                >
-                  <span
-                    className={cn(
-                      'h-2 w-2 rounded-full',
-                      s.state === 'done' && 'bg-success',
-                      s.state === 'active' && 'bg-accent',
-                      s.state === 'pending' && 'bg-fill/30',
-                    )}
-                  />
-                  <span className={cn('text-footnote font-medium', s.state === 'pending' ? 'text-text-tertiary' : 'text-text-primary')}>
-                    {s.label}
-                  </span>
-                </div>
-                {i < data.stages.length - 1 && <span className="text-text-tertiary">→</span>}
+                />
+                <span className={cn('text-footnote font-medium', s.state === 'pending' ? 'text-text-tertiary' : 'text-text-primary')}>
+                  {s.label}
+                </span>
+                {s.hint && <span className="text-caption text-text-secondary">{s.hint}</span>}
               </div>
             ))}
           </div>
-        </div>
+        )}
 
-        {/* Quick links */}
-        <div className="mt-6 flex flex-wrap gap-2">
-          {QUICK_LINKS.map((p) => (
-            <button
-              key={p}
-              type="button"
-              onClick={() => openPath(p)}
-              className="flex items-center gap-1.5 rounded-md border border-separator bg-surface px-2.5 py-1.5 text-caption text-text-secondary shadow-elev-1 transition hover:border-accent/40 hover:text-text-primary"
-            >
-              <FileTextIcon className="h-3.5 w-3.5 text-text-tertiary" />
-              {p}
-            </button>
-          ))}
-        </div>
-
-        {/* Structure sections */}
+        {/* Structure sections — the server lists the modules and key files that really exist; the
+            view invents no shortcuts to files that may not be there. */}
         <div className="mt-6 space-y-4">
           {data.structure.map((section) => (
             <section key={section.title} className="overflow-hidden rounded-card border border-separator bg-surface shadow-elev-1">

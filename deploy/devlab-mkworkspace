@@ -5,6 +5,19 @@
 # non-writable. The dir is 2750 <user>:devlab (setgid) so files inherit the devlab group and the
 # read-only devlab service can read them, while other users (700 on the parent's entries) cannot.
 set -euo pipefail
+
+# The ONE state-root derivation shared by every DevLab wrapper, mirroring statepath.Workspaces():
+# workspaces live at <state root>/workspaces. Keep this identical in devlab-install, devlab-exec and
+# devlab-deploy-recv — a second, drifting definition would provision one root while the daemon and the
+# executor confine against another.
+#
+# These are env-overridable DEFAULTS and the override is a DIRECT-INVOCATION test seam only: this
+# helper is invoked BY the devlab service through sudo, whose env_reset strips the caller's
+# environment. DEVLAB_STATE_DIR and DEVLAB_WORKSPACES must therefore never be added to env_keep in
+# devlab.sudoers.
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"
+
 u="${1:-}"
 [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "devlab-mkworkspace: bad username" >&2; exit 64; }
 id -u "$u" >/dev/null 2>&1 || { echo "devlab-mkworkspace: no such user" >&2; exit 64; }
@@ -13,7 +26,7 @@ if ! id -nG "$u" | tr ' ' '\n' | grep -qxE 'hp_devlab_access|sudo'; then
   echo "devlab-mkworkspace: $u is not devlab-eligible" >&2; exit 77
 fi
 getent group devlab >/dev/null 2>&1 || { echo "devlab-mkworkspace: devlab group missing" >&2; exit 71; }
-base=/var/lib/devlab/workspaces
+base="$WORKSPACES_ROOT"
 install -d -m 0711 -o devlab -g devlab "$base"
 dir="$base/$u"
 if [ ! -d "$dir" ]; then

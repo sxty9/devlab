@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { useWorkspace } from '@/state/workspace';
 import type { Change } from '@/types';
 import { PanelHeader } from './PanelHeader';
+import { ContextMenu } from './ContextMenu';
+import { changeMenu } from './treeOps';
 import { Button, IconButton } from '@/ui/Button';
 import { GitCommitIcon, RefreshIcon } from '@/ui/icons';
 import { useToast } from '@/ui/Toast';
@@ -11,22 +13,50 @@ import { cn } from '@/lib/cn';
 
 function ChangeRow({
   change,
+  selected,
   onOpen,
+  onSelect,
+  onMenu,
   action,
   onAction,
   busy,
 }: {
   change: Change;
+  selected: boolean;
   onOpen: (c: Change) => void;
+  onSelect: (c: Change) => void;
+  onMenu: (c: Change, x: number, y: number) => void;
   action: '+' | '−';
   onAction: (c: Change) => void;
   busy: boolean;
 }) {
   const meta = gitStatusMeta[change.status];
   return (
-    <div className="group flex h-[28px] w-full items-center gap-2 rounded-sm px-3 text-footnote text-text-secondary transition-colors hover:bg-fill/10">
-      <button type="button" onClick={() => onOpen(change)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <span className={cn('w-3 shrink-0 text-center font-mono text-caption', meta.cls)} title={meta.label}>
+    <div
+      role="option"
+      aria-selected={selected}
+      data-change-path={change.path}
+      tabIndex={selected ? 0 : -1}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onSelect(change);
+        onMenu(change, e.clientX, e.clientY);
+      }}
+      className={cn(
+        'group flex h-[28px] w-full items-center gap-2 rounded-sm px-3 text-footnote text-text-secondary transition-colors hover:bg-fill/10',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/40',
+        selected && 'bg-fill/[0.08]',
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => {
+          onSelect(change);
+          onOpen(change);
+        }}
+        className="flex min-w-0 flex-1 items-center gap-2 text-left"
+      >
+        <span className={cn('w-3 shrink-0 text-center font-mono text-caption', meta.cls)} aria-label={meta.label}>
           {meta.letter}
         </span>
         <span className="truncate text-text-primary">{basename(change.path)}</span>
@@ -42,7 +72,7 @@ function ChangeRow({
           type="button"
           disabled={busy}
           onClick={() => onAction(change)}
-          title={action === '+' ? 'Stage' : 'Unstage'}
+          aria-label={action === '+' ? `Stage ${change.path}` : `Unstage ${change.path}`}
           className="flex h-5 w-5 items-center justify-center rounded-sm font-mono text-caption text-text-tertiary opacity-0 transition hover:bg-fill/15 hover:text-text-primary group-hover:opacity-100 disabled:opacity-30 focus-visible:opacity-100"
         >
           {action}
@@ -57,6 +87,8 @@ export function VersionControlPanel() {
   const { toast } = useToast();
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; change: Change } | null>(null);
 
   const staged = data.changes.filter((c) => c.staged);
   const unstaged = data.changes.filter((c) => !c.staged);
@@ -82,6 +114,66 @@ export function VersionControlPanel() {
       setMessage('');
       toast({ title: 'Committed', description: `${res.hash} on ${res.branch}`, variant: 'success' });
     }, 'Commit failed');
+
+  // Arrow keys walk the change list (staged rows first, then unstaged — the order on screen), and
+  // the context-menu key opens the row's menu (D 17).
+  const ordered = [...staged, ...unstaged];
+  const focusRow = useCallback((path: string) => {
+    setSelected(path);
+    requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>(`[data-change-path="${CSS.escape(path)}"]`)?.focus();
+    });
+  }, []);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (ordered.length === 0) return;
+    const at = ordered.findIndex((c) => c.path === selected);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const next = e.key === 'ArrowDown' ? Math.min(at + 1, ordered.length - 1) : Math.max(at <= 0 ? 0 : at - 1, 0);
+      focusRow(ordered[next].path);
+      return;
+    }
+    if (at < 0) return;
+    const change = ordered[at];
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (e.metaKey || e.ctrlKey) {
+        const r = document.querySelector<HTMLElement>(`[data-change-path="${CSS.escape(change.path)}"]`)?.getBoundingClientRect();
+        setMenu({ x: r ? r.left + 16 : 16, y: r ? r.bottom : 16, change });
+      } else {
+        open(change);
+      }
+      return;
+    }
+    if (e.key === 'ContextMenu') {
+      e.preventDefault();
+      const r = document.querySelector<HTMLElement>(`[data-change-path="${CSS.escape(change.path)}"]`)?.getBoundingClientRect();
+      setMenu({ x: r ? r.left + 16 : 16, y: r ? r.bottom : 16, change });
+    }
+  };
+
+  const chooseMenu = (id: string) => {
+    const change = menu?.change;
+    if (!change) return;
+    switch (id) {
+      case 'diff':
+        open(change);
+        return;
+      case 'copyPath':
+        navigator.clipboard?.writeText(change.path).then(
+          () => toast({ title: 'Path copied', description: change.path }),
+          () => toast({ title: 'Could not copy path', variant: 'danger' }),
+        );
+        return;
+      case 'stage':
+        void run(() => stageChange(change.path), 'Stage failed');
+        return;
+      case 'unstage':
+        void run(() => unstageChange(change.path), 'Unstage failed');
+        return;
+    }
+  };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -109,24 +201,54 @@ export function VersionControlPanel() {
         </Button>
       </div>
 
-      <div className="dl-scroll min-h-0 flex-1 overflow-y-auto pb-3">
+      <div className="dl-scroll min-h-0 flex-1 overflow-y-auto pb-3" role="listbox" aria-label="Changes" onKeyDown={onKeyDown}>
         {staged.length > 0 && (
           <Section title="Staged Changes" count={staged.length}>
             {staged.map((c) => (
-              <ChangeRow key={`s:${c.path}`} change={c} onOpen={open} action="−" onAction={(x) => run(() => unstageChange(x.path), 'Unstage failed')} busy={busy || !canWrite} />
+              <ChangeRow
+                key={`s:${c.path}`}
+                change={c}
+                selected={selected === c.path}
+                onOpen={open}
+                onSelect={(x) => setSelected(x.path)}
+                onMenu={(x, mx, my) => setMenu({ x: mx, y: my, change: x })}
+                action="−"
+                onAction={(x) => run(() => unstageChange(x.path), 'Unstage failed')}
+                busy={busy || !canWrite}
+              />
             ))}
           </Section>
         )}
         <Section title="Changes" count={unstaged.length}>
           {unstaged.length ? (
             unstaged.map((c) => (
-              <ChangeRow key={`u:${c.path}`} change={c} onOpen={open} action="+" onAction={(x) => run(() => stageChange(x.path), 'Stage failed')} busy={busy || !canWrite} />
+              <ChangeRow
+                key={`u:${c.path}`}
+                change={c}
+                selected={selected === c.path}
+                onOpen={open}
+                onSelect={(x) => setSelected(x.path)}
+                onMenu={(x, mx, my) => setMenu({ x: mx, y: my, change: x })}
+                action="+"
+                onAction={(x) => run(() => stageChange(x.path), 'Stage failed')}
+                busy={busy || !canWrite}
+              />
             ))
           ) : (
             <p className="px-3 py-2 text-caption text-text-tertiary">Nothing to commit.</p>
           )}
         </Section>
       </div>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          entries={changeMenu(menu.change.staged, canWrite)}
+          onChoose={chooseMenu}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }

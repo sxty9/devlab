@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"devlab/backend/internal/model"
+	"devlab/backend/internal/telemetry"
 	"devlab/backend/internal/workspace"
 )
 
@@ -72,8 +74,19 @@ func (s *Server) agent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reply := parseClaudeResult(out)
+	reply, meta := parseClaudeResult(out)
 	reply.Changes = workspace.Changes(wc.wt)
+	// The agentic path reports to the SAME usage pool as the assistant (cross-cutting 5). The
+	// model is the one the CLI said it used; only when it named none does the requested model
+	// stand in — nothing is invented.
+	s.recordAiUsage(telemetry.UsageSample{
+		Source: usageSourceAgent,
+		User:   wc.user,
+		Repo:   r.PathValue("id"),
+		Model:  answerModel(meta.Model, body.Model),
+		In:     meta.In,
+		Out:    meta.Out,
+	})
 	writeJSON(w, http.StatusOK, reply)
 }
 
@@ -84,19 +97,55 @@ func agentPreamble(repo string) string {
 		"tools and rights. Make focused, well-scoped changes and clearly summarise what you did."
 }
 
-// parseClaudeResult extracts the fields DevLab surfaces from the claude CLI's --output-format json.
-func parseClaudeResult(out []byte) model.AgentReply {
+// agentMeta is what the run reported about itself beyond the answer: which model actually served
+// it and how many tokens it consumed. It feeds the usage pool and the answer's model label; it is
+// read from the CLI's own report, never guessed.
+type agentMeta struct {
+	Model string
+	In    int64
+	Out   int64
+}
+
+// parseClaudeResult extracts the fields DevLab surfaces from the claude CLI's --output-format json,
+// plus the run's self-reported model and token consumption.
+func parseClaudeResult(out []byte) (model.AgentReply, agentMeta) {
 	var raw struct {
 		Result    string  `json:"result"`
 		SessionID string  `json:"session_id"`
 		IsError   bool    `json:"is_error"`
 		TotalCost float64 `json:"total_cost_usd"`
 		NumTurns  int     `json:"num_turns"`
+		Model     string  `json:"model"`
+		Usage     struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+		} `json:"usage"`
+		// modelUsage is the CLI's per-model breakdown; its keys name the models that served the
+		// run (a run may hand off between models, so all of them are reported).
+		ModelUsage map[string]struct {
+			InputTokens  int64 `json:"inputTokens"`
+			OutputTokens int64 `json:"outputTokens"`
+		} `json:"modelUsage"`
 	}
 	_ = json.Unmarshal(out, &raw)
 	output := strings.TrimSpace(raw.Result)
 	if output == "" {
 		output = "_(the agent produced no textual output)_"
+	}
+	meta := agentMeta{Model: strings.TrimSpace(raw.Model), In: raw.Usage.InputTokens, Out: raw.Usage.OutputTokens}
+	if len(raw.ModelUsage) > 0 {
+		names := make([]string, 0, len(raw.ModelUsage))
+		var in, out int64
+		for name, u := range raw.ModelUsage {
+			names = append(names, name)
+			in += u.InputTokens
+			out += u.OutputTokens
+		}
+		sort.Strings(names) // stable label regardless of map order
+		meta.Model = strings.Join(names, ", ")
+		if in > 0 || out > 0 {
+			meta.In, meta.Out = in, out
+		}
 	}
 	return model.AgentReply{
 		Output:    output,
@@ -104,7 +153,7 @@ func parseClaudeResult(out []byte) model.AgentReply {
 		CostUSD:   raw.TotalCost,
 		NumTurns:  raw.NumTurns,
 		IsError:   raw.IsError,
-	}
+	}, meta
 }
 
 // agentError turns a claude CLI failure into a clear, actionable message for the KI tab.

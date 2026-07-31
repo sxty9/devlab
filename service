@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# service — DevLab's uniform holistic-service CLI (template convention; D 9/10, REQ-029.2).
+# Verbs and exit codes follow the holistic-service-template `service` exactly:
+#   init (n/a here — the id is fixed) · setup · build · start|stop|restart · status · update ·
+#   uninstall [--purge] · version · help
+# Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+#
+# Role boundary (E §7.4): this CLI is the INTERACTIVE human path (a person with sudo present)
+# and the conformity marker Detect() recognizes. The UNATTENDED chain never runs it — it
+# delivers through the generic install-only wrapper (deploy/devlab-install). Even here, root
+# never compiles: builds drop to the invoking user (SUDO_USER) before touching a toolchain.
+#
+# Paths follow the template convention, derived from the service id — not instance values.
+# DEVLAB_STATE_DIR / SERVICE_PORT / DEVLAB_UNIT override the defaults.
+
+set -euo pipefail
+
+SERVICE_VERSION="0.2.0"
+SERVICE_ID="devlab"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ORIG_ARGS=("$@")
+
+# ── config (template-convention defaults, env-overridable) ───────────────────────
+UNIT_NAME="${DEVLAB_UNIT:-${SERVICE_ID}d}"                 # historical unit name: devlabd
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/${SERVICE_ID}}"
+: "${SERVICE_PORT:=8781}"                                  # loopback port (must match the route)
+DAEMON_BIN="/usr/local/bin/${UNIT_NAME}"
+UNIT_FILE="/etc/systemd/system/${UNIT_NAME}.service"
+CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+CADDY_ROUTE="$CADDY_CONF/${SERVICE_ID}.caddy"
+PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
+PERMS_FILE="$PERMS_DIR/${SERVICE_ID}.json"
+WRAPPERS=(devlab-exec devlab-mkworkspace devlab-install devlab-restart-when-free)
+SUDOERS=(devlab devlab-runs)
+
+log()  { printf '[%s] %s\n' "$SERVICE_ID" "$*"; }
+warn() { printf '[%s] warning: %s\n' "$SERVICE_ID" "$*" >&2; }
+die()  { printf '[%s] error: %s\n' "$SERVICE_ID" "$*" >&2; exit "${2:-1}"; }
+
+confirm() {
+  [ "${SERVICE_YES:-0}" = "1" ] && return 0
+  local reply
+  printf '[%s] %s [y/N] ' "$SERVICE_ID" "$1" >&2
+  read -r reply || return 1
+  [[ "$reply" =~ ^[yY]$ ]]
+}
+
+# Re-exec under sudo, preserving env + the original argv (template convention).
+needs_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  command -v sudo >/dev/null || die "must run as root (sudo not found)" 4
+  exec sudo -E "$0" "${ORIG_ARGS[@]}"
+}
+
+# Run a build step as the human who invoked sudo — root itself never compiles (E §7.4).
+as_builder() {
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    sudo -u "$SUDO_USER" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# The free probe (same signal the handover restart uses): free | busy | dead.
+ready_state() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+    --unix-socket "$STATE_DIR/restart-ready.sock" http://localhost/ready 2>/dev/null)" || code=000
+  case "$code" in 204) echo free ;; 000) echo dead ;; *) echo busy ;; esac
+}
+
+warn_if_busy() {
+  if [ "$(ready_state)" = busy ]; then
+    warn "executions are in flight — a $1 interrupts them (they persist and resume after start)"
+    confirm "$1 anyway?" || die "declined" 10
+  fi
+}
+
+port_listening() {
+  local hex; hex="$(printf '%04X' "$1")"
+  awk -v h="$hex" 'NR>1 && $4=="0A" { split($2,a,":"); if (a[2]==h) { print "y"; exit } }' \
+    /proc/net/tcp /proc/net/tcp6 2>/dev/null | grep -q y
+}
+
+# ── build (daemon + SPA, never as root) ──────────────────────────────────────────
+build_all() {
+  command -v go >/dev/null || die "Go toolchain not found" 4
+  command -v npm >/dev/null || die "npm not found" 4
+  log "building ${UNIT_NAME} (as ${SUDO_USER:-$(id -un)} — root never builds)..."
+  as_builder bash -c "cd '$REPO_ROOT/backend' && go build -o /tmp/${UNIT_NAME}.build ./cmd/${UNIT_NAME}" \
+    || die "daemon build failed" 4
+  log "building the SPA..."
+  as_builder bash -c "cd '$REPO_ROOT' && npm ci --no-audit --no-fund && npm run build" \
+    || die "SPA build failed" 4
+}
+
+install_artifacts() {
+  install -o root -g root -m 0755 "/tmp/${UNIT_NAME}.build" "$DAEMON_BIN"
+  rm -f "/tmp/${UNIT_NAME}.build"
+  install -d -m 0755 "$STATE_DIR/www"
+  rsync -a --delete "$REPO_ROOT/dist/" "$STATE_DIR/www/"
+}
+
+install_wrappers() {
+  log "installing the pinned wrappers + sudoers..."
+  local w
+  for w in "${WRAPPERS[@]}"; do
+    install -o root -g root -m 0755 "$REPO_ROOT/deploy/$w" "/usr/local/sbin/$w"
+  done
+  for w in "${SUDOERS[@]}"; do
+    install -o root -g root -m 0440 "$REPO_ROOT/deploy/${w}.sudoers" "/etc/sudoers.d/$w"
+    visudo -cf "/etc/sudoers.d/$w" >/dev/null || die "sudoers validation failed for $w — NOT trusting it" 4
+  done
+}
+
+install_route() {
+  if [ ! -d "$CADDY_CONF" ]; then
+    warn "no route dir at $CADDY_CONF — route not written (edge not on this host?)"
+    return 0
+  fi
+  cat > "$CADDY_ROUTE" <<EOF
+# Generated by \`service setup\`. Routes the DevLab tab's API to the daemon.
+handle /api/services/${SERVICE_ID}/* {
+	reverse_proxy 127.0.0.1:${SERVICE_PORT}
+}
+EOF
+  systemctl reload caddy 2>/dev/null || warn "caddy reload unavailable — reload it manually"
+}
+
+install_permissions() {
+  [ -f "$REPO_ROOT/permissions/${SERVICE_ID}.json" ] || die "missing permissions/${SERVICE_ID}.json" 5
+  install -d -m 0755 "$PERMS_DIR"
+  install -m 0644 "$REPO_ROOT/permissions/${SERVICE_ID}.json" "$PERMS_FILE"
+  local g
+  grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$PERMS_FILE" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
+    while read -r g; do groupadd -f "$g"; done
+}
+
+verify_started() {  # honest gate (F10): active AND holding the port, or the setup FAILED
+  local i
+  for (( i = 0; i < 15; i++ )); do
+    if systemctl is-active --quiet "$UNIT_NAME" && port_listening "$SERVICE_PORT"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────────
+cmd_setup() {
+  needs_root
+  build_all
+
+  log "system user + groups..."
+  getent group "$SERVICE_ID" >/dev/null || groupadd --system "$SERVICE_ID"
+  getent passwd "$SERVICE_ID" >/dev/null \
+    || useradd --system --gid "$SERVICE_ID" --shell /usr/sbin/nologin --home-dir "$STATE_DIR" "$SERVICE_ID"
+  groupadd -f hp_devlab_access
+  getent group holistic >/dev/null 2>&1 && usermod -aG holistic "$SERVICE_ID" \
+    || warn "group 'holistic' missing — the daemon cannot read the shared session secret yet"
+  install -d -o "$SERVICE_ID" -g "$SERVICE_ID" -m 0750 "$STATE_DIR"
+
+  log "installing binary + SPA..."
+  install_artifacts
+  install_wrappers
+
+  log "configuring systemd..."
+  install -m 0644 "$REPO_ROOT/deploy/${UNIT_NAME}.service" "$UNIT_FILE"
+  systemctl daemon-reload
+  systemctl enable "$UNIT_NAME" >/dev/null 2>&1 || true
+
+  log "declaring rights (permissions.d) + route..."
+  install_permissions
+  install_route
+
+  warn_if_busy "restart"
+  systemctl restart "$UNIT_NAME"
+  if verify_started; then
+    log "installed and started — active and holding :${SERVICE_PORT}"
+  else
+    journalctl -u "$UNIT_NAME" -n 20 --no-pager >&2 || true
+    die "$UNIT_NAME is not running after setup — failed setup, not success (F10)" 4
+  fi
+}
+
+cmd_build() {
+  needs_root
+  build_all
+  install_artifacts
+  if systemctl is-active --quiet "$UNIT_NAME"; then
+    warn_if_busy "restart"
+    systemctl restart "$UNIT_NAME"
+    verify_started || die "$UNIT_NAME did not come back after the rebuild" 4
+    log "rebuilt and restarted ${UNIT_NAME}"
+  else
+    log "rebuilt ${UNIT_NAME} (service not running)"
+  fi
+}
+
+cmd_lifecycle() {
+  needs_root
+  local action="$1"
+  [ "$action" = start ] || warn_if_busy "$action"
+  systemctl "$action" "$UNIT_NAME" && log "$action: $UNIT_NAME" \
+    || die "'$action $UNIT_NAME' failed — installed? run 'sudo $0 setup'" 4
+}
+
+cmd_status() {
+  local state
+  state="$(systemctl is-active "$UNIT_NAME" 2>/dev/null || true)"
+  echo "── ${SERVICE_ID} (service CLI $SERVICE_VERSION) ──"
+  printf '  %-14s %s\n' "daemon:" "${state:-unknown}"
+  printf '  %-14s 127.0.0.1:%s (%s)\n' "listen:" "$SERVICE_PORT" "$(port_listening "$SERVICE_PORT" && echo held || echo 'not held')"
+  printf '  %-14s %s\n' "executions:" "$(ready_state)"
+  printf '  %-14s %s\n' "binary:" "$([ -x "$DAEMON_BIN" ] && echo "$DAEMON_BIN" || echo '(not installed)')"
+  printf '  %-14s %s\n' "unit:"   "$([ -f "$UNIT_FILE" ] && echo "$UNIT_FILE" || echo missing)"
+  printf '  %-14s %s\n' "route:"  "$([ -f "$CADDY_ROUTE" ] && echo "$CADDY_ROUTE" || echo missing)"
+  printf '  %-14s %s\n' "rights:" "$([ -f "$PERMS_FILE" ] && echo "$PERMS_FILE" || echo missing)"
+  local w missing=""
+  for w in "${WRAPPERS[@]}"; do [ -x "/usr/local/sbin/$w" ] || missing="$missing $w"; done
+  if [ -n "$missing" ]; then
+    printf '  %-14s missing:%s\n' "wrappers:" "$missing"
+  else
+    printf '  %-14s all installed\n' "wrappers:"
+  fi
+}
+
+cmd_update() {
+  log "pulling latest..."
+  git -C "$REPO_ROOT" pull --ff-only || die "pull failed" 4
+  cmd_setup
+}
+
+cmd_uninstall() {
+  needs_root
+  local purge=0
+  [ "${1:-}" = "--purge" ] && purge=1
+  confirm "remove ${SERVICE_ID} from this server$([ "$purge" = 1 ] && echo ' (and purge users + state)')?" || die "declined" 10
+
+  systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+  rm -f "$UNIT_FILE"; systemctl daemon-reload
+  rm -f "$CADDY_ROUTE" "$PERMS_FILE" "$DAEMON_BIN"
+  local w
+  for w in "${WRAPPERS[@]}"; do rm -f "/usr/local/sbin/$w"; done
+  for w in "${SUDOERS[@]}"; do rm -f "/etc/sudoers.d/$w"; done
+  systemctl reload caddy 2>/dev/null || true
+
+  if [ "$purge" = 1 ]; then
+    userdel "$SERVICE_ID" >/dev/null 2>&1 || true
+    groupdel "$SERVICE_ID" >/dev/null 2>&1 || true
+    rm -rf "$STATE_DIR"
+    log "purged user + $STATE_DIR (the runner user and its workspaces are provisioned separately — see deploy/RUNS-PROVISIONING.md)"
+  fi
+  log "uninstalled"
+}
+
+cmd_help() {
+  cat <<EOF
+service — CLI for the holistic service '${SERVICE_ID}' (v$SERVICE_VERSION).
+
+Usage:
+  ./service init <name>               n/a — the service id is fixed ('devlab')
+  sudo ./service setup                Install/repair: binary, SPA, wrappers, sudoers, unit,
+                                      rights, route — then prove it runs (honest gate)
+  sudo ./service build                Rebuild daemon + SPA, install, restart if running
+  sudo ./service start|stop|restart   Control the daemon (warns while executions run)
+  ./service status                    Show daemon/port/route/rights/wrapper health
+  sudo ./service update               git pull --ff-only + re-run setup
+  sudo ./service uninstall [--purge]  Remove (--purge also drops user + state dir)
+  ./service help | version
+
+This CLI is the interactive human path. The autonomous chain installs through the generic
+install-only wrapper (deploy/devlab-install) and never executes repo code as root.
+
+Env (override defaults): DEVLAB_STATE_DIR, DEVLAB_UNIT, SERVICE_PORT, SERVICE_YES=1
+Exit codes: 0 ok · 1 generic · 2 usage · 4 external · 5 config-state · 10 declined
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)                 die "the service id is fixed ('devlab'); init is not applicable" 2 ;;
+    setup)                cmd_setup ;;
+    build)                cmd_build ;;
+    start|stop|restart)   cmd_lifecycle "$cmd" ;;
+    status)               cmd_status ;;
+    update)               cmd_update ;;
+    uninstall)            cmd_uninstall "$@" ;;
+    version|-v|--version) echo "$SERVICE_ID service $SERVICE_VERSION" ;;
+    help|-h|--help)       cmd_help ;;
+    *) die "unknown command: $cmd (run './service help')" 2 ;;
+  esac
+}
+
+main "$@"

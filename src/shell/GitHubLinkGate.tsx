@@ -13,11 +13,11 @@ export function GitHubLinkGate({ user }: { user: User }) {
       <p className="mt-1 max-w-sm text-footnote text-text-secondary">
         {user.displayName || user.username ? (
           <>
-            Angemeldet als <span className="font-medium text-text-primary">{user.displayName || user.username}</span>.{' '}
+            Signed in as <span className="font-medium text-text-primary">{user.displayName || user.username}</span>.{' '}
           </>
         ) : null}
-        Verknüpfe dein GitHub-Konto, um deine Repositories zu sehen und zu bearbeiten. Welche Repos du
-        siehst und was du darfst (lesen / pushen) ergibt sich ausschließlich aus GitHub.
+        Link your GitHub account to see and edit your repositories. Which repositories you see, and whether
+        you may read or push, follows from GitHub alone.
       </p>
       <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
         <Button
@@ -28,10 +28,10 @@ export function GitHubLinkGate({ user }: { user: User }) {
             window.location.href = source.githubAuthorizeUrl();
           }}
         >
-          GitHub verknüpfen
+          Link GitHub
         </Button>
         <Button variant="secondary" size="md" className="w-full" onClick={() => window.location.reload()}>
-          Erneut prüfen
+          Check again
         </Button>
       </div>
     </GateShell>

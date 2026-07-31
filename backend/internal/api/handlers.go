@@ -41,46 +41,6 @@ func (s *Server) repos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, repos)
 }
 
-func (s *Server) branches(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.repoPath(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, git.Branches(p))
-}
-
-func (s *Server) tree(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.repoPath(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, git.Tree(p))
-}
-
-func (s *Server) changes(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.repoPath(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, git.Changes(p))
-}
-
-func (s *Server) worktrees(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.repoPath(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, git.Worktrees(p))
-}
-
-func (s *Server) commits(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.repoPath(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, git.Commits(p, r.URL.Query().Get("branch"), 100))
-}
-
 func (s *Server) file(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.repoPath(w, r)
 	if !ok {
@@ -150,9 +110,10 @@ func (s *Server) repoData(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, data)
 }
 
-// stages derives the delivery pipeline from real git state: Code is active while the working tree
-// is dirty (else committed/clean), and Delivery is active while the branch has unpushed commits.
-func stages(hasChanges bool, ahead int) []model.Stage {
+// stages derives the repo overview rows HONESTLY from real git state and nothing else
+// (B 1.4): Code is active while the working tree is dirty, Delivery while the branch has
+// unpushed commits. Rows this server cannot attest (vision, preview, merge) are NOT invented.
+func stages(hasChanges bool, ahead int) []model.RepoStage {
 	code, codeHint := "done", "Committed"
 	if hasChanges {
 		code, codeHint = "active", "Uncommitted changes"
@@ -164,12 +125,9 @@ func stages(hasChanges bool, ahead int) []model.Stage {
 	} else if !hasChanges {
 		deliveryHint = "Up to date"
 	}
-	return []model.Stage{
-		{ID: "vision", Label: "Vision", State: "done", Hint: "Captured"},
+	return []model.RepoStage{
 		{ID: "code", Label: "Code", State: code, Hint: codeHint},
-		{ID: "preview", Label: "Preview", State: "pending", Hint: "sxgate"},
 		{ID: "delivery", Label: "Delivery", State: delivery, Hint: deliveryHint},
-		{ID: "merge", Label: "main", State: "pending", Hint: "Awaiting merge"},
 	}
 }
 
@@ -189,7 +147,7 @@ func structure(repoPath string, tree []model.FileNode) []model.StructureSection 
 			dirs = append(dirs, model.StructureEntry{Name: n.Name + "/", Kind: "dir", Note: "module"})
 		}
 	}
-	for _, name := range []string{"README.md", "package.json", "go.mod", "CLAUDE.md", ".sxgate/preview.conf"} {
+	for _, name := range []string{"README.md", "package.json", "go.mod", "CLAUDE.md", "service", "holistic-service.json"} {
 		if _, err := os.Stat(filepath.Join(repoPath, name)); err == nil {
 			files = append(files, model.StructureEntry{Name: name, Kind: "file", Note: "key file"})
 		}

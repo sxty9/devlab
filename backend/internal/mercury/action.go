@@ -83,32 +83,34 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 	case ActionCreateTodo:
 		a.Name, a.Task = strings.TrimSpace(a.Name), strings.TrimSpace(a.Task)
 		if a.Name == "" || a.Task == "" {
-			return fmt.Errorf("%w: create_todo braucht name und task", ErrInvalidAction)
+			return fmt.Errorf("%w: create_todo needs name and task", ErrInvalidAction)
 		}
 		if len(a.Targets) == 0 {
-			return fmt.Errorf("%w: create_todo braucht mindestens ein Ziel (targets)", ErrInvalidAction)
+			return fmt.Errorf("%w: create_todo needs at least one target (targets)", ErrInvalidAction)
 		}
 		for i := range a.Targets {
 			t := &a.Targets[i]
 			t.Repo, t.NewRepo = strings.TrimSpace(t.Repo), strings.TrimSpace(t.NewRepo)
 			if (t.Repo == "") == (t.NewRepo == "") {
-				return fmt.Errorf("%w: jedes Ziel ist genau ein vorhandenes Repo (repo) ODER ein neues (newRepo)", ErrInvalidAction)
+				return fmt.Errorf("%w: every target is exactly one existing repository (repo) OR a new one (newRepo)", ErrInvalidAction)
 			}
 			if t.Repo != "" && len(ac.RepoIDs) > 0 && !ac.RepoIDs[t.Repo] {
-				return fmt.Errorf("%w: unbekanntes Repo %q — nutze eine repo-id aus der Liste oder newRepo", ErrInvalidAction, t.Repo)
+				return fmt.Errorf("%w: unknown repository %q — use a repo id from the list or newRepo", ErrInvalidAction, t.Repo)
 			}
 		}
 	case ActionCreateRun:
 		a.Name = strings.TrimSpace(a.Name)
 		if a.Name == "" {
-			return fmt.Errorf("%w: create_run braucht name", ErrInvalidAction)
+			return fmt.Errorf("%w: create_run needs name", ErrInvalidAction)
 		}
-		if len(a.AxiomIDs) == 0 {
-			return fmt.Errorf("%w: create_run braucht mindestens ein Axiom (axiomIds)", ErrInvalidAction)
+		// create_run creates an ACTIVE run, so the one rule applies in that state; the wording is
+		// the model's retry correction, the rule itself is not restated here.
+		if RunLacksRequiredAxioms(true, a.AxiomIDs) {
+			return fmt.Errorf("%w: create_run needs at least one axiom (axiomIds)", ErrInvalidAction)
 		}
 		for _, id := range a.AxiomIDs {
 			if len(ac.AxiomIDs) > 0 && !ac.AxiomIDs[id] {
-				return fmt.Errorf("%w: unbekanntes Axiom %q", ErrInvalidAction, id)
+				return fmt.Errorf("%w: unknown axiom %q", ErrInvalidAction, id)
 			}
 		}
 		if err := validatePlanSchedule(a.Name, a.Schedule); err != nil {
@@ -116,11 +118,11 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 		}
 	case ActionAddRecord:
 		if !validSection(a.Section) {
-			return fmt.Errorf("%w: section muss axiome, regeln, laeufe oder meta sein", ErrInvalidAction)
+			return fmt.Errorf("%w: section must be axiome, regeln, laeufe or meta", ErrInvalidAction)
 		}
 		a.Titel, a.Body = strings.TrimSpace(a.Titel), strings.TrimSpace(a.Body)
 		if a.Titel == "" || a.Body == "" {
-			return fmt.Errorf("%w: add_record braucht titel und body", ErrInvalidAction)
+			return fmt.Errorf("%w: add_record needs titel and body", ErrInvalidAction)
 		}
 	case ActionEditRecord:
 		a.Path, a.Titel, a.Body = strings.TrimSpace(a.Path), strings.TrimSpace(a.Titel), strings.TrimSpace(a.Body)
@@ -128,7 +130,7 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 			return err
 		}
 		if a.Titel == "" || a.Body == "" {
-			return fmt.Errorf("%w: edit_record braucht titel und body", ErrInvalidAction)
+			return fmt.Errorf("%w: edit_record needs titel and body", ErrInvalidAction)
 		}
 	case ActionDeleteRecord:
 		a.Path = strings.TrimSpace(a.Path)
@@ -138,17 +140,17 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 	case ActionDeleteRun, ActionRunNow:
 		a.RunID = strings.TrimSpace(a.RunID)
 		if a.RunID == "" {
-			return fmt.Errorf("%w: %s braucht runId", ErrInvalidAction, a.Kind)
+			return fmt.Errorf("%w: %s needs runId", ErrInvalidAction, a.Kind)
 		}
 		if len(ac.RunIDs) > 0 && !ac.RunIDs[a.RunID] {
-			return fmt.Errorf("%w: kein Lauf/ToDo mit id %q", ErrInvalidAction, a.RunID)
+			return fmt.Errorf("%w: no run or todo with id %q", ErrInvalidAction, a.RunID)
 		}
 	case ActionPlanRuns:
 		if a.Mode == "" {
 			a.Mode = "replace"
 		}
 		if a.Mode != "fill" && a.Mode != "replace" {
-			return fmt.Errorf("%w: plan_runs mode muss fill oder replace sein", ErrInvalidAction)
+			return fmt.Errorf("%w: plan_runs mode must be fill or replace", ErrInvalidAction)
 		}
 		plan := RunPlan{Runs: a.Runs}
 		if err := ValidateRunPlan(&plan, keysOfBool(ac.AxiomIDs)); err != nil {
@@ -156,9 +158,9 @@ func ValidateChatAction(a *ChatAction, ac ActionContext) error {
 		}
 		a.Runs = plan.Runs
 	case "":
-		return fmt.Errorf("%w: fehlendes kind", ErrInvalidAction)
+		return fmt.Errorf("%w: missing kind", ErrInvalidAction)
 	default:
-		return fmt.Errorf("%w: unbekannte Aktion %q", ErrInvalidAction, a.Kind)
+		return fmt.Errorf("%w: unknown action %q", ErrInvalidAction, a.Kind)
 	}
 	return nil
 }
@@ -192,24 +194,24 @@ func ExtractChatAction(text string, ac ActionContext) (action ChatAction, cleane
 // the daily/weekly rules live in one place). runName only labels the error.
 func validatePlanSchedule(runName string, s PlanSchedule) error {
 	if !runTimeOfDayRe.MatchString(s.TimeOfDay) {
-		return fmt.Errorf("%w: Lauf %q hat ungültige timeOfDay %q (HH:MM)", ErrInvalidPlacement, runName, s.TimeOfDay)
+		return fmt.Errorf("%w: run %q has an invalid timeOfDay %q (HH:MM)", ErrInvalidPlacement, runName, s.TimeOfDay)
 	}
 	switch s.Kind {
 	case "daily":
 		if len(s.Weekdays) != 0 {
-			return fmt.Errorf("%w: Lauf %q (daily) darf keine Wochentage haben", ErrInvalidPlacement, runName)
+			return fmt.Errorf("%w: run %q (daily) must carry no weekdays", ErrInvalidPlacement, runName)
 		}
 	case "weekly":
 		if len(s.Weekdays) == 0 {
-			return fmt.Errorf("%w: Lauf %q (weekly) braucht Wochentage", ErrInvalidPlacement, runName)
+			return fmt.Errorf("%w: run %q (weekly) needs weekdays", ErrInvalidPlacement, runName)
 		}
 		for _, d := range s.Weekdays {
 			if d < 0 || d > 6 {
-				return fmt.Errorf("%w: Lauf %q hat ungültigen Wochentag %d (0=So..6=Sa)", ErrInvalidPlacement, runName, d)
+				return fmt.Errorf("%w: run %q has an invalid weekday %d (0=Sunday..6=Saturday)", ErrInvalidPlacement, runName, d)
 			}
 		}
 	default:
-		return fmt.Errorf("%w: Lauf %q hat schedule.kind %q (erwartet daily|weekly)", ErrInvalidPlacement, runName, s.Kind)
+		return fmt.Errorf("%w: run %q has schedule.kind %q (expected daily|weekly)", ErrInvalidPlacement, runName, s.Kind)
 	}
 	return nil
 }
@@ -224,10 +226,10 @@ func validSection(s string) bool {
 
 func knownRecordPath(path string, ac ActionContext) error {
 	if !ValidRecordPath(path) {
-		return fmt.Errorf("%w: %q ist kein gültiger Eintragspfad (z. B. axiome/kategorie/name.md)", ErrInvalidAction, path)
+		return fmt.Errorf("%w: %q is not a valid record path (e.g. axiome/category/name.md)", ErrInvalidAction, path)
 	}
 	if len(ac.RecordPaths) > 0 && !ac.RecordPaths[path] {
-		return fmt.Errorf("%w: kein Eintrag unter %q", ErrInvalidAction, path)
+		return fmt.Errorf("%w: no record at %q", ErrInvalidAction, path)
 	}
 	return nil
 }

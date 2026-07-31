@@ -21,7 +21,7 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Setenv("DEVLAB_LINKS", filepath.Join(dir, "links"))
 	t.Setenv("DEVLAB_LINK_ENC_KEY_FILE", keyPath)
-	s, err := NewStore()
+	s, err := NewStore(nil)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}

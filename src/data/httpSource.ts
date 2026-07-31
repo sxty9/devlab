@@ -82,7 +82,7 @@ export const httpSource: DataSource = {
   async init(): Promise<InitResult> {
     try {
       const h = await fetch('/api/health', opts);
-      if (!h.ok) return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
+      if (!h.ok) return { mode: 'stub', signedIn: true, canUseDevlab: true, githubLinked: true };
       // /api/user requires only a session (not the right), so we can tell "signed in but no
       // access" from "not signed in". request() refreshes once on 401 so an expired access
       // token (with a still-valid refresh) does not bounce the user to the login gate.
@@ -92,10 +92,14 @@ export const httpSource: DataSource = {
       const body = (await u.json()) as { canUseDevlab?: boolean; githubLinked?: boolean };
       return { mode: 'api', signedIn: true, canUseDevlab: !!body.canUseDevlab, githubLinked: !!body.githubLinked };
     } catch {
-      // Backend unreachable (offline dev) → caller falls back to mock.
-      return { mode: 'mock', signedIn: true, canUseDevlab: true, githubLinked: true };
+      // Backend unreachable (offline dev) → caller falls back to the stub's empty states.
+      return { mode: 'stub', signedIn: true, canUseDevlab: true, githubLinked: true };
     }
   },
+
+  // The seam's refresh IS the single-flight refresh every request already rides, so a caller that
+  // needs to re-mint before retrying by itself (the live stream, C F5) uses one and the same path.
+  refreshSession,
 
   async getUser(): Promise<User> {
     return json(await request('/api/user'));
@@ -195,15 +199,15 @@ export const httpSource: DataSource = {
     return json(await request('/api/assistant/models'));
   },
 
-  terminalUrl(id) {
+  terminalUrl(id, sessionKey) {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    return `${proto}://${location.host}/api/repos/${enc(id)}/pty`;
+    const q = sessionKey ? `?session=${enc(sessionKey)}` : '';
+    return `${proto}://${location.host}/api/repos/${enc(id)}/pty${q}`;
   },
 
   async atlas() {
     return json(await request('/api/atlas'));
   },
-
   async atlasPorts() {
     return json(await request('/api/atlas/ports'));
   },
@@ -213,7 +217,9 @@ export const httpSource: DataSource = {
   },
   async mercuryItem(path) {
     const r = await request(`/api/mercury/item?path=${encodeURIComponent(path)}`);
-    return (await json<{ axiom: import('@/types').Axiom }>(r)).axiom;
+    // Authorship comes back as a sibling of the axiom (local pool, joined by id); fold it onto the axiom.
+    const body = await json<{ axiom: import('@/types').Axiom; author?: import('@/types').AxiomAuthor }>(r);
+    return { ...body.axiom, author: body.author };
   },
   async mercuryAddAxiom(titel, body, section, force) {
     const r = await post('/api/mercury/axiom', { titel, body, section, force });
@@ -240,10 +246,6 @@ export const httpSource: DataSource = {
   async mercuryReorder(category, order) {
     await json<void>(await post('/api/mercury/reorder', { category, order }));
   },
-  async mercuryRolloutStatus() {
-    return json(await request('/api/mercury/rollout'));
-  },
-
   async mercuryRuns() {
     return json(await request('/api/mercury/runs'));
   },
@@ -274,11 +276,16 @@ export const httpSource: DataSource = {
   async mercuryDeleteRun(id) {
     await json<void>(await request(`/api/mercury/runs/${enc(id)}`, withCsrf({ method: 'DELETE' })));
   },
-  async mercuryRunAiFill() {
-    return json(await post('/api/mercury/runs/ai-fill', {}));
+  async mercuryRunAssign() {
+    return json(await post('/api/mercury/runs/assign', {}));
   },
-  async mercuryRunAiFinetune() {
-    return json(await post('/api/mercury/runs/ai-finetune', {}));
+  // The action rides in the body of the one access point, so requesting, reading and abandoning a
+  // proposal never become three parallel paths to the same entity.
+  async mercuryRunAiFill(action) {
+    return json(await post('/api/mercury/runs/ai-fill', { action: action ?? 'request' }));
+  },
+  async mercuryRunAiFinetune(action) {
+    return json(await post('/api/mercury/runs/ai-finetune', { action: action ?? 'request' }));
   },
   async mercuryApplyRunProposal(mode, plan) {
     await json<void>(await post('/api/mercury/runs/apply-proposal', { mode, plan }));
@@ -295,46 +302,55 @@ export const httpSource: DataSource = {
   async mercuryRunResult(id, resultId) {
     return json(await request(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}`));
   },
-  async mercuryRunCalendar(days, type) {
+  async mercuryRunCalendar(days, kind) {
     const p = new URLSearchParams();
     if (days) p.set('days', String(days));
-    if (type) p.set('type', type);
+    if (kind) p.set('type', kind);
     const q = p.toString();
     return json(await request(`/api/mercury/runs/calendar${q ? `?${q}` : ''}`));
   },
-  async mercuryRunExecutions(type) {
-    return json(await request(`/api/mercury/runs/executions${type ? `?type=${encodeURIComponent(type)}` : ''}`));
+  async mercuryRunExecutions(kind) {
+    return json(await request(`/api/mercury/runs/executions${kind ? `?type=${enc(kind)}` : ''}`));
+  },
+  async mercuryReportStatus() {
+    return json(await request('/api/mercury/runs/report-status'));
+  },
+  async mercuryResumeReportDelivery(day) {
+    return json(await post('/api/mercury/runs/report-status', { day: day ?? '' }));
   },
   async mercuryChat(messages) {
     return json(await post('/api/mercury/chat', { messages }));
   },
   async mercuryRunNow(id, opts) {
     return json(await post(`/api/mercury/runs/${enc(id)}/run`, {
-      fresh: !!opts?.fresh,
-      strategy: opts?.strategy,
-      deferRunId: opts?.deferRunId,
+      placement: opts?.placement, fresh: opts?.fresh ?? false,
     }));
   },
   async mercuryRunActive() {
     return json(await request('/api/mercury/runs/active'));
   },
-  async mercuryCancelRun(id: string) {
-    await json<void>(await post(`/api/mercury/runs/${enc(id)}/cancel`, {}));
+  async mercurySlots() {
+    return json(await request('/api/mercury/runs/slots'));
   },
-  async mercuryDeferRun(id: string) {
+  async mercuryCancelRun(runId) {
+    await json<void>(await post(`/api/mercury/runs/${enc(runId)}/cancel`, {}));
+  },
+  async mercuryDeferRun(id) {
     await json<void>(await post(`/api/mercury/runs/${enc(id)}/defer`, {}));
   },
-  async mercuryRunConfig() {
-    return json(await request('/api/mercury/runs/config'));
+  async mercuryResumeRun(id) {
+    await json<void>(await post(`/api/mercury/runs/${enc(id)}/resume`, {}));
   },
-  async mercurySetRunConfig(maxConcurrent: number) {
-    return json(await post('/api/mercury/runs/config', { maxConcurrent }, 'PUT'));
+  async mercuryDeliveries() {
+    return json<{ deliveries: import('@/types').Delivery[] }>(
+      await request('/api/mercury/runs/deliveries'),
+    ).then((r) => r.deliveries);
   },
-  async mercuryBlockedDeploys() {
-    return json(await request('/api/mercury/runs/deploys'));
+  async mercuryRollbackDelivery(deliveryId) {
+    return json(await post(`/api/mercury/runs/deliveries/${enc(deliveryId)}/rollback`, {}));
   },
-  async mercuryResumeDeploy(repo, number) {
-    return json(await post('/api/mercury/runs/deploys/resume', { repo, number }));
+  async mercuryRepoReset(repoId) {
+    await json<void>(await post('/api/mercury/runs/reset', { repo: repoId }));
   },
   async mercuryUploadAttachment(id, filename, contentB64) {
     return json<{ attachments: import('@/types').RunAttachment[] }>(
@@ -349,6 +365,25 @@ export const httpSource: DataSource = {
   mercuryAttachmentRawUrl(id, attachmentId) {
     return `/api/mercury/runs/${enc(id)}/attachments/${enc(attachmentId)}/raw`;
   },
+
+  events() {
+    // The ONE stream. Reconnect-with-refresh selfheals in lib/live.ts (C F5); this hands out
+    // the raw source for the provider to manage.
+    return new EventSource('/api/events', { withCredentials: true });
+  },
+
+  async serviceConfig() {
+    return json(await request('/api/service/config'));
+  },
+  async serviceStorage() {
+    return json(await request('/api/service/storage'));
+  },
+  async serviceTelemetry() {
+    return json(await request('/api/service/telemetry'));
+  },
+  async serviceAiUsage() {
+    return json(await request('/api/service/ai-usage'));
+  },
 };
 
 /** Mutating-request helper: JSON body (optional), CSRF header, refresh-aware. Defaults to POST. */
@@ -362,9 +397,6 @@ function post(path: string, body?: unknown, method = 'POST'): Promise<Response> 
 }
 
 /** Builds a power-op request init with the CSRF header (for mutating calls). */
-export function withCsrf(init: RequestInit = {}): RequestInit {
+function withCsrf(init: RequestInit = {}): RequestInit {
   return { ...init, headers: { ...(init.headers ?? {}), 'X-CSRF-Token': csrfToken() } };
 }
-
-/** Exposed so Slice 2/3 mutating sources can reuse the refresh-aware fetch. */
-export { request as apiFetch, json as apiJson };

@@ -1,36 +1,107 @@
+// Resume planning (C F1) — a PURE decision: given the persisted execution documents, results,
+// open deliveries and an optionally adopted open PR, decide whether a start resumes the existing
+// execution (same id, REQ-019.1), starts fresh, or adopts an open PR's state. No I/O here; the
+// scheduler calls this inside its one atomic Submit.
 package runs
 
-// ResumeAction is what the next fire of a run will do with any interrupted execution it finds: continue
-// the SAME execution, or start a fresh one. It is the honest, surfaced answer to "resume or restart?" —
-// decided in ONE place (the executor's resume classifier) and reported back to whoever triggered the run,
-// so a re-trigger never silently redoes a whole night's work into a second, duplicate pull request.
-type ResumeAction string
+import (
+	"fmt"
+	"time"
 
-const (
-	// ResumeContinue continues the same execution (same id), skipping the repositories it already finished.
-	ResumeContinue ResumeAction = "resume"
-	// ResumeFresh starts a new execution — either because no resumable one exists, or because an existing
-	// one was deliberately discarded (an explicit fresh start), or because it belonged to a different mode.
-	ResumeFresh ResumeAction = "fresh"
+	"devlab/backend/internal/execstate"
+	"devlab/backend/internal/model"
 )
 
-// ResumePlan describes what a trigger is about to do and why: whether it continues an interrupted
-// execution or begins a new one, which execution it continues (ResultID) and how far that one already got
-// (ReposDone), and — on an explicit fresh start — which incomplete execution it discarded. It is purely
-// descriptive: the executor enacts it. It travels from the scheduler's FireNow back to the HTTP trigger so
-// the difference between "fortgesetzt" and "neu begonnen" is visible to whoever pressed the button.
+// ResumePlan is the decision Submit acts on.
 type ResumePlan struct {
-	Action ResumeAction `json:"action"`
-	// ResultID is the execution being continued (set only when Action == resume).
-	ResultID string `json:"resultId,omitempty"`
-	// ReposDone is how many repositories that execution had already completed — the ones a resume skips.
-	ReposDone int `json:"reposDone"`
-	// Reason is a human-readable explanation of the decision (why it resumed, started fresh, or discarded).
-	Reason string `json:"reason"`
-	// Discarded is the resultId of an incomplete execution that an explicit fresh start marked as discarded,
-	// so the caller can name it (and any pull request it left open) instead of it lingering unnoticed.
-	Discarded string `json:"discarded,omitempty"`
-	// DiscardedPRUrl names an open pull request the discarded execution left behind, so a deliberate fresh
-	// start surfaces it rather than silently placing a second one beside it.
-	DiscardedPRUrl string `json:"discardedPrUrl,omitempty"`
+	// Action is "resume" | "fresh" | "adopt-pr".
+	Action      string
+	ExecutionID string
+	Reason      string
+}
+
+// Resume plan actions.
+const (
+	ResumeActionResume  = "resume"
+	ResumeActionFresh   = "fresh"
+	ResumeActionAdoptPR = "adopt-pr"
+)
+
+// PlanResume classifies the situation: a live document within the resume window resumes under
+// its OWN id; a document older than resumeWindow counts as reliably abandoned; an open,
+// run-created PR is adopted rather than duplicated (REQ-019.5). An explicit fresh start is the
+// caller's decision and marks the old document discarded — not decided here.
+func PlanResume(docs []execstate.Doc, results []Result, open []Delivery, openPR *model.PRRef, resumeWindow time.Duration, now time.Time) ResumePlan {
+	// The newest resumable live document wins (per run there is at most one live document —
+	// the store invariant; over a mixed doc set the newest is the honest anchor).
+	var cand *execstate.Doc
+	for i := range docs {
+		d := docs[i]
+		switch d.Phase {
+		case model.PhasePaused, model.PhaseBlocked, model.PhaseInterrupted:
+			if cand == nil || !d.CreatedAt.Before(cand.CreatedAt) {
+				cand = &docs[i]
+			}
+		}
+	}
+	if cand != nil {
+		age := now.Sub(lastTouched(*cand))
+		if resumeWindow > 0 && age > resumeWindow {
+			return ResumePlan{
+				Action:      ResumeActionFresh,
+				ExecutionID: cand.ID,
+				Reason: fmt.Sprintf("previous execution %s counts as reliably abandoned (untouched for %s, resume window %s)",
+					cand.ID, age.Round(time.Minute), resumeWindow),
+			}
+		}
+		reason := fmt.Sprintf("continuing execution %s (%s", cand.ID, cand.Phase)
+		if cand.Continuation != nil {
+			reason += fmt.Sprintf(" at %s/%s", cand.Continuation.Repo, cand.Continuation.Stage)
+		}
+		reason += ") — finished repositories stay finished"
+		if d := progressNote(*cand); d != "" {
+			reason += "; " + d
+		}
+		return ResumePlan{Action: ResumeActionResume, ExecutionID: cand.ID, Reason: reason}
+	}
+
+	// No resumable document. Work that already reached a PR is ADOPTED, never duplicated:
+	// either the caller found an open PR by head, or the ledger still holds an open
+	// execution-created delivery.
+	if openPR != nil {
+		return ResumePlan{
+			Action: ResumeActionAdoptPR,
+			Reason: fmt.Sprintf("open pull request #%d (%s) already carries this work — adopting it instead of duplicating", openPR.Number, openPR.HeadBranch),
+		}
+	}
+	for _, d := range open {
+		if d.ExecutionID != "" && d.OpenState() {
+			return ResumePlan{
+				Action:      ResumeActionAdoptPR,
+				ExecutionID: d.ExecutionID,
+				Reason:      fmt.Sprintf("open delivery %s at %s already carries this work — adopting its branch instead of duplicating", d.ID, d.Repo),
+			}
+		}
+	}
+	return ResumePlan{Action: ResumeActionFresh, Reason: "no unfinished execution to continue — starting fresh"}
+}
+
+func lastTouched(d execstate.Doc) time.Time {
+	if d.UpdatedAt != nil {
+		return *d.UpdatedAt
+	}
+	return d.CreatedAt
+}
+
+func progressNote(d execstate.Doc) string {
+	done := 0
+	for _, r := range d.Repos {
+		if r.State == execstate.RepoDone {
+			done++
+		}
+	}
+	if done == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d of %d repositories already finished", done, len(d.Repos))
 }

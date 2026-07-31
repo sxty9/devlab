@@ -1,43 +1,79 @@
-# DevLab backend (devlabd) — production systemd unit.
+# DevLab backend (devlabd) — systemd unit TEMPLATE.
 #
-# Slice 0 reads the operator's local working copies under /home/nanu and discovers repos via the
-# operator's `gh` auth, so the daemon runs as `nanu` (the owner of both). It only needs read
-# access; nothing under /home is written. Slice 3 re-architects storage to per-user clones under
-# /var/lib/devlab with per-user GitHub tokens, at which point this should move to a dedicated
-# unprivileged `devlab` system user (no /home access, no shared gh PAT).
+# Instance values (domain, cookie domain, ports, run user, GitHub owner) belong in a local
+# drop-in (/etc/systemd/system/devlabd.service.d/*.conf), NEVER in this repo. The values below
+# are overridable defaults. There is NO operating-mode variable — modes do not exist
+# (REQ-027.1); DEVLAB_RUNS_MAX_CONCURRENCY, when set, is only the FIRST-start seed of the
+# runtime settings pool (REQ-013.2).
 #
-# Install (run once, as root):
-#   # 1. binary + unit
+# Environment-contract migration (B-45 — one note per changed variable):
+#   DEVLAB_GH_OWNER           now MANDATORY, previously optional. The GitHub owner the managed
+#                             repository set lives under has NO default any more: a default would
+#                             scope both the set and every repository the delivery chain creates
+#                             to another organisation. Unset, every resolution fails closed with
+#                             an empty set and the named ErrOwnerUnset. Set it in the drop-in —
+#                             it is an instance value and therefore not in this template.
+#   DEVLAB_RUNS_MODE          REMOVED. Operating modes do not exist; the one chain always runs
+#                             preflight → implement → deliver-dev → publish → pull-request.
+#   DEVLAB_RUNS_MAX_COST*     REMOVED. There is no cost cap (REQ-017): consumption is counted
+#                             live and reported, never capped. The time budget is a per-run
+#                             tunable in the runtime settings, not an env variable.
+#   DEVLAB_RUNS_AUTOMERGE     RENAMED to DEVLAB_RUNS_AUTOMERGE_WINDOW, and demoted: it SEEDS the
+#                             runtime settings pool on the first start only (REQ-013.2), so the
+#                             stored window wins from the first write on. The old name is read by
+#                             nothing — left in a drop-in it silently does nothing.
+#   DEVLAB_RUNS_LIMIT_MAXRESUMES
+#                             RENAMED to DEVLAB_RUNS_LIMIT_MAX_RESUMES (one word boundary, so the
+#                             name matches every other DEVLAB_RUNS_* knob). Read by nothing under
+#                             the old spelling: a usage-limit cap left behind would silently become
+#                             the default of 8 resumes.
+#   DEVLAB_RUNS_AGENT_TIMEOUT REMOVED. The per-attempt wall-clock budget is the settings pool's
+#                             DefaultTimeBudget, seeded once by DEVLAB_RUNS_TIME_BUDGET and tuned
+#                             per run afterwards (REQ-010); DEVLAB_RUNS_MAX_DURATION remains the
+#                             scheduler's hard stop per attempt.
+#   DEVLAB_RUNS_PROTECTION_START_DELAY / DEVLAB_RUNS_PROTECTION_ENFORCE
+#                             NEW. The branch-protection pass reaches every repository of the
+#                             configured organisation, so it is held: the first pass waits (default
+#                             15m) instead of running at boot, and it only READS and REPORTS until
+#                             the operator arms writing. See the hardening block below.
+#   DEVLAB_RUNS_MAINTAIN_ENFORCE
+#                             NEW, and the second switch of the same kind. The recurring pull-request
+#                             maintenance merges, prunes delivery branches and writes commit statuses
+#                             in the managed repositories, driven by the scheduler tick — so on a
+#                             freshly migrated instance it would do all of that from the FIRST tick,
+#                             over a pool nobody has looked at yet. Unarmed (the default) the pass
+#                             reports the standstill from DevLab's own pools and makes no foreign call
+#                             at all. Arm it in the drop-in once the pool has been inspected
+#                             (00-cutover.md step 6a).
+#   run-active/runs-active    REMOVED (REQ-039.3). Activity is a projection over the execution
+#                             documents; the only marker file is mercury/restart.json.
+#   DEVLAB_LINKS, DEVLAB_WORKSPACES, DEVLAB_STATIC_DIR, DEVLAB_REPOS_PATH
+#                             now DERIVE from DEVLAB_STATE_DIR (internal/statepath). The
+#                             historical per-variable overrides keep working as overrides for
+#                             genuinely split roots; stop setting them otherwise. DEVLAB_REPOS_PATH
+#                             in particular is only the dev-bypass sandbox base: carried over from an
+#                             older unit that pointed it at an operator home, it aims repository
+#                             resolution at foreign working copies instead of the per-user
+#                             workspaces under the state root.
+#   listen address            DEVLAB_ADDR ONLY. The binary parses NO command-line flags, so a
+#                             `--listen <addr>` argument carried over from an older ExecStart is
+#                             silently ignored and the process listens wherever DEVLAB_ADDR points
+#                             — which must be the address the edge proxies to.
+#   DEVLAB_COOKIE_DOMAIN      unchanged in meaning, but it is an INSTANCE value and therefore no
+#                             longer in this template (see the commented line below). Unset, the
+#                             session cookies this service re-mints are host-only and stand BESIDE
+#                             the landscape's domain-wide ones instead of overwriting them.
+#   DEVLAB_RESTART_POLL / DEVLAB_RESTART_MAXWAIT
+#                             unchanged, but now consumed by devlab-restart-when-free polling
+#                             the ready SOCKET (restart-ready.sock) — the PID busy-marker of
+#                             devlab-restart-idle is gone.
+#
+# Install (once, as root — the `service` CLI performs these steps interactively):
 #   sudo install -m0755 devlabd /usr/local/bin/devlabd
 #   sudo install -m0644 deploy/devlabd.service /etc/systemd/system/devlabd.service
-#   # 2. rights manifest → privleg discovers it; create the backing group (mirrors the
-#   #    holistic-service-template install_permissions step)
 #   sudo install -m0644 permissions/devlab.json /etc/holistic/permissions.d/devlab.json
 #   sudo groupadd -f hp_devlab_access
-#   # 3. let nanu read the shared Holistic session secret (validates the h_access SSO cookie)
-#   sudo usermod -aG holistic nanu        # log out/in or restart the unit for it to take effect
-#   # 4. start
 #   sudo systemctl daemon-reload && sudo systemctl enable --now devlabd
-#
-# Grant a non-admin developer access (admins are implicitly allowed):
-#   privleg-grant <user> hp_devlab_access on     # or via the privleg UI
-#
-# GitHub linking (Slice 2) — one-time operator setup:
-#   # a) Register a GitHub OAuth App (Settings → Developer settings → OAuth Apps):
-#   #      Homepage:      https://devlab.henrysoase.org
-#   #      Callback URL:  https://devlab.henrysoase.org/api/github/callback
-#   #    then drop its credentials (root:devlab 0640) where devlabd can read them:
-#   sudo install -d -m0750 -o root -g devlab /etc/devlab
-#   printf '{"client_id":"...","client_secret":"...","redirect_uri":"https://devlab.henrysoase.org/api/github/callback"}' \
-#     | sudo install -m0640 -o root -g devlab /dev/stdin /etc/devlab/github-oauth.json
-#   # b) 32-byte AES key that encrypts each user's GitHub token at rest:
-#   sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/devlab/link-key' && sudo chgrp devlab /etc/devlab/link-key && sudo chmod 0640 /etc/devlab/link-key
-#   # /var/lib/devlab/{links,workspaces} are created by StateDirectory + the daemon (0700).
-#
-# Register the production route (Cloudflare tunnel via sxgate):
-#   sudo /home/nanu/sxgate/sxgate service add devlab http://localhost:8781
-#   sudo /home/nanu/sxgate/sxgate route add devlab.henrysoase.org devlab
-#   (+ a proxied CNAME `devlab` in the Cloudflare DNS for henrysoase.org)
 
 [Unit]
 Description=DevLab backend (devlabd)
@@ -45,41 +81,96 @@ After=network.target
 
 [Service]
 Type=simple
-# Phase C: dedicated unprivileged service user. Per-user git/file ops (and the terminal/AI) run AS
-# the logged-in Linux user via the pinned devlab-exec sudo wrapper; the service itself only reads.
+# Dedicated unprivileged service user. Per-user git/file ops (and terminal/AI) run AS the
+# logged-in Linux user via the pinned devlab-exec sudo wrapper; the service itself only reads.
 User=devlab
 SupplementaryGroups=holistic
-ExecStart=/usr/local/bin/devlabd --listen 127.0.0.1:8781
+ExecStart=/usr/local/bin/devlabd
 Restart=on-failure
 RestartSec=3
+# On SIGTERM devlabd drains: admissions close, agent children get SIGTERM, every running
+# execution is persisted as interrupted with its continuation (< DEVLAB_RUNS_DRAIN_GRACE),
+# then HTTP shuts down. Keep TimeoutStopSec above that grace (K-2) — a long run never blocks
+# the stop.
+TimeoutStopSec=90
 
-# Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable secret
-# makes devlabd refuse to start in SSO mode (fail closed) rather than accept forged tokens.
+# The ONE state root. Every persisted path derives from it (internal/statepath).
+Environment=DEVLAB_STATE_DIR=/var/lib/devlab
+# Listen address (loopback; the edge proxy routes the public host here).
+Environment=DEVLAB_ADDR=127.0.0.1:8781
+# Shared Holistic session secret (validates the h_access SSO cookie). Missing/unreadable
+# secret makes devlabd refuse to start in SSO mode (fail closed).
 Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
-# Cookies re-minted by devlabd (local refresh) are domain-wide + secure in production, so they
-# overwrite the shared Holistic variants rather than shadowing them.
 Environment=DEVLAB_COOKIE_SECURE=1
-Environment=DEVLAB_COOKIE_DOMAIN=.henrysoase.org
-# Slice 0/2 reads local working copies in the sandbox; production discovery is per-user GitHub:
-Environment=DEVLAB_REPOS_PATH=/home/nanu
-# Slice 1: honor a Holistic logout/rotation at refresh time (read-only). Falls back to the
-# refresh-token TTL if unreadable.
+# The shared parent domain the landscape's session cookies are scoped to. It is an instance value,
+# so it is set in the drop-in and stays out of this template; unset, the cookies re-minted here are
+# host-only and shadow the domain-wide ones instead of overwriting them:
+#   Environment=DEVLAB_COOKIE_DOMAIN=<cookie-domain>
+# Honor a Holistic logout/rotation at refresh time (read-only).
 Environment=HOLISTIC_REVOKED=/var/lib/holistic/revoked.json
-# Slice 2: per-user GitHub link store (AES-256-GCM token at rest) + OAuth app config.
-Environment=DEVLAB_LINKS=/var/lib/devlab/links
+# Per-user GitHub link store key + OAuth app config (operator-provisioned files).
 Environment=DEVLAB_LINK_ENC_KEY_FILE=/etc/devlab/link-key
 Environment=DEVLAB_GITHUB_OAUTH_FILE=/etc/devlab/github-oauth.json
-# Slice 3: per-user git workspaces.
-Environment=DEVLAB_WORKSPACES=/var/lib/devlab/workspaces
-# Serve the built SPA (dist/) directly so one process serves both UI and API (sxgate routes
-# devlab.henrysoase.org straight here). Deploy dist/ to this path on each release.
-Environment=DEVLAB_STATIC_DIR=/var/lib/devlab/www
+# MANDATORY, no default: the GitHub owner whose topic-marked repositories form the managed set.
+# It is an instance value, so it is set in the drop-in and stays out of this template:
+#   Environment=DEVLAB_GH_OWNER=<github-owner>
+# The set marker itself does have a default ("holistic", the landscape-wide topic); override it
+# only where the instance marks membership differently:
+#   Environment=DEVLAB_GH_TOPIC=<topic>
+# Drain/resume knobs (runtime settings win over env where a settings value exists).
+Environment=DEVLAB_RUNS_DRAIN_GRACE=60s
+Environment=DEVLAB_RUNS_RESUME_WINDOW=240h
+# Branch protection (REQ-033.7) is the ONE recurring pass whose effect leaves DevLab: it walks every
+# repository of the configured organisation and, armed, PATCHes the default branch of each one that
+# deviates. So it is held by default — the first pass waits, and an unarmed pass reads and reports
+# without changing anything. Arm it in the drop-in once the reported findings are the intended ones:
+#   Environment=DEVLAB_RUNS_PROTECTION_ENFORCE=1
+Environment=DEVLAB_RUNS_PROTECTION_START_DELAY=15m
+# The pull-request maintenance is the SECOND pass whose effect leaves DevLab: it merges, prunes
+# delivery branches and writes commit statuses in the managed repositories, on the scheduler's tick.
+# It is held the same way — unarmed it reports the standstill and makes no foreign call — and it is
+# armed in the drop-in once the pending-pull-request pool has been inspected:
+#   Environment=DEVLAB_RUNS_MAINTAIN_ENFORCE=1
 
-# Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo wrappers to
-# run ops as the end user); ProtectHome false so per-user git/claude configs (~/.gitconfig, ~/.claude)
+# Hardening. NoNewPrivileges must be false (the service escalates via the pinned sudo
+# wrappers to run ops as the end user); ProtectHome false so per-user git/claude configs
 # resolve. Isolation is at the sudo/OS-user layer (devlab-exec), not the mount namespace.
 StateDirectory=devlab
-ReadWritePaths=/var/lib/devlab
+# 0711, not systemd's default 0755: the state root holds the link store, the transcripts and the
+# restart-ready socket, so no local account may LIST it — but the per-user workspaces below it are
+# entered by devlab-exec running AS the end user, which needs the traverse bit (x). 0750 would cut
+# that path and break every per-user git op. The workspaces root keeps the same shape (0711).
+StateDirectoryMode=0711
+# 0027: what the daemon creates is readable by itself and the operating group only, never by every
+# local user. It matches devlab-exec's umask, so a file's mode does not depend on who created it.
+# Security-relevant modes are still set explicitly at the site (e.g. api.SocketMode) — this is the
+# floor, never the guarantee.
+UMask=0027
+# ProtectSystem=strict makes the WHOLE hierarchy read-only apart from what is listed here — /tmp
+# included. Every per-user child this service starts through devlab-exec needs a writable one: the
+# claude CLI keeps its scratch in /tmp/claude-<uid>, and `go build` / `npm run build` put their work
+# there. So /tmp is writable explicitly rather than through PrivateTmp: a private /tmp would give the
+# service a namespace of its own, where the per-user scratch is invisible to the user's own session and
+# to every other service, while the isolation this service actually relies on is the OS user
+# (devlab-exec), not the mount namespace. A drop-in that sets PrivateTmp=true silently takes that
+# decision back — the cutover removes it.
+#
+# The four install targets are writable for ONE reason: the mount namespace is inherited by every
+# child, the pinned root installer (devlab-install) is such a child, and a read-only /opt made EVERY
+# dev deploy of EVERY service fail with "chmod failed with error Read-only file system". Measured on
+# 2026-07-30: nine services in one execution, all with that one sentence.
+#
+# It gives the daemon itself nothing: it runs as the unprivileged `devlab` account, and all four
+# paths are root-owned, so file permissions still refuse it. What the namespace was blocking was the
+# root child alone — and the boundary this service actually relies on is the sudoers pin plus the OS
+# user (devlab-exec), as stated above, not the mount namespace. Exactly the paths the installer
+# writes are listed, nothing wider:
+#   /opt                  the service artifact (/opt/<id>/bin/<id>d)
+#   /usr/local/bin        the self repository's own binary
+#   /etc/systemd/system   the generated unit of a first-time setup
+#   /etc/caddy/conf.d     its generated route
+#   /var/lib              the state directory of a first-time setup (useradd creates /var/lib/<id>)
+ReadWritePaths=/var/lib /tmp /opt /usr/local/bin /etc/systemd/system /etc/caddy/conf.d
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=false

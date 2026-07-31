@@ -1,0 +1,45 @@
+{
+  "runId": "run_legacy_sweep",
+  "resultId": "2026-07-20T02-00-00.000Z",
+  "runName": "Consistency sweep",
+  "type": "",
+  "startedAt": "2026-07-20T02:00:00Z",
+  "finishedAt": "2026-07-20T02:41:12Z",
+  "prompt": "# Task\n\nlegacy prompt snapshot",
+  "mode": "pr",
+  "model": "opus",
+  "effort": "max",
+  "ok": false,
+  "trigger": { "auto": true },
+  "requestedBy": "owner",
+  "repos": [
+    {
+      "repo": "svc-a",
+      "ok": true,
+      "deployed": true,
+      "steps": [
+        { "name": "analyze", "status": "ok", "log": "looked around", "at": "2026-07-20T02:01:00Z" },
+        { "name": "implement", "status": "ok", "at": "2026-07-20T02:10:00Z" },
+        { "name": "dev-deploy", "status": "not-applicable", "log": "library, nothing to deploy", "at": "2026-07-20T02:11:00Z" },
+        { "name": "push", "ok": true, "at": "2026-07-20T02:12:00Z" },
+        { "name": "pr", "status": "ok", "at": "2026-07-20T02:13:00Z" }
+      ]
+    },
+    {
+      "repo": "svc-b",
+      "ok": false,
+      "error": "skipped because of a setting",
+      "steps": []
+    }
+  ],
+  "live": {
+    "repo": "svc-c",
+    "steps": [
+      { "name": "implement", "running": true, "status": "", "log": "streaming…", "at": "2026-07-20T02:40:00Z" }
+    ]
+  },
+  "inputTokens": 123456,
+  "outputTokens": 6543,
+  "costUsd": 12.34,
+  "numTurns": 42
+}

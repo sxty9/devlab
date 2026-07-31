@@ -1,161 +1,204 @@
 package atlas
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"devlab/backend/internal/model"
 )
 
-// The prizm case: a setup on an already-held port is rejected — it names the holder and grants a free
-// port instead, never silently the taken one.
-func TestProposeRejectsOccupiedAndNamesFree(t *testing.T) {
-	routed := map[int][]string{8780: {"aigentic"}, 8771: {"hostek"}}
-	p := proposeFrom("prizm", 8780, 8770, 8785, routed, nil)
-
-	if p.Granted == 8780 {
-		t.Fatalf("granted the occupied port 8780: %+v", p)
+// writeRouteFixtures lays down a route directory shaped like the host's drop-in dir.
+func writeRouteFixtures(t *testing.T, routes map[string]int) string {
+	t.Helper()
+	dir := t.TempDir()
+	for id, port := range routes {
+		content := "handle /api/services/" + id + "/* {\n\treverse_proxy 127.0.0.1:" + strconv.Itoa(port) + "\n}\n"
+		if err := os.WriteFile(filepath.Join(dir, id+".caddy"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if p.Conflict != "aigentic" {
-		t.Errorf("conflict = %q, want aigentic", p.Conflict)
-	}
-	if p.Granted != 8770 { // lowest free in 8770..8785 with 8780,8771 taken
-		t.Errorf("granted = %d, want 8770", p.Granted)
-	}
-	if !p.InBand {
-		t.Errorf("granted %d should be in band", p.Granted)
-	}
-	if !strings.Contains(p.Note, "aigentic") || !strings.Contains(p.Note, "free") {
-		t.Errorf("note should name the holder and a free port: %q", p.Note)
-	}
+	return dir
 }
 
-func TestProposeGrantsFreeDesired(t *testing.T) {
-	p := proposeFrom("prizm", 8781, 8770, 8785, map[int][]string{8780: {"aigentic"}}, nil)
-	if p.Granted != 8781 || p.Conflict != "" || !p.InBand {
-		t.Errorf("a free desired port should be granted as-is: %+v", p)
+// writeProcNetTCP writes a /proc/net/tcp-format fixture with the given ports in LISTEN state.
+func writeProcNetTCP(t *testing.T, name string, listen []int) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+	for i, p := range listen {
+		b.WriteString("   " + strconv.Itoa(i) + ": 0100007F:" + strings.ToUpper(strconv.FormatInt(int64(p), 16)) +
+			" 00000000:0000 0A 00000000:00000000 00:00000000 00000000   999        0 1 0000000000000000 100 0 0 10 0\n")
 	}
+	// One ESTABLISHED row (state 01) that must NOT count as listening.
+	b.WriteString("  99: 0100007F:1F90 0100007F:2222 01 00000000:00000000 00:00000000 00000000   999        0 1 0000000000000000 100 0 0 10 0\n")
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
-func TestProposeNoPreferenceLowestFree(t *testing.T) {
-	routed := map[int][]string{8770: {"a"}, 8771: {"b"}, 8773: {"c"}}
-	p := proposeFrom("new", 0, 8770, 8785, routed, nil)
-	if p.Granted != 8772 { // 8770,8771 taken; 8772 is the lowest free (8773 also taken)
-		t.Errorf("granted = %d, want 8772: %+v", p.Granted, p)
+func find(allocs []model.PortAllocation, port int, service string) (model.PortAllocation, bool) {
+	for _, a := range allocs {
+		if a.Port == port && a.Service == service {
+			return a, true
+		}
 	}
+	return model.PortAllocation{}, false
 }
 
-// A service that already holds a port keeps it — re-proposing must be idempotent, not a move.
-func TestProposeIdempotentKeepsOwnPort(t *testing.T) {
-	routed := map[int][]string{8780: {"aigentic"}}
-	for _, desired := range []int{0, 8780} {
-		p := proposeFrom("aigentic", desired, 8770, 8785, routed, nil)
-		if p.Granted != 8780 || p.Conflict != "" {
-			t.Errorf("desired=%d: aigentic should keep 8780, got %+v", desired, p)
+// The known legacy double-booking pattern: two services routed to ONE port. The ledger derived
+// from fixture routes + a fixture socket table must find and NAME it (REQ-044.5, B-04).
+func TestAllocationsFindsDoubleBookingFromFixtures(t *testing.T) {
+	routes := writeRouteFixtures(t, map[string]int{"aigentic": 8780, "prizm": 8780, "hostek": 8771})
+	tcp := writeProcNetTCP(t, "tcp", []int{8780, 8771, 8781}) // 8781: bound but unrouted (the dashboard's own)
+	tcp6 := writeProcNetTCP(t, "tcp6", nil)
+
+	allocs, err := Allocations(routes, tcp, tcp6)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, svc := range []string{"aigentic", "prizm"} {
+		a, ok := find(allocs, 8780, svc)
+		if !ok {
+			t.Fatalf("missing allocation for %s on 8780: %+v", svc, allocs)
+		}
+		if !a.Conflict || !a.Routed || !a.Bound {
+			t.Errorf("%s on 8780 should be routed+bound+conflict, got %+v", svc, a)
+		}
+	}
+	if a, ok := find(allocs, 8771, "hostek"); !ok || a.Conflict {
+		t.Errorf("hostek on 8771 should exist without conflict, got %+v ok=%v", a, ok)
+	}
+	if a, ok := find(allocs, 8781, ""); !ok || a.Routed || !a.Bound {
+		t.Errorf("8781 should appear as bound-but-unrouted, got %+v ok=%v", a, ok)
+	}
+	if _, ok := find(allocs, 8080, ""); ok {
+		t.Errorf("the ESTABLISHED row must not count as listening: %+v", allocs)
+	}
+	// Sorted by port, then service.
+	for i := 1; i < len(allocs); i++ {
+		prev, cur := allocs[i-1], allocs[i]
+		if prev.Port > cur.Port || (prev.Port == cur.Port && prev.Service > cur.Service) {
+			t.Errorf("allocations not sorted at %d: %+v", i, allocs)
 		}
 	}
 }
 
-// A port that is bound but carries no Caddy route (the dashboard's own, say) is still occupied and must
-// never be proposed as free.
-func TestProposeExcludesBoundButUnroutedPort(t *testing.T) {
-	bound := map[int]bool{8770: true, 8771: true}
-	p := proposeFrom("new", 8770, 8770, 8785, nil, bound)
-	if p.Granted == 8770 || p.Granted == 8771 {
-		t.Fatalf("granted a bound port: %+v", p)
-	}
-	if p.Granted != 8772 {
-		t.Errorf("granted = %d, want 8772", p.Granted)
-	}
-	if !strings.Contains(p.Note, "in use") {
-		t.Errorf("note should say the desired port is in use: %q", p.Note)
+// A route directory that cannot be read is an honest error, never an empty green ledger.
+func TestAllocationsMissingRoutesDirErrors(t *testing.T) {
+	if _, err := Allocations(filepath.Join(t.TempDir(), "absent"), "", ""); err == nil {
+		t.Fatal("expected an error for an unreadable routes dir")
 	}
 }
 
-func TestProposeBandExhausted(t *testing.T) {
-	routed := map[int][]string{8770: {"a"}, 8771: {"b"}}
-	p := proposeFrom("new", 0, 8770, 8771, routed, nil)
-	if p.Granted != 0 || p.InBand {
-		t.Errorf("an exhausted band should grant 0 / not-in-band: %+v", p)
+// Unreadable socket tables degrade to the routes alone (sandbox), not to an error.
+func TestAllocationsDegradesWithoutProcfs(t *testing.T) {
+	routes := writeRouteFixtures(t, map[string]int{"hostek": 8771})
+	allocs, err := Allocations(routes, filepath.Join(t.TempDir(), "no-tcp"), "")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(p.Note, "No port is free") {
-		t.Errorf("note should say no port is free: %q", p.Note)
-	}
-}
-
-func TestProposeDesiredFreeButOutOfBand(t *testing.T) {
-	p := proposeFrom("new", 9001, 8770, 8799, nil, nil)
-	if p.Granted != 9001 || p.InBand {
-		t.Errorf("a free out-of-band desired port is granted but flagged out-of-band: %+v", p)
-	}
-	if !strings.Contains(p.Note, "outside") {
-		t.Errorf("note should flag the out-of-band port: %q", p.Note)
+	if a, ok := find(allocs, 8771, "hostek"); !ok || a.Bound {
+		t.Errorf("expected routed-only hostek, got %+v ok=%v", a, ok)
 	}
 }
 
-func TestAllocationHeldAndFree(t *testing.T) {
-	routed := map[int][]string{8772: {"privleg"}, 8770: {"hostek"}}
-	bound := map[int]bool{8771: true} // bound but unrouted
-	a := allocationFrom(8770, 8774, routed, bound, "t")
-
-	if len(a.Held) != 2 || a.Held[0].Port != 8770 || a.Held[1].Port != 8772 {
-		t.Errorf("held should be sorted by port: %+v", a.Held)
+func TestProposeLowestFreeSkipsRoutedAndBound(t *testing.T) {
+	allocs := []model.PortAllocation{
+		{Port: 8770, Service: "a", Routed: true},
+		{Port: 8771, Bound: true}, // bound but unrouted still counts as taken
+		{Port: 8773, Service: "c", Routed: true},
 	}
-	// free = band 8770..8774 minus routed {8770,8772} minus bound {8771} = 8773,8774
-	want := []int{8773, 8774}
-	if len(a.Free) != len(want) || a.Free[0] != 8773 || a.Free[1] != 8774 {
-		t.Errorf("free = %v, want %v", a.Free, want)
+	got, err := Propose(allocs, Band{Lo: 8770, Hi: 8785})
+	if err != nil || got != 8772 {
+		t.Errorf("Propose = %d, %v; want 8772", got, err)
 	}
 }
 
-func TestAllocationSurfacesDoubleBooking(t *testing.T) {
-	routed := map[int][]string{8780: {"aigentic", "prizm"}}
-	a := allocationFrom(8770, 8785, routed, nil, "t")
-	if len(a.Held) != 1 || len(a.Held[0].IDs) != 2 {
-		t.Fatalf("a double-booked port should list both holders: %+v", a.Held)
+func TestProposeExhaustedBandErrors(t *testing.T) {
+	allocs := []model.PortAllocation{
+		{Port: 8770, Service: "a", Routed: true},
+		{Port: 8771, Service: "b", Routed: true},
+	}
+	if _, err := Propose(allocs, Band{Lo: 8770, Hi: 8771}); err == nil {
+		t.Fatal("expected an error for an exhausted band")
 	}
 }
 
-func TestFindingsFlagsOutOfBand(t *testing.T) {
-	t.Setenv("DEVLAB_PORT_BAND", "8770-8799")
-	nodes := []Node{
-		{ID: "aigentic", Port: 8780, HasManifest: true, HasRoute: true},
-		{ID: "legacy", Port: 9001, HasManifest: true, HasRoute: true},
+// The setup-on-a-taken-port case: rejected, the holder named, a free port proposed instead
+// (REQ-044.2) — never silently the taken one.
+func TestProposeDesiredOccupiedRejectedWithProposal(t *testing.T) {
+	allocs := []model.PortAllocation{
+		{Port: 8780, Service: "aigentic", Routed: true, Bound: true},
+		{Port: 8771, Service: "hostek", Routed: true},
 	}
-	fs := findings(nodes, false)
-	if !hasFinding(fs, "warn", "legacy", "außerhalb") {
-		t.Errorf("expected an out-of-band finding for legacy: %+v", fs)
+	_, err := ProposeDesired(allocs, Band{Lo: 8770, Hi: 8785}, 8780)
+	var occ *OccupiedError
+	if !errors.As(err, &occ) {
+		t.Fatalf("expected *OccupiedError, got %v", err)
 	}
-	if hasFinding(fs, "warn", "aigentic", "außerhalb") {
-		t.Errorf("aigentic is in band and must not be flagged out-of-band: %+v", fs)
+	if occ.Holder != "aigentic" || occ.Free != 8770 {
+		t.Errorf("occ = %+v; want holder aigentic, free 8770", occ)
 	}
-}
-
-func TestFindingsFlagsDoubleBooking(t *testing.T) {
-	nodes := []Node{
-		{ID: "aigentic", Port: 8780, HasManifest: true, HasRoute: true},
-		{ID: "prizm", Port: 8780, HasManifest: true, HasRoute: true},
-	}
-	fs := findings(nodes, false)
-	found := false
-	for _, f := range fs {
-		if f.Severity == "error" && strings.Contains(f.Message, "8780") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected a port-collision error: %+v", fs)
+	if msg := occ.Error(); !strings.Contains(msg, "aigentic") || !strings.Contains(msg, "8770") {
+		t.Errorf("error should name the holder and the free proposal: %q", msg)
 	}
 }
 
-func hasFinding(fs []Finding, severity, node, substr string) bool {
-	for _, f := range fs {
-		if f.Severity != severity || !strings.Contains(f.Message, substr) {
-			continue
-		}
-		for _, n := range f.Nodes {
-			if n == node {
-				return true
-			}
-		}
+func TestProposeDesiredBoundButUnroutedNamesNoHolder(t *testing.T) {
+	allocs := []model.PortAllocation{{Port: 8781, Bound: true}}
+	_, err := ProposeDesired(allocs, Band{Lo: 8770, Hi: 8785}, 8781)
+	var occ *OccupiedError
+	if !errors.As(err, &occ) {
+		t.Fatalf("expected *OccupiedError, got %v", err)
 	}
-	return false
+	if occ.Holder != "" || !strings.Contains(occ.Error(), "bound but not routed") {
+		t.Errorf("bound-only occupation should carry no holder: %+v (%s)", occ, occ.Error())
+	}
+}
+
+func TestProposeDesiredFreeGranted(t *testing.T) {
+	got, err := ProposeDesired(nil, Band{Lo: 8770, Hi: 8785}, 8779)
+	if err != nil || got != 8779 {
+		t.Errorf("ProposeDesired = %d, %v; want 8779", got, err)
+	}
+	// No preference falls back to the lowest free.
+	got, err = ProposeDesired([]model.PortAllocation{{Port: 8770, Service: "a", Routed: true}}, Band{Lo: 8770, Hi: 8785}, 0)
+	if err != nil || got != 8771 {
+		t.Errorf("ProposeDesired(0) = %d, %v; want 8771", got, err)
+	}
+}
+
+func TestRoutedPort(t *testing.T) {
+	allocs := []model.PortAllocation{
+		{Port: 8771, Service: "hostek", Routed: true},
+		{Port: 8781, Bound: true},
+	}
+	if p, ok := RoutedPort(allocs, "hostek"); !ok || p != 8771 {
+		t.Errorf("RoutedPort(hostek) = %d, %v; want 8771, true", p, ok)
+	}
+	if _, ok := RoutedPort(allocs, "absent"); ok {
+		t.Error("RoutedPort should miss for an unrouted service")
+	}
+}
+
+func TestBandFromEnv(t *testing.T) {
+	t.Setenv("DEVLAB_PORT_BAND", "9000-9010")
+	if b := BandFromEnv(); b.Lo != 9000 || b.Hi != 9010 {
+		t.Errorf("band = %+v, want 9000-9010", b)
+	}
+	t.Setenv("DEVLAB_PORT_BAND", "garbage")
+	if b := BandFromEnv(); b.Lo != defaultBandLo || b.Hi != defaultBandHi {
+		t.Errorf("malformed band should fall back to the default, got %+v", b)
+	}
+	t.Setenv("DEVLAB_PORT_BAND", "")
+	if b := BandFromEnv(); b.Lo != defaultBandLo || b.Hi != defaultBandHi {
+		t.Errorf("unset band should be the default, got %+v", b)
+	}
 }

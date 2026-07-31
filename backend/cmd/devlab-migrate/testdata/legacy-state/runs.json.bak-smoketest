@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "id": "run_auto1",
+      "kind": "auto",
+      "title": "Reuse and shared building blocks",
+      "active": false,
+      "promptSnapshot": "# Automatic run\n\nrebuilt-form snapshot",
+      "promptInputHash": "sha256:0001",
+      "authorship": { "created": { "user": "owner" } }
+    }
+  ]
+}

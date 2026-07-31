@@ -1,81 +1,120 @@
+// Service settings — the single source of truth for slot capacity, the default time budget and
+// the automerge window (C F3; W3). A passive, atomic JSON pool; environment values are ONLY the
+// first-start seed (REQ-013.2): once the file exists, runtime wins.
 package runs
 
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
+	"time"
+
+	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
+	"devlab/backend/internal/statepath"
 )
 
-// RunSettings are the live, UI-adjustable settings of the runs subsystem. Currently just the number of
-// execution slots (the concurrency cap). Persisted so a chosen value survives a restart. A zero value
-// means "not set" — the caller then falls back to the env/default seed, so the environment value stays
-// valid only until something is configured (req 13).
-type RunSettings struct {
-	MaxConcurrent int `json:"maxConcurrent,omitempty"` // 0 = not set → use the env/default seed
+// Settings are the three service tunables. The default time budget lives EXACTLY here (W3).
+type Settings struct {
+	MaxConcurrency    int           `json:"maxConcurrency"`
+	DefaultTimeBudget time.Duration `json:"defaultTimeBudget"`
+	AutomergeWindow   time.Duration `json:"automergeWindow"`
 }
 
-// SettingsStore persists RunSettings (a small JSON file, same discipline as the other run stores: atomic
-// tmp+rename, 0600, missing → zero value). A passive pool: it stores and returns, the caller decides.
+// settingsFile is the on-disk form. Durations are stored as model.Duration strings ("3h") so the
+// pool stays human-readable; the tolerant unmarshal also accepts legacy nanosecond integers. Who
+// changed the settings last is recorded as a label (REQ-041), never evaluated here.
+type settingsFile struct {
+	MaxConcurrency    int            `json:"maxConcurrency"`
+	DefaultTimeBudget model.Duration `json:"defaultTimeBudget"`
+	AutomergeWindow   model.Duration `json:"automergeWindow"`
+	Updated           model.Actor    `json:"updated"`
+	UpdatedAt         time.Time      `json:"updatedAt"`
+}
+
+// SettingsStore is the passive settings pool (mercury/settings.json).
 type SettingsStore struct {
 	path string
+	seed Settings
 	mu   sync.Mutex
 }
 
-func NewSettingsStore() *SettingsStore { return &SettingsStore{path: settingsPath()} }
-
-func settingsPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_SETTINGS"); p != "" {
-		return p
+// NewSettingsStore builds the store below the state root. seed provides the first-start values
+// (from env in cmd/devlabd); it is used only while no file exists.
+func NewSettingsStore(p *statepath.Paths, seed Settings) *SettingsStore {
+	path := os.Getenv("DEVLAB_MERCURY_SETTINGS")
+	if path == "" && p != nil {
+		path = p.Settings()
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-settings.json")
+	return &SettingsStore{path: path, seed: seed}
 }
 
-func (s *SettingsStore) load() (RunSettings, error) {
+// Get returns the current settings (the seed while no file exists). A present-but-unreadable
+// file is an error, never silently the seed — a runtime choice must not be shadowed.
+func (s *SettingsStore) Get() (Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return RunSettings{}, nil
+			return s.seed, nil
 		}
-		return RunSettings{}, err
+		return Settings{}, err
 	}
-	var rs RunSettings
-	if err := json.Unmarshal(b, &rs); err != nil {
-		return RunSettings{}, err
+	var f settingsFile
+	if err := json.Unmarshal(b, &f); err != nil {
+		return Settings{}, err
 	}
-	return rs, nil
+	return Settings{
+		MaxConcurrency:    f.MaxConcurrency,
+		DefaultTimeBudget: time.Duration(f.DefaultTimeBudget),
+		AutomergeWindow:   time.Duration(f.AutomergeWindow),
+	}, nil
 }
 
-// Get returns the current settings (missing store → zero value).
-func (s *SettingsStore) Get() (RunSettings, error) {
+// Put replaces the settings atomically, recording who changed them. From the first Put on, the
+// stored values win over the env seed (REQ-013.2).
+func (s *SettingsStore) Put(set Settings, by model.Actor) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.load()
+	return fsatomic.WriteJSON(s.path, settingsFile{
+		MaxConcurrency:    set.MaxConcurrency,
+		DefaultTimeBudget: model.Duration(set.DefaultTimeBudget),
+		AutomergeWindow:   model.Duration(set.AutomergeWindow),
+		Updated:           by,
+		UpdatedAt:         time.Now().UTC(),
+	})
 }
 
-// Set applies fn to the settings and saves atomically, returning the new value.
-func (s *SettingsStore) Set(fn func(*RunSettings)) (RunSettings, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, err := s.load()
-	if err != nil {
-		return RunSettings{}, err
-	}
-	fn(&cur)
-	return cur, s.save(cur)
+// ResolvedTuning is a run's fully resolved engine choice — reference semantics applied.
+type ResolvedTuning struct {
+	Model           string
+	ModelVersion    string
+	Effort          string
+	Budget          time.Duration
+	BudgetIsDefault bool
 }
 
-func (s *SettingsStore) save(rs RunSettings) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
+// EffectiveTuning resolves a run's tuning against the service defaults — the ONE place the
+// reference semantics live (REQ-010): a nil budget REFERS to the default (so a later default
+// change reaches every referring run), a present zero budget means "no budget". A negative
+// stored value (corrupt data; the API refuses it) resolves to "no budget" rather than an
+// unusable negative timeout.
+func EffectiveTuning(r Run, set Settings) ResolvedTuning {
+	rt := ResolvedTuning{
+		Model:        strings.TrimSpace(r.Tuning.Model),
+		ModelVersion: strings.TrimSpace(r.Tuning.ModelVersion),
+		Effort:       strings.TrimSpace(r.Tuning.Effort),
 	}
-	b, err := json.MarshalIndent(rs, "", "  ")
-	if err != nil {
-		return err
+	if r.Tuning.TimeBudget == nil {
+		rt.Budget = set.DefaultTimeBudget
+		rt.BudgetIsDefault = true
+		return rt
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
+	rt.Budget = time.Duration(*r.Tuning.TimeBudget)
+	if rt.Budget < 0 {
+		rt.Budget = 0
 	}
-	return os.Rename(tmp, s.path)
+	return rt
 }

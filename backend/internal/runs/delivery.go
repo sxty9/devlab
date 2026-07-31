@@ -1,3 +1,8 @@
+// The delivery ledger — a passive pool of every delivery (intent-before-PR): the addressable
+// unit of work an execution produced at one repository. A delivery is NEVER destroyed: rolling
+// one back appends a REVERSING delivery (ReversalOf set) and the original is closed with a
+// reason; history is only appended to. The origin status (REQ-033) is derived solely from this
+// ledger.
 package runs
 
 import (
@@ -5,69 +10,39 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/statepath"
 )
 
-// A Delivery is the UNIT of work a run produced at one repository (req 8): the exact commit range it
-// added to the growing dev branch, the per-delivery snapshot branch that carries it, its stacked PR, and
-// when it was made. Recording it is what makes a single piece of work addressable afterwards — to name
-// what dev serves, to stack the next PR on it, and to counter-book (roll back) precisely this delivery.
-//
-// A delivery is NEVER destroyed. Rolling one back adds a REVERSING delivery (RevertOf set) and flips this
-// one's Status to reverted; history is only ever appended to.
+// Delivery is one recorded delivery (Welle-0 contract §3.6). Branch is the delivery branch the
+// PR rides on; FromCommit..ToCommit is exactly this delivery's work. MergedAt set = merged;
+// ClosedAt set = closed without merge, with its reason (the B-8 completion rule needs
+// merged | rolled back | closed-with-reason to be distinguishable). ReversalOf, on a REVERSING
+// delivery, points at the delivery it counter-books. ExecutionID ties the delivery to its
+// execution ("" on none, e.g. a reversal issued by hand).
 type Delivery struct {
-	ID       string `json:"id"`
-	RunID    string `json:"runId"`
-	ResultID string `json:"resultId"`
-	RunName  string `json:"runName,omitempty"` // snapshot so a delivery is legible after the run is deleted
-	Repo     string `json:"repo"`              // owner/name
-
-	// Branch is the immutable per-delivery snapshot branch (mercury-run/<runId>/<deliveryId>) whose tip is
-	// ToCommit; its PR is stacked on BaseBranch so the PR shows only THIS delivery's changes. DevBranch is
-	// the persistent integration branch (mercury-dev) this delivery grew — the state dev actually serves.
-	Branch     string `json:"branch"`
-	DevBranch  string `json:"devBranch"`
-	BaseBranch string `json:"baseBranch"` // the stacked PR base: the previous open delivery's branch, else the default branch
-
-	// FromCommit..ToCommit is exactly this delivery's own work on the dev branch (captured AFTER the
-	// default-branch fold, so the range is linear and contains no merge) — the range a counter-booking
-	// reverses.
-	FromCommit string `json:"fromCommit"`
-	ToCommit   string `json:"toCommit"`
-
-	PRNumber  int            `json:"prNumber,omitempty"`
-	PRUrl     string         `json:"prUrl,omitempty"`
-	CreatedAt time.Time      `json:"createdAt"`
-	Status    DeliveryStatus `json:"status"`
-
-	// RevertedAt/RevertedBy are set when this delivery has been counter-booked. RevertOf, on a REVERSING
-	// delivery, points at the delivery it undoes (so a reversal is itself addressable and traceable).
-	RevertedAt *time.Time `json:"revertedAt,omitempty"`
-	RevertedBy string     `json:"revertedBy,omitempty"`
-	RevertOf   string     `json:"revertOf,omitempty"`
-
-	// BranchPruned records that the per-delivery snapshot Branch has been deleted (its work reached the
-	// default branch — a merged delivery's branch has served its purpose). It gates the branch-prune sweep
-	// so each branch is deleted exactly once and a steady-state ledger is not re-swept every tick. The
-	// delivery record itself is never destroyed — only its now-redundant Git branch is.
-	BranchPruned bool `json:"branchPruned,omitempty"`
+	ID           string     `json:"id"`
+	Repo         string     `json:"repo"`
+	Branch       string     `json:"branch"`
+	FromCommit   string     `json:"fromCommit"`
+	ToCommit     string     `json:"toCommit"`
+	PRNumber     int        `json:"prNumber,omitempty"`
+	PRURL        string     `json:"prUrl,omitempty"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	MergedAt     *time.Time `json:"mergedAt,omitempty"`
+	ClosedAt     *time.Time `json:"closedAt,omitempty"`
+	ClosedReason string     `json:"closedReason,omitempty"`
+	ReversalOf   string     `json:"reversalOf,omitempty"`
+	ExecutionID  string     `json:"executionId,omitempty"`
 }
 
-// DeliveryStatus tracks a delivery's lifecycle. It mirrors the PR outcome for the common path and adds
-// "reverted" for a counter-booked delivery. Only an "open" delivery is eligible as a stacked PR base
-// (req 9 — the base is the previous NOT-YET-MERGED delivery).
-type DeliveryStatus string
-
-const (
-	DeliveryOpen     DeliveryStatus = "open"     // PR still open (not yet merged) — the growing dev tip lineage
-	DeliveryMerged   DeliveryStatus = "merged"   // PR merged into the default branch
-	DeliveryClosed   DeliveryStatus = "closed"   // PR closed without merging (withdrawn)
-	DeliveryReverted DeliveryStatus = "reverted" // counter-booked by a reversing delivery
-)
+// OpenState reports whether the delivery is still open: neither merged nor closed.
+func (d Delivery) OpenState() bool { return d.MergedAt == nil && d.ClosedAt == nil }
 
 // NewDeliveryID mints an unguessable delivery id (a record key, never a path segment).
 func NewDeliveryID() string {
@@ -76,21 +51,21 @@ func NewDeliveryID() string {
 	return "dlv_" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
 }
 
-// DeliveryStore persists the delivery ledger (a small JSON file, same discipline as PRStore/runs.json:
-// atomic tmp+rename, 0600, missing → empty). It is a passive pool — it records deliveries and answers
-// queries; every decision (which base to stack on, what to roll back) is made by the caller.
+// DeliveryStore persists the delivery ledger — a passive pool; every decision (which base to
+// stack on, what to roll back) is made by the caller.
 type DeliveryStore struct {
 	path string
 	mu   sync.Mutex
 }
 
-func NewDeliveryStore() *DeliveryStore { return &DeliveryStore{path: deliveriesPath()} }
-
-func deliveriesPath() string {
-	if p := os.Getenv("DEVLAB_MERCURY_RUNS_DELIVERIES"); p != "" {
-		return p
+// NewDeliveryStore builds the store below the state root (env override
+// DEVLAB_MERCURY_RUNS_DELIVERIES first — a ported test seam).
+func NewDeliveryStore(p *statepath.Paths) *DeliveryStore {
+	path := os.Getenv("DEVLAB_MERCURY_RUNS_DELIVERIES")
+	if path == "" && p != nil {
+		path = p.Deliveries()
 	}
-	return filepath.Join("/var/lib/devlab/mercury", "runs-deliveries.json")
+	return &DeliveryStore{path: path}
 }
 
 type deliveryFile struct {
@@ -112,15 +87,10 @@ func (s *DeliveryStore) load() ([]Delivery, error) {
 	return f.Deliveries, nil
 }
 
-// List returns every delivery, oldest first (missing store → empty).
-func (s *DeliveryStore) List() ([]Delivery, error) {
+// All returns every delivery, oldest first (missing store → empty).
+func (s *DeliveryStore) All() ([]Delivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sorted()
-}
-
-// sorted loads and returns deliveries oldest-first (stable ordering by CreatedAt). Caller holds s.mu.
-func (s *DeliveryStore) sorted() ([]Delivery, error) {
 	cur, err := s.load()
 	if err != nil {
 		return nil, err
@@ -129,24 +99,42 @@ func (s *DeliveryStore) sorted() ([]Delivery, error) {
 	return cur, nil
 }
 
-// ListForRepo returns a repo's deliveries, oldest first.
-func (s *DeliveryStore) ListForRepo(repo string) ([]Delivery, error) {
-	all, err := s.List()
+// Open returns a repo's OPEN deliveries (not merged, not closed) in stack order (oldest first)
+// — the next PR stacks on the last of them (REQ-024).
+func (s *DeliveryStore) Open(repo string) ([]Delivery, error) {
+	all, err := s.All()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Delivery, 0, len(all))
+	out := []Delivery{}
 	for _, d := range all {
-		if d.Repo == repo {
+		if d.Repo == repo && d.OpenState() {
 			out = append(out, d)
 		}
 	}
 	return out, nil
 }
 
-// Get returns one delivery by id.
-func (s *DeliveryStore) Get(id string) (Delivery, bool, error) {
-	all, err := s.List()
+// OpenForExecution returns the newest open delivery at repo that belongs to an execution
+// (ExecutionID set) — the resume path's probe "did my interrupted execution already deliver
+// here?" (C F1). nil when none.
+func (s *DeliveryStore) OpenForExecution(repo string) (*Delivery, error) {
+	open, err := s.Open(repo)
+	if err != nil {
+		return nil, err
+	}
+	for i := len(open) - 1; i >= 0; i-- {
+		if open[i].ExecutionID != "" {
+			d := open[i]
+			return &d, nil
+		}
+	}
+	return nil, nil
+}
+
+// ByID returns one delivery by id.
+func (s *DeliveryStore) ByID(id string) (Delivery, bool, error) {
+	all, err := s.All()
 	if err != nil {
 		return Delivery{}, false, err
 	}
@@ -158,142 +146,25 @@ func (s *DeliveryStore) Get(id string) (Delivery, bool, error) {
 	return Delivery{}, false, nil
 }
 
-// LatestOpen returns the most recent OPEN delivery for a repo — the stacked-PR base of the next delivery
-// (req 9). ok=false when none is open, in which case the caller stacks on the default branch instead.
-func (s *DeliveryStore) LatestOpen(repo string) (Delivery, bool, error) {
-	list, err := s.ListForRepo(repo)
-	if err != nil {
-		return Delivery{}, false, err
-	}
-	for i := len(list) - 1; i >= 0; i-- {
-		if list[i].Status == DeliveryOpen {
-			return list[i], true, nil
-		}
-	}
-	return Delivery{}, false, nil
-}
-
-// OpenForExecution returns the OPEN delivery a SPECIFIC execution (runId + resultId) already made for a
-// repo, if any. It is how the executor recognises that a prior attempt of THIS SAME execution already
-// opened a pull request for the repo but crashed before its repo-result was recorded — so a resume must
-// ADOPT that pull request rather than implement the work again and stack a duplicate beside it (req 5).
-// Matching on the exact resultId keeps it precise: a legitimate later delivery from a different execution
-// (an automatic run stacking the next night's work) has a different resultId and is never mistaken for one.
-// Passive: it only answers the query; the adopt decision is the caller's.
-func (s *DeliveryStore) OpenForExecution(runID, resultID, repo string) (Delivery, bool, error) {
-	list, err := s.ListForRepo(repo)
-	if err != nil {
-		return Delivery{}, false, err
-	}
-	for i := len(list) - 1; i >= 0; i-- {
-		if d := list[i]; d.RunID == runID && d.ResultID == resultID && d.Status == DeliveryOpen {
-			return d, true, nil
-		}
-	}
-	return Delivery{}, false, nil
-}
-
-// LaterOpenDeliveries returns the OPEN deliveries for a repo created after the given delivery — the work
-// that is stacked ON it. A rollback consults this to name what a counter-booking would sit under.
-func (s *DeliveryStore) LaterOpenDeliveries(repo, afterID string) ([]Delivery, error) {
-	list, err := s.ListForRepo(repo)
-	if err != nil {
-		return nil, err
-	}
-	seen := false
-	var out []Delivery
-	for _, d := range list {
-		if d.ID == afterID {
-			seen = true
-			continue
-		}
-		if seen && d.Status == DeliveryOpen {
-			out = append(out, d)
-		}
-	}
-	return out, nil
-}
-
-// Add records a new delivery (deduped by id).
-func (s *DeliveryStore) Add(d Delivery) error {
+// Put inserts or replaces one delivery (matched by ID) atomically — the intent write BEFORE the
+// PR exists, and every later status mirror.
+func (s *DeliveryStore) Put(d Delivery) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, err := s.load()
 	if err != nil {
 		return err
 	}
-	for _, e := range cur {
-		if e.ID == d.ID {
-			return nil // already recorded
-		}
-	}
-	if d.Status == "" {
-		d.Status = DeliveryOpen
-	}
-	return s.save(append(cur, d))
-}
-
-// Update applies fn to the delivery with the given id and saves. A no-op (delivery absent) returns nil.
-func (s *DeliveryStore) Update(id string, fn func(*Delivery)) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, err := s.load()
-	if err != nil {
-		return err
-	}
-	changed := false
+	replaced := false
 	for i := range cur {
-		if cur[i].ID == id {
-			fn(&cur[i])
-			changed = true
+		if cur[i].ID == d.ID {
+			cur[i] = d
+			replaced = true
+			break
 		}
 	}
-	if !changed {
-		return nil
+	if !replaced {
+		cur = append(cur, d)
 	}
-	return s.save(cur)
-}
-
-// SetStatusByPR flips the status of the delivery matching (repo, prNumber) — used by Maintain to mirror a
-// PR merge/close onto the ledger. A reverted delivery is left as-is (its withdrawal is authoritative). It
-// returns the affected delivery (ok=false when none matches, e.g. a PR predating the ledger).
-func (s *DeliveryStore) SetStatusByPR(repo string, prNumber int, status DeliveryStatus) (Delivery, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, err := s.load()
-	if err != nil {
-		return Delivery{}, false, err
-	}
-	var hit Delivery
-	found := false
-	for i := range cur {
-		if cur[i].Repo == repo && cur[i].PRNumber == prNumber && prNumber != 0 {
-			if cur[i].Status != DeliveryReverted {
-				cur[i].Status = status
-			}
-			hit, found = cur[i], true
-		}
-	}
-	if !found {
-		return Delivery{}, false, nil
-	}
-	if err := s.save(cur); err != nil {
-		return Delivery{}, false, err
-	}
-	return hit, true, nil
-}
-
-func (s *DeliveryStore) save(ds []Delivery) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(deliveryFile{Deliveries: ds}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	return fsatomic.WriteJSON(s.path, deliveryFile{Deliveries: cur})
 }
