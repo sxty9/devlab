@@ -39,16 +39,16 @@ func TestChainKeepsUnpublishedCommitsOfAnInterruptedRun(t *testing.T) {
 
 	// The state an interrupted run leaves: the working branch exists locally AND on the remote, and
 	// carries one more commit than the remote knows about.
-	mustGit(t, gr.wt, "checkout", "--quiet", "-b", workbench.Branch)
+	mustGit(t, gr.wt, "checkout", "--quiet", "-b", workbench.LegacyShared)
 	writeInto(t, gr.wt, "work/published.txt", "secured by the previous run\n")
 	mustGit(t, gr.wt, "add", "-A")
 	mustGit(t, gr.wt, "commit", "--quiet", "-m", "previous run, published")
-	mustGit(t, gr.wt, "push", "--quiet", "origin", workbench.Branch)
+	mustGit(t, gr.wt, "push", "--quiet", "origin", workbench.LegacyShared)
 	writeInto(t, gr.wt, "work/unpublished.txt", "committed, never pushed — the interrupted run\n")
 	mustGit(t, gr.wt, "add", "-A")
 	mustGit(t, gr.wt, "commit", "--quiet", "-m", "interrupted before publish")
 	unpublishedTip := gitAt(t, gr.wt, "rev-parse", "HEAD")
-	if remote := gr.originHead("refs/heads/" + workbench.Branch); remote == unpublishedTip {
+	if remote := gr.originHead("refs/heads/" + workbench.LegacyShared); remote == unpublishedTip {
 		t.Fatalf("the premise failed: the remote already carries the unpublished commit")
 	}
 
@@ -68,12 +68,12 @@ func TestChainKeepsUnpublishedCommitsOfAnInterruptedRun(t *testing.T) {
 	if !fileIn(gr.wt, "work/published.txt") {
 		t.Error("previously published work disappeared from the working state")
 	}
-	if !ancestorOf(t, gr.wt, unpublishedTip, "refs/heads/"+workbench.Branch) {
-		t.Errorf("commit %s is no longer reachable from %s — it was discarded", unpublishedTip, workbench.Branch)
+	if !ancestorOf(t, gr.wt, unpublishedTip, "refs/heads/"+workbench.LegacyShared) {
+		t.Errorf("commit %s is no longer reachable from %s — it was discarded", unpublishedTip, workbench.LegacyShared)
 	}
 	// And it is now secured on the remote: publish-after-commit reaches back over what the crashed
 	// run could not push.
-	if !ancestorOfIn(t, gr.origin, unpublishedTip, "refs/heads/"+workbench.Branch) {
+	if !ancestorOfIn(t, gr.origin, unpublishedTip, "refs/heads/"+workbench.LegacyShared) {
 		t.Error("the recovered commit was never published — an abort would lose it again")
 	}
 }
@@ -389,8 +389,8 @@ func TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault(t *testing.T) {
 	if gr.originHead("refs/heads/"+branch) != "" {
 		t.Errorf("the delivery branch %s survived its merge — merge and prune are the same place", branch)
 	}
-	if gr.originHead("refs/heads/"+workbench.Branch) == "" {
-		t.Errorf("the working branch %s was pruned — it never falls under the prune", workbench.Branch)
+	if gr.originHead("refs/heads/"+workbench.LegacyShared) == "" {
+		t.Errorf("the working branch %s was pruned — it never falls under the prune", workbench.LegacyShared)
 	}
 	if left, err := e.prs.List(); err != nil || len(left) != 0 {
 		t.Errorf("the merged pull request is still tracked: %+v (%v)", left, err)

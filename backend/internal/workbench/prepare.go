@@ -64,13 +64,13 @@ func (b *Bench) Prepare(ctx context.Context) (PrepareResult, error) {
 		return res, fmt.Errorf("clean: %w", err)
 	}
 
-	local := b.refExists(ctx, "refs/heads/"+Branch)
-	remote := b.refExists(ctx, "refs/remotes/origin/"+Branch)
+	local := b.refExists(ctx, "refs/heads/"+b.branch)
+	remote := b.refExists(ctx, "refs/remotes/origin/"+b.branch)
 	switch {
 	case !local && remote:
 		// No local branch — nothing committed here to protect. Grow onto the pushed state.
-		if err := b.ex.CreateBranch(ctx, b.repo, Branch, "origin/"+Branch); err != nil {
-			return res, fmt.Errorf("create %s from origin: %w", Branch, err)
+		if err := b.ex.CreateBranch(ctx, b.repo, b.branch, "origin/"+b.branch); err != nil {
+			return res, fmt.Errorf("create %s from origin: %w", b.branch, err)
 		}
 		res.FoldedRemote = true
 	case !local && !remote:
@@ -79,32 +79,32 @@ func (b *Bench) Prepare(ctx context.Context) (PrepareResult, error) {
 		if !b.refExists(ctx, "refs/remotes/origin/"+def) {
 			start = def
 		}
-		if err := b.ex.CreateBranch(ctx, b.repo, Branch, start); err != nil {
-			return res, fmt.Errorf("create %s from %s: %w", Branch, start, err)
+		if err := b.ex.CreateBranch(ctx, b.repo, b.branch, start); err != nil {
+			return res, fmt.Errorf("create %s from %s: %w", b.branch, start, err)
 		}
 		res.Created, res.FoldedDefault = true, true
 	default:
 		// The local branch exists — it STAYS, whatever the remote says. An interrupted
 		// predecessor may have left committed-but-unpublished work on it; that is exactly
 		// what a reset onto origin would destroy, so no such reset exists here.
-		if err := b.ex.Checkout(ctx, b.repo, Branch); err != nil {
-			return res, fmt.Errorf("switch to %s: %w", Branch, err)
+		if err := b.ex.Checkout(ctx, b.repo, b.branch); err != nil {
+			return res, fmt.Errorf("switch to %s: %w", b.branch, err)
 		}
 		res.Recovered = b.unpublishedCount(ctx, def, remote)
 		if res.Recovered > 0 {
-			log.Printf("workbench: %s — recovered %d committed-but-unpublished commit(s) an interrupted run left on %s; retained and republishing", b.repo, res.Recovered, Branch)
+			log.Printf("workbench: %s — recovered %d committed-but-unpublished commit(s) an interrupted run left on %s; retained and republishing", b.repo, res.Recovered, b.branch)
 		}
 		if remote {
 			// Fold the pushed state IN — never reset onto it. "Already up to date" (local is
 			// ahead of or equal to the remote — the interrupted-run case) is a clean no-op
 			// that keeps the local commits.
-			if ferr := b.ex.FoldInBranch(ctx, b.repo, Branch); ferr != nil {
+			if ferr := b.ex.FoldInBranch(ctx, b.repo, b.branch); ferr != nil {
 				if !errors.Is(ferr, workspace.ErrMergeConflict) {
-					return res, fmt.Errorf("fold origin/%s: %w", Branch, ferr)
+					return res, fmt.Errorf("fold origin/%s: %w", b.branch, ferr)
 				}
 				res.Conflicted = true
-				res.ConflictFiles = b.conflictNames(ctx, "refs/heads/"+Branch, "refs/remotes/origin/"+Branch)
-				log.Printf("workbench: %s — pushed %s did not fold cleanly into the local state (conflicts: %s); kept local, nothing rolled back", b.repo, Branch, nameList(res.ConflictFiles))
+				res.ConflictFiles = b.conflictNames(ctx, "refs/heads/"+b.branch, "refs/remotes/origin/"+b.branch)
+				log.Printf("workbench: %s — pushed %s did not fold cleanly into the local state (conflicts: %s); kept local, nothing rolled back", b.repo, b.branch, nameList(res.ConflictFiles))
 			} else {
 				res.FoldedRemote = true
 			}
@@ -145,8 +145,8 @@ func (b *Bench) FoldInDefault(ctx context.Context) (FoldReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	if cur := b.ex.CurrentBranch(ctx, b.repo); cur != Branch {
-		return rep, fmt.Errorf("workbench not prepared: working tree is on %q, want %s", cur, Branch)
+	if cur := b.ex.CurrentBranch(ctx, b.repo); cur != b.branch {
+		return rep, fmt.Errorf("workbench not prepared: working tree is on %q, want %s", cur, b.branch)
 	}
 	if !b.refExists(ctx, "refs/remotes/origin/"+def) {
 		// No published default branch — nothing to fold; honest no-op.
@@ -159,7 +159,7 @@ func (b *Bench) FoldInDefault(ctx context.Context) (FoldReport, error) {
 			return rep, fmt.Errorf("fold origin/%s: %w", def, ferr)
 		}
 		rep.Conflicted = true
-		rep.ConflictFiles = b.conflictNames(ctx, "refs/heads/"+Branch, "refs/remotes/origin/"+def)
+		rep.ConflictFiles = b.conflictNames(ctx, "refs/heads/"+b.branch, "refs/remotes/origin/"+def)
 		rep.Head = before
 		log.Printf("workbench: %s — default branch %s does not fold cleanly (conflicts: %s); kept the workbench as-is, nothing rolled back", b.repo, def, nameList(rep.ConflictFiles))
 		return rep, nil
@@ -199,7 +199,7 @@ func (b *Bench) unpublishedCount(ctx context.Context, def string, remoteDev bool
 		not = append(not, def)
 	}
 	if remoteDev {
-		not = append(not, "origin/"+Branch)
+		not = append(not, "origin/"+b.branch)
 	}
 	if len(not) == 0 {
 		return 0 // nothing to measure against — counting all of history would be a lie

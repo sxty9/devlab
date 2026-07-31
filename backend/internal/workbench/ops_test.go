@@ -32,7 +32,7 @@ func TestAheadOfDefaultIsHonestInEveryState(t *testing.T) {
 	if ahead {
 		t.Errorf("a freshly created workbench is not ahead of the default branch")
 	}
-	if head != gitOut(t, wt, "rev-parse", "refs/heads/"+Branch) {
+	if head != gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared) {
 		t.Errorf("head %q does not name the workbench tip", head)
 	}
 
@@ -47,7 +47,7 @@ func TestAheadOfDefaultIsHonestInEveryState(t *testing.T) {
 	if !ahead {
 		t.Errorf("a workbench carrying its own commit IS ahead of the default branch")
 	}
-	if head != gitOut(t, wt, "rev-parse", "refs/heads/"+Branch) {
+	if head != gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared) {
 		t.Errorf("head %q is stale", head)
 	}
 }
@@ -223,17 +223,17 @@ func TestBranchAtLeavesTheWorkbenchWhereItIs(t *testing.T) {
 	if got := gitOut(t, wt, "rev-parse", "refs/heads/feature/thing"); got != tip {
 		t.Errorf("delivery branch at %s, want %s", got, tip)
 	}
-	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != Branch {
+	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != LegacyShared {
 		t.Errorf("the working tree left the workbench (now on %q)", got)
 	}
 
 	if err := b.PushBranch(ctx, "feature/thing"); err != nil {
 		t.Fatalf("PushBranch(delivery): %v", err)
 	}
-	if err := b.PushBranch(ctx, Branch); err != nil {
+	if err := b.PushBranch(ctx, LegacyShared); err != nil {
 		t.Fatalf("PushBranch(workbench): %v", err)
 	}
-	if got := gitOut(t, wt, "rev-parse", "refs/remotes/origin/"+Branch); got != tip {
+	if got := gitOut(t, wt, "rev-parse", "refs/remotes/origin/"+LegacyShared); got != tip {
 		t.Errorf("the workbench was not published through its own path: origin at %s, want %s", got, tip)
 	}
 }

@@ -153,6 +153,9 @@ func (w *gitWorld) get(name string) (*gitRepo, error) {
 		}
 	}
 	b, err := workbench.New(&workspace.Executor{PerUser: false}, r.wt)
+	if err == nil {
+		b, err = b.On(workbench.LegacyShared)
+	}
 	if err != nil {
 		return nil, err
 	}

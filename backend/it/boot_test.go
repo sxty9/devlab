@@ -63,9 +63,9 @@ func TestBootChainEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("workbench head: %v", err)
 	}
-	if published := gr.originHead("refs/heads/" + workbench.Branch); published != localTip {
+	if published := gr.originHead("refs/heads/" + workbench.LegacyShared); published != localTip {
 		t.Errorf("origin/%s is %q but the workbench is at %q — committed work was not secured",
-			workbench.Branch, published, localTip)
+			workbench.LegacyShared, published, localTip)
 	}
 	if open := e.deps.openPRs(); len(open) != 1 {
 		t.Errorf("pull requests opened: %d, want exactly 1", len(open))

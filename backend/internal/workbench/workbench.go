@@ -24,8 +24,12 @@ import (
 	"devlab/backend/internal/workspace"
 )
 
-// Branch is the ONE constant naming the working-state branch.
-const Branch = "mercury-dev"
+// LegacyShared is the retired shared working branch. Every task used to commit onto this ONE
+// branch per repository, so what lay on it never said WHOSE work it was — the fault that let a
+// fresh task be declared done and skipped (measured 2026-07-31 across all 23 repositories). It
+// survives here as a name to recognise, never to write: the newest open delivery branch carries
+// everything it carried, and that is what a new task now branches from.
+const LegacyShared = "mercury-dev"
 
 // branchRe mirrors the ported Executor's branch validation so no option-shaped or otherwise
 // hostile name ever reaches git through the local bridge below.
@@ -34,10 +38,30 @@ var branchRe = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
 // Bench operates the working state of one repo. repo is the absolute path of the working
 // tree (the per-user workspace checkout of this repository).
 type Bench struct {
-	ex    *workspace.Executor
-	repo  string
-	token string
+	ex   *workspace.Executor
+	repo string
+	// branch is THIS task's own working branch. One branch per task, cut from the top of the
+	// stack — never a branch shared with another task, so ownership can never be lost.
+	branch string
+	token  string
 }
+
+// On points the bench at one task's working branch. Empty is refused: a bench without a named
+// branch would fall back to a shared one, which is exactly the construction this replaced.
+func (b *Bench) On(branch string) (*Bench, error) {
+	if strings.TrimSpace(branch) == "" {
+		return nil, errors.New("workbench: empty working branch")
+	}
+	if !branchRe.MatchString(branch) {
+		return nil, fmt.Errorf("workbench: invalid working branch %q", branch)
+	}
+	c := *b
+	c.branch = branch
+	return &c, nil
+}
+
+// Name is the working branch this bench operates on.
+func (b *Bench) Name() string { return b.branch }
 
 // New builds a bench. Guard: the runner works ONLY in the runner user's workspace (B 1.3a) —
 // a foreign workspace path is refused. The per-user workspace layout is
@@ -75,9 +99,9 @@ func (b *Bench) WithToken(token string) *Bench {
 // It resolves the branch ref itself, so the answer is right even while the working tree
 // is parked elsewhere.
 func (b *Bench) Head(ctx context.Context) (string, error) {
-	sha, err := b.ex.RevParse(ctx, b.repo, "refs/heads/"+Branch)
+	sha, err := b.ex.RevParse(ctx, b.repo, "refs/heads/"+b.branch)
 	if err != nil {
-		return "", fmt.Errorf("workbench %s does not exist yet: %w", Branch, err)
+		return "", fmt.Errorf("workbench %s does not exist yet: %w", b.branch, err)
 	}
 	return sha, nil
 }
@@ -97,8 +121,8 @@ func (b *Bench) defaultBranch() (string, error) {
 	if !branchRe.MatchString(def) || strings.HasPrefix(def, "-") {
 		return "", fmt.Errorf("workbench: unusable default branch name %q", def)
 	}
-	if def == Branch {
-		return "", fmt.Errorf("workbench: default branch resolves to %s itself — refusing to derive the workbench from itself", Branch)
+	if def == b.branch {
+		return "", fmt.Errorf("workbench: default branch resolves to %s itself — refusing to derive the workbench from itself", b.branch)
 	}
 	return def, nil
 }

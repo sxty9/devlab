@@ -390,15 +390,15 @@ func newBenchFixture(t *testing.T) *benchFixture {
 	gitCmd(t, seed, "commit", "-m", "seed")
 	gitCmd(t, seed, "push", "--quiet", "origin", "main")
 	// The workbench, one commit ahead — the state a reset must discard.
-	gitCmd(t, seed, "checkout", "--quiet", "-b", workbench.Branch)
+	gitCmd(t, seed, "checkout", "--quiet", "-b", workbench.LegacyShared)
 	if err := os.WriteFile(filepath.Join(seed, "undelivered.txt"), []byte("work\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	gitCmd(t, seed, "add", "-A")
 	gitCmd(t, seed, "commit", "-m", "undelivered work")
-	gitCmd(t, seed, "push", "--quiet", "origin", workbench.Branch)
+	gitCmd(t, seed, "push", "--quiet", "origin", workbench.LegacyShared)
 
-	gitCmd(t, "", "clone", "--quiet", "--branch", workbench.Branch, f.origin, f.wt)
+	gitCmd(t, "", "clone", "--quiet", "--branch", workbench.LegacyShared, f.origin, f.wt)
 
 	old := openRunnerBench
 	openRunnerBench = func(_ *Server, _ context.Context, _, _, repoID, full string) (*workbench.Bench, string, func(), error) {
@@ -407,6 +407,9 @@ func newBenchFixture(t *testing.T) *benchFixture {
 		// The hermetic executor form: no user identity, so git runs directly instead of through
 		// the per-user sudo wrapper (workbench.New documents this form).
 		b, err := workbench.New(&workspace.Executor{}, f.wt)
+		if err == nil {
+			b, err = b.On(workbench.LegacyShared)
+		}
 		return b, f.wt, func() {}, err
 	}
 	t.Cleanup(func() { openRunnerBench = old })
@@ -446,7 +449,7 @@ func TestRepoResetOverLedgerRepoName(t *testing.T) {
 	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_1", Repo: "o/a", Branch: "fix/a-1", CreatedAt: tD})
 
 	mainTip := f.tip(t, f.wt, "refs/remotes/origin/main")
-	if f.tip(t, f.wt, "refs/heads/"+workbench.Branch) == mainTip {
+	if f.tip(t, f.wt, "refs/heads/"+workbench.LegacyShared) == mainTip {
 		t.Fatal("precondition: the workbench must be ahead of the default branch")
 	}
 
@@ -462,10 +465,10 @@ func TestRepoResetOverLedgerRepoName(t *testing.T) {
 	if f.repoID != "a" || f.full != "o/a" {
 		t.Errorf("workbench opened for repoID=%q full=%q, want \"a\" / \"o/a\"", f.repoID, f.full)
 	}
-	if got := f.tip(t, f.wt, "refs/heads/"+workbench.Branch); got != mainTip {
+	if got := f.tip(t, f.wt, "refs/heads/"+workbench.LegacyShared); got != mainTip {
 		t.Errorf("workbench tip = %s, want the default tip %s — the reset did not happen", got, mainTip)
 	}
-	if got := f.tip(t, f.origin, "refs/heads/"+workbench.Branch); got != mainTip {
+	if got := f.tip(t, f.origin, "refs/heads/"+workbench.LegacyShared); got != mainTip {
 		t.Errorf("origin workbench = %s, want %s — the reset was not published", got, mainTip)
 	}
 	var out struct {

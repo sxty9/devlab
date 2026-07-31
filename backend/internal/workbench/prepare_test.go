@@ -21,8 +21,8 @@ func TestPrepareCreatesFromDefaultFirstTime(t *testing.T) {
 	if res.Conflicted || res.Recovered != 0 || len(res.Orphans) != 0 {
 		t.Errorf("first Prepare reported drama on a pristine repo: %+v", res)
 	}
-	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != Branch {
-		t.Errorf("working tree on %q, want %s", got, Branch)
+	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != LegacyShared {
+		t.Errorf("working tree on %q, want %s", got, LegacyShared)
 	}
 	if res.Head == "" || res.Head != gitOut(t, wt, "rev-parse", "HEAD") {
 		t.Errorf("Head %q does not name the tip", res.Head)
@@ -63,8 +63,8 @@ func TestWorkbenchGrowsAcrossWorkspaces(t *testing.T) {
 	if !exists(wt2, "run1.txt") {
 		t.Errorf("run1's work missing after preparing the next run — the state was reset, not grown")
 	}
-	if got := gitOut(t, wt2, "rev-parse", "--abbrev-ref", "HEAD"); got != Branch {
-		t.Errorf("workspace on %q, want %s", got, Branch)
+	if got := gitOut(t, wt2, "rev-parse", "--abbrev-ref", "HEAD"); got != LegacyShared {
+		t.Errorf("workspace on %q, want %s", got, LegacyShared)
 	}
 }
 

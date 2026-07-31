@@ -259,7 +259,7 @@ func chainEffort(effort string) string {
 // snapshot (REQ-002.1).
 func chainPreamble(repo, effort string) string {
 	s := "You are the autonomous DevLab runner. You work in the checked-out workspace of the " +
-		"repository \"" + repo + "\" on its long-lived working branch " + workbench.Branch + ". " +
+		"repository \"" + repo + "\" on its long-lived working branch " + workbench.LegacyShared + ". " +
 		"Implement what the task asks for, commit your work with clear messages, and state plainly " +
 		"what you did and what you did not do."
 	if effort == "ultracode" {
@@ -507,6 +507,13 @@ func (d *ChainDeps) observeBench(ctx context.Context, repo string) (*workbench.B
 	ex := workspace.Executor{User: d.user, PerUser: true}
 	b, err := workbench.New(&ex, wt)
 	if err != nil {
+		return nil, false, err
+	}
+	// STEP 1 of the branch-per-task rebuild: the bench now CARRIES the branch it works on instead
+	// of reaching for one shared name. The observation path still names the retired shared branch,
+	// because that is where today's undelivered work lies; the per-task name is wired in with the
+	// stage that creates it.
+	if b, err = b.On(workbench.LegacyShared); err != nil {
 		return nil, false, err
 	}
 	b = b.WithToken(d.token)

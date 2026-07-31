@@ -19,7 +19,7 @@ func orphanCommit(t *testing.T, wt string) string {
 	sha := gitOut(t, wt, "rev-parse", "HEAD")
 	// External mangling: the branch ref is moved back, the commit is now unreachable
 	// (reflogs deliberately do not count — they expire).
-	gitT(t, wt, "update-ref", "refs/heads/"+Branch, base)
+	gitT(t, wt, "update-ref", "refs/heads/"+LegacyShared, base)
 	gitT(t, wt, "reset", "--hard", "HEAD") // realign index+tree with the moved ref (test-side hygiene)
 	return sha
 }

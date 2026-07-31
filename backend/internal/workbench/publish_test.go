@@ -25,11 +25,11 @@ func TestPublishAfterCommit(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 	// The abort happens HERE — and costs nothing: origin already carries the commit.
-	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+Branch); got != tip {
-		t.Errorf("origin %s = %s, want %s — the commit was not published", Branch, got, tip)
+	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+LegacyShared); got != tip {
+		t.Errorf("origin %s = %s, want %s — the commit was not published", LegacyShared, got, tip)
 	}
 	shipped := filepath.Join(t.TempDir(), "shipped")
-	gitT(t, "", "clone", "-b", Branch, origin, shipped)
+	gitT(t, "", "clone", "-b", LegacyShared, origin, shipped)
 	if !exists(shipped, "work.txt") {
 		t.Errorf("published workbench does not carry the committed work")
 	}
@@ -60,7 +60,7 @@ func TestPublishRejectedFoldsAndRetries(t *testing.T) {
 		t.Fatalf("Publish (rejected → fold → retry): %v", err)
 	}
 	shipped := filepath.Join(t.TempDir(), "shipped")
-	gitT(t, "", "clone", "-b", Branch, origin, shipped)
+	gitT(t, "", "clone", "-b", LegacyShared, origin, shipped)
 	if !exists(shipped, "remote.txt") || !exists(shipped, "local.txt") {
 		t.Errorf("published state lost a side: remote=%v local=%v", exists(shipped, "remote.txt"), exists(shipped, "local.txt"))
 	}
@@ -82,7 +82,7 @@ func TestPublishConflictIsHonest(t *testing.T) {
 	}
 
 	advanceDev(t, origin, "shared.txt", "remote version\n")
-	remoteTip := gitOut(t, origin, "rev-parse", "refs/heads/"+Branch)
+	remoteTip := gitOut(t, origin, "rev-parse", "refs/heads/"+LegacyShared)
 	writeF(t, filepath.Join(wt, "shared.txt"), "local version\n")
 	gitT(t, wt, "add", "-A")
 	gitCommit(t, wt, "local conflicting")
@@ -98,7 +98,7 @@ func TestPublishConflictIsHonest(t *testing.T) {
 	if got := gitOut(t, wt, "rev-parse", "HEAD"); got != localTip {
 		t.Errorf("local tip moved (%s → %s) — a failed publish must change nothing", localTip, got)
 	}
-	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+Branch); got != remoteTip {
+	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+LegacyShared); got != remoteTip {
 		t.Errorf("origin tip moved (%s → %s) — a failed publish must never force", remoteTip, got)
 	}
 	if out := gitOut(t, wt, "status", "--porcelain"); out != "" {

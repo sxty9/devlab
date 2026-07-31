@@ -298,6 +298,10 @@ func (s *Server) runnerBench(ctx context.Context, user, token, repoID, full stri
 		unlock()
 		return nil, "", nil, err
 	}
+	if bench, err = bench.On(workbench.LegacyShared); err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
 	return bench, wt, unlock, nil
 }
 
@@ -364,7 +368,7 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	}
 	res.Changed, res.After = true, after
 
-	pushRefs := []string{workbench.Branch}
+	pushRefs := []string{workbench.LegacyShared}
 	if reversalBranch != "" {
 		if err := ex.BranchAt(ctx, wt, reversalBranch, "HEAD"); err != nil {
 			return res, fmt.Errorf("reversal branch: %w", err)
