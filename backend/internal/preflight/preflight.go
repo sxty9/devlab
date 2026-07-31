@@ -17,9 +17,10 @@ import (
 // in cmd/devlabd composes them from the workbench (git), the delivery ledger, the result pool
 // and the GitHub client; fixtures substitute the whole interface.
 type Sources interface {
-	// WorkbenchState reports whether the workbench branch (mercury-dev) is ahead of the
-	// default branch, and its head commit.
-	WorkbenchState(ctx context.Context, repo string) (aheadOfDefault bool, headCommit string, err error)
+	// WorkbenchState reports whether ONE named branch is ahead of the default branch, and its
+	// head commit. The branch asked about is the task's own — a branch that does not exist yet
+	// is not an error, it is "nothing here".
+	WorkbenchState(ctx context.Context, repo, branch string) (aheadOfDefault bool, headCommit string, err error)
 	// RunDeliveries returns every ledger delivery this run produced at repo (joined via the
 	// run's executions), oldest first. Empty when the run never delivered there.
 	RunDeliveries(runID, repo string) ([]runs.Delivery, error)
@@ -45,15 +46,25 @@ type Finding struct {
 // unknown, each with evidence — NEVER from a stored flag (K-3). Pure over what Sources report;
 // an unreachable source yields unknown plus the error (never a guess).
 //
-// Rules (REQ-020, D 50):
-//   - an OPEN ledger delivery of this run at repo            ⇒ implemented-undelivered
-//   - the workbench ahead of the default branch              ⇒ implemented-undelivered
-//   - ≥ 1 delivery of this run merged, none open, not ahead  ⇒ delivered
-//   - otherwise                                              ⇒ not-implemented
+// Rules (REQ-020, D 50). Every rule reads THIS task's own branch — one branch per run, named after
+// it — so commits on it are this task's by construction and no rule has to ask whose they are.
+//   - an OPEN ledger delivery of this run at repo   ⇒ implemented-undelivered
+//   - this task's branch ahead of the default one   ⇒ implemented-undelivered
+//   - ≥ 1 delivery of this run merged, none open    ⇒ delivered
+//   - otherwise                                     ⇒ not-implemented
 func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Finding, error) {
 	f := Finding{State: model.TaskUnknown, ObservedAt: time.Now().UTC()}
 
-	ahead, head, err := src.WorkbenchState(ctx, repo)
+	// The branch this task owns in this repository — derived, never looked up, so the observation
+	// and the chain can never disagree about which branch is being talked about.
+	create := false
+	for _, t := range run.Targets {
+		if t.Repo == repo {
+			create = t.Create
+			break
+		}
+	}
+	ahead, head, err := src.WorkbenchState(ctx, repo, runs.TaskBranch(create, run.Title, run.ID))
 	if err != nil {
 		f.Err = "workbench state unreachable: " + err.Error()
 		f.Evidence = append(f.Evidence, f.Err)
@@ -96,17 +107,19 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 			f.Evidence = append(f.Evidence, "no open PR for the delivery branch yet")
 		}
 	case ahead:
+		// This task's OWN branch carries commits the default branch does not. Whose they are is
+		// not a question any more: the branch belongs to this run and to no other.
 		f.State = model.TaskImplementedUndelivered
 		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench mercury-dev is ahead of the default branch @%s; no open delivery recorded", short(head)))
+			fmt.Sprintf("this task's branch is ahead of the default branch @%s; no delivery of it is recorded", short(head)))
 	case merged != nil:
 		f.State = model.TaskDelivered
-		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s; workbench not ahead of the default branch",
+		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s",
 			merged.ID, merged.MergedAt.UTC().Format(time.RFC3339)))
 	default:
 		f.State = model.TaskNotImplemented
 		f.Evidence = append(f.Evidence,
-			fmt.Sprintf("workbench equals the default branch @%s; no delivery recorded for this run", short(head)))
+			fmt.Sprintf("this task's branch carries nothing beyond the default branch @%s; no delivery recorded", short(head)))
 	}
 	return f, nil
 }

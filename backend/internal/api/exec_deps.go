@@ -259,7 +259,7 @@ func chainEffort(effort string) string {
 // snapshot (REQ-002.1).
 func chainPreamble(repo, effort string) string {
 	s := "You are the autonomous DevLab runner. You work in the checked-out workspace of the " +
-		"repository \"" + repo + "\" on its long-lived working branch " + workbench.Branch + ". " +
+		"repository \"" + repo + "\" on its long-lived working branch " + workbench.LegacyShared + ". " +
 		"Implement what the task asks for, commit your work with clear messages, and state plainly " +
 		"what you did and what you did not do."
 	if effort == "ultracode" {
@@ -349,12 +349,16 @@ func (d *ChainDeps) Now() time.Time { return time.Now().UTC() }
 
 // WorkbenchState reports whether the workbench carries work the default branch does not. A repo the
 // runner has never cloned is not an error — there simply is no workbench yet.
-func (d *ChainDeps) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (d *ChainDeps) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
 	b, ok, err := d.observeBench(ctx, repo)
 	if err != nil || !ok {
 		return false, "", err
 	}
-	return b.AheadOfDefault(ctx)
+	on, err := b.On(branch)
+	if err != nil {
+		return false, "", err
+	}
+	return on.AheadOfDefault(ctx)
 }
 
 // ContainedInDefault reports whether a commit arrived in the default branch. Without a local
@@ -465,6 +469,13 @@ func (d *ChainDeps) observeBench(ctx context.Context, repo string) (*workbench.B
 	if err != nil {
 		return nil, false, err
 	}
+	// STEP 1 of the branch-per-task rebuild: the bench now CARRIES the branch it works on instead
+	// of reaching for one shared name. The observation path still names the retired shared branch,
+	// because that is where today's undelivered work lies; the per-task name is wired in with the
+	// stage that creates it.
+	if b, err = b.On(workbench.LegacyShared); err != nil {
+		return nil, false, err
+	}
 	b = b.WithToken(d.token)
 	// Best-effort refresh of the remote refs: observation wants the CURRENT default branch, but an
 	// unreachable remote must not turn the observation into a failure — the refs on disk still
@@ -482,12 +493,12 @@ type benchOps struct {
 
 // prepare maps the workbench's own report onto the motor's PrepareInfo (the seam keeps its own
 // shape so the motor stays mockable without importing the workbench).
-func (o benchOps) Prepare(ctx context.Context) (executor.PrepareInfo, error) {
+func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.PrepareInfo, error) {
 	b, _, err := o.d.bench(ctx, o.repo)
 	if err != nil {
 		return executor.PrepareInfo{}, err
 	}
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, branch, base)
 	info := executor.PrepareInfo{
 		Created:       res.Created,
 		FoldedRemote:  res.FoldedRemote,
@@ -648,8 +659,23 @@ func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// The stack top comes from the LEDGER, which is local. GitHub is only needed for the name of
+	// the default branch, and only when no delivery is open — so the common case asks GitHub
+	// nothing at all. This matters because the base is now resolved before every task starts: a
+	// throttled GitHub would otherwise stop the chain from beginning any work, which it did on
+	// 2026-07-31 ("resolve the base of this task's branch: github: 403").
+	if base := deliver.NextPRBase(open, ""); base != "" {
+		return base, nil
+	}
 	def, err := github.DefaultBranch(ctx, c.d.token, full)
 	if err != nil {
+		// The local clone knows its default branch too — the SAME truth, read from the checkout
+		// instead of over the network. This is not a guess: an unresolvable name still fails.
+		if b, ok, berr := c.d.observeBench(ctx, repo); berr == nil && ok {
+			if local, lerr := b.DefaultBranchName(); lerr == nil && local != "" {
+				return local, nil
+			}
+		}
 		return "", err
 	}
 	return deliver.NextPRBase(open, def), nil

@@ -19,7 +19,7 @@ func orphanCommit(t *testing.T, wt string) string {
 	sha := gitOut(t, wt, "rev-parse", "HEAD")
 	// External mangling: the branch ref is moved back, the commit is now unreachable
 	// (reflogs deliberately do not count — they expire).
-	gitT(t, wt, "update-ref", "refs/heads/"+Branch, base)
+	gitT(t, wt, "update-ref", "refs/heads/"+LegacyShared, base)
 	gitT(t, wt, "reset", "--hard", "HEAD") // realign index+tree with the moved ref (test-side hygiene)
 	return sha
 }
@@ -30,7 +30,7 @@ func orphanCommit(t *testing.T, wt string) string {
 func TestCollectOrphansRescues(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	sha := orphanCommit(t, wt)
@@ -74,12 +74,12 @@ func TestCollectOrphansRescues(t *testing.T) {
 func TestPrepareSweepsOrphans(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	sha := orphanCommit(t, wt)
 
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestPrepareSweepsOrphans(t *testing.T) {
 func TestCollectOrphansQuietOnCleanRepo(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	orphans, err := b.CollectOrphans(ctx)

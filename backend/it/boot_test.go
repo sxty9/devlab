@@ -56,16 +56,22 @@ func TestBootChainEndToEnd(t *testing.T) {
 	}
 
 	// The agent's committed work was published (K-1: publish after commit) and a PR exists on
-	// the ONE PR path. "Published" is asked of the REMOTE: the origin's working branch must carry
-	// exactly the local tip.
+	// the ONE PR path. "Published" is asked of the REMOTE: the origin must carry exactly the local
+	// tip — on THIS TASK'S OWN branch. There is no shared working branch to look at any more, and
+	// that is the point: the ref that carries the work names the run that produced it.
 	gr := e.deps.git("alpha")
 	localTip, err := gr.bench.Head(ctx)
 	if err != nil {
 		t.Fatalf("workbench head: %v", err)
 	}
-	if published := gr.originHead("refs/heads/" + workbench.Branch); published != localTip {
+	taskBranch := e.taskBranchOf("run_alpha")
+	if published := gr.originHead("refs/heads/" + taskBranch); published != localTip {
 		t.Errorf("origin/%s is %q but the workbench is at %q — committed work was not secured",
-			workbench.Branch, published, localTip)
+			taskBranch, published, localTip)
+	}
+	if stale := gr.originHead("refs/heads/" + workbench.LegacyShared); stale != "" {
+		t.Errorf("the retired shared branch %s was written again (%s) — no task may commit onto it",
+			workbench.LegacyShared, stale)
 	}
 	if open := e.deps.openPRs(); len(open) != 1 {
 		t.Errorf("pull requests opened: %d, want exactly 1", len(open))

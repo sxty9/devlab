@@ -298,6 +298,10 @@ func (s *Server) runnerBench(ctx context.Context, user, token, repoID, full stri
 		unlock()
 		return nil, "", nil, err
 	}
+	if bench, err = bench.On(workbench.LegacyShared); err != nil {
+		unlock()
+		return nil, "", nil, err
+	}
 	return bench, wt, unlock, nil
 }
 
@@ -330,7 +334,9 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	}
 	res.DefaultBranch = defaultBranch
 
-	prep, err := bench.Prepare(ctx)
+	// A counter-booking works on the branch that carries the delivery, which already exists —
+	// so it never cuts one and the base is the default branch.
+	prep, err := bench.Prepare(ctx, "", defaultBranch)
 	if err != nil {
 		return res, fmt.Errorf("workbench: %w", err)
 	}
@@ -364,7 +370,7 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	}
 	res.Changed, res.After = true, after
 
-	pushRefs := []string{workbench.Branch}
+	pushRefs := []string{workbench.LegacyShared}
 	if reversalBranch != "" {
 		if err := ex.BranchAt(ctx, wt, reversalBranch, "HEAD"); err != nil {
 			return res, fmt.Errorf("reversal branch: %w", err)

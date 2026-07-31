@@ -208,25 +208,33 @@ func TestRepositoryExclusivityQueuesInsteadOfSkipping(t *testing.T) {
 	e.waitPhase(first.ExecutionID, model.PhaseCompleted)
 	e.waitPhase(second.ExecutionID, model.PhaseCompleted)
 
-	// "Never skipped" is asked of the second execution's own pipeline: it VISITED the repository
-	// and recorded every stage terminally. What it then found there is the repo truth — the first
-	// run's work is committed and undelivered, so the second observes exactly that and creates
-	// nothing new (K-3/REQ-020.3); it does NOT invoke the agent a second time on the same work.
-	// (That is why this test counts visits, not agent invocations: a repeated agent run over
-	// already-implemented work would itself be the defect.)
+	// "Never skipped" is asked of the second execution's own pipeline: it VISITED the repository,
+	// recorded every stage terminally — AND did its own task there.
+	//
+	// These are two DIFFERENT todos. mercury-dev is shared, so once the first commits, the workbench
+	// runs ahead; that attests undelivered work EXISTS, never whose it is. Reading it as the second
+	// task's work is the fault measured on 2026-07-31: the second run created nothing, every stage
+	// still reported executed, a delivery of the FIRST run's commits opened a pull request, and the
+	// work that was asked for never came into existence. All 23 workbenches were ahead at the time,
+	// so it applied to every new task on every repository.
+	//
+	// So the second run observes not-implemented — the ahead commits are named as another run's —
+	// and its agent runs. It re-implements nothing; it implements something else. A second agent run
+	// over the SAME task is still the defect, and it is fenced where it belongs: by the run-scoped
+	// rest path in preflight.Derive.
 	stages := e.stagesOf(second.ExecutionID, "shared")
 	assertAllTerminal(t, "shared (second execution)", stages)
 	if stages[0].State != model.StepExecuted {
 		t.Errorf("the queued execution never reached the repository: preflight = %s (%s)",
 			stages[0].State, stageNames(stages))
 	}
-	if got := taskStateOf(t, e, second.ExecutionID, "shared"); got != model.TaskImplementedUndelivered {
-		t.Errorf("the second run observed %q at the shared repository, want implemented-undelivered "+
-			"(the first run's work is committed and not yet merged)", got)
+	if got := taskStateOf(t, e, second.ExecutionID, "shared"); got != model.TaskNotImplemented {
+		t.Errorf("the second run observed %q at the shared repository, want not-implemented "+
+			"(the ahead commits are the FIRST run's work; this task has none yet)", got)
 	}
-	if runs := e.deps.repo("shared").agentRuns; runs != 1 {
-		t.Errorf("the agent ran %d times at the shared repository, want exactly 1 — the second run "+
-			"must not re-implement work that is already there", runs)
+	if runs := e.deps.repo("shared").agentRuns; runs != 2 {
+		t.Errorf("the agent ran %d times at the shared repository, want exactly 2 — a second, "+
+			"different task must be implemented, not silently declared done", runs)
 	}
 }
 

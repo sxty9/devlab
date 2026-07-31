@@ -95,7 +95,17 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		}
 	}
 
-	prep, err := wb.Prepare(ctx)
+	// The task's branch is cut from the TOP OF THE STACK — the branch of the task before it in this
+	// repository, or the default branch when none is open. So the tasks build on each other in the
+	// order they ran, and each one's pull request shows only its OWN change against the one before.
+	stackBase, err := rc.Deps.Deliver().NextPRBase(ctx, rc.Repo)
+	if err != nil {
+		return fmt.Errorf("resolve the base of this task's branch: %w", err)
+	}
+	// One branch per TASK, named after the run, in every repository it targets. The name records
+	// the owner, so what lies on the branch can never again be mistaken for somebody else's work.
+	taskBranch := runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
+	prep, err := wb.Prepare(ctx, taskBranch, stackBase)
 	if err != nil {
 		return fmt.Errorf("prepare workbench: %w", err)
 	}
@@ -474,13 +484,14 @@ func pullRequestRun(ctx context.Context, rc *RepoCtx) error {
 		rc.deliveryID = runs.NewDeliveryID()
 	}
 	if rc.deliveryBranch == "" {
-		rc.deliveryBranch = runs.BranchName(runs.BranchKindFor(rc.Target.Create), rc.Run.Title, runs.NewBranchToken())
+		// The delivery branch IS the task's own branch. There is no snapshot to cut any more:
+		// the agent already committed onto exactly this branch, so what is pushed here is the
+		// task's work and nothing else. The old snapshot existed only because every task shared
+		// one branch, and a copy of it was the only way to isolate a delivery from it.
+		rc.deliveryBranch = runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
 	}
 	if rc.head == "" {
 		return errors.New("pull-request without an established head")
-	}
-	if err := wb.BranchAt(ctx, rc.deliveryBranch, rc.head); err != nil {
-		return fmt.Errorf("snapshot delivery branch %s: %w", rc.deliveryBranch, err)
 	}
 	if err := faultclass.Retry(ctx, &model.Backoff{}, transientMaxAttempts, func() error {
 		return wb.PushBranch(ctx, rc.deliveryBranch)
@@ -532,8 +543,27 @@ func prBody(rc *RepoCtx) string {
 	b.WriteString(rc.Doc.ID)
 	b.WriteString(" (" + string(rc.Run.Kind) + " \"" + rc.Run.Title + "\").\n\n")
 	b.WriteString("Span " + short(rc.deliveryBase) + ".." + short(rc.head) + " on " + workbenchBranch + ".\n")
+
+	// What the CHAIN itself did, stated by the chain. Without this line the reader is left with
+	// the agent's account alone — and the agent writes it at the END OF IMPLEMENT, from a sandbox
+	// that has neither sudo nor push rights. Its honest "built, but not live — I may not deploy"
+	// then stands unqualified next to a deployment that DID happen two stages later, and the pull
+	// request reads as a failure that never occurred. Measured 2026-07-31 on presentr #7: the
+	// service was installed and running at 18:59 while its own pull request said "NOT live".
+	b.WriteString("\n**Dev delivery:** ")
+	if rc.deliveredCommit != "" {
+		b.WriteString("installed and running at " + short(rc.deliveredCommit) +
+			" — performed by this pipeline AFTER the report below was written.\n")
+	} else {
+		b.WriteString("not performed in this run.\n")
+	}
+
 	if rc.report != "" {
-		b.WriteString("\n" + clip(rc.report) + "\n")
+		b.WriteString("\n---\n\n**The agent's own report**, written at the end of the implement stage — " +
+			"before delivery, deployment and this pull request existed. Where it says the agent could not " +
+			"deploy, push or open a pull request, that describes the agent's sandbox, not the outcome: the " +
+			"line above states the outcome.\n\n")
+		b.WriteString(clip(rc.report) + "\n")
 	}
 	return b.String()
 }

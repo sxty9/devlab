@@ -18,7 +18,7 @@ func TestResetOnlyExplicit(t *testing.T) {
 	ctx := context.Background()
 
 	// Accumulate real state through the whole machinery.
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "accumulated.txt"), "grown state\n")
@@ -30,13 +30,13 @@ func TestResetOnlyExplicit(t *testing.T) {
 	if _, err := b.FoldInDefault(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Prepare(ctx); err != nil { // a full second pass — still no reset anywhere
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil { // a full second pass — still no reset anywhere
 		t.Fatal(err)
 	}
 	if err := b.CleanUntracked(ctx); err != nil {
 		t.Fatal(err)
 	}
-	oldTip := gitOut(t, wt, "rev-parse", "refs/heads/"+Branch)
+	oldTip := gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared)
 	mainTip := gitOut(t, wt, "rev-parse", "origin/main")
 	if oldTip == mainTip {
 		t.Fatal("precondition: the workbench must be ahead of the default branch")
@@ -49,11 +49,11 @@ func TestResetOnlyExplicit(t *testing.T) {
 	if exists(wt, "accumulated.txt") {
 		t.Errorf("accumulated work survived an explicit reset")
 	}
-	if got := gitOut(t, wt, "rev-parse", "refs/heads/"+Branch); got != mainTip {
+	if got := gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared); got != mainTip {
 		t.Errorf("workbench tip = %s, want the default tip %s", got, mainTip)
 	}
 	// The reset is published: origin's workbench equals the default tip too.
-	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+Branch); got != mainTip {
+	if got := gitOut(t, origin, "rev-parse", "refs/heads/"+LegacyShared); got != mainTip {
 		t.Errorf("origin workbench = %s, want %s — the reset was not published", got, mainTip)
 	}
 	// The discarded state is sheltered, locally and on the origin.
@@ -72,13 +72,13 @@ func TestResetOnlyExplicit(t *testing.T) {
 func TestResetRefusesTheMachinery(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "keep.txt"), "stays\n")
 	gitT(t, wt, "add", "-A")
 	gitCommit(t, wt, "work")
-	tip := gitOut(t, wt, "rev-parse", "refs/heads/"+Branch)
+	tip := gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared)
 
 	for _, by := range []model.Actor{
 		{},
@@ -90,7 +90,7 @@ func TestResetRefusesTheMachinery(t *testing.T) {
 			t.Errorf("ResetToDefault accepted non-person actor %+v", by)
 		}
 	}
-	if got := gitOut(t, wt, "rev-parse", "refs/heads/"+Branch); got != tip {
+	if got := gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared); got != tip {
 		t.Errorf("a refused reset moved the workbench (%s → %s)", tip, got)
 	}
 	if !exists(wt, "keep.txt") {

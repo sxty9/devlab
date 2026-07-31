@@ -52,7 +52,7 @@ func newFakeBench() *fakeBench {
 	}
 }
 
-func (b *fakeBench) Prepare(ctx context.Context) (PrepareInfo, error) {
+func (b *fakeBench) Prepare(ctx context.Context, branch, base string) (PrepareInfo, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prepares++

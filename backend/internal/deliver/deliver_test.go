@@ -292,9 +292,9 @@ func TestNextPRBase(t *testing.T) {
 	if got := NextPRBase(open, "main"); got != "fix/second-bbb222" {
 		t.Errorf("base = %q, want the LAST open delivery's branch", got)
 	}
-	open = append(open, runs.Delivery{ID: "d3", Branch: ""}, runs.Delivery{ID: "d4", Branch: workbench.Branch})
+	open = append(open, runs.Delivery{ID: "d3", Branch: ""}, runs.Delivery{ID: "d4", Branch: workbench.LegacyShared})
 	if got := NextPRBase(open, "main"); got != "fix/second-bbb222" {
-		t.Errorf("base = %q — empty and %s branches must be skipped", got, workbench.Branch)
+		t.Errorf("base = %q — empty and %s branches must be skipped", got, workbench.LegacyShared)
 	}
 }
 
@@ -445,8 +445,8 @@ func TestOpenOrAdoptPRHuman(t *testing.T) {
 func TestOpenOrAdoptPRGuards(t *testing.T) {
 	gh := newFakeGH()
 	ledger := tempLedger(t)
-	if _, _, err := OpenOrAdoptPR(context.Background(), gh, ledger, PRIn{Repo: "o/x", Head: workbench.Branch, Base: "main"}); err == nil {
-		t.Errorf("%s must never become a pull request", workbench.Branch)
+	if _, _, err := OpenOrAdoptPR(context.Background(), gh, ledger, PRIn{Repo: "o/x", Head: workbench.LegacyShared, Base: "main"}); err == nil {
+		t.Errorf("%s must never become a pull request", workbench.LegacyShared)
 	}
 	_, _, err := OpenOrAdoptPR(context.Background(), gh, ledger, PRIn{Repo: "o/x", Head: "fix/a-abc123", Base: "main", DeliveryID: "dlv_missing"})
 	if !errors.Is(err, ErrDeliveryNotFound) {
@@ -897,17 +897,17 @@ func TestMaintainNeverPrunesWorkbench(t *testing.T) {
 	armMaintain(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
-	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: workbench.Branch, PRNumber: 5, CreatedAt: t0}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: workbench.LegacyShared, PRNumber: 5, CreatedAt: t0}
 	_ = ledger.Put(d)
 	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
-	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: workbench.Branch, HeadSHA: "c1"}
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: workbench.LegacyShared, HeadSHA: "c1"}
 
 	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
 		t.Fatalf("Maintain: %v", err)
 	}
 	for _, del := range gh.deleted {
-		if strings.HasSuffix(del, "|"+workbench.Branch) {
-			t.Fatalf("%s must NEVER be deleted, deleted = %v", workbench.Branch, gh.deleted)
+		if strings.HasSuffix(del, "|"+workbench.LegacyShared) {
+			t.Fatalf("%s must NEVER be deleted, deleted = %v", workbench.LegacyShared, gh.deleted)
 		}
 	}
 	if left, _ := prs.List(); len(left) != 0 {
@@ -1131,8 +1131,8 @@ func TestBranchNameForm(t *testing.T) {
 	if !form.MatchString(r1) || !strings.HasPrefix(r1, "fix/revert_") {
 		t.Errorf("reversal branch %q must follow the fix/revert_… form", r1)
 	}
-	if workbench.Branch == runs.BranchName(runs.BranchKindFix, workbench.Branch, "") {
-		t.Errorf("%s must not be producible by the naming scheme", workbench.Branch)
+	if workbench.LegacyShared == runs.BranchName(runs.BranchKindFix, workbench.LegacyShared, "") {
+		t.Errorf("%s must not be producible by the naming scheme", workbench.LegacyShared)
 	}
 }
 

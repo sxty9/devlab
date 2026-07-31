@@ -1151,3 +1151,106 @@ goes with the blockade, nothing is merged or removed, and a second press frees n
 `TestResumingAnUnknownPullRequestChangesNothing` holds that naming an untracked pull request invents
 none. Parity stays list-shaped as before: `TestToolTableMirrorsTheDataSource` and
 `TestEveryRouteHasAToolOrAStatedReason`.
+
+---
+
+## The task state is derived per RUN, not per workbench
+
+**What changed:** `preflight.Sources` gains one observation point, `PriorImplementAt(runID, repo)`,
+and `preflight.Derive` uses it. The rule "the workbench is ahead of the default branch ⇒
+implemented-undelivered" is no longer a rule on its own; it holds only where THIS run already ran
+the implement stage at that repository and the ledger holds no delivery for it. A merged delivery of
+this run now outranks an ahead workbench instead of the other way round.
+
+Alongside it, the wire key of the resume answer is `resumed`, not `released` — the contract's word
+for `delivered` may not be reused for something else, and its sibling `mercuryResumeReportDelivery`
+already answered with `resumed`.
+
+**Why:** `mercury-dev` is a branch every run shares. That it runs ahead attests that undelivered
+work EXISTS — never whose it is. The old rule read it as the current task's own work, so a fresh
+task on a repository carrying anyone's undelivered commit took the rest path: implement created
+nothing, every stage still reported `executed`, a delivery of the OTHER run's commits opened a pull
+request, and the work that had been asked for never came into existence. Nothing looked wrong
+anywhere.
+
+Measured on 2026-07-31 on the running instance: all 23 workbenches were ahead — from 1 commit
+(presentr, remshel, scheme, …) to 34 (devlab). Every new task on every repository would have been
+skipped this way. It was found because the todo "Presentr: Dateien hochladen als Raumwissen" reported
+`implement: already implemented — nothing new created` at a token consumption of 0.
+
+**What it does and does not do:** the second run at a shared repository now implements its own task
+instead of being declared done. It is not re-implementing anything — a second agent run over the SAME
+task stays fenced, by the same rule, now run-scoped: an open ledger delivery of this run, or this
+run's own earlier implement, still take the rest path. The execution archive is read as a source like
+any other: unreachable ⇒ `unknown`, named, never guessed. An archived pre-rebuild document is skipped
+by its provenance (`Result.Legacy`) rather than by a stage-name comparison, because it carries the
+retired vocabulary and never wrote into today's ledger.
+
+**State of record:**
+
+- `backend/internal/preflight/preflight.go@4e806dc4522e`
+- `backend/internal/api/exec_deps.go@9baa7e5eddbd`
+- `backend/internal/api/handlers_mercury_prs.go@fa5ab380dc71`
+- `src/data/source.ts@a04b0b6b865f`
+- `src/views/mercury/NoticesPanel.tsx@e9fae0d92d0a`
+
+**Diff hint:**
+`git diff b6ed499 -- backend/internal/preflight backend/internal/api/exec_deps.go backend/internal/api/handlers_mercury_prs.go src/data/source.ts src/views/mercury/NoticesPanel.tsx`.
+**Proof:** `backend/internal/preflight/preflight_test.go`:
+`TestDeriveForeignWorkOnSharedWorkbenchIsNotThisTask` holds the fault itself — an ahead workbench
+without this run's own implement is `not-implemented`, and the evidence names whose work it is;
+`TestDeriveThreeStates/implemented-undelivered via workbench ahead after this run's own implement`
+holds the one case the rest path exists for; `TestDeriveMergedWinsOverForeignAhead` holds the new
+precedence; `TestDeriveUnknownOnUnreachableHistory` holds the honest unknown. End to end,
+`backend/it/race_test.go:TestRepositoryExclusivityQueuesInsteadOfSkipping` now counts two agent runs
+at the shared repository, one per task, where it previously counted one.
+
+---
+
+## One branch per task — the shared working branch is retired
+
+**What changed:** there is no `mercury-dev` any more. Every task works on a branch of its own,
+`runs.TaskBranch(create, title, runID)`, cut from the TOP OF THE STACK — the branch of the task
+before it in that repository, or the default branch when none is open. The delivery branch IS that
+branch; no snapshot is cut. `workbench.Bench` carries the branch it operates (`On`, and `Prepare`
+establishes it), `preflight.Sources.WorkbenchState` takes the branch to observe, and
+`PriorImplementAt` is gone — it existed only to work around the shared branch.
+
+**Why:** one branch per repository meant every task committed onto the same ref, so what lay there
+never said WHOSE work it was. A fresh task on a repository carrying anyone's undelivered commit was
+declared already implemented: implement created nothing, every stage still reported `executed`, a
+delivery of the OTHER task's commits opened a pull request, and the requested work never came into
+existence. Measured 2026-07-31: all 23 workbenches were ahead, so it applied to every new task on
+every repository. The run-scoped patch of the same day narrowed the fault; it did not remove its
+cause. A branch named after its owner removes the question instead of answering it.
+
+**What it does and does not do:** the stack is preserved and is now explicit — task B branches from
+task A, so B's pull request shows only B's change and can only merge after A. Merge order therefore
+follows the order the tasks ran, with each pull request waiting out its own window. The prune ends a
+task's branch with its merge; there is no shared branch left over to spare. Nothing that lies on a
+`mercury-dev` today is lost: the newest open delivery branch of each repository carries it, and that
+is exactly what the next task branches from. The name survives as `workbench.LegacyShared` — to
+recognise, never to write.
+
+**State of record:**
+
+- `backend/internal/runs/branch.go@a8d06df9b6d4`
+- `backend/internal/workbench/workbench.go@1be66835e73b`
+- `backend/internal/workbench/prepare.go@af1036149886`
+- `backend/internal/executor/executor.go@e1aa5246a94a`
+- `backend/internal/executor/stages.go@90415b583e0c`
+- `backend/internal/preflight/preflight.go@b34bb15d84c3`
+- `backend/internal/api/exec_deps.go@d79641997143`
+
+**Diff hint:** `git diff 1ed73d3 -- backend/internal/runs/branch.go backend/internal/workbench
+backend/internal/executor backend/internal/preflight backend/internal/api/exec_deps.go`.
+**Proof:** `backend/internal/runs/branch_task_test.go:TestTaskBranchIsStablePerRunAndDistinctBetweenRuns`
+holds the two properties the name must have — stable across firings of one task, distinct between
+tasks. `backend/internal/preflight/preflight_test.go:TestDeriveObservesTheTasksOwnBranch` holds that
+the observation asks about the task's OWN branch and that the ref names its owner. End to end,
+`backend/it/boot_test.go:TestBootChainEndToEnd` asserts the work is published on the task's branch
+AND that the retired shared branch was never written;
+`backend/it/invariants_test.go:TestChainKeepsUnpublishedCommitsOfAnInterruptedRun` holds K-1 on the
+task's own branch (an interrupted run's unpublished commit survives and is secured);
+`TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault` holds that the merge prunes the task's
+branch and that no shared branch exists.

@@ -269,7 +269,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 
 	wb := deps.Workbench("alpha")
 	ctx := context.Background()
-	if _, err := wb.Prepare(ctx); err == nil || !strings.Contains(err.Error(), "runner account") {
+	if _, err := wb.Prepare(ctx, "fix/probe-run_x", ""); err == nil || !strings.Contains(err.Error(), "runner account") {
 		t.Errorf("Prepare must name the missing runner account, got %v", err)
 	}
 	if _, err := wb.Head(ctx); err == nil {
@@ -281,7 +281,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 	if _, err := deps.Agent(ctx, "alpha", "do it", runs.ResolvedTuning{}, executor.AgentSession{}); err == nil {
 		t.Errorf("the agent must refuse without a runner account")
 	}
-	if _, _, err := deps.WorkbenchState(ctx, "alpha"); err == nil {
+	if _, _, err := deps.WorkbenchState(ctx, "alpha", "fix/probe-run_x"); err == nil {
 		t.Errorf("the observation must refuse without a runner account")
 	}
 	// The hooks are optional in the observation form, and their absence is NAMED, not ignored.

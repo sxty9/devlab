@@ -3,6 +3,7 @@ package preflight
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,9 +23,13 @@ type fakeSources struct {
 	prErr      error
 	contained  map[string]bool // commit → contained
 	containErr error
+	// askedBranch records WHICH branch the observation asked about — the whole model rests on it
+	// being the task's own, never one shared with another task.
+	askedBranch string
 }
 
-func (f *fakeSources) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (f *fakeSources) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
+	f.askedBranch = branch
 	return f.ahead, f.head, f.wbErr
 }
 func (f *fakeSources) RunDeliveries(runID, repo string) ([]runs.Delivery, error) {
@@ -102,7 +107,10 @@ func TestDeriveThreeStates(t *testing.T) {
 		}
 	})
 
-	t.Run("implemented-undelivered via workbench ahead", func(t *testing.T) {
+	t.Run("implemented-undelivered via this task's own branch being ahead", func(t *testing.T) {
+		// Commits on the task's OWN branch, no ledger record — the crash between the agent's
+		// commit and the ledger write. Whose commits they are is not a question: the branch
+		// belongs to this run.
 		src := &fakeSources{ahead: true, head: "cccc3333"}
 		f, err := Derive(ctx, src, "org/app", run)
 		if err != nil {
@@ -149,6 +157,42 @@ func TestDeriveStateless(t *testing.T) {
 	f3, _ := Derive(ctx, src, "org/app", run)
 	if f3.State != model.TaskImplementedUndelivered {
 		t.Fatalf("… and the derived state must follow: %s", f3.State)
+	}
+}
+
+// The whole model rests on WHICH branch is observed: one named after the run, never one shared. If
+// the observation ever asked about a shared branch again, a fresh task would see another task's
+// commits and be declared done — the fault measured 2026-07-31 across all 23 repositories.
+func TestDeriveObservesTheTasksOwnBranch(t *testing.T) {
+	run := mkRun("run_own", "org/app")
+	src := &fakeSources{}
+	if _, err := Derive(context.Background(), src, "org/app", run); err != nil {
+		t.Fatal(err)
+	}
+	want := runs.TaskBranch(false, run.Title, run.ID)
+	if src.askedBranch != want {
+		t.Fatalf("observed %q, want this task's own branch %q", src.askedBranch, want)
+	}
+	if !strings.Contains(src.askedBranch, run.ID) {
+		t.Fatalf("the observed branch does not name its owner: %q", src.askedBranch)
+	}
+}
+
+// A delivery of this run that merged is delivered.
+func TestDeriveMergedIsDelivered(t *testing.T) {
+	run := mkRun("run_m", "org/app")
+	src := &fakeSources{
+		head: "ffff6666",
+		deliveries: map[string][]runs.Delivery{"run_m/org/app": {{
+			ID: "dlv_9", Repo: "org/app", ToCommit: "ffff", MergedAt: ts("2026-07-30T09:00:00Z"),
+		}}},
+	}
+	f, err := Derive(context.Background(), src, "org/app", run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.State != model.TaskDelivered {
+		t.Fatalf("state = %s", f.State)
 	}
 }
 

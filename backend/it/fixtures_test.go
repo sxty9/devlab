@@ -153,6 +153,9 @@ func (w *gitWorld) get(name string) (*gitRepo, error) {
 		}
 	}
 	b, err := workbench.New(&workspace.Executor{PerUser: false}, r.wt)
+	if err == nil {
+		b, err = b.On(workbench.LegacyShared)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -563,13 +566,17 @@ func (d *fixtureDeps) Now() time.Time       { return time.Now().UTC() }
 // does not — a git fact, not a fixture claim. The remote refs are refreshed best-effort first, the
 // way the production observation adapter does: an observation against a stale default branch would
 // report work as undelivered long after it was merged.
-func (d *fixtureDeps) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (d *fixtureDeps) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
 	gr, err := d.world.get(repo)
 	if err != nil {
 		return false, "", err
 	}
 	d.refreshRefs(ctx, gr)
-	return gr.bench.AheadOfDefault(ctx)
+	on, err := gr.bench.On(branch)
+	if err != nil {
+		return false, "", err
+	}
+	return on.AheadOfDefault(ctx)
 }
 
 // refreshRefs updates the remote-tracking refs of the observation clone (best-effort: an
@@ -628,8 +635,8 @@ func (d *fixtureDeps) ContainedInDefault(ctx context.Context, repo, commit strin
 // adapter does. It adds NO behaviour: every invariant K-1 asks about is the bench's.
 type benchOps struct{ b *workbench.Bench }
 
-func (o benchOps) Prepare(ctx context.Context) (executor.PrepareInfo, error) {
-	res, err := o.b.Prepare(ctx)
+func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.PrepareInfo, error) {
+	res, err := o.b.Prepare(ctx, branch, base)
 	return executor.PrepareInfo{
 		Created:       res.Created,
 		FoldedRemote:  res.FoldedRemote,
@@ -673,7 +680,7 @@ func (o benchOps) MergeBaseDefault(ctx context.Context) (string, error) {
 // motor then FAILS the stage honestly instead of skipping it (K-4).
 type brokenBench struct{ err error }
 
-func (x brokenBench) Prepare(context.Context) (executor.PrepareInfo, error) {
+func (x brokenBench) Prepare(context.Context, string, string) (executor.PrepareInfo, error) {
 	return executor.PrepareInfo{}, x.err
 }
 func (x brokenBench) CleanUntracked(context.Context) error              { return x.err }

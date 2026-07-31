@@ -80,7 +80,7 @@ type Protection struct {
 // delivery branch (S9), and a defensive skip keeps a corrupt ledger from ever stacking on it.
 func NextPRBase(open []runs.Delivery, defaultBranch string) string {
 	for i := len(open) - 1; i >= 0; i-- {
-		if b := open[i].Branch; b != "" && b != workbench.Branch {
+		if b := open[i].Branch; b != "" && b != workbench.LegacyShared {
 			return b
 		}
 	}
@@ -106,9 +106,9 @@ func OpenOrAdoptPR(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore
 	if in.Repo == "" || in.Head == "" {
 		return model.PRRef{}, false, errors.New("deliver: repo and head are required")
 	}
-	if in.Head == workbench.Branch {
+	if in.Head == workbench.LegacyShared {
 		// mercury-dev is pushed as a backup and is NEVER itself turned into a pull request (S9).
-		return model.PRRef{}, false, fmt.Errorf("deliver: %s is never turned into a pull request", workbench.Branch)
+		return model.PRRef{}, false, fmt.Errorf("deliver: %s is never turned into a pull request", workbench.LegacyShared)
 	}
 
 	// 1. Head search — an open PR with the same head is ADOPTED, never duplicated (REQ-019.5).
@@ -396,7 +396,7 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 			out.ClosedPR = &model.PRRef{Number: d.PRNumber, URL: d.PRURL, HeadBranch: d.Branch}
 		}
 		d.ClosedAt = &now
-		d.ClosedReason = rolledBackReasonPrefix + actorName(by) + " — counter-booked on " + workbench.Branch + "@" + shortSHA(cb.After)
+		d.ClosedReason = rolledBackReasonPrefix + actorName(by) + " — counter-booked on " + workbench.LegacyShared + "@" + shortSHA(cb.After)
 		if err := ledger.Put(d); err != nil {
 			return out, err
 		}
@@ -471,7 +471,7 @@ func buildRollbackTodo(d runs.Delivery, later []runs.Delivery, conflictFiles []s
 // rollbackCloseReason is the justification a rolled-back delivery's open PR is closed with.
 func rollbackCloseReason(d runs.Delivery, by model.Actor) string {
 	return "Delivery " + d.ID + " was rolled back by " + actorName(by) +
-		": its changes were withdrawn from " + workbench.Branch + " as a counter-booking commit. " +
+		": its changes were withdrawn from " + workbench.LegacyShared + " as a counter-booking commit. " +
 		"This pull request is closed because the work it proposes is no longer part of the dev state."
 }
 
@@ -897,7 +897,7 @@ func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger
 	if branch == "" && ok {
 		branch = d.Branch
 	}
-	if branch != "" && branch != workbench.Branch {
+	if branch != "" && branch != workbench.LegacyShared {
 		if err := gh.DeleteBranch(ctx, p.Repo, branch); err != nil && !isSatisfiedDelete(err) {
 			// The delete stays owed: keep the record tracked with a backoff so the next tick
 			// retries the prune (the merge itself is already mirrored — re-finalizing is safe).
