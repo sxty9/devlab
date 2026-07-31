@@ -1235,12 +1235,12 @@ recognise, never to write.
 **State of record:**
 
 - `backend/internal/runs/branch.go@a8d06df9b6d4`
-- `backend/internal/workbench/workbench.go@6c786ab53ed6`
+- `backend/internal/workbench/workbench.go@1be66835e73b`
 - `backend/internal/workbench/prepare.go@af1036149886`
 - `backend/internal/executor/executor.go@e1aa5246a94a`
 - `backend/internal/executor/stages.go@90415b583e0c`
 - `backend/internal/preflight/preflight.go@b34bb15d84c3`
-- `backend/internal/api/exec_deps.go@2f248d512f65`
+- `backend/internal/api/exec_deps.go@d79641997143`
 
 **Diff hint:** `git diff 1ed73d3 -- backend/internal/runs/branch.go backend/internal/workbench
 backend/internal/executor backend/internal/preflight backend/internal/api/exec_deps.go`.

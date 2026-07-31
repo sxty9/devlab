@@ -206,3 +206,8 @@ func (b *Bench) conflictNames(ctx context.Context, ours, theirs string) []string
 	}
 	return names
 }
+
+// DefaultBranchName is the repository's default branch, read from the local checkout. It is the
+// same truth GitHub would report, asked of the clone — so resolving it never depends on the network
+// being reachable.
+func (b *Bench) DefaultBranchName() (string, error) { return b.defaultBranch() }

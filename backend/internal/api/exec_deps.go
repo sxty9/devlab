@@ -659,8 +659,23 @@ func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// The stack top comes from the LEDGER, which is local. GitHub is only needed for the name of
+	// the default branch, and only when no delivery is open — so the common case asks GitHub
+	// nothing at all. This matters because the base is now resolved before every task starts: a
+	// throttled GitHub would otherwise stop the chain from beginning any work, which it did on
+	// 2026-07-31 ("resolve the base of this task's branch: github: 403").
+	if base := deliver.NextPRBase(open, ""); base != "" {
+		return base, nil
+	}
 	def, err := github.DefaultBranch(ctx, c.d.token, full)
 	if err != nil {
+		// The local clone knows its default branch too — the SAME truth, read from the checkout
+		// instead of over the network. This is not a guess: an unresolvable name still fails.
+		if b, ok, berr := c.d.observeBench(ctx, repo); berr == nil && ok {
+			if local, lerr := b.DefaultBranchName(); lerr == nil && local != "" {
+				return local, nil
+			}
+		}
 		return "", err
 	}
 	return deliver.NextPRBase(open, def), nil
