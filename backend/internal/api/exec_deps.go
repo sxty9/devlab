@@ -515,6 +515,14 @@ func (o benchOps) Head(ctx context.Context) (string, error) {
 	return b.Head(ctx)
 }
 
+func (o benchOps) CurrentBranch(ctx context.Context) string {
+	b, _, err := o.d.bench(ctx, o.repo)
+	if err != nil {
+		return ""
+	}
+	return b.CurrentBranch(ctx)
+}
+
 func (o benchOps) CommitsAhead(ctx context.Context, since string) (int, error) {
 	b, _, err := o.d.bench(ctx, o.repo)
 	if err != nil {
@@ -763,6 +771,7 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	out, err := deploy.DeliverDev(ctx, deploy.SudoInstaller{}, deploy.LivePorts{}, deploy.DefaultGate(), det, repoShort(repo), artifact)
 	return executor.DeployOutcome{
 		Installed: out.Installed, Running: out.Running, Port: out.Port, Detail: out.Detail,
+		UI: string(out.UI), UIDetail: out.UIDetail,
 	}, err
 }
 
