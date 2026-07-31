@@ -43,7 +43,17 @@ export function ExecutionDetail({ runId, resultId, hideHeader, onDeliver, onResu
 
   const load = useCallback(async () => {
     try {
-      setRes(await source.mercuryRunResult(runId, resultId));
+      const got = await source.mercuryRunResult(runId, resultId);
+      // An answer that carries NOTHING is an answer, not a pending request. Assigning it and
+      // leaving the panel on "Loading…" is how one history entry span for ever: nothing threw, so
+      // no failure was shown, and no document arrived, so the spinner never left. "No stored
+      // document" is a defined state and is stated as one (REQ-037.4/037.5).
+      if (!got) {
+        gotRef.current = true;
+        setFailed('no stored document for this execution');
+        return;
+      }
+      setRes(got);
       gotRef.current = true;
       setFailed(null);
     } catch (e) {

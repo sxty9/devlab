@@ -767,8 +767,12 @@ func TestLegacyArchiveRecordWithTheRealWorldTraitsIsRead(t *testing.T) {
 	if !equalSorted(repos, []string{"alpha", "beta", "gamma"}) {
 		t.Errorf("repos = %v, want the two recorded ones plus the live one", repos)
 	}
-	if got := stages["übersprungen"]; got != model.StepExecuted {
-		t.Errorf("the historical stage name must be carried verbatim as executed, got %q", got)
+	// The NAME is carried verbatim — history is not rewritten. The retired system's claim that the
+	// step RAN is not: it marked a step it had skipped as ok, and "executed" is painted green, so
+	// the history showed a green skip. That is the one thing K-4/REQ-030.6 forbids, and it is the
+	// dishonesty this rebuild exists to end. Found in the running surface on 2026-07-31.
+	if got := stages["übersprungen"]; got != model.StepNotApplicable {
+		t.Errorf("a skipped step must not read as executed (it would render green), got %q", got)
 	}
 	if got := stages["implement"]; got == "" {
 		t.Error("a step recorded as ok before statuses existed was dropped")

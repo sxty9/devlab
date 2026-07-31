@@ -601,3 +601,21 @@ test('a repo without any stage is read as "no stage yet", never as a crash', () 
   assert.equal(stagesOf(live).length, 1);
   assert.equal(runningStage(live)?.state, 'running');
 });
+
+// A detail panel that gets an answer carrying NOTHING must not stay on "Loading…" — that is how one
+// history entry span for ever on the running surface (found 2026-07-31): nothing threw, so no
+// failure appeared, and nothing arrived, so the spinner never left. Asserted on the component's own
+// source, because the decision lives there and a re-implementation here would agree with itself.
+test('an answer that carries nothing ends in a defined state, never an endless wait (REQ-037.4)', () => {
+  const src = readFileSync(join(HERE, 'ExecutionDetail.tsx'), 'utf8');
+  assert.match(
+    src,
+    /const got = await source\.mercuryRunResult\([^)]*\);[\s\S]{0,600}?if \(!got\) \{[\s\S]{0,300}?setFailed\(/,
+    'ExecutionDetail must treat an empty answer as a stated failure, not as a pending request',
+  );
+  assert.doesNotMatch(
+    src,
+    /setRes\(await source\.mercuryRunResult/,
+    'assigning the answer unchecked is exactly what leaves the panel on "Loading…" for ever',
+  );
+});

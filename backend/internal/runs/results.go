@@ -217,6 +217,11 @@ func normalizeResult(res *Result) {
 
 // ── Tolerant legacy reading (REQ-027.3) ─────────────────────────────────────────────────
 
+// legacySkippedStep is the retired system's own word for a step it did not run. It appears in no
+// record this system writes — only in imported ones — and it is matched EXACTLY, so a step that
+// merely mentions the word in its log is untouched.
+const legacySkippedStep = "übersprungen"
+
 // legacyResult is the pre-rebuild result shape — only the fields the mapping needs. Unknown
 // fields are ignored; missing fields default. Derived from the archived format (fixture:
 // testdata/legacy-result.json, taken from the old runs-results layout at ae5eed5).
@@ -330,6 +335,21 @@ func mapLegacy(lr legacyResult) Result {
 				sv.State, sv.Reason = model.StepFailed, abortedReason(st.At)
 				aborted++
 			case st.Status == "ok" || (st.Status == "" && st.OK != nil && *st.OK):
+				// The retired system marked a step it had SKIPPED as ok, under a step it literally
+				// named "übersprungen". Carried over unchanged that reads as executed — and the
+				// surface paints executed green, so a person browsing the history sees a GREEN
+				// SKIP. That is the one thing the acceptance line forbids, and it is the very
+				// dishonesty this rebuild exists to end; carrying it over would preserve the fault
+				// rather than the record. Found by the browser inspection on 2026-07-31.
+				//
+				// The name stays verbatim and the log stays untouched — no history is rewritten.
+				// Only the claim "this ran" is withdrawn, because it never ran. That is a
+				// translation of the old vocabulary into this system's own, exactly like every
+				// other field of an imported record.
+				if st.Name == legacySkippedStep {
+					sv.State, sv.Reason = model.StepNotApplicable, st.Log
+					break
+				}
 				sv.State = model.StepExecuted
 			case st.Status == "not-applicable":
 				sv.State = model.StepNotApplicable
