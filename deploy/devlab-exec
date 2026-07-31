@@ -92,7 +92,10 @@ case "$verb" in
     # prebuilt result — root NEVER builds agent/repo code (Finding C: an npm postinstall or go build
     # directive would otherwise run as root). Trust-equivalent to the `claude` verb: it runs the repo's
     # own npm/go build as this user, which the agent could run anyway. Produces <wt>/.mercury-artifact
-    # holding the Go daemon binary + the built web SPA in web/.
+    # holding the Go daemon binary, the built web SPA in web/ (self repo), and — for a holistic service
+    # that carries a ui/ directory — that dashboard-facing UI SOURCE in ui/ (built later by the shared
+    # dashboard, never here: a service ui may use only @holistic/ui, react, react-dom or relative files,
+    # so it has no deps of its own and cannot be built in isolation).
     wt="${1:-}"; require_under_root "$wt"
     [ -d "$wt" ] || die "no such workspace: $wt"
     cd -- "$wt"
@@ -146,7 +149,19 @@ case "$verb" in
       ( cd -- "$gd" && if [ -d cmd ]; then go build ${tags:+-tags "$tags"} -o "$art/" ./cmd/...; else go build ${tags:+-tags "$tags"} -o "$art/" ./...; fi )
       built=1
     fi
-    [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod)"
+    # ── the service UI belongs INTO the artifact (a delivery ships all a service needs, not just its
+    # program). A holistic service contributes its dashboard face through a ui/ directory; its SOURCE
+    # is staged verbatim so the root installer can wire it into the shared dashboard and let THAT build
+    # verify it (only @holistic/ui, react, react-dom or relative files are allowed there, so the source
+    # carries no deps and is never built here). A repo without ui/ is untouched — nothing is invented.
+    if [ -d ui ]; then
+      rm -rf -- "$art/ui"; mkdir -p -- "$art/ui"
+      # node_modules / dist / build are the dashboard's to produce, never shipped in the source stage.
+      ( cd ui && tar --exclude=./node_modules --exclude=./dist --exclude=./build -cf - . ) \
+        | ( cd "$art/ui" && tar -xf - )
+      built=1
+    fi
+    [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui)"
     ;;
 
   *)

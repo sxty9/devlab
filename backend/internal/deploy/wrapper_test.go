@@ -223,6 +223,67 @@ func TestInstallCheckSelfHandoverPlansTransientUnit(t *testing.T) {
 	}
 }
 
+// A foreign artifact WITHOUT a ui/ reports the ui half as absent — never silently omitted.
+func TestInstallCheckNoUIReportsNone(t *testing.T) {
+	env, _, _ := installEnv(t)
+	artifact := filepath.Join(env["DEVLAB_STATE_DIR"], "workspaces", "runner", "svc-a", ".mercury-artifact")
+	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
+	if res.exit != 0 {
+		t.Fatalf("valid check must exit 0, got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "MERCURY-UI: none") {
+		t.Errorf("a service without a ui must say so on the half-report line: %s", res.out)
+	}
+}
+
+// A ui-bearing service with NO holistic checkout configured is a NAMED deficiency (exit 5) — the
+// program installs, but the delivery says the face could NOT be built in, never a silent skip.
+func TestInstallCheckUIUnconfiguredIsNamed(t *testing.T) {
+	env, workRoot, _ := installEnv(t)
+	artifact := filepath.Join(workRoot, "runner", "svc-a", ".mercury-artifact")
+	if err := os.MkdirAll(filepath.Join(artifact, "ui"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// No DEVLAB_HOLISTIC_REPO, and the config file default does not exist under a temp state dir.
+	env["DEVLAB_HOLISTIC_REPO_FILE"] = filepath.Join(env["DEVLAB_STATE_DIR"], "no-such-holistic-repo")
+	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
+	if res.exit != 5 {
+		t.Fatalf("an unconfigured dashboard for a ui service must die with exit 5, got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "MERCURY-UI: unconfigured") || !strings.Contains(res.out, "could NOT be built in") {
+		t.Errorf("the refusal must name the ui half and why: %s", res.out)
+	}
+}
+
+// A ui-bearing service WITH a configured dashboard plans the wire-in + shared rebuild, and names the
+// isolation rule (own failure fails the stage; a foreign failure is reported, not charged here).
+func TestInstallCheckUIConfiguredPlansWireInAndBuild(t *testing.T) {
+	env, workRoot, _ := installEnv(t)
+	artifact := filepath.Join(workRoot, "runner", "svc-a", ".mercury-artifact")
+	if err := os.MkdirAll(filepath.Join(artifact, "ui"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	holistic := filepath.Join(t.TempDir(), "holistic")
+	if err := os.MkdirAll(filepath.Join(holistic, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(holistic, "frontend", "external"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env["DEVLAB_HOLISTIC_REPO"] = holistic
+	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
+	if res.exit != 0 {
+		t.Fatalf("a configured ui check must exit 0, got %d\n%s", res.exit, res.out)
+	}
+	for _, want := range []string{
+		"external/svc-a", "npm run build", "MERCURY-UI: planned", "foreign-blocked",
+	} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("the ui plan should mention %q: %s", want, res.out)
+		}
+	}
+}
+
 // The self artifact must be complete (binary + web) — honest config-state refusal otherwise.
 func TestInstallCheckSelfArtifactComplete(t *testing.T) {
 	env, workRoot, _ := installEnv(t)
