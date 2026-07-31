@@ -58,6 +58,30 @@ export function NoticesPanel() {
   // The feed refreshes on the one live stream; a resting panel makes no request (REQ-034).
   useLiveTopic('notices', () => void reload());
 
+  // How many deliveries stand blocked right now — read off the notices the pool already carries, so
+  // the panel opens no second data path for a number it is already being told.
+  const blockedDeliveries = (notices ?? []).filter((n) => n.kind === 'delivery-blocked' && !n.read).length;
+
+  // The explicit release a blocked delivery waits for (K-5). The blocked state was there from the
+  // start; the way out of it was not, so a delivery blocked by a passing outage stayed blocked for
+  // ever. It merges nothing — the maintenance re-evaluates and blocks again whatever really fails,
+  // which is why pressing it twice is harmless.
+  const release = async () => {
+    setBusy(true);
+    try {
+      const out = await source.mercuryResumeDelivery();
+      toast({
+        title: out.released > 0 ? `${out.released} blocked deliveries released` : 'Nothing was blocked',
+        description: out.released > 0 ? 'The next maintenance pass evaluates them again.' : undefined,
+      });
+      await reload();
+    } catch (e) {
+      toast({ title: 'The blockade could not be released', description: errMsg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const dismiss = async (id: string) => {
     if (busy) return;
     setBusy(true);
@@ -130,6 +154,20 @@ export function NoticesPanel() {
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        {/* A blocked delivery waits for a person to say "try again" — that is what replaces endless
+            retrying (K-5/REQ-016.3). Until this control existed the state had no way out at all,
+            and one passing outage could halt every delivery for good. It merges nothing: the next
+            maintenance pass re-evaluates and blocks again whatever really fails. */}
+        {blockedDeliveries > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md bg-danger/[0.10] px-3 py-2 text-caption text-danger">
+            <span>
+              {blockedDeliveries} {blockedDeliveries === 1 ? 'delivery is' : 'deliveries are'} blocked and wait for a release.
+            </span>
+            <Button variant="secondary" size="sm" className="ml-auto" disabled={busy} onClick={() => void release()}>
+              Release
+            </Button>
+          </div>
+        )}
         {status && (
           <div className={cn('mb-3 flex flex-wrap items-center gap-2 rounded-md px-3 py-2 text-caption', toneBox(status.tone))}>
             <span>

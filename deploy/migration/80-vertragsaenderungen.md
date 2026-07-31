@@ -1102,3 +1102,52 @@ and `TestBothPlanningToolsOfferRequestReadAndCancel` hold the agent's three acts
 `TestAiProposalFailureCarriesANamedReason` holds the deliberate two-step restart. Parity itself stays
 list-shaped: `TestToolTableMirrorsTheDataSource` and `TestEveryRouteHasAToolOrAStatedReason`
 (backend/internal/api), `backend/it/surface_test.go` and `src/parity.test.ts`.
+
+---
+
+## The explicit release of a blocked pull request
+
+**What changed:** a new capability `delivery_resume` — route `POST /api/mercury/runs/deliveries/resume`,
+store operation `runs.PRStore.ResumeBlocked`, data-source operation `mercuryResumeDelivery`, and a
+control in the notices panel.
+
+**Why:** the chain has always had an honest terminal state for a pull request whose read keeps
+failing: it is blocked, and it waits for a person to say "try again" instead of retrying for ever
+(K-5). The state was implemented, its comment even names the way out — "no further automatic attempt
+until an explicit resume clears it" — but that resume did not exist. Neither a route, nor a store
+operation, nor a control. A pull request blocked by a passing outage therefore stayed blocked for
+good, and with it every delivery queued behind it in that repository.
+
+Measured on 2026-07-31 on the running instance: 63 of 64 tracked pull requests carried a block, and
+not one of the reasons described the pull request itself — 50 reads that never reached GitHub while
+the service was restarting, 7 refused by the rate limit those restarts had burned, 1 stray 404, and
+5 naming a production condition from the retired system that no longer exists. The whole delivery of
+the instance stood still with no way to start it again.
+
+**What it does and does not do:** it clears the blockade and the spent retry episode, so the next
+maintenance pass evaluates the pull request again from a fresh start. It merges nothing, removes
+nothing and decides nothing about the pull request — the pass blocks again, with a fresh reason,
+whatever genuinely fails. That is why pressing it twice is harmless, and why it is not a destructive
+capability. Without an argument it releases every blocked entry; with `{repo, number}` exactly the
+named one, so a single repository can be started again without touching the rest.
+
+**State of record:**
+
+- `backend/internal/runs/prs.go@c5cb2cf13415`
+- `backend/internal/api/api.go@539e0fd900ed`
+- `backend/internal/api/mcp_tools.go@0fb2b422be21`
+- `contract/mcp-tools.json@48acef6f9a9c`
+- `src/data/source.ts@37c47a4effd5`
+- `src/data/httpSource.ts@794942a541a2`
+- `src/data/stubSource.ts@2bcc72284c4a`
+- `src/views/mercury/NoticesPanel.tsx@0d331b3ef77a`
+
+**Diff hint:**
+`git diff 4793de5 -- backend/internal/runs/prs.go backend/internal/api/api.go backend/internal/api/mcp_tools.go contract/mcp-tools.json src/data src/views/mercury/NoticesPanel.tsx`.
+**Proof:** `backend/internal/runs/prs_resume_test.go`:
+`TestTheExplicitResumeIsTheWayOutOfTheBlockedState` releases one named entry and leaves its
+neighbour blocked, then releases the rest, and holds all three invariants — the spent retry state
+goes with the blockade, nothing is merged or removed, and a second press frees nothing;
+`TestResumingAnUnknownPullRequestChangesNothing` holds that naming an untracked pull request invents
+none. Parity stays list-shaped as before: `TestToolTableMirrorsTheDataSource` and
+`TestEveryRouteHasAToolOrAStatedReason`.
