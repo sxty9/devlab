@@ -269,7 +269,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 
 	wb := deps.Workbench("alpha")
 	ctx := context.Background()
-	if _, err := wb.Prepare(ctx); err == nil || !strings.Contains(err.Error(), "runner account") {
+	if _, err := wb.Prepare(ctx, "fix/probe-run_x", ""); err == nil || !strings.Contains(err.Error(), "runner account") {
 		t.Errorf("Prepare must name the missing runner account, got %v", err)
 	}
 	if _, err := wb.Head(ctx); err == nil {

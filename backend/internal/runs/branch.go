@@ -87,3 +87,17 @@ func NewBranchToken() string {
 	_, _ = rand.Read(b[:])
 	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))[:6]
 }
+
+// TaskBranch is THE branch of one task: one branch per run, in every repository it targets.
+//
+// Stability is the whole point. The branch name is derived from the run ID, so a second firing of
+// the same task finds the branch the first one built on instead of opening a parallel one — and so
+// the branch NAME itself records who owns the commits on it. That is what the retired shared branch
+// could never say: every task committed onto one `mercury-dev` per repository, so what lay there
+// never told whose work it was, and a fresh task could be declared done and skipped (measured
+// 2026-07-31 across all 23 repositories).
+//
+// The title only makes the ref readable; the ID is what makes it unique.
+func TaskBranch(newService bool, title, runID string) string {
+	return BranchName(BranchKindFor(newService), title, runID)
+}

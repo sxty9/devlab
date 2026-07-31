@@ -13,7 +13,7 @@ import (
 func TestPublishAfterCommit(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "work.txt"), "committed then published\n")
@@ -41,7 +41,7 @@ func TestPublishAfterCommit(t *testing.T) {
 func TestPublishRejectedFoldsAndRetries(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "base.txt"), "base\n")
@@ -71,7 +71,7 @@ func TestPublishRejectedFoldsAndRetries(t *testing.T) {
 func TestPublishConflictIsHonest(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "shared.txt"), "base\n")

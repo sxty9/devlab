@@ -49,8 +49,20 @@ type PrepareResult struct {
 // edits and untracked leftovers would block the switch and the fold) — committed work is
 // untouched by it, per its own contract. Orphan rescue (REQ-023.5) runs as part of the
 // preparation; its bookkeeping is best-effort and never sinks the run.
-func (b *Bench) Prepare(ctx context.Context) (PrepareResult, error) {
+func (b *Bench) Prepare(ctx context.Context, branch, base string) (PrepareResult, error) {
 	var res PrepareResult
+	// Establishing the branch IS preparing: the caller that knows WHICH task this is names it here.
+	// A bench is never left pointing at a branch somebody else chose.
+	if strings.TrimSpace(branch) != "" {
+		on, err := b.On(branch)
+		if err != nil {
+			return res, err
+		}
+		b.branch = on.branch
+	}
+	if strings.TrimSpace(b.branch) == "" {
+		return res, errors.New("workbench: prepare without a working branch")
+	}
 	if err := b.ex.Fetch(ctx, b.repo, b.token); err != nil {
 		return res, fmt.Errorf("fetch: %w", err)
 	}
@@ -74,10 +86,19 @@ func (b *Bench) Prepare(ctx context.Context) (PrepareResult, error) {
 		}
 		res.FoldedRemote = true
 	case !local && !remote:
-		// The very first establishment: derive the workbench from the default branch.
-		start := "origin/" + def
-		if !b.refExists(ctx, "refs/remotes/origin/"+def) {
+		// The task's branch does not exist yet: cut it from the TOP OF THE STACK — the branch of
+		// the task before it, so the tasks of a repository build on each other in the order they
+		// ran. Without a stack the top is the default branch. An unresolvable base is never
+		// silently swapped for another: it is named, because cutting from the wrong place would
+		// put someone else's work into this task's pull request.
+		start := strings.TrimSpace(base)
+		if start == "" {
 			start = def
+		}
+		if b.refExists(ctx, "refs/remotes/origin/"+start) {
+			start = "origin/" + start
+		} else if !b.refExists(ctx, "refs/heads/"+start) {
+			return res, fmt.Errorf("workbench: base %q for %s exists neither locally nor on origin", start, b.branch)
 		}
 		if err := b.ex.CreateBranch(ctx, b.repo, b.branch, start); err != nil {
 			return res, fmt.Errorf("create %s from %s: %w", b.branch, start, err)

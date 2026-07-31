@@ -97,7 +97,7 @@ func TestNetworkOpsNeverPersistToken(t *testing.T) {
 	const token = "token-that-must-never-persist"
 	b.WithToken(token)
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatalf("Prepare with token: %v", err)
 	}
 	writeF(t, filepath.Join(wt, "w.txt"), "w\n")

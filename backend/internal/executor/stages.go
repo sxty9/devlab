@@ -95,7 +95,17 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		}
 	}
 
-	prep, err := wb.Prepare(ctx)
+	// The task's branch is cut from the TOP OF THE STACK — the branch of the task before it in this
+	// repository, or the default branch when none is open. So the tasks build on each other in the
+	// order they ran, and each one's pull request shows only its OWN change against the one before.
+	stackBase, err := rc.Deps.Deliver().NextPRBase(ctx, rc.Repo)
+	if err != nil {
+		return fmt.Errorf("resolve the base of this task's branch: %w", err)
+	}
+	// One branch per TASK, named after the run, in every repository it targets. The name records
+	// the owner, so what lies on the branch can never again be mistaken for somebody else's work.
+	taskBranch := runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
+	prep, err := wb.Prepare(ctx, taskBranch, stackBase)
 	if err != nil {
 		return fmt.Errorf("prepare workbench: %w", err)
 	}
@@ -474,13 +484,14 @@ func pullRequestRun(ctx context.Context, rc *RepoCtx) error {
 		rc.deliveryID = runs.NewDeliveryID()
 	}
 	if rc.deliveryBranch == "" {
-		rc.deliveryBranch = runs.BranchName(runs.BranchKindFor(rc.Target.Create), rc.Run.Title, runs.NewBranchToken())
+		// The delivery branch IS the task's own branch. There is no snapshot to cut any more:
+		// the agent already committed onto exactly this branch, so what is pushed here is the
+		// task's work and nothing else. The old snapshot existed only because every task shared
+		// one branch, and a copy of it was the only way to isolate a delivery from it.
+		rc.deliveryBranch = runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
 	}
 	if rc.head == "" {
 		return errors.New("pull-request without an established head")
-	}
-	if err := wb.BranchAt(ctx, rc.deliveryBranch, rc.head); err != nil {
-		return fmt.Errorf("snapshot delivery branch %s: %w", rc.deliveryBranch, err)
 	}
 	if err := faultclass.Retry(ctx, &model.Backoff{}, transientMaxAttempts, func() error {
 		return wb.PushBranch(ctx, rc.deliveryBranch)

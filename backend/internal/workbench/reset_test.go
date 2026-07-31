@@ -18,7 +18,7 @@ func TestResetOnlyExplicit(t *testing.T) {
 	ctx := context.Background()
 
 	// Accumulate real state through the whole machinery.
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "accumulated.txt"), "grown state\n")
@@ -30,7 +30,7 @@ func TestResetOnlyExplicit(t *testing.T) {
 	if _, err := b.FoldInDefault(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Prepare(ctx); err != nil { // a full second pass — still no reset anywhere
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil { // a full second pass — still no reset anywhere
 		t.Fatal(err)
 	}
 	if err := b.CleanUntracked(ctx); err != nil {
@@ -72,7 +72,7 @@ func TestResetOnlyExplicit(t *testing.T) {
 func TestResetRefusesTheMachinery(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "keep.txt"), "stays\n")

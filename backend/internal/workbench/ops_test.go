@@ -22,7 +22,7 @@ func TestAheadOfDefaultIsHonestInEveryState(t *testing.T) {
 	}
 
 	// (b) established but level with the default branch.
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	ahead, head, err = b.AheadOfDefault(ctx)
@@ -57,7 +57,7 @@ func TestAheadOfDefaultIsHonestInEveryState(t *testing.T) {
 func TestContainedInDefaultProvesDelivery(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	seed := gitOut(t, wt, "rev-parse", "refs/remotes/origin/main")
@@ -95,7 +95,7 @@ func TestContainedInDefaultProvesDelivery(t *testing.T) {
 func TestMergeBaseDefaultAndCommitsAheadNameTheSpan(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	base, err := b.MergeBaseDefault(ctx)
@@ -131,7 +131,7 @@ func TestMergeBaseDefaultAndCommitsAheadNameTheSpan(t *testing.T) {
 func TestCommitAllSecuresLooseWorkAndNeverMovesBack(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	before, err := b.Head(ctx)
@@ -175,7 +175,7 @@ func TestCommitAllSecuresLooseWorkAndNeverMovesBack(t *testing.T) {
 // readable back, and a path escaping the working tree is refused.
 func TestReadWriteFileStayInsideTheWorkingTree(t *testing.T) {
 	_, wt, b := testRepo(t)
-	if _, err := b.Prepare(context.Background()); err != nil {
+	if _, err := b.Prepare(context.Background(), LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -206,7 +206,7 @@ func TestReadWriteFileStayInsideTheWorkingTree(t *testing.T) {
 func TestBranchAtLeavesTheWorkbenchWhereItIs(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "feature.txt"), "feature\n")

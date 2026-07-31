@@ -655,8 +655,8 @@ func (d *fixtureDeps) ContainedInDefault(ctx context.Context, repo, commit strin
 // adapter does. It adds NO behaviour: every invariant K-1 asks about is the bench's.
 type benchOps struct{ b *workbench.Bench }
 
-func (o benchOps) Prepare(ctx context.Context) (executor.PrepareInfo, error) {
-	res, err := o.b.Prepare(ctx)
+func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.PrepareInfo, error) {
+	res, err := o.b.Prepare(ctx, branch, base)
 	return executor.PrepareInfo{
 		Created:       res.Created,
 		FoldedRemote:  res.FoldedRemote,
@@ -700,7 +700,7 @@ func (o benchOps) MergeBaseDefault(ctx context.Context) (string, error) {
 // motor then FAILS the stage honestly instead of skipping it (K-4).
 type brokenBench struct{ err error }
 
-func (x brokenBench) Prepare(context.Context) (executor.PrepareInfo, error) {
+func (x brokenBench) Prepare(context.Context, string, string) (executor.PrepareInfo, error) {
 	return executor.PrepareInfo{}, x.err
 }
 func (x brokenBench) CleanUntracked(context.Context) error              { return x.err }

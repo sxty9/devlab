@@ -533,12 +533,12 @@ type benchOps struct {
 
 // prepare maps the workbench's own report onto the motor's PrepareInfo (the seam keeps its own
 // shape so the motor stays mockable without importing the workbench).
-func (o benchOps) Prepare(ctx context.Context) (executor.PrepareInfo, error) {
+func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.PrepareInfo, error) {
 	b, _, err := o.d.bench(ctx, o.repo)
 	if err != nil {
 		return executor.PrepareInfo{}, err
 	}
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, branch, base)
 	info := executor.PrepareInfo{
 		Created:       res.Created,
 		FoldedRemote:  res.FoldedRemote,

@@ -30,7 +30,7 @@ func orphanCommit(t *testing.T, wt string) string {
 func TestCollectOrphansRescues(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	sha := orphanCommit(t, wt)
@@ -74,12 +74,12 @@ func TestCollectOrphansRescues(t *testing.T) {
 func TestPrepareSweepsOrphans(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	sha := orphanCommit(t, wt)
 
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestPrepareSweepsOrphans(t *testing.T) {
 func TestCollectOrphansQuietOnCleanRepo(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	orphans, err := b.CollectOrphans(ctx)

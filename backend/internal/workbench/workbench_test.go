@@ -179,7 +179,7 @@ func TestNewGuardRefusesForeignWorkspace(t *testing.T) {
 func TestHeadNamesTheTip(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "work.txt"), "work\n")

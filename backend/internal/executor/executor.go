@@ -50,7 +50,8 @@ type PrepareInfo struct {
 // composes. The adapter in cmd/devlabd implements it over workbench.Bench + workspace.Executor;
 // fixtures substitute the whole interface. No operation here ever resets committed work (K-1).
 type WorkbenchOps interface {
-	Prepare(ctx context.Context) (PrepareInfo, error)
+	// Prepare establishes THIS task's branch, cutting it from base when it does not exist yet.
+	Prepare(ctx context.Context, branch, base string) (PrepareInfo, error)
 	CleanUntracked(ctx context.Context) error
 	Head(ctx context.Context) (string, error)
 	// CommitsAhead counts commits on the workbench since the given commit.

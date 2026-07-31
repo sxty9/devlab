@@ -334,7 +334,9 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	}
 	res.DefaultBranch = defaultBranch
 
-	prep, err := bench.Prepare(ctx)
+	// A counter-booking works on the branch that carries the delivery, which already exists —
+	// so it never cuts one and the base is the default branch.
+	prep, err := bench.Prepare(ctx, "", defaultBranch)
 	if err != nil {
 		return res, fmt.Errorf("workbench: %w", err)
 	}
