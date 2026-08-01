@@ -779,6 +779,15 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	}
 	self := repoShort(repo) == selfRepo()
 	if self {
+		// The chain ships only the daemon binary; the root wrappers under sbin are replaced solely
+		// by a human with sudo (E §7.4). So BEFORE installing a new binary, prove the installed
+		// wrappers still match this checkout — otherwise a change touching deploy/devlab-install or
+		// deploy/devlab-exec would go live half-shipped and report green (measured 31.07./01.08.2026).
+		// A drift is a NAMED failure that installs nothing (no half state, K-4); it names each stale
+		// wrapper and the one line a human runs to make them current, then resumes the execution.
+		if err := deploy.GuardWrappersCurrent(wt); err != nil {
+			return executor.DeployOutcome{Self: true}, err
+		}
 		if err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact); err != nil {
 			return executor.DeployOutcome{Self: true}, err
 		}
