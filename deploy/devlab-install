@@ -2,6 +2,8 @@
 # devlab-install — the generic, install-only root wrapper (S11; replaces the retired
 # per-repo devlab-deploy mechanics, B-44). Invoked ONLY via the pinned sudoers grant:
 #     sudo -n /usr/local/sbin/devlab-install <repo> <artifact-dir> <env> [--port <n>] [--handover] [--check]
+# It installs BOTH halves a service needs — its program (binary/unit/route/rights) AND its dashboard
+# UI — so a green delivery never stands over a half-installed service.
 #
 # Contract:
 #   * name grammar: <repo> must match ^[a-z][a-z0-9-]{2,30}$ — nothing else ever reaches a path
@@ -29,8 +31,20 @@
 #   * path canonicalization: <artifact-dir> resolves via `realpath -e` and MUST lie under the
 #     workspace root; a traversal (…/../../tmp/evil) dies before any effect
 #   * env is exactly `dev` or `prod` (prod is NOT armed in this phase — it dies)
-#   * install-only: root copies validated artifacts and restarts the unit; root NEVER builds
-#     and NEVER executes repo-provided code (E §7.4)
+#   * install-only for the SERVICE artifact: root copies the validated program + rights and restarts
+#     the unit; root NEVER builds and NEVER executes the service's own repo code (E §7.4)
+#   * the service UI (a staged ui/ in the artifact) is wired into the instance's holistic dashboard
+#     (<holistic>/<frontend>/external/<repo>), the SHARED dashboard is rebuilt AS THE CHECKOUT OWNER
+#     (never as root — the same "root never builds" rule as the program half; runuser drops privilege
+#     so no root-owned file is left in the operator's checkout), and the freshly built bundle is then
+#     DELIVERED to the serve root the browser fetches from (DEVLAB_HOLISTIC_WWW). `built` is reported
+#     ONLY once the bundle has arrived there — a rebuilt-but-undelivered dashboard is a failure, not
+#     green (the browser would keep serving the old bundle). The dashboard path and serve root are
+#     instance configuration (DEVLAB_HOLISTIC_REPO / DEVLAB_HOLISTIC_WWW / root-owned files); absent
+#     dashboard config is a NAMED deficiency, never a silent skip. The half's outcome is reported on a
+#     single `MERCURY-UI: <none|built|unconfigured|failed|foreign-blocked|planned|would-fail>` line
+#     (would-fail is --check-only: the dry-run predicts the relocation would carry an outside-tree config
+#     into the dashboard and break the build — a regression guard, never a production outcome)
 #   * first-time setup of template-conforming services generates unit/route/rights from
 #     root-owned INLINE templates with validated values (port via the atlas proposal, --port)
 #   * --handover (self-repo only): install + `systemd-run --unit=devlab-restart-<ts> --collect
@@ -60,6 +74,25 @@ CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
 CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
 PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
+# The holistic dashboard checkout a service UI is wired into. Its path is INSTANCE-SPECIFIC (the axiom
+# "Keine Instanz-Spezifika" forbids it as a literal in the repo), so it comes from runtime configuration
+# exactly like PERMS_DIR: an env override for the direct-invocation test seam, otherwise a root-owned
+# file. There is NO built-in default path — an unconfigured instance is a NAMED state, never a silent
+# skip of the UI half. FRONTEND is the dashboard's web subtree that carries external/<id>.
+HOLISTIC_REPO="${DEVLAB_HOLISTIC_REPO:-}"
+HOLISTIC_REPO_FILE="${DEVLAB_HOLISTIC_REPO_FILE:-/etc/devlab/holistic-repo}"
+HOLISTIC_FRONTEND="${DEVLAB_HOLISTIC_FRONTEND:-frontend}"
+# WHERE THE BROWSER FETCHES THE DASHBOARD FROM — the serve root the edge exposes (Caddy: `root *
+# <www>`). Building the dashboard is only half the delivery: "delivered" means the freshly built
+# bundle sits HERE, where the browser reads it, not merely in the checkout's build output. This is
+# an instance value like every path above (the served tree is `/opt/<product>/www` by the holistic
+# convention, holding no user- or machine-specific segment), so it is an env-overridable DEFAULT
+# with a root-owned file seam — never asked of the caller. HOLISTIC_DIST is the built-SPA subtree
+# the dashboard's own build writes under <frontend> (holistic emits `app/dist`).
+HOLISTIC_WWW="${DEVLAB_HOLISTIC_WWW:-}"
+HOLISTIC_WWW_FILE="${DEVLAB_HOLISTIC_WWW_FILE:-/etc/devlab/holistic-www}"
+HOLISTIC_WWW_DEFAULT="/opt/holistic/www"
+HOLISTIC_DIST="${DEVLAB_HOLISTIC_DIST:-app/dist}"
 RESTART_HELPER="/usr/local/sbin/devlab-restart-when-free"
 # The ONE artifact directory the unprivileged per-user build produces inside a working tree
 # (mirrors deploy.ArtifactDirName). Nothing else is ever installed from.
@@ -393,4 +426,191 @@ fi
 run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
 run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
 run "$SYSTEMCTL" restart "$REPO"
-log "install-only deploy of '$REPO' done (running-proof is the caller's honest gate, F10)"
+log "install-only deploy of '$REPO' program done (running-proof is the caller's honest gate, F10)"
+
+# ── the service UI: wire it in, rebuild the dashboard, and DELIVER it to where the browser reads ──
+# "Delivered" means the user SEES it — the browser fetches the NEW bundle. A service that ships a ui/
+# is fully delivered only once three things have happened, in order:
+#   1. its ui SOURCE (staged by the unprivileged build) is copied into <frontend>/external/<repo>;
+#   2. the SHARED dashboard is rebuilt — the build IS the check (lint + typecheck + vite enforce that a
+#      service ui uses only @holistic/ui, react, react-dom or relative files and no raw HTML elements);
+#   3. the freshly built bundle is COPIED to the serve root the browser fetches from ($HOLISTIC_WWW).
+# The old delivery did (1) and (2) and then reported `built` — but never (3), so the browser kept
+# serving the OLD bundle: a green report over half-done work. `built` is now reported ONLY after (3).
+# And the rebuild (2) runs AS THE CHECKOUT OWNER, never as root: "root never builds" holds for the ui
+# half as much as the program half, so no root-owned file is left in the operator's checkout to trip
+# their next `git`/`npm` with "Permission denied". The single `MERCURY-UI:` line reports the outcome.
+UI_SRC="$real/ui"
+if [ ! -d "$UI_SRC" ]; then
+  echo "MERCURY-UI: none"
+  log "no ui/ in the artifact — service '$REPO' ships no dashboard face"
+  exit 0
+fi
+
+# The dashboard checkout is INSTANCE configuration (never a literal in the repo): env seam, else the
+# root-owned file. Absent config is a NAMED deficiency of the delivery, not a silent skip of the UI half.
+if [ -z "$HOLISTIC_REPO" ] && [ -r "$HOLISTIC_REPO_FILE" ]; then
+  HOLISTIC_REPO="$(head -n1 -- "$HOLISTIC_REPO_FILE" | tr -d '[:space:]')"
+fi
+if [ -z "$HOLISTIC_REPO" ]; then
+  echo "MERCURY-UI: unconfigured"
+  die "service '$REPO' ships a ui/, but no holistic dashboard checkout is configured (DEVLAB_HOLISTIC_REPO / $HOLISTIC_REPO_FILE) — the program is installed, but its face could NOT be built in" 5
+fi
+FRONT="$HOLISTIC_REPO/$HOLISTIC_FRONTEND"
+EXT="$FRONT/external/$REPO"
+{ [ -d "$HOLISTIC_REPO/.git" ] || [ -f "$HOLISTIC_REPO/.git" ]; } \
+  || die "configured holistic checkout '$HOLISTIC_REPO' is not a git repository — cannot wire the UI of '$REPO' in" 5
+[ -d "$FRONT" ] || die "holistic frontend '$FRONT' not found under the configured checkout — cannot wire the UI of '$REPO' in" 5
+
+# WHO builds the dashboard: the OWNER of the checkout, never root. Measured, not assumed — the build
+# writes node_modules/dist into the checkout, so it must run as whoever owns that tree, or it leaves
+# foreign-owned files behind (root did exactly that: 109 root-owned files the operator then could not
+# touch). A root-owned checkout is itself the misconfiguration this rule removes, so it is refused by
+# name rather than silently building as root again.
+CO_OWNER="$(stat -c %U "$HOLISTIC_REPO" 2>/dev/null || true)"
+CO_GROUP="$(stat -c %G "$HOLISTIC_REPO" 2>/dev/null || true)"
+{ [ -n "$CO_OWNER" ] && [ "$CO_OWNER" != root ]; } \
+  || die "holistic checkout '$HOLISTIC_REPO' is owned by '${CO_OWNER:-?}' — the dashboard build must run unprivileged (root never builds); give the checkout a non-root owner" 5
+CO_HOME="$(getent passwd "$CO_OWNER" | cut -d: -f6)"
+
+# WHERE the browser reads the dashboard from — the serve root. Instance config like the checkout: env
+# seam, root-owned file, else the holistic convention. This is the MEASURE of the ui half: a build that
+# does not reach here has not been delivered, whatever the checkout's build output says.
+if [ -z "$HOLISTIC_WWW" ] && [ -r "$HOLISTIC_WWW_FILE" ]; then
+  HOLISTIC_WWW="$(head -n1 -- "$HOLISTIC_WWW_FILE" | tr -d '[:space:]')"
+fi
+[ -n "$HOLISTIC_WWW" ] || HOLISTIC_WWW="$HOLISTIC_WWW_DEFAULT"
+DIST_DIR="$FRONT/$HOLISTIC_DIST"
+
+# ── the ONE rule for relocating a service ui into the dashboard ──────────────────────────────────
+# The delivery MOVES a tree whose editor configuration knows its ORIGINAL place. A service
+# ui/tsconfig.json extends the dashboard base by a path that resolves only where the service repo sits
+# BESIDE holistic (../../holistic/frontend/tsconfig.base.json); once copied into
+# <frontend>/external/<repo> that path climbs out of the tree into nothing, and the vite build dies
+# before it starts — for EVERY ui-bearing service, since they all carry that same line. The
+# AUTHORITATIVE build is the dashboard's OWN (this very rebuild); the tsconfig inside a service is
+# editor convenience, by its own header. So the relocation NEUTRALISES it: the editor-only TS project
+# configs are NOT copied into the dashboard, and the dashboard's own config governs external/<repo>/src.
+# The fault is straightened at the SINGLE point where the tree changes location — the service sources
+# are copied verbatim and never rewritten. Both the real wire-in and the --check simulation call THIS
+# one function, so the acceptance guards exactly the behaviour that ships. Never a symlink: a link into
+# the user-writable workspace would let the checkout mutate what the dashboard builds after vetting.
+wire_ui_copy() {  # <src> <dst>
+  install -d -m 0755 "$2"
+  rsync -a --delete --exclude='/tsconfig.json' --exclude='/tsconfig.*.json' "$1/" "$2/"
+}
+
+# serve_dashboard is the DELIVERY step whose absence was the whole bug: it copies the built bundle to
+# the serve root the browser fetches. Install-only (a plain copy of already-built bytes — root does
+# not build here), so both the real path and the --check simulation call this ONE function and the
+# acceptance guards exactly the copy that ships.
+serve_dashboard() {  # <built-bundle-dir> <serve-root>
+  install -d -m 0755 "$2"
+  rsync -a --delete "$1/" "$2/"
+}
+
+# serve_stamp is the before/after proof of arrival: the newest file mtime under the serve root. The
+# measure of the ui half is THIS tree's timestamp, not the checkout's build output.
+serve_stamp() {  # <serve-root>
+  if [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; then
+    # `|| true`: a permission-denied in find must not, under pipefail, abort the delivery it is only
+    # trying to describe.
+    { find "$1" -type f -printf '%TY-%Tm-%Td %TH:%TM:%TS\n' 2>/dev/null | sort | tail -n1; } || true
+  else
+    echo "(empty)"
+  fi
+}
+
+# build_dashboard rebuilds the shared dashboard AS THE CHECKOUT OWNER — runuser drops root's privilege
+# so npm runs unprivileged and every file it writes is owned by the checkout owner, not root (E §7.4:
+# root never builds). A login shell loads that user's own toolchain (node/npm on their PATH), exactly
+# as the operator would build by hand.
+build_dashboard() {
+  runuser -u "$CO_OWNER" -- env -i \
+    HOME="$CO_HOME" USER="$CO_OWNER" LOGNAME="$CO_OWNER" PATH="/usr/local/bin:/usr/bin:/bin" CI=true \
+    bash -lc 'cd "$1" || exit 1; if [ ! -d node_modules ]; then npm ci --no-audit --no-fund || exit 1; fi; npm run build' _ "$FRONT" 2>&1
+}
+
+if [ "$CHECK" = 1 ]; then
+  echo "PLAN: rsync the service ui source $UI_SRC -> $EXT (validated copy, never a symlink into the workspace), then chown to the checkout owner '$CO_OWNER' so root leaves no file in the operator's checkout"
+  # Prove BOTH location-changing steps against a throwaway pair with the very functions the real path
+  # uses, without touching anything persistent: (a) the wire-in must NOT carry the editor tsconfig out
+  # of its tree, and (b) the serve step must actually move a built bundle to the serve root — the step
+  # whose ABSENCE let a rebuilt dashboard never reach the browser.
+  sim="$(mktemp -d)"
+  wire_ui_copy "$UI_SRC" "$sim/ext"
+  leaked="$(cd "$sim/ext" && ls tsconfig.json tsconfig.*.json 2>/dev/null || true)"
+  mkdir -p "$sim/dist"; echo "sentinel" > "$sim/dist/index.html"
+  serve_dashboard "$sim/dist" "$sim/www"
+  arrived=no; if [ -f "$sim/www/index.html" ]; then arrived=yes; fi
+  rm -rf -- "$sim"
+  if [ -n "$leaked" ]; then
+    echo "PLAN: FAULT — an editor tsconfig would be copied into external/$REPO and break the dashboard build: $leaked"
+    echo "MERCURY-UI: would-fail"
+    exit 2
+  fi
+  if [ "$arrived" != yes ]; then
+    echo "PLAN: FAULT — the serve step did not deliver the bundle to the serve root (the browser would keep the old one)"
+    echo "MERCURY-UI: would-fail"
+    exit 2
+  fi
+  echo "PLAN: editor-only tsconfig is neutralised (not copied) — the dashboard's own build config governs external/$REPO"
+  echo "PLAN: rebuild the shared dashboard in $FRONT AS THE CHECKOUT OWNER '$CO_OWNER' (runuser — root never builds; no root-owned file lands in the operator's checkout)"
+  echo "PLAN: DELIVER the built bundle $DIST_DIR -> the serve root $HOLISTIC_WWW (rsync --delete + chown to its owner) — this is what the browser fetches; serve-copy verified on a throwaway pair (bundle arrived)"
+  echo "PLAN: MERCURY-UI: built is reported ONLY after the bundle has ARRIVED at $HOLISTIC_WWW — a rebuilt-but-undelivered dashboard fails, never green"
+  echo "PLAN: a build failure naming external/$REPO removes $EXT and fails with the real error (MERCURY-UI: failed)"
+  echo "PLAN: a build failure naming ANOTHER service keeps $EXT and is reported, not charged to '$REPO' (MERCURY-UI: foreign-blocked)"
+  echo "MERCURY-UI: planned"
+  exit 0
+fi
+
+# (1) Wire the vetted ui source into the dashboard, neutralising the editor-only tsconfig (wire_ui_copy).
+# rm -rf first for a clean slate. root did the copy (it reads the group-owned artifact the checkout
+# owner cannot), so chown the result to the checkout owner immediately — no root-owned file stays behind.
+if [ ! -d "$FRONT/external" ]; then
+  install -d -m 0755 "$FRONT/external"; chown "$CO_OWNER:$CO_GROUP" "$FRONT/external" 2>/dev/null || true
+fi
+rm -rf -- "$EXT"
+wire_ui_copy "$UI_SRC" "$EXT"
+chown -R "$CO_OWNER:$CO_GROUP" "$EXT" 2>/dev/null || true
+
+# (2) Rebuild the shared dashboard AS THE CHECKOUT OWNER (root never builds). It is EXPENSIVE and
+# compiles every wired-in service at once; it runs ONCE per UI-bearing delivery — the minimal cadence
+# that still proves "the user sees it".
+if build_out="$(build_dashboard)"; then
+  # (3) DELIVER: the bundle only counts once it sits where the browser reads. Prove the build produced
+  # one, copy it to the serve root, chown it back to the serve root's owner (root's copy leaves no
+  # root-owned file there either), and confirm it arrived — THEN, and only then, report built.
+  { [ -d "$DIST_DIR" ] && [ -n "$(ls -A "$DIST_DIR" 2>/dev/null)" ]; } || {
+    echo "MERCURY-UI: failed"
+    die "the shared dashboard build reported success but produced no bundle at $DIST_DIR — nothing to deliver; a rebuilt-but-undelivered dashboard is a failure, not green" 4
+  }
+  www_before="$(serve_stamp "$HOLISTIC_WWW")"
+  www_owner="$(stat -c %U "$HOLISTIC_WWW" 2>/dev/null || true)"
+  www_group="$(stat -c %G "$HOLISTIC_WWW" 2>/dev/null || true)"
+  serve_dashboard "$DIST_DIR" "$HOLISTIC_WWW"
+  [ -n "$www_owner" ] && chown -R "$www_owner:$www_group" "$HOLISTIC_WWW" 2>/dev/null || true
+  [ -n "$(ls -A "$HOLISTIC_WWW" 2>/dev/null)" ] || {
+    echo "MERCURY-UI: failed"
+    die "the serve-copy delivered nothing to the serve root $HOLISTIC_WWW — the browser would keep serving the old bundle" 4
+  }
+  www_after="$(serve_stamp "$HOLISTIC_WWW")"
+  echo "MERCURY-UI: built"
+  log "service '$REPO' ui wired into $EXT; dashboard rebuilt as '$CO_OWNER' (root never built); bundle delivered to the serve root $HOLISTIC_WWW — the browser now serves the new dashboard (serve root: was [$www_before], now [$www_after])"
+  exit 0
+fi
+
+# The build failed. A SHARED build must not fail THIS service for ANOTHER service's broken ui — but it
+# must not hide it either. Attribution is by the paths the toolchain names: a failure touching
+# external/<repo> is OURS; one that never names it belongs to a service broken before this delivery.
+if printf '%s\n' "$build_out" | grep -qF "external/$REPO"; then
+  rm -rf -- "$EXT"     # leave no half-wired, unbuildable tree behind — the next attempt starts clean
+  echo "MERCURY-UI: failed"
+  die "service '$REPO' ui does not build in the dashboard (lint/typecheck/vite) — removed $EXT: $(printf '%s' "$build_out" | tail -n 20)" 4
+fi
+# Blocked by another service: this ui is wired and neutralised, but the shared bundle did NOT rebuild,
+# so there is nothing new to deliver — reported, not charged to '$REPO', and NOT served (serving a
+# failed build would push a broken dashboard to the browser).
+echo "MERCURY-UI: foreign-blocked | $(printf '%s' "$build_out" | tail -n 3 | tr '\n' ' ')"
+log "service '$REPO' ui wired into $EXT and verified, but the shared dashboard build is blocked by another service — reported, not charged to '$REPO'; nothing delivered to the serve root"
+exit 0
