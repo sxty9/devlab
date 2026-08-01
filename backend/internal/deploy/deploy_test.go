@@ -187,11 +187,12 @@ func TestFindGapsDistinguishesStates(t *testing.T) {
 type fakeInstaller struct {
 	calls []string
 	err   error
+	res   InstallResult // the UI half the wrapper would report
 }
 
-func (f *fakeInstaller) Install(_ context.Context, repo, artifactDir, env string, port int, handover bool) error {
+func (f *fakeInstaller) Install(_ context.Context, repo, artifactDir, env string, port int, handover bool) (InstallResult, error) {
 	f.calls = append(f.calls, fmt.Sprintf("%s %s %s port=%d handover=%v", repo, artifactDir, env, port, handover))
-	return f.err
+	return f.res, f.err
 }
 
 type fakePorts struct {
@@ -285,6 +286,76 @@ func TestDeliverDevFreshTemplateServiceWithoutSetup(t *testing.T) {
 	}
 	if !strings.Contains(out.Detail, "installed and started") {
 		t.Errorf("detail = %q", out.Detail)
+	}
+}
+
+// Both halves are reported: the wrapper's UI outcome rides into the Outcome so the stage can name
+// program AND ui separately (a delivery ships all a service needs, not just its program).
+func TestDeliverDevReportsUIHalf(t *testing.T) {
+	ri := &fakeInstaller{res: InstallResult{UI: UIBuilt}}
+	out, err := DeliverDev(context.Background(), ri, fakePorts{port: 8775}, greenGate(),
+		Detection{Kind: KindService, ID: "svc", Evidence: "./service"}, "svc", "/tmp/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.UI != UIBuilt {
+		t.Errorf("the ui half must be reported, got %q", out.UI)
+	}
+}
+
+// A ui that cannot be built in is a NAMED failure of the delivery: the program installed, but the
+// stage still fails and reports which half broke — never a green stage over a half service (K-4).
+func TestDeliverDevUIFailureFailsStageButNamesProgram(t *testing.T) {
+	ri := &fakeInstaller{
+		res: InstallResult{UI: UIFailed},
+		err: errors.New("exit status 4: service 'svc' ui does not build in the dashboard"),
+	}
+	out, err := DeliverDev(context.Background(), ri, fakePorts{port: 8776}, greenGate(),
+		Detection{Kind: KindService, ID: "svc", Evidence: "./service"}, "svc", "/tmp/a")
+	if err == nil {
+		t.Fatal("a ui that does not build must fail the stage")
+	}
+	if !out.Installed {
+		t.Errorf("the program reached the ui step, so it is installed: %+v", out)
+	}
+	if out.Running {
+		t.Errorf("a failed install is never reported running: %+v", out)
+	}
+	if out.UI != UIFailed {
+		t.Errorf("the failing half must be named, got %q", out.UI)
+	}
+}
+
+// A foreign service's broken ui blocks the shared build but must NOT fail THIS delivery — it is
+// reported, not charged to this service (the outcome carries the foreign-blocked state + detail).
+func TestDeliverDevForeignBlockedUIStillDelivers(t *testing.T) {
+	ri := &fakeInstaller{res: InstallResult{UI: UIForeign, UIDetail: "external/other: TS2307"}}
+	out, err := DeliverDev(context.Background(), ri, fakePorts{port: 8777}, greenGate(),
+		Detection{Kind: KindService, ID: "svc", Evidence: "./service"}, "svc", "/tmp/a")
+	if err != nil {
+		t.Fatalf("a foreign ui failure must not fail this delivery: %v", err)
+	}
+	if out.UI != UIForeign || out.UIDetail == "" {
+		t.Errorf("the foreign block must be reported with its reason: %+v", out)
+	}
+}
+
+// parseUILine reads the wrapper's machine-readable half-report off the combined output.
+func TestParseUILine(t *testing.T) {
+	for _, tc := range []struct {
+		out    string
+		state  UIState
+		detail string
+	}{
+		{"install-only deploy done\nMERCURY-UI: built\n", UIBuilt, ""},
+		{"MERCURY-UI: none", UINone, ""},
+		{"MERCURY-UI: foreign-blocked | external/other: TS2307 here", UIForeign, "external/other: TS2307 here"},
+		{"no ui line at all", "", ""},
+	} {
+		got := parseUILine(tc.out)
+		if got.UI != tc.state || got.UIDetail != tc.detail {
+			t.Errorf("parseUILine(%q) = %+v, want %q / %q", tc.out, got, tc.state, tc.detail)
+		}
 	}
 }
 
