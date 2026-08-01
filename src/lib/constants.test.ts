@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { aigenticUrl, devServiceUrl, holisticOrigin, instanceBaseDomain, serviceTabUrl } from './constants.ts';
+import { aigenticUrl, devServiceUrl, holisticOrigin, instanceBaseDomain, instanceEnvSuffix, serviceTabUrl } from './constants.ts';
 
 /** Serve the module from a given host, the way a browser would. */
 function servedFrom(hostname: string, protocol = 'https:') {
@@ -43,6 +43,29 @@ test('the dashboard, a service tab and the AI service all follow from that one d
   assert.equal(holisticOrigin(), 'http://holistic.example.org');
 });
 
+test('a jump stays inside its environment — a dev host never reaches production', () => {
+  // The environment marker rides on the first label and is carried to every sibling: a session
+  // opened from DevLab dev lands in the Holistic DEV dashboard, not in production with live data.
+  servedFrom('devlab-dev.example.org');
+  assert.equal(instanceBaseDomain(), 'example.org', 'the zone is shared by every environment');
+  assert.equal(instanceEnvSuffix(), '-dev');
+  assert.equal(holisticOrigin(), 'https://holistic-dev.example.org');
+  assert.equal(serviceTabUrl('remshel'), 'https://holistic-dev.example.org/app/remshel');
+  assert.equal(aigenticUrl(), 'https://holistic-dev.example.org/app/aigentic');
+  assert.equal(devServiceUrl('prizm'), 'https://holistic-dev.example.org/app/prizm');
+
+  // Production carries no marker, so it reaches production — and nothing else.
+  servedFrom('devlab.example.org');
+  assert.equal(instanceEnvSuffix(), '');
+  assert.equal(holisticOrigin(), 'https://holistic.example.org');
+
+  // A host that matches neither the plain prod shape nor the `-dev` one keeps its own marker: an
+  // unrecognised environment stays named (`-staging`) and does NOT collapse into production.
+  servedFrom('devlab-staging.example.org');
+  assert.equal(instanceEnvSuffix(), '-staging');
+  assert.equal(holisticOrigin(), 'https://holistic-staging.example.org');
+});
+
 test('without a zone everything stays on the current origin, and without a window on a path', () => {
   servedFrom('localhost:5173'.split(':')[0]);
   assert.equal(holisticOrigin(), 'https://localhost');
@@ -71,7 +94,7 @@ test('this module holds no instance literal, and it is the only place that deriv
     if (path === join(here, 'constants.ts')) continue;
     const other = readFileSync(path, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
     assert.ok(
-      !/holistic\.\$\{|`.*\/\/holistic\./.test(other),
+      !/holistic[-.]?\$\{|`.*\/\/holistic[-.]/.test(other),
       `${path.slice(root.length + 1)} must take the dashboard origin from lib/constants`,
     );
   }
