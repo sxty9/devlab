@@ -32,6 +32,7 @@ type MaintainFunc func(ctx context.Context) error
 // Config are the scheduler's runtime knobs (env only seeds them; runtime wins).
 type Config struct {
 	Tick            time.Duration
+	MaintainEvery   time.Duration
 	ResumeWindow    time.Duration
 	DrainGrace      time.Duration
 	MaxDuration     time.Duration
@@ -108,6 +109,12 @@ func New(cfg Config, docs *execstate.Store, rs *runs.Store, res *runs.ResultStor
 	gate PreflightGate, exec ExecFunc, maintain MaintainFunc, pub live.Publisher) *Scheduler {
 	if cfg.Tick <= 0 {
 		cfg.Tick = 30 * time.Second
+	}
+	if cfg.MaintainEvery <= 0 {
+		// The admission tick is fast (it lets contended executions in); GitHub PR maintenance is NOT.
+		// A tracked pull request read every 20 s over dozens of entries exhausts the hourly request
+		// budget, so the maintenance runs on its own, far wider cadence — decoupled from the tick.
+		cfg.MaintainEvery = 5 * time.Minute
 	}
 	if cfg.ResumeWindow <= 0 {
 		cfg.ResumeWindow = 240 * time.Hour
@@ -232,10 +239,15 @@ func (s *Scheduler) abandonedByAge(d execstate.Doc, now time.Time) bool {
 	return now.Sub(ref) > s.cfg.ResumeWindow
 }
 
-// loop is the tick: maintenance, limit-pause probes, queued promotion, due fires.
+// loop runs two independent cadences: the fast admission tick (limit-pause probes, queued
+// promotion, due fires) and the much slower PR maintenance. They are SEPARATE tickers on purpose —
+// the maintenance reads GitHub, and running it at the admission tick's pace is what exhausted the
+// hourly request budget.
 func (s *Scheduler) loop(ctx context.Context) {
 	t := time.NewTicker(s.cfg.Tick)
 	defer t.Stop()
+	mt := time.NewTicker(s.cfg.MaintainEvery)
+	defer mt.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -243,8 +255,9 @@ func (s *Scheduler) loop(ctx context.Context) {
 		case <-s.poke:
 			s.pass(ctx, false)
 		case <-t.C:
-			s.runMaintain(ctx)
 			s.pass(ctx, true)
+		case <-mt.C:
+			s.runMaintain(ctx)
 		}
 	}
 }

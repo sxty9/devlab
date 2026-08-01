@@ -116,3 +116,10 @@ func (g liveGitHub) PostCommitStatus(ctx context.Context, repo, sha, statusConte
 func (g liveGitHub) DefaultBranch(ctx context.Context, repo string) (string, error) {
 	return github.DefaultBranch(ctx, g.token, repo)
 }
+
+// RateBudget maps the github client's last observed request budget onto the maintenance view. It
+// makes no call: the snapshot is filled from the headers of every response the client already made.
+func (g liveGitHub) RateBudget() RateBudget {
+	s := github.RateLimit()
+	return RateBudget{Known: s.Known, Remaining: s.Remaining, Limit: s.Limit, Reset: s.Reset}
+}

@@ -317,6 +317,7 @@ func protectionLoop(ctx context.Context, delay, interval time.Duration, pass fun
 func schedConfig() sched.Config {
 	return sched.Config{
 		Tick:            envDuration("DEVLAB_RUNS_TICK", 30*time.Second),
+		MaintainEvery:   envDuration("DEVLAB_RUNS_MAINTAIN_INTERVAL", 5*time.Minute),
 		ResumeWindow:    envDuration("DEVLAB_RUNS_RESUME_WINDOW", 240*time.Hour),
 		DrainGrace:      envDuration("DEVLAB_RUNS_DRAIN_GRACE", 60*time.Second),
 		MaxDuration:     envDuration("DEVLAB_RUNS_MAX_DURATION", 0),

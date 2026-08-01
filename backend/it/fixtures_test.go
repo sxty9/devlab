@@ -969,6 +969,9 @@ func (g fixtureGH) DefaultBranch(_ context.Context, repo string) (string, error)
 	return "main", nil
 }
 
+// RateBudget: the in-memory fixture has no request window — an unknown budget reads normally.
+func (g fixtureGH) RateBudget() deliver.RateBudget { return deliver.RateBudget{} }
+
 // commitStatus reports the delivery-origin verdict posted for one commit ("" when none).
 func (d *fixtureDeps) commitStatus(repo, sha string) string {
 	gh := d.world.gh

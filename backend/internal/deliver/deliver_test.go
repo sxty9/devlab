@@ -53,6 +53,8 @@ type fakeGH struct {
 	cbCalls      []string // "repo|reversalBranch"
 	redelivered  []string
 	redeliverErr error
+
+	budget RateBudget // the observed request budget the maintenance consults before reading
 }
 
 func newFakeGH() *fakeGH {
@@ -177,6 +179,12 @@ func (f *fakeGH) PostCommitStatus(_ context.Context, repo, sha, statusContext, s
 
 func (f *fakeGH) DefaultBranch(_ context.Context, _ string) (string, error) {
 	return f.defaultBranch, nil
+}
+
+func (f *fakeGH) RateBudget() RateBudget {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.budget
 }
 
 func (f *fakeGH) CounterBook(_ context.Context, d runs.Delivery, reversalBranch string) (CounterBookResult, error) {
@@ -1076,6 +1084,97 @@ func TestMaintainOriginStatuses(t *testing.T) {
 	}
 	if v := got["h2"]; !strings.HasPrefix(v, "failure|") {
 		t.Errorf("a namesake branch without its own record must fail, got %q", v)
+	}
+}
+
+// TestMaintainThrottlesReadsByDeadline is the NACHWEIS (point 6): with many tracked pull requests
+// whose merge deadlines are far away, a run of maintenance passes produces a bounded, NAMED number
+// of GitHub reads — exactly one read per pull request across the whole run, NOT one per pull request
+// per pass. Before the fix, 50 pull requests over 5 passes read 250 times; here they read 50 times,
+// because a not-yet-due pull request rechecked moments ago spends no request.
+func TestMaintainThrottlesReadsByDeadline(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+
+	const nPRs = 50
+	farOff := time.Now().Add(720 * time.Hour) // the shipped default window — weeks away, never due
+	for i := 1; i <= nPRs; i++ {
+		d := runs.Delivery{ID: fmt.Sprintf("dlv_%d", i), Repo: "o/x", Branch: fmt.Sprintf("fix/n%d-aaa111", i), PRNumber: i, CreatedAt: t0.Add(time.Duration(i) * time.Second)}
+		_ = ledger.Put(d)
+		_ = prs.Add(runs.PendingPR{Repo: "o/x", Number: i, DeliveryID: d.ID, CreatedAt: d.CreatedAt, MergeBy: farOff})
+		gh.prState[key("o/x", i)] = PRState{Number: i, State: "open", HeadRef: d.Branch, HeadSHA: fmt.Sprintf("c%d", i)}
+	}
+
+	const passes = 5
+	for p := 0; p < passes; p++ {
+		if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+			t.Fatalf("Maintain pass %d: %v", p, err)
+		}
+	}
+
+	// The NAMED bound: one read per pull request across ALL passes — the first pass learns each
+	// pull request's state, the rest find the recheck interval not yet elapsed and read nothing.
+	if gh.getPRCalls != nPRs {
+		t.Fatalf("throttle failed: %d pull requests over %d passes must read %d times (once each), not %d — %d per tick would be %d",
+			nPRs, passes, nPRs, gh.getPRCalls, nPRs, nPRs*passes)
+	}
+	// Nothing was merged (none is due) and everything stays tracked for its eventual window.
+	if len(gh.mergeCalls) != 0 {
+		t.Errorf("no far-off pull request may be merged, merges = %v", gh.mergeCalls)
+	}
+	if left, _ := prs.List(); len(left) != nPRs {
+		t.Errorf("every pull request must stay tracked, left %d of %d", len(left), nPRs)
+	}
+}
+
+// TestMaintainQuotaExhaustedIsSharedAndSelfEnding pins points 3 and 5: an empty request budget is
+// ONE shared standstill, not a blockade on each entry. The pass reads nothing, blocks no pull
+// request, states the standstill once, and — when the window refills — resumes on its own.
+func TestMaintainQuotaExhaustedIsSharedAndSelfEnding(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	now := time.Now()
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, now.Add(-time.Hour))) // overdue — an armed pass with budget WOULD merge it
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d.Branch, HeadSHA: "c1"}
+	_ = res.Put(runs.Result{ID: "exec_1", RunID: "run_1", Kind: model.KindTodo, StartedAt: t0})
+
+	// Budget exhausted, window not yet reset.
+	gh.budget = RateBudget{Known: true, Remaining: 0, Limit: 5000, Reset: now.Add(time.Hour)}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("an empty budget is a standstill, not a failure: %v", err)
+	}
+	if gh.getPRCalls != 0 {
+		t.Errorf("the exhausted pass must read nothing, read %d time(s)", gh.getPRCalls)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Errorf("the exhausted pass must merge nothing, merges = %v", gh.mergeCalls)
+	}
+	// Not a per-PR blockade: the single tracked pull request stays exactly as it was.
+	left, _ := prs.List()
+	if len(left) != 1 || left[0].Blocked || left[0].Backoff != nil {
+		t.Errorf("an empty budget must not block a pull request, got %+v", left)
+	}
+	// One shared standstill in the feed, and it names the self-ending nature.
+	notices, _ := n.List()
+	if len(notices) != 1 || notices[0].Kind != runs.NoticeGitHubQuota {
+		t.Fatalf("the shared standstill is not in the feed exactly once: %+v", notices)
+	}
+	if !strings.Contains(notices[0].Message(), "resumes by itself") {
+		t.Errorf("the notice must state that it ends on its own, got %q", notices[0].Message())
+	}
+
+	// The window refills — and the SAME situation is worked, without any per-PR resume.
+	gh.budget = RateBudget{Known: true, Remaining: 5000, Limit: 5000, Reset: now.Add(time.Hour)}
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain after refill: %v", err)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != "o/x|5|merge" {
+		t.Errorf("the refilled pass must merge what is due, merges = %v", gh.mergeCalls)
 	}
 }
 

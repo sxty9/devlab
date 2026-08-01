@@ -74,6 +74,10 @@ const (
 	// The standstill of the delivery maintenance: its writing half is not armed, so nothing is
 	// merged, pruned or stamped. A STATE the operator ends, and the reason nothing moves.
 	NoticeDeliveryHeld = "delivery-held"
+	// The shared, self-ending standstill of an exhausted GitHub request budget: a property of the
+	// whole request window, not of any single pull request, so nothing is blocked and it ends by
+	// itself once the window refills.
+	NoticeGitHubQuota = "github-quota"
 	// Delivery-origin findings (REQ-033): a protection that drifted, and a deliberate override.
 	NoticeProtectionDeviation = "protection-deviation"
 	NoticeAdminOverride       = "admin-override"

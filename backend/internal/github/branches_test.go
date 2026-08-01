@@ -109,6 +109,63 @@ func TestGetPullState(t *testing.T) {
 	}
 }
 
+// TestGetPullStateConditional pins the budget-thrift measures the maintenance relies on: the second
+// read of an UNCHANGED pull request is conditional (If-None-Match), GitHub answers 304, the client
+// returns the cached state WITHOUT decoding a body, and the rate-limit headers of every response are
+// recorded so the maintenance can stop before the budget is spent. A 304 does not count against the
+// GitHub budget — this is what makes the recurring "is it merged yet?" poll essentially free.
+func TestGetPullStateConditional(t *testing.T) {
+	const etag = `"abc123"`
+	var conditionalSeen bool
+	var served int
+	withFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/x/pulls/5" {
+			http.NotFound(w, r)
+			return
+		}
+		served++
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Remaining", "4321")
+		w.Header().Set("X-RateLimit-Reset", "1900000000")
+		if r.Header.Get("If-None-Match") == etag {
+			conditionalSeen = true
+			w.WriteHeader(http.StatusNotModified) // unchanged — no body, does not count against the budget
+			return
+		}
+		w.Header().Set("ETag", etag)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 5, "state": "open", "merged": false,
+			"head": map[string]any{"ref": "fix/one-aaa111", "sha": "c1"},
+		})
+	}))
+
+	first, err := GetPullState(context.Background(), "tok", "o/x", 5)
+	if err != nil {
+		t.Fatalf("first GetPullState: %v", err)
+	}
+	// The budget reading is captured from the response headers — not discovered by a rejected call.
+	if b := RateLimit(); !b.Known || b.Remaining != 4321 || b.Limit != 5000 {
+		t.Fatalf("rate budget not recorded from headers: %+v", b)
+	}
+
+	second, err := GetPullState(context.Background(), "tok", "o/x", 5)
+	if err != nil {
+		t.Fatalf("second GetPullState: %v", err)
+	}
+	if !conditionalSeen {
+		t.Error("the second read must be conditional (If-None-Match), so an unchanged PR is free")
+	}
+	if served != 2 {
+		t.Errorf("server saw %d requests, want 2 (the 304 still travels, it just does not cost budget)", served)
+	}
+	if second != first {
+		t.Errorf("a 304 must return the cached state, got %+v vs %+v", second, first)
+	}
+	if second.State != "open" || second.HeadSHA != "c1" {
+		t.Errorf("cached state wrong: %+v", second)
+	}
+}
+
 // TestListOpenPullHeads pins the origin-status input: every open PR with number, head ref AND
 // head SHA (the status is posted on the SHA).
 func TestListOpenPullHeads(t *testing.T) {

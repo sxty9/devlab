@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,33 +95,132 @@ func (r apiRepo) toRepo() Repo {
 
 // do issues an authenticated GET and decodes JSON into out. The token is used only here.
 func do(ctx context.Context, token, url string, out any) (*http.Response, error) {
+	res, _, err := doCond(ctx, token, url, "", out)
+	return res, err
+}
+
+// doCond is do with an optional conditional-request ETag. A non-empty etag is sent as
+// If-None-Match; GitHub then answers 304 Not Modified for an unchanged resource — a response that
+// does NOT count against the hourly request budget. On a 304 notModified is true and out is left
+// untouched (the caller supplies the last known value). Every response's rate-limit headers are
+// recorded (recordRateLimit), so a caller can stop BEFORE the budget is spent instead of
+// discovering an empty budget by a rejected request.
+func doCond(ctx context.Context, token, url, etag string, out any) (res *http.Response, notModified bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 	req.Header.Set("User-Agent", userAgent)
-	res, err := httpClient.Do(req)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	res, err = httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer res.Body.Close()
+	recordRateLimit(res.Header)
+	if res.StatusCode == http.StatusNotModified {
+		return res, true, nil
+	}
 	if res.StatusCode == http.StatusUnauthorized {
-		return res, ErrUnauthorized
+		return res, false, ErrUnauthorized
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-		return res, fmt.Errorf("github: %s: %s", res.Status, strings.TrimSpace(string(body)))
+		return res, false, fmt.Errorf("github: %s: %s", res.Status, strings.TrimSpace(string(body)))
 	}
 	if out != nil {
 		if err := json.NewDecoder(res.Body).Decode(out); err != nil {
-			return res, fmt.Errorf("github: decode: %w", err)
+			return res, false, fmt.Errorf("github: decode: %w", err)
 		}
 	}
-	return res, nil
+	return res, false, nil
 }
+
+// ── Rate-limit budget (the shared, finite request window) ────────────────────────────────
+//
+// GitHub returns the remaining budget of the hourly window on EVERY response (X-RateLimit-*). The
+// client keeps the last observed reading so a caller — above all the PR maintenance — can stop
+// reading before the window is empty, rather than learning it is empty from a rejected request.
+// This is process-wide because the budget is per TOKEN, not per call: the runner holds one token.
+type RateSnapshot struct {
+	Known     bool      // false until a real response was observed (a cold start reads normally)
+	Remaining int       // requests left in the current window
+	Limit     int       // the window's size (5000 for an authenticated user)
+	Reset     time.Time // when the window refills — the moment a standstill ends by itself
+}
+
+var (
+	rateMu   sync.Mutex
+	rateSnap RateSnapshot
+)
+
+// recordRateLimit folds one response's rate-limit headers into the shared snapshot. A response
+// without the headers (a non-API host, a transport error) leaves the last reading untouched.
+func recordRateLimit(h http.Header) {
+	rem := h.Get("X-RateLimit-Remaining")
+	if rem == "" {
+		return
+	}
+	n, err := strconv.Atoi(rem)
+	if err != nil {
+		return
+	}
+	snap := RateSnapshot{Known: true, Remaining: n}
+	if l, err := strconv.Atoi(h.Get("X-RateLimit-Limit")); err == nil {
+		snap.Limit = l
+	}
+	if r, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+		snap.Reset = time.Unix(r, 0).UTC()
+	}
+	rateMu.Lock()
+	rateSnap = snap
+	rateMu.Unlock()
+}
+
+// RateLimit returns the last observed request budget of the token's hourly window.
+func RateLimit() RateSnapshot {
+	rateMu.Lock()
+	defer rateMu.Unlock()
+	return rateSnap
+}
+
+// ── Conditional-request cache (unchanged reads cost nothing) ─────────────────────────────
+//
+// The maintenance re-reads the same pull requests again and again to notice a merge. With an ETag
+// the unchanged ones answer 304 and do not count against the budget, so the cache holds the last
+// ETag and the value it belonged to, keyed by request URL.
+type condCache struct {
+	mu sync.Mutex
+	m  map[string]condEntry
+}
+
+type condEntry struct {
+	etag  string
+	state PullState
+}
+
+func (c *condCache) get(url string) (etag string, state PullState, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[url]
+	return e.etag, e.state, ok
+}
+
+func (c *condCache) put(url, etag string, state PullState) {
+	if etag == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[url] = condEntry{etag: etag, state: state}
+}
+
+var pullConditional = &condCache{m: map[string]condEntry{}}
 
 // ErrUnauthorized means the token was rejected (revoked/expired) — the caller should prompt a relink.
 var ErrUnauthorized = errors.New("github: token unauthorized")
@@ -197,6 +297,7 @@ func doMethod(ctx context.Context, method, token, url string, body, out any) (*h
 		return nil, err
 	}
 	defer res.Body.Close()
+	recordRateLimit(res.Header)
 	if res.StatusCode == http.StatusUnauthorized {
 		return res, ErrUnauthorized
 	}
