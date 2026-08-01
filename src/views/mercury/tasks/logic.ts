@@ -12,6 +12,8 @@ import type {
   RunTarget,
   RunTuning,
 } from '../../../types';
+import type { BadgeTone } from '../../../ui/tint';
+import type { OpenTodoState } from './select';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 export const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
@@ -160,6 +162,39 @@ export function targetLabel(run: Pick<Run, 'targets'>, repos: Repo[]): string {
   return ts
     .map((t) => (t.create ? `new: ${t.repo}` : (repos.find((r) => r.id === t.repo)?.name ?? t.repo)))
     .join(', ');
+}
+
+/** The pill an open todo shows so its state reads at a glance, without a tooltip (the "intuitive by
+ *  design" axiom): a moving amber for the run in flight, a calm blue for the timed wait on a merge,
+ *  a still amber for the delivery held for a release, red for the failed one that needs a person,
+ *  grey for the untouched. Running pulses; nothing else does — so the moving one is never confused
+ *  with the held one. */
+export function openTodoStatePill(state: OpenTodoState): { label: string; tone: BadgeTone; pulse?: boolean } {
+  switch (state.kind) {
+    case 'not-run':
+      return { label: 'not run yet', tone: 'neutral' };
+    case 'running':
+      return { label: 'running', tone: 'warning', pulse: true };
+    case 'awaiting-merge':
+      return { label: 'awaiting merge', tone: 'accent' };
+    case 'blocked':
+      return { label: 'blocked', tone: 'warning' };
+    case 'failed':
+      return { label: 'failed', tone: 'danger' };
+  }
+}
+
+/** The extra line an open-todo state adds under its row when it has something specific to say: the
+ *  deadline the awaiting state waits on (formatted by the caller's clock), or the reason a delivery
+ *  is blocked. Empty for the states whose pill already says everything. `at` formats a timestamp. */
+export function openTodoStateNote(state: OpenTodoState, at: (iso: string) => string): string {
+  if (state.kind === 'awaiting-merge') {
+    return state.mergeBy ? `Merges automatically after ${at(state.mergeBy)}` : 'Merges automatically once its window elapses';
+  }
+  if (state.kind === 'blocked') {
+    return state.reason ? `Blocked: ${state.reason}` : 'Blocked — waits for a release';
+  }
+  return '';
 }
 
 // ── Attachments (REQ-007) — the ONE ingest pipeline for dialog AND clipboard ──

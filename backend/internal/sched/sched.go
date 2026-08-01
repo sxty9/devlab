@@ -342,7 +342,9 @@ func (s *Scheduler) resumeDueLimitPausesLocked() bool {
 
 // promoteQueuedLocked starts every queued document the admission rules allow, oldest first —
 // busy repos stay queued (put to the back by order), never skipped. StartCap (when set) bounds
-// one pass's start burst.
+// one pass's start burst. It is also where a queued start that can NEVER be kept is retired
+// visibly: a vanished run or one older than the resume window turns discarded with its reason and
+// an operator notice — the same sweep that keeps the promise is the one that reports breaking it.
 func (s *Scheduler) promoteQueuedLocked() bool {
 	if s.draining || s.restartPendingLocked() {
 		return false
@@ -353,18 +355,57 @@ func (s *Scheduler) promoteQueuedLocked() bool {
 		return false
 	}
 	set := s.settingsEffective()
+	now := s.now()
 	started := 0
 	changed := false
 	for _, d := range docs {
 		if d.Phase != model.PhaseQueued {
 			continue
 		}
-		if s.cfg.StartCap > 0 && started >= s.cfg.StartCap {
-			break
-		}
 		if s.running[d.ID] != nil {
 			// Its previous goroutine is still winding down — it pokes a new pass on exit.
 			continue
+		}
+		// A queued start is a promise, not an immortal one. The two reasons a promise cannot be
+		// kept — the run is gone, or the start is older than the resume window — end it VISIBLY:
+		// the document turns discarded WITH its reason, and an operator notice names it. A queued
+		// start never disappears in silence (REQ-018 · "verlieren ist erlaubt, schweigen nicht").
+		if s.abandonedByAge(d, now) {
+			upd, _ := s.docs.Update(d.ID, func(doc *execstate.Doc) error {
+				if doc.Phase != model.PhaseQueued {
+					return nil
+				}
+				doc.SetPhase(model.PhaseDiscarded, "abandoned: queued longer than the resume window", model.Actor{Autonomous: true}, now)
+				return nil
+			})
+			if upd.Phase == model.PhaseDiscarded {
+				s.notice("execution-abandoned", fmt.Sprintf("queued start of run %s (execution %s) abandoned: it waited longer than the resume window", d.RunID, d.ID))
+				changed = true
+			}
+			continue
+		}
+		// Run-existence is checked BEFORE admission so a vanished run is closed at once, never left
+		// to wait out a busy repository in silence.
+		run, ok, err := s.runs.Get(d.RunID)
+		if err != nil {
+			continue // a transient read error: leave it queued and retry next pass
+		}
+		if !ok {
+			upd, _ := s.docs.Update(d.ID, func(doc *execstate.Doc) error {
+				if doc.Phase != model.PhaseQueued {
+					return nil
+				}
+				doc.SetPhase(model.PhaseDiscarded, "run definition no longer exists", model.Actor{Autonomous: true}, now)
+				return nil
+			})
+			if upd.Phase == model.PhaseDiscarded {
+				s.notice("execution-abandoned", fmt.Sprintf("queued start of run %s (execution %s) abandoned: its run definition no longer exists", d.RunID, d.ID))
+				changed = true
+			}
+			continue
+		}
+		if s.cfg.StartCap > 0 && started >= s.cfg.StartCap {
+			continue // the start burst is spent this pass; the doc stays queued for the next
 		}
 		// Re-read the live picture each admission — an earlier start in this pass claims slots.
 		cur, err := s.docs.Live()
@@ -373,16 +414,6 @@ func (s *Scheduler) promoteQueuedLocked() bool {
 		}
 		dec, err := Admit(without(cur, d.ID), set, claimTargets(d), placementForDoc(d))
 		if err != nil || !dec.Admit {
-			continue
-		}
-		run, ok, err := s.runs.Get(d.RunID)
-		if err != nil || !ok {
-			// A queued document whose run definition vanished can never start — close it out.
-			_, _ = s.docs.Update(d.ID, func(doc *execstate.Doc) error {
-				doc.SetPhase(model.PhaseDiscarded, "run definition no longer exists", model.Actor{Autonomous: true}, s.now())
-				return nil
-			})
-			changed = true
 			continue
 		}
 		if err := s.startLocked(d.ID, run); err != nil {

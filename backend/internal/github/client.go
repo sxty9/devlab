@@ -254,8 +254,12 @@ func CreatePullRequest(ctx context.Context, token, fullName, head, base, title, 
 	}
 	payload := map[string]any{"title": title, "head": head, "base": base, "body": body}
 	var pr PullRequest
-	if _, err := doPost(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/pulls", payload, &pr); err != nil {
-		return PullRequest{}, err
+	// typed() attaches the HTTP status so faultclass can classify. A 422 here ("No commits between
+	// X and X", or a PR for this head already exists) is a construction fault of the request, NOT a
+	// transient hiccup: it must be classified Permanent so it earns ONE attempt, never four. Left
+	// untyped it would fall through to the Transient default and be retried pointlessly.
+	if res, err := doPost(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/pulls", payload, &pr); err != nil {
+		return PullRequest{}, typed(res, err)
 	}
 	return pr, nil
 }

@@ -25,6 +25,7 @@ type fakeBench struct {
 	mu          sync.Mutex
 	prep        PrepareInfo
 	prepErr     error
+	branch      string // the working-tree branch CurrentBranch reports (default "mercury-dev")
 	head        string
 	aheadNow    int // CommitsAhead result; CommitAll increments it
 	uncommitted bool
@@ -52,7 +53,7 @@ func newFakeBench() *fakeBench {
 	}
 }
 
-func (b *fakeBench) Prepare(ctx context.Context) (PrepareInfo, error) {
+func (b *fakeBench) Prepare(ctx context.Context, branch, base string) (PrepareInfo, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.prepares++
@@ -63,6 +64,12 @@ func (b *fakeBench) Prepare(ctx context.Context) (PrepareInfo, error) {
 }
 func (b *fakeBench) CleanUntracked(ctx context.Context) error { b.cleans++; return nil }
 func (b *fakeBench) Head(ctx context.Context) (string, error) { return b.head, nil }
+func (b *fakeBench) CurrentBranch(ctx context.Context) string {
+	if b.branch != "" {
+		return b.branch
+	}
+	return "mercury-dev"
+}
 func (b *fakeBench) CommitsAhead(ctx context.Context, since string) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -205,7 +212,7 @@ type fakeDeliver struct {
 	protections []string
 }
 
-func (d *fakeDeliver) NextPRBase(ctx context.Context, repo string) (string, error) {
+func (d *fakeDeliver) NextPRBase(ctx context.Context, repo, head string) (string, error) {
 	if d.baseErr != nil {
 		return "", d.baseErr
 	}

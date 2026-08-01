@@ -23,25 +23,25 @@ const publishAttempts = 3
 func (b *Bench) Publish(ctx context.Context) error {
 	var lastErr error
 	for attempt := 0; attempt < publishAttempts; attempt++ {
-		if _, err := b.ex.PushRefs(ctx, b.repo, b.token, false, Branch); err == nil {
+		if _, err := b.ex.PushRefs(ctx, b.repo, b.token, false, b.branch); err == nil {
 			return nil
 		} else {
 			lastErr = err
 		}
 		// Rejected (or failed): bring the remote in and try again — fold, never reset.
 		if err := b.ex.Fetch(ctx, b.repo, b.token); err != nil {
-			return fmt.Errorf("publish %s: push failed (%v) and refetch failed: %w", Branch, lastErr, err)
+			return fmt.Errorf("publish %s: push failed (%v) and refetch failed: %w", b.branch, lastErr, err)
 		}
-		if !b.refExists(ctx, "refs/remotes/origin/"+Branch) {
+		if !b.refExists(ctx, "refs/remotes/origin/"+b.branch) {
 			continue // nothing to fold — the failure was not a remote advance; retry the push
 		}
-		if err := b.ex.FoldInBranch(ctx, b.repo, Branch); err != nil {
+		if err := b.ex.FoldInBranch(ctx, b.repo, b.branch); err != nil {
 			if errors.Is(err, workspace.ErrMergeConflict) {
-				names := b.conflictNames(ctx, "refs/heads/"+Branch, "refs/remotes/origin/"+Branch)
-				return fmt.Errorf("publish %s: push rejected and the pushed state does not fold in cleanly (conflicts: %s); local state kept unchanged", Branch, nameList(names))
+				names := b.conflictNames(ctx, "refs/heads/"+b.branch, "refs/remotes/origin/"+b.branch)
+				return fmt.Errorf("publish %s: push rejected and the pushed state does not fold in cleanly (conflicts: %s); local state kept unchanged", b.branch, nameList(names))
 			}
-			return fmt.Errorf("publish %s: fold before retry: %w", Branch, err)
+			return fmt.Errorf("publish %s: fold before retry: %w", b.branch, err)
 		}
 	}
-	return fmt.Errorf("publish %s: %w", Branch, lastErr)
+	return fmt.Errorf("publish %s: %w", b.branch, lastErr)
 }

@@ -212,12 +212,19 @@ func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.Resol
 		return nil, err
 	}
 	ex := workspace.Executor{User: d.user, PerUser: true}
-	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, prompt, t, sess)), nil
+	// Name the branch the working tree is ACTUALLY on — each run works on its own order branch, so a
+	// preamble that always said "mercury-dev" told the agent a falsehood about where its commits land.
+	// The workbench constant is only the fallback when the measurement yields nothing (bare/detached).
+	branch := ex.CurrentBranch(ctx, wt)
+	if branch == "" || branch == "HEAD" {
+		branch = workbench.LegacyShared
+	}
+	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, branch, prompt, t, sess)), nil
 }
 
 // chainAgentArgs is the agent invocation of ONE stage, as a value — the seam that lets the
 // invocation be verified without a workspace and without root.
-func chainAgentArgs(repo, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
+func chainAgentArgs(repo, branch, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
@@ -242,7 +249,7 @@ func chainAgentArgs(repo, prompt string, t runs.ResolvedTuning, sess executor.Ag
 			args = append(args, "--session-id", sessionUUID(sess.Key, repo))
 		}
 	}
-	return append(args, "--append-system-prompt", chainPreamble(repo, t.Effort))
+	return append(args, "--append-system-prompt", chainPreamble(repo, branch, t.Effort))
 }
 
 // chainEffort maps the run's effort onto the CLI ladder. "ultracode" is DevLab's own maximal tier:
@@ -257,9 +264,12 @@ func chainEffort(effort string) string {
 // chainPreamble tells the agent what it is: the autonomous DevLab runner working on the workbench
 // of one repository. The constitution itself is NEVER composed here — it rides in the prompt
 // snapshot (REQ-002.1).
-func chainPreamble(repo, effort string) string {
+func chainPreamble(repo, branch, effort string) string {
+	if branch == "" {
+		branch = workbench.LegacyShared
+	}
 	s := "You are the autonomous DevLab runner. You work in the checked-out workspace of the " +
-		"repository \"" + repo + "\" on its long-lived working branch " + workbench.Branch + ". " +
+		"repository \"" + repo + "\" on its working branch " + branch + ". " +
 		"Implement what the task asks for, commit your work with clear messages, and state plainly " +
 		"what you did and what you did not do."
 	if effort == "ultracode" {
@@ -349,12 +359,16 @@ func (d *ChainDeps) Now() time.Time { return time.Now().UTC() }
 
 // WorkbenchState reports whether the workbench carries work the default branch does not. A repo the
 // runner has never cloned is not an error — there simply is no workbench yet.
-func (d *ChainDeps) WorkbenchState(ctx context.Context, repo string) (bool, string, error) {
+func (d *ChainDeps) WorkbenchState(ctx context.Context, repo, branch string) (bool, string, error) {
 	b, ok, err := d.observeBench(ctx, repo)
 	if err != nil || !ok {
 		return false, "", err
 	}
-	return b.AheadOfDefault(ctx)
+	on, err := b.On(branch)
+	if err != nil {
+		return false, "", err
+	}
+	return on.AheadOfDefault(ctx)
 }
 
 // ContainedInDefault reports whether a commit arrived in the default branch. Without a local
@@ -465,6 +479,13 @@ func (d *ChainDeps) observeBench(ctx context.Context, repo string) (*workbench.B
 	if err != nil {
 		return nil, false, err
 	}
+	// STEP 1 of the branch-per-task rebuild: the bench now CARRIES the branch it works on instead
+	// of reaching for one shared name. The observation path still names the retired shared branch,
+	// because that is where today's undelivered work lies; the per-task name is wired in with the
+	// stage that creates it.
+	if b, err = b.On(workbench.LegacyShared); err != nil {
+		return nil, false, err
+	}
 	b = b.WithToken(d.token)
 	// Best-effort refresh of the remote refs: observation wants the CURRENT default branch, but an
 	// unreachable remote must not turn the observation into a failure — the refs on disk still
@@ -482,12 +503,12 @@ type benchOps struct {
 
 // prepare maps the workbench's own report onto the motor's PrepareInfo (the seam keeps its own
 // shape so the motor stays mockable without importing the workbench).
-func (o benchOps) Prepare(ctx context.Context) (executor.PrepareInfo, error) {
+func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.PrepareInfo, error) {
 	b, _, err := o.d.bench(ctx, o.repo)
 	if err != nil {
 		return executor.PrepareInfo{}, err
 	}
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, branch, base)
 	info := executor.PrepareInfo{
 		Created:       res.Created,
 		FoldedRemote:  res.FoldedRemote,
@@ -513,6 +534,14 @@ func (o benchOps) Head(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return b.Head(ctx)
+}
+
+func (o benchOps) CurrentBranch(ctx context.Context) string {
+	b, _, err := o.d.bench(ctx, o.repo)
+	if err != nil {
+		return ""
+	}
+	return b.CurrentBranch(ctx)
 }
 
 func (o benchOps) CommitsAhead(ctx context.Context, since string) (int, error) {
@@ -636,7 +665,7 @@ func (g chainGitHub) CreateRepo(ctx context.Context, repo string, _ bool) error 
 
 type chainDeliver struct{ d *ChainDeps }
 
-func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, error) {
+func (c chainDeliver) NextPRBase(ctx context.Context, repo, head string) (string, error) {
 	if c.d.s.deliveries == nil {
 		return "", errors.New("the delivery ledger is not available")
 	}
@@ -648,11 +677,27 @@ func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, erro
 	if err != nil {
 		return "", err
 	}
+	// The stack top comes from the LEDGER, which is local. GitHub is only needed for the name of
+	// the default branch, and only when no delivery OTHER THAN head is open — so the common case
+	// asks GitHub nothing at all. This matters because the base is now resolved before every task
+	// starts: a throttled GitHub would otherwise stop the chain from beginning any work, which it
+	// did on 2026-07-31 ("resolve the base of this task's branch: github: 403"). head is excluded
+	// by the pure function, so this delivery is never chosen as its own base.
+	if base := deliver.NextPRBase(open, head, ""); base != "" {
+		return base, nil
+	}
 	def, err := github.DefaultBranch(ctx, c.d.token, full)
 	if err != nil {
+		// The local clone knows its default branch too — the SAME truth, read from the checkout
+		// instead of over the network. This is not a guess: an unresolvable name still fails.
+		if b, ok, berr := c.d.observeBench(ctx, repo); berr == nil && ok {
+			if local, lerr := b.DefaultBranchName(); lerr == nil && local != "" {
+				return local, nil
+			}
+		}
 		return "", err
 	}
-	return deliver.NextPRBase(open, def), nil
+	return deliver.NextPRBase(open, head, def), nil
 }
 
 // OpenOrAdoptPR writes the ledger INTENT and then rides deliver.OpenOrAdoptPR — the one PR path
@@ -752,6 +797,15 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	}
 	self := repoShort(repo) == selfRepo()
 	if self {
+		// The chain ships only the daemon binary; the root wrappers under sbin are replaced solely
+		// by a human with sudo (E §7.4). So BEFORE installing a new binary, prove the installed
+		// wrappers still match this checkout — otherwise a change touching deploy/devlab-install or
+		// deploy/devlab-exec would go live half-shipped and report green (measured 31.07./01.08.2026).
+		// A drift is a NAMED failure that installs nothing (no half state, K-4); it names each stale
+		// wrapper and the one line a human runs to make them current, then resumes the execution.
+		if err := deploy.GuardWrappersCurrent(wt); err != nil {
+			return executor.DeployOutcome{Self: true}, err
+		}
 		if err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact); err != nil {
 			return executor.DeployOutcome{Self: true}, err
 		}
@@ -763,6 +817,7 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	out, err := deploy.DeliverDev(ctx, deploy.SudoInstaller{}, deploy.LivePorts{}, deploy.DefaultGate(), det, repoShort(repo), artifact)
 	return executor.DeployOutcome{
 		Installed: out.Installed, Running: out.Running, Port: out.Port, Detail: out.Detail,
+		UI: string(out.UI), UIDetail: out.UIDetail,
 	}, err
 }
 
@@ -799,8 +854,17 @@ func startAgentStreamWith(ctx context.Context, run streamFunc) *agentStream {
 	go func() {
 		defer close(a.done)
 		a.err = run(runCtx, func(line []byte) {
+			// The callback hands over ONE line WITHOUT its terminator (workspace.runAgentCmd trims it),
+			// while the compaction on the other end splits the stream on '\n'. The terminator therefore
+			// has to be put back HERE. Without it every event of an invocation is glued into a single
+			// unparsable blob: no transcript line is ever emitted and the token counters stay at zero,
+			// while the agent works perfectly normally and the stage still succeeds. That is exactly
+			// how it stayed unnoticed — nothing fails, the numbers are just silently absent.
+			buf := make([]byte, 0, len(line)+1)
+			buf = append(buf, line...)
+			buf = append(buf, '\n')
 			// A write error means the reader is gone; the invocation is then stopped by the context.
-			if _, werr := pw.Write(line); werr != nil {
+			if _, werr := pw.Write(buf); werr != nil {
 				cancel()
 			}
 		})

@@ -11,7 +11,7 @@ import (
 // workbench from the default branch and says so (Created + FoldedDefault).
 func TestPrepareCreatesFromDefaultFirstTime(t *testing.T) {
 	_, wt, b := testRepo(t)
-	res, err := b.Prepare(context.Background())
+	res, err := b.Prepare(context.Background(), LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -21,8 +21,8 @@ func TestPrepareCreatesFromDefaultFirstTime(t *testing.T) {
 	if res.Conflicted || res.Recovered != 0 || len(res.Orphans) != 0 {
 		t.Errorf("first Prepare reported drama on a pristine repo: %+v", res)
 	}
-	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != Branch {
-		t.Errorf("working tree on %q, want %s", got, Branch)
+	if got := gitOut(t, wt, "rev-parse", "--abbrev-ref", "HEAD"); got != LegacyShared {
+		t.Errorf("working tree on %q, want %s", got, LegacyShared)
 	}
 	if res.Head == "" || res.Head != gitOut(t, wt, "rev-parse", "HEAD") {
 		t.Errorf("Head %q does not name the tip", res.Head)
@@ -36,7 +36,7 @@ func TestWorkbenchGrowsAcrossWorkspaces(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "run1.txt"), "built by run 1\n")
@@ -50,7 +50,7 @@ func TestWorkbenchGrowsAcrossWorkspaces(t *testing.T) {
 	wt2 := filepath.Join(t.TempDir(), "work2")
 	gitT(t, "", "clone", origin, wt2)
 	b2 := benchAt(t, wt2)
-	res, err := b2.Prepare(ctx)
+	res, err := b2.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare run2: %v", err)
 	}
@@ -63,8 +63,8 @@ func TestWorkbenchGrowsAcrossWorkspaces(t *testing.T) {
 	if !exists(wt2, "run1.txt") {
 		t.Errorf("run1's work missing after preparing the next run — the state was reset, not grown")
 	}
-	if got := gitOut(t, wt2, "rev-parse", "--abbrev-ref", "HEAD"); got != Branch {
-		t.Errorf("workspace on %q, want %s", got, Branch)
+	if got := gitOut(t, wt2, "rev-parse", "--abbrev-ref", "HEAD"); got != LegacyShared {
+		t.Errorf("workspace on %q, want %s", got, LegacyShared)
 	}
 }
 
@@ -77,7 +77,7 @@ func TestPrepareKeepsUnpushedLocalCommits(t *testing.T) {
 	ctx := context.Background()
 
 	// Run 1 establishes AND publishes the workbench, so origin/mercury-dev exists.
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "published.txt"), "published\n")
@@ -88,7 +88,7 @@ func TestPrepareKeepsUnpushedLocalCommits(t *testing.T) {
 	}
 
 	// Run 2 commits more work but is interrupted before any publish.
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "unpushed.txt"), "interrupted before publish\n")
@@ -98,7 +98,7 @@ func TestPrepareKeepsUnpushedLocalCommits(t *testing.T) {
 
 	// Run 3 prepares the SAME workspace again. The pre-fix machinery reset the branch onto
 	// origin/mercury-dev here and silently destroyed the commit.
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare run3: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestPrepareFirstRunUnpushedKept(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestPrepareFirstRunUnpushedKept(t *testing.T) {
 	gitCommit(t, wt, "first run work")
 	// No publish — origin/mercury-dev is never created (the run was interrupted).
 
-	res, err = b.Prepare(ctx)
+	res, err = b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestPrepareRemoteFoldConflictKeepsLocal(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "shared.txt"), "base\n")
@@ -178,7 +178,7 @@ func TestPrepareRemoteFoldConflictKeepsLocal(t *testing.T) {
 	gitCommit(t, wt, "local edits shared")
 	localTip := gitOut(t, wt, "rev-parse", "HEAD")
 
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("a fold conflict must be non-fatal, got: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestPrepareFoldsDivergedRemoteIn(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "base.txt"), "base\n")
@@ -219,7 +219,7 @@ func TestPrepareFoldsDivergedRemoteIn(t *testing.T) {
 	gitT(t, wt, "add", "-A")
 	gitCommit(t, wt, "local unpushed")
 
-	res, err := b.Prepare(ctx)
+	res, err := b.Prepare(ctx, LegacyShared, "")
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestFoldInDefaultGrowsOnly(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "dev-only.txt"), "dev work\n")
@@ -287,7 +287,7 @@ func TestFoldInDefaultConflictNamed(t *testing.T) {
 	origin, wt, b := testRepo(t)
 	ctx := context.Background()
 
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "README.md"), "dev version\n")
@@ -328,7 +328,7 @@ func TestFoldInDefaultRequiresPreparedWorkbench(t *testing.T) {
 func TestCleanUntrackedOnlyUnversioned(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "committed.txt"), "keep me\n")

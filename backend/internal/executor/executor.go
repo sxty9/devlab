@@ -50,9 +50,13 @@ type PrepareInfo struct {
 // composes. The adapter in cmd/devlabd implements it over workbench.Bench + workspace.Executor;
 // fixtures substitute the whole interface. No operation here ever resets committed work (K-1).
 type WorkbenchOps interface {
-	Prepare(ctx context.Context) (PrepareInfo, error)
+	// Prepare establishes THIS task's branch, cutting it from base when it does not exist yet.
+	Prepare(ctx context.Context, branch, base string) (PrepareInfo, error)
 	CleanUntracked(ctx context.Context) error
 	Head(ctx context.Context) (string, error)
+	// CurrentBranch names the branch the working tree is actually on — the honest branch a log line
+	// reports instead of a compile-time constant. Best-effort: "" when it cannot be measured.
+	CurrentBranch(ctx context.Context) string
 	// CommitsAhead counts commits on the workbench since the given commit.
 	CommitsAhead(ctx context.Context, since string) (int, error)
 	HasUncommitted(ctx context.Context) (bool, error)
@@ -88,9 +92,10 @@ type GitHubOps interface {
 
 // DeliverOps is the delivery slice (the ONE PR path + protection on repo creation).
 type DeliverOps interface {
-	// NextPRBase returns the stacked base of the next PR: the last open delivery's branch,
-	// else the default branch (REQ-024).
-	NextPRBase(ctx context.Context, repo string) (string, error)
+	// NextPRBase returns the stacked base of the next PR: the most recent open delivery's branch
+	// OTHER THAN head (the branch being delivered), else the default branch (REQ-024). Passing
+	// head lets the pure function exclude it, so a PR is never opened against itself.
+	NextPRBase(ctx context.Context, repo, head string) (string, error)
 	OpenOrAdoptPR(ctx context.Context, in DeliverPRIn) (model.PRRef, bool, error)
 	// EnsureProtection sets the full branch protection; failing to set it fails the repo
 	// creation (REQ-033.6).
@@ -123,6 +128,10 @@ type DeployOutcome struct {
 	Self      bool
 	Port      int
 	Detail    string
+	// UI names the dashboard-UI half's outcome, so the stage reports program AND ui separately;
+	// UIDetail carries the reason when another service blocks the shared dashboard build.
+	UI       string
+	UIDetail string
 }
 
 // DeployOps is the deploy slice (S11): detection and the one dev delivery (build as user,
@@ -268,6 +277,7 @@ type RepoCtx struct {
 
 	prepared        bool
 	prep            PrepareInfo
+	branch          string // the branch actually worked on (measured, not the workbench constant)
 	head            string // current workbench head
 	deliveryBase    string // head AFTER the fold — the delivery span start
 	deliveryCommits int
@@ -617,7 +627,7 @@ func (rc *RepoCtx) budgetAchieved() string {
 	if err != nil || n == 0 {
 		return "the transcript is preserved; no commits had been made yet"
 	}
-	return fmt.Sprintf("the transcript is preserved and %d commit(s) on %s are already published", n, workbenchBranch)
+	return fmt.Sprintf("the transcript is preserved and %d commit(s) on %s are already published", n, rc.branchName())
 }
 
 // takeFailLogOr returns the transcript tail when one was captured (F11 — a failed/killed agent
@@ -631,9 +641,22 @@ func (rc *RepoCtx) takeFailLogOr() string {
 	return rc.takeLog()
 }
 
-// workbenchBranch names the workbench in messages. The constant itself lives in package
-// workbench (S9); the literal here stays aligned by the vocabulary test.
+// workbenchBranch names the workbench in messages ONLY as a fallback — the honest source is the
+// branch actually checked out for this run (rc.branch, measured after Prepare). Each job long since
+// works on its OWN branch, so a log line that always said "mercury-dev" was a false statement about
+// which branch carried the work. The constant itself lives in package workbench (S9); the literal
+// here stays aligned by the vocabulary test.
 const workbenchBranch = "mercury-dev"
+
+// branchName is the branch this run actually worked on, measured from the working tree; it falls
+// back to the workbench constant only when no measurement is available (a stage that runs before
+// Prepare, e.g. a delivered-state skip).
+func (rc *RepoCtx) branchName() string {
+	if rc.branch != "" {
+		return rc.branch
+	}
+	return workbenchBranch
+}
 
 func isUsageLimit(err error) bool {
 	var ul *usageLimitError

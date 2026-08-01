@@ -23,7 +23,7 @@ import (
 // names its tip. A workbench that does not exist yet is not ahead and has no tip — that is an
 // ANSWER, not an error: the preflight observation "nothing implemented" needs exactly this.
 func (b *Bench) AheadOfDefault(ctx context.Context) (ahead bool, head string, err error) {
-	if !b.refExists(ctx, "refs/heads/"+Branch) {
+	if !b.refExists(ctx, "refs/heads/"+b.branch) {
 		return false, "", nil
 	}
 	head, err = b.Head(ctx)
@@ -40,7 +40,7 @@ func (b *Bench) AheadOfDefault(ctx context.Context) (ahead bool, head string, er
 		// what margin is unknown — say "ahead" rather than claim a clean slate.
 		return true, head, nil
 	}
-	n, err := b.countAhead(ctx, base, "refs/heads/"+Branch)
+	n, err := b.countAhead(ctx, base, "refs/heads/"+b.branch)
 	if err != nil {
 		return false, head, err
 	}
@@ -84,9 +84,9 @@ func (b *Bench) MergeBaseDefault(ctx context.Context) (string, error) {
 	if base == "" {
 		return "", fmt.Errorf("workbench: default branch %s resolves to no ref", def)
 	}
-	out, err := b.gitRO(ctx, "merge-base", base, "refs/heads/"+Branch)
+	out, err := b.gitRO(ctx, "merge-base", base, "refs/heads/"+b.branch)
 	if err != nil {
-		return "", fmt.Errorf("workbench: merge base of %s and %s: %w", Branch, base, err)
+		return "", fmt.Errorf("workbench: merge base of %s and %s: %w", b.branch, base, err)
 	}
 	return strings.TrimSpace(out), nil
 }
@@ -96,7 +96,7 @@ func (b *Bench) CommitsAhead(ctx context.Context, since string) (int, error) {
 	if strings.TrimSpace(since) == "" || strings.HasPrefix(since, "-") {
 		return 0, fmt.Errorf("workbench: invalid span start %q", since)
 	}
-	return b.countAhead(ctx, since, "refs/heads/"+Branch)
+	return b.countAhead(ctx, since, "refs/heads/"+b.branch)
 }
 
 // HasUncommitted reports whether anything is loose in the working tree (tracked edits, staged
@@ -160,6 +160,13 @@ func (b *Bench) WriteFile(rel string, data []byte) error {
 	return b.ex.WriteFileBytes(b.repo, rel, data)
 }
 
+// CurrentBranch names the branch the working tree is actually checked out on — the honest branch a
+// log line reports instead of the workbench constant. Best-effort through the ported read-only
+// primitive: "" (or "HEAD" when detached) on any hiccup, never an error that could sink a run.
+func (b *Bench) CurrentBranch(ctx context.Context) string {
+	return b.ex.CurrentBranch(ctx, b.repo)
+}
+
 // BranchAt snapshots a branch at a commit WITHOUT checking it out — the delivery branch is cut
 // from the workbench, so the workbench itself is never re-pointed (K-1).
 func (b *Bench) BranchAt(ctx context.Context, name, at string) error {
@@ -168,7 +175,7 @@ func (b *Bench) BranchAt(ctx context.Context, name, at string) error {
 
 // PushBranch pushes one named branch to origin (never forced).
 func (b *Bench) PushBranch(ctx context.Context, name string) error {
-	if name == Branch {
+	if name == b.branch {
 		// The workbench has its own publish path (fold + retry); routing it through here would
 		// be a second, weaker way to the same effect.
 		return b.Publish(ctx)

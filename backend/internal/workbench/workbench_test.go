@@ -46,7 +46,14 @@ func benchAt(t *testing.T, wt string) *Bench {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return b
+	// Every bench names the branch it works on — there is no shared fallback any more. The tests
+	// of this package are about the branch MECHANICS, so they use one fixed name; which name a
+	// task gets is the executor's decision, tested there.
+	on, err := b.On(LegacyShared)
+	if err != nil {
+		t.Fatalf("On: %v", err)
+	}
+	return on
 }
 
 // advanceMain advances origin's default branch from a throwaway clone — an external change
@@ -66,11 +73,11 @@ func advanceMain(t *testing.T, origin, name, content string) {
 func advanceDev(t *testing.T, origin, name, content string) {
 	t.Helper()
 	other := filepath.Join(t.TempDir(), "other")
-	gitT(t, "", "clone", "-b", Branch, origin, other)
+	gitT(t, "", "clone", "-b", LegacyShared, origin, other)
 	writeF(t, filepath.Join(other, name), content)
 	gitT(t, other, "add", "-A")
 	gitCommit(t, other, "remote work: "+name)
-	gitT(t, other, "push", "origin", Branch)
+	gitT(t, other, "push", "origin", LegacyShared)
 }
 
 func gitT(t *testing.T, dir string, args ...string) {
@@ -139,7 +146,7 @@ func exists(wt, rel string) bool {
 // commitReachable reports whether sha is an ancestor of (or equal to) the workbench tip.
 func commitReachable(t *testing.T, wt, sha string) bool {
 	t.Helper()
-	cmd := exec.Command("git", "-C", wt, "merge-base", "--is-ancestor", sha, "refs/heads/"+Branch)
+	cmd := exec.Command("git", "-C", wt, "merge-base", "--is-ancestor", sha, "refs/heads/"+LegacyShared)
 	cmd.Env = gitEnv()
 	return cmd.Run() == nil
 }
@@ -172,13 +179,13 @@ func TestNewGuardRefusesForeignWorkspace(t *testing.T) {
 func TestHeadNamesTheTip(t *testing.T) {
 	_, wt, b := testRepo(t)
 	ctx := context.Background()
-	if _, err := b.Prepare(ctx); err != nil {
+	if _, err := b.Prepare(ctx, LegacyShared, ""); err != nil {
 		t.Fatal(err)
 	}
 	writeF(t, filepath.Join(wt, "work.txt"), "work\n")
 	gitT(t, wt, "add", "-A")
 	gitCommit(t, wt, "work")
-	want := gitOut(t, wt, "rev-parse", "refs/heads/"+Branch)
+	want := gitOut(t, wt, "rev-parse", "refs/heads/"+LegacyShared)
 
 	got, err := b.Head(ctx)
 	if err != nil {

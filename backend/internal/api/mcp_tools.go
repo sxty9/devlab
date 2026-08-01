@@ -689,6 +689,15 @@ func mcpToolRows() []mcpTool {
 			Params: []mcpParam{pathArg("deliveryId", "id", "Delivery id from delivery_list.")},
 		},
 		{
+			Name: "delivery_resume", Desc: "Release the blockade of a blocked pull request so the maintenance evaluates it again. Merges nothing; safe to repeat. Without arguments it releases every blocked one.",
+			Op: "mercuryResumeDelivery", Method: http.MethodPost, Path: "/api/mercury/runs/deliveries/resume", Tier: tierCSRF,
+			Handler: (*Server).runPRResume,
+			Params: []mcpParam{
+				bodyArg("repo", mcp.KindString, false, "owner/name of ONE blocked pull request; omit to release all."),
+				bodyArg("number", mcp.KindNumber, false, "Its pull request number; required together with repo."),
+			},
+		},
+		{
 			Name: "repo_reset", Desc: "Discard the development branch of one repository and start it again from the default branch.",
 			Op: "mercuryRepoReset", Method: http.MethodPost, Path: "/api/mercury/runs/reset", Tier: tierCSRF,
 			Handler: (*Server).runRepoReset, Destructive: true,

@@ -18,9 +18,31 @@ import (
 // repo-provided code (E §7.4).
 const installWrapper = "/usr/local/sbin/devlab-install"
 
-// RootInstaller is the thin seam over `sudo devlab-install` (the pinned wrapper).
+// RootInstaller is the thin seam over `sudo devlab-install` (the pinned wrapper). Install returns
+// both halves' result: the InstallResult carries the UI outcome the wrapper reports, and err is the
+// program/UI failure (a UI half that could not be built in fails the install with its named reason).
 type RootInstaller interface {
-	Install(ctx context.Context, repo, artifactDir, env string, port int, handover bool) error
+	Install(ctx context.Context, repo, artifactDir, env string, port int, handover bool) (InstallResult, error)
+}
+
+// UIState is the outcome of a service's dashboard-UI half — one belegter Zustand, never silent.
+type UIState string
+
+const (
+	UINone      UIState = "none"            // the service ships no ui/ — the half is absent, said so
+	UIBuilt     UIState = "built"           // ui wired into the dashboard and the shared build passed
+	UIForeign   UIState = "foreign-blocked" // this ui verified, but another service blocks the shared build
+	UIFailed    UIState = "failed"          // this service's ui does not build — a named stage failure
+	UIUnconfig  UIState = "unconfigured"    // ui present but no dashboard checkout configured — a deficiency
+	UIPlanned   UIState = "planned"         // --check dry-run reached the ui step
+	UIWouldFail UIState = "would-fail"      // --check only: the relocation would carry an outside-tree config into the dashboard
+)
+
+// InstallResult is what the wrapper reports beyond the raw error: the UI half's outcome, parsed off
+// the wrapper's `MERCURY-UI:` line, so the calling stage can report program AND ui, each on its own.
+type InstallResult struct {
+	UI       UIState
+	UIDetail string
 }
 
 // PortSource answers "which port does this service use?" from observed state: an already-routed
@@ -30,12 +52,15 @@ type PortSource interface {
 	PortFor(ctx context.Context, service string, desired int) (port int, firstTime bool, err error)
 }
 
-// Outcome is the honest install result.
+// Outcome is the honest install result — both halves a service needs, each reported on its own.
 type Outcome struct {
 	Installed bool
 	Running   bool
 	Port      int
 	Detail    string
+	// UI is the dashboard-UI half's outcome; UIDetail carries the reason for the foreign-blocked case.
+	UI       UIState
+	UIDetail string
 }
 
 // Honest no-attempt reasons: these repos are never installed, and the caller can prove WHY
@@ -99,17 +124,25 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 		return Outcome{Detail: err.Error()}, err
 	}
 
-	if err := ri.Install(ctx, key, artifactDir, "dev", port, false); err != nil {
-		return Outcome{Port: port, Detail: err.Error()}, fmt.Errorf("deploy: install of %s failed: %w", key, err)
+	res, err := ri.Install(ctx, key, artifactDir, "dev", port, false)
+	if err != nil {
+		// A reported UI state means the program install reached the ui step, i.e. the program itself
+		// installed — the failure is the UI half (unconfigured/failed). Both halves are reported, and
+		// the stage still fails: a ui that could not be built in is a deficiency, never green (K-4).
+		o := Outcome{Port: port, Detail: err.Error(), UI: res.UI, UIDetail: res.UIDetail}
+		if res.UI != "" {
+			o.Installed = true
+		}
+		return o, fmt.Errorf("deploy: install of %s failed: %w", key, err)
 	}
 
 	// The honest gate (F10): "installed and started" only when the unit is ACTIVE and the port
 	// is HELD — otherwise the setup FAILED, never green by default (REQ-044.3, K-4).
 	if err := gate.VerifyRunning(ctx, key, port); err != nil {
-		return Outcome{Installed: true, Port: port,
+		return Outcome{Installed: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
 			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", key, err)
 	}
-	return Outcome{Installed: true, Running: true, Port: port,
+	return Outcome{Installed: true, Running: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
 		Detail: "installed and started (active, holding :" + strconv.Itoa(port) + ")"}, nil
 }
 
@@ -119,7 +152,7 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 // a failed stage, never an inline restart (K-2). The running proof for self is the restart marker
 // plus the next boot — there is no port probe here.
 func SelfInstallAndHandover(ctx context.Context, ri RootInstaller, repo, artifactDir string) error {
-	if err := ri.Install(ctx, repo, artifactDir, "dev", 0, true); err != nil {
+	if _, err := ri.Install(ctx, repo, artifactDir, "dev", 0, true); err != nil {
 		return fmt.Errorf("deploy: self install/handover failed (stage fails, no inline restart): %w", err)
 	}
 	return nil
@@ -131,7 +164,7 @@ func SelfInstallAndHandover(ctx context.Context, ri RootInstaller, repo, artifac
 // [--port n] [--handover]`. The sudoers grant pins the service user to exactly this wrapper.
 type SudoInstaller struct{}
 
-func (SudoInstaller) Install(ctx context.Context, repo, artifactDir, env string, port int, handover bool) error {
+func (SudoInstaller) Install(ctx context.Context, repo, artifactDir, env string, port int, handover bool) (InstallResult, error) {
 	args := []string{"-n", installWrapper, repo, artifactDir, env}
 	if port > 0 {
 		args = append(args, "--port", strconv.Itoa(port))
@@ -140,10 +173,27 @@ func (SudoInstaller) Install(ctx context.Context, repo, artifactDir, env string,
 		args = append(args, "--handover")
 	}
 	out, err := exec.CommandContext(ctx, "sudo", args...).CombinedOutput()
+	res := parseUILine(string(out))
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
+		return res, fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 	}
-	return nil
+	return res, nil
+}
+
+// parseUILine reads the wrapper's single `MERCURY-UI: <state> [| detail]` line off its output — the
+// machine-readable half-report that lets the stage name program AND ui separately. Absent (a wrapper
+// that predates the ui half, or a program that never reached the ui step) yields the zero UIState.
+func parseUILine(out string) InstallResult {
+	for _, line := range strings.Split(out, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "MERCURY-UI:")
+		if !ok {
+			continue
+		}
+		rest = strings.TrimSpace(rest)
+		state, detail, _ := strings.Cut(rest, "|")
+		return InstallResult{UI: UIState(strings.TrimSpace(state)), UIDetail: strings.TrimSpace(detail)}
+	}
+	return InstallResult{}
 }
 
 // LivePorts is the production PortSource: the ledger is derived fresh from the host's routes and

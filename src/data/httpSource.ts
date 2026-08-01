@@ -349,6 +349,9 @@ export const httpSource: DataSource = {
   async mercuryRollbackDelivery(deliveryId) {
     return json(await post(`/api/mercury/runs/deliveries/${enc(deliveryId)}/rollback`, {}));
   },
+  async mercuryResumeDelivery(pr) {
+    return json(await post('/api/mercury/runs/deliveries/resume', pr ?? {}));
+  },
   async mercuryRepoReset(repoId) {
     await json<void>(await post('/api/mercury/runs/reset', { repo: repoId }));
   },

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -268,7 +269,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 
 	wb := deps.Workbench("alpha")
 	ctx := context.Background()
-	if _, err := wb.Prepare(ctx); err == nil || !strings.Contains(err.Error(), "runner account") {
+	if _, err := wb.Prepare(ctx, "fix/probe-run_x", ""); err == nil || !strings.Contains(err.Error(), "runner account") {
 		t.Errorf("Prepare must name the missing runner account, got %v", err)
 	}
 	if _, err := wb.Head(ctx); err == nil {
@@ -280,7 +281,7 @@ func TestChainDepsWithoutARunnerAccountFailsByName(t *testing.T) {
 	if _, err := deps.Agent(ctx, "alpha", "do it", runs.ResolvedTuning{}, executor.AgentSession{}); err == nil {
 		t.Errorf("the agent must refuse without a runner account")
 	}
-	if _, _, err := deps.WorkbenchState(ctx, "alpha"); err == nil {
+	if _, _, err := deps.WorkbenchState(ctx, "alpha", "fix/probe-run_x"); err == nil {
 		t.Errorf("the observation must refuse without a runner account")
 	}
 	// The hooks are optional in the observation form, and their absence is NAMED, not ignored.
@@ -323,14 +324,21 @@ func TestChainEffortAndPreamble(t *testing.T) {
 			t.Errorf("chainEffort(%q) = %q, want %q", in, got, want)
 		}
 	}
-	plain := chainPreamble("alpha", "high")
-	if !strings.Contains(plain, "alpha") || !strings.Contains(plain, "mercury-dev") {
-		t.Errorf("the preamble names neither the repository nor the working branch: %q", plain)
+	plain := chainPreamble("alpha", "fix/some-order-branch", "high")
+	if !strings.Contains(plain, "alpha") || !strings.Contains(plain, "fix/some-order-branch") {
+		t.Errorf("the preamble names neither the repository nor the ACTUAL order branch: %q", plain)
+	}
+	if strings.Contains(plain, "mercury-dev") {
+		t.Errorf("the preamble hardcodes the workbench constant instead of the measured branch: %q", plain)
+	}
+	// An empty measurement falls back to the workbench constant rather than an empty branch name.
+	if !strings.Contains(chainPreamble("alpha", "", "high"), "mercury-dev") {
+		t.Errorf("an unmeasurable branch should fall back to the workbench constant")
 	}
 	if strings.Contains(plain, "most thorough") {
 		t.Errorf("the ultracode directive leaked into an ordinary run: %q", plain)
 	}
-	if !strings.Contains(chainPreamble("alpha", "ultracode"), "most thorough") {
+	if !strings.Contains(chainPreamble("alpha", "mercury-dev", "ultracode"), "most thorough") {
 		t.Errorf("the ultracode tier carries no directive")
 	}
 }
@@ -348,6 +356,20 @@ func TestAgentStreamAdapter(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"assistant"`) || !strings.Contains(string(out), `"result"`) {
 		t.Errorf("the stream lost lines: %q", out)
+	}
+	// The stream must arrive as LINES, one event per line. Asserting only that the text is somewhere
+	// in there passed happily while every event was glued into one blob — and a blob parses as
+	// nothing, so the transcript stayed empty and the token counters stayed at zero on the running
+	// service, with no stage ever failing. Count the lines, do not search the text.
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 separate lines, got %d: %q", len(lines), out)
+	}
+	for i, l := range lines {
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(l), &ev); err != nil {
+			t.Errorf("line %d is not a parsable event (%v): %q", i, err, l)
+		}
 	}
 	if err := a.Wait(); err != nil {
 		t.Errorf("Wait: %v", err)
@@ -388,9 +410,12 @@ type fakeStreamer struct {
 	block bool
 }
 
+// run mirrors the REAL primitive (workspace.runAgentCmd): it hands over one line WITHOUT its
+// terminator. The fake used to append "\n" itself — so the adapter looked correct here while it
+// dropped every separator in production, and the whole live transcript came out as one blob.
 func (f fakeStreamer) run(ctx context.Context, onStdout func([]byte)) error {
 	for _, l := range f.lines {
-		onStdout([]byte(l + "\n"))
+		onStdout([]byte(l))
 	}
 	if f.block {
 		<-ctx.Done()

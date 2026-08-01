@@ -41,19 +41,19 @@ func (b *Bench) ResetToDefault(ctx context.Context, by model.Actor) error {
 		return fmt.Errorf("resolve %s: %w", target, err)
 	}
 
-	pushRefs := []string{Branch}
-	if !b.refExists(ctx, "refs/heads/"+Branch) {
+	pushRefs := []string{b.branch}
+	if !b.refExists(ctx, "refs/heads/"+b.branch) {
 		// No workbench yet — the "reset" simply establishes it at the default tip.
 		if err := b.CleanUntracked(ctx); err != nil {
 			return fmt.Errorf("clean: %w", err)
 		}
-		if err := b.ex.CreateBranch(ctx, b.repo, Branch, target); err != nil {
-			return fmt.Errorf("create %s at %s: %w", Branch, target, err)
+		if err := b.ex.CreateBranch(ctx, b.repo, b.branch, target); err != nil {
+			return fmt.Errorf("create %s at %s: %w", b.branch, target, err)
 		}
 	} else {
-		oldTip, err := b.ex.RevParse(ctx, b.repo, "refs/heads/"+Branch)
+		oldTip, err := b.ex.RevParse(ctx, b.repo, "refs/heads/"+b.branch)
 		if err != nil {
-			return fmt.Errorf("resolve %s: %w", Branch, err)
+			return fmt.Errorf("resolve %s: %w", b.branch, err)
 		}
 		// Shelter the discarded state first — unless it is already contained in the target
 		// (then there is nothing to lose).
@@ -76,11 +76,11 @@ func (b *Bench) ResetToDefault(ctx context.Context, by model.Actor) error {
 		if err := b.CleanUntracked(ctx); err != nil {
 			return fmt.Errorf("clean: %w", err)
 		}
-		if err := b.ex.Checkout(ctx, b.repo, Branch); err != nil {
-			return fmt.Errorf("switch to %s: %w", Branch, err)
+		if err := b.ex.Checkout(ctx, b.repo, b.branch); err != nil {
+			return fmt.Errorf("switch to %s: %w", b.branch, err)
 		}
 		if _, err := b.gitUser(ctx, "reset", "--hard", targetSHA); err != nil {
-			return fmt.Errorf("move %s to %s: %w", Branch, target, err)
+			return fmt.Errorf("move %s to %s: %w", b.branch, target, err)
 		}
 		if _, err := b.gitUser(ctx, "clean", "-fdx"); err != nil {
 			return fmt.Errorf("clean after move: %w", err)
@@ -92,6 +92,6 @@ func (b *Bench) ResetToDefault(ctx context.Context, by model.Actor) error {
 	if _, err := b.ex.PushRefs(ctx, b.repo, b.token, true, pushRefs...); err != nil {
 		return fmt.Errorf("publish the reset: %w", err)
 	}
-	log.Printf("workbench: %s — %s reset to %s (%.8s) by %s; previous state sheltered under %s", b.repo, Branch, def, targetSHA, by.User, rescueRefPrefix+"*")
+	log.Printf("workbench: %s — %s reset to %s (%.8s) by %s; previous state sheltered under %s", b.repo, b.branch, def, targetSHA, by.User, rescueRefPrefix+"*")
 	return nil
 }

@@ -229,6 +229,10 @@ export interface DataSource {
   // ── Mercury: deliveries (S10) ──────────────────────────────────────────────
   mercuryDeliveries(): Promise<Delivery[]>;
   mercuryRollbackDelivery(deliveryId: string): Promise<{ outcome: string; todoId?: string }>;
+  /** Release the blockade of a blocked pull request so the maintenance evaluates it again
+   *  (K-5). Merges nothing and is safe to repeat; without an argument it releases every
+   *  blocked one. Without this the honest "blocked" state had no way out at all. */
+  mercuryResumeDelivery(pr?: { repo: string; number: number }): Promise<{ resumed: number }>;
   /** The DELIBERATE dev reset (REQ-022.4) — always behind a UI confirmation. */
   mercuryRepoReset(repoId: string): Promise<void>;
 

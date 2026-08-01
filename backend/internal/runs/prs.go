@@ -166,3 +166,38 @@ func (s *PRStore) Update(repo string, number int, mutate func(*PendingPR)) (bool
 func (s *PRStore) save(prs []PendingPR) error {
 	return fsatomic.WriteJSON(s.path, prFile{PRs: prs})
 }
+
+// ResumeBlocked clears the blockade of tracked pull requests so the maintenance evaluates them
+// again. It is the "explicit resume" the blocked state waits for (K-5) — without it the honest
+// terminal state has no way out, and a pull request blocked by a transient outage stays blocked for
+// ever. Measured on 2026-07-31: 63 of 64 entries carried a block, none of which described the pull
+// request itself; they were reads that never reached GitHub while the service was restarting.
+//
+// repo=="" releases EVERY blocked entry; otherwise exactly the named one. Only the blockade is
+// cleared — the growing-interval retry state goes with it, so the next attempt starts a fresh
+// episode rather than continuing a spent one. Nothing is merged here: the pass re-evaluates and
+// blocks again, with a fresh reason, whatever genuinely fails.
+func (s *PRStore) ResumeBlocked(repo string, number int) ([]PendingPR, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	freed := []PendingPR{}
+	for i := range cur {
+		if !cur[i].Blocked {
+			continue
+		}
+		if repo != "" && (cur[i].Repo != repo || cur[i].Number != number) {
+			continue
+		}
+		cur[i].Blocked, cur[i].BlockedReason, cur[i].BlockedAt = false, "", time.Time{}
+		cur[i].Backoff = nil
+		freed = append(freed, cur[i])
+	}
+	if len(freed) == 0 {
+		return freed, nil
+	}
+	return freed, s.save(cur)
+}
