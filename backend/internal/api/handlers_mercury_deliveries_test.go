@@ -548,6 +548,54 @@ func TestDeliveriesListCarriesExecutionLink(t *testing.T) {
 	}
 }
 
+// The open list needs to say WHY a todo waits: whether its delivery is merely waiting out the
+// auto-merge window (and until when) or blocked for a release (K-5). Those facts live on the tracked
+// pull request, so the ledger wire joins them by delivery id — the ONE place a surface reads them.
+func TestDeliveriesListCarriesMergeDeadlineAndBlockade(t *testing.T) {
+	s := deliveriesServer(t)
+	mergeBy := tD.Add(7 * 24 * time.Hour)
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_wait", Repo: "o/a", Branch: "fix/a-1", PRNumber: 11, CreatedAt: tD, ExecutionID: "exec_wait"})
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_block", Repo: "o/a", Branch: "fix/a-2", PRNumber: 12, CreatedAt: tD, ExecutionID: "exec_block"})
+	// One tracked PR waits out its window; the other is blocked with a reason.
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 11, DeliveryID: "dlv_wait", CreatedAt: tD, MergeBy: mergeBy})
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 12, DeliveryID: "dlv_block", CreatedAt: tD, MergeBy: mergeBy, Blocked: true, BlockedReason: "rate limit"})
+
+	rec := httptest.NewRecorder()
+	s.runDeliveriesList(rec, authedReq(http.MethodGet, "/api/mercury/runs/deliveries", nil, "alice"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Deliveries []struct {
+			ID            string     `json:"id"`
+			MergeBy       *time.Time `json:"mergeBy"`
+			Blocked       bool       `json:"blocked"`
+			BlockedReason string     `json:"blockedReason"`
+		} `json:"deliveries"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]struct {
+		MergeBy       *time.Time
+		Blocked       bool
+		BlockedReason string
+	}{}
+	for _, d := range out.Deliveries {
+		byID[d.ID] = struct {
+			MergeBy       *time.Time
+			Blocked       bool
+			BlockedReason string
+		}{d.MergeBy, d.Blocked, d.BlockedReason}
+	}
+	if w := byID["dlv_wait"]; w.MergeBy == nil || !w.MergeBy.Equal(mergeBy) || w.Blocked {
+		t.Errorf("waiting delivery = %+v, want the merge deadline and no block", w)
+	}
+	if b := byID["dlv_block"]; !b.Blocked || b.BlockedReason != "rate limit" {
+		t.Errorf("blocked delivery = %+v, want blocked with its reason", b)
+	}
+}
+
 // BLOCKER: the standstill report must reach the configuration it was written for — the cutover's
 // FIRST start (00-cutover.md step 6), which runs deliberately WITHOUT a runner identity so no pass
 // can reach GitHub. The tick resolved the token first and returned on its absence, so in exactly

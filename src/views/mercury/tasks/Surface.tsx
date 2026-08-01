@@ -18,8 +18,8 @@ import { TaskForm } from './TaskForm';
 import { TaskList } from './TaskList';
 import { TaskDetail } from './TaskDetail';
 import { errMsg } from './logic';
-import { splitOpenHistory } from './select';
-import { openDeliveryExecutionIds } from '../deliveries/deliveries';
+import { openTodoState, splitOpenHistory, type OpenTodoState } from './select';
+import { openDeliveryExecutionIds, openDeliveryFactsByExecution } from '../deliveries/deliveries';
 import type { Delivery, Repo, RunCoverage, RunKind, RunList, RunResult } from '@/types';
 
 export interface SurfaceProps {
@@ -160,8 +160,20 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   const ofKind = list.runs.filter((r) => r.kind === kind);
   // Open ∩ history = ∅ (REQ-011.2): a done todo leaves this list; its executions live in the
   // History section. An open delivery keeps its execution — and so its todo — open (B-8).
-  const { open } = splitOpenHistory(ofKind, executions, openDeliveryExecutionIds(deliveries));
+  const openDeliveryIds = openDeliveryExecutionIds(deliveries);
+  const { open } = splitOpenHistory(ofKind, executions, openDeliveryIds);
   const shownBase = isTodo ? open : ofKind;
+
+  // WHY each open todo is still open — one derived state per row (REQ-011.2), read from the same
+  // partition the history is the complement of (outsideHistory) plus the ledger's own delivery
+  // facts, so no open row stands without a reason. Only todos carry it; an auto run recurs and has
+  // no such state.
+  let stateByRun: Record<string, OpenTodoState> | undefined;
+  if (isTodo) {
+    const facts = openDeliveryFactsByExecution(deliveries);
+    stateByRun = {};
+    for (const r of open) stateByRun[r.id] = openTodoState(r, executions, openDeliveryIds, facts, liveRunIds);
+  }
 
   const lastStarted: Record<string, string> = {};
   for (const res of executions) {
@@ -256,6 +268,7 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
               setMode('view');
             }}
             liveRunIds={liveRunIds}
+            stateByRun={stateByRun}
             emptyText={emptyText}
             noMatchText="Nothing matches the current filter."
             filtered={shownBase.length > 0 && shown.length === 0}

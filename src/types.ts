@@ -430,6 +430,15 @@ export interface Delivery {
    *  which executions still hold an open delivery — the server's own B-8 rule — instead of guessing
    *  it from a chain stage name (B-35). Absent on a record the ledger cannot attribute. */
   executionId?: string;
+  /** When the auto-merge of this delivery's pull request is due (K-5): the deadline the open list
+   *  names so a todo waiting only for its merge shows that it waits, and until when. Absent when no
+   *  tracked pull request carries a deadline (already merged, closed, or never opened). */
+  mergeBy?: string;
+  /** Whether this delivery's pull request is BLOCKED — the honest terminal state after the merge
+   *  retries are spent, waiting for an explicit release rather than for the clock (K-5). */
+  blocked?: boolean;
+  /** Why the delivery is blocked, in words a person can act on (only set when `blocked`). */
+  blockedReason?: string;
 }
 
 export interface PRRef {

@@ -1553,16 +1553,23 @@ note "info-2" "user-facing messages still in German (implementation language is 
 
 if [[ $WITH_TESTS -eq 1 ]]; then
   section "acceptance tests"
-  if (cd backend && go test ./it/... >/tmp/abnahme-go.log 2>&1); then
+  # Per-run log files, not a fixed shared path: a hard-coded /tmp/abnahme-*.log is created by
+  # whoever runs the acceptance first and is then un-writable by every other user, so the redirect
+  # fails with "Permission denied" and the tests read as FAILED though they never ran. mktemp gives
+  # each run its own writable file; they are removed on exit.
+  go_log="$(mktemp "${TMPDIR:-/tmp}/abnahme-go.XXXXXX.log")"
+  node_log="$(mktemp "${TMPDIR:-/tmp}/abnahme-node.XXXXXX.log")"
+  trap 'rm -f "$go_log" "$node_log"' EXIT
+  if (cd backend && go test ./it/... >"$go_log" 2>&1); then
     pass "tests-go" "backend/it integration + list suites"
   else
-    fail "tests-go" "backend/it integration + list suites" "$(tail -n 40 /tmp/abnahme-go.log)"
+    fail "tests-go" "backend/it integration + list suites" "$(tail -n 40 "$go_log")"
   fi
   if node --test --experimental-strip-types src/parity.test.ts src/reload.test.ts \
-    >/tmp/abnahme-node.log 2>&1; then
+    >"$node_log" 2>&1; then
     pass "tests-ts" "MCP parity + reload state preservation"
   else
-    fail "tests-ts" "MCP parity + reload state preservation" "$(tail -n 40 /tmp/abnahme-node.log)"
+    fail "tests-ts" "MCP parity + reload state preservation" "$(tail -n 40 "$node_log")"
   fi
 fi
 

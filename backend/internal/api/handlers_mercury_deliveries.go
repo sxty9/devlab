@@ -74,6 +74,23 @@ var openRunnerBench = (*Server).runnerBench
 type deliveryWire struct {
 	model.Delivery
 	ExecutionID string `json:"executionId,omitempty"`
+	// The pull-request maintenance facts of THIS delivery, joined from the pending-PR pool by its
+	// ledger id (B-8 / K-5). MergeBy is the instant the auto-merge is due — the deadline the open
+	// list names so a todo that only waits for its merge says so and says until when. Blocked (with
+	// its reason) is the honest terminal state after the retries are spent (K-5): the delivery that
+	// waits for an explicit release, not for the clock. Both are absent when the ledger record has
+	// no tracked pull request — already merged, closed, or never opened.
+	MergeBy       *time.Time `json:"mergeBy,omitempty"`
+	Blocked       bool       `json:"blocked,omitempty"`
+	BlockedReason string     `json:"blockedReason,omitempty"`
+}
+
+// prFacts is the maintenance state one pending pull request contributes to its delivery's wire
+// view: the auto-merge deadline and the honest blockade (K-5).
+type prFacts struct {
+	mergeBy *time.Time
+	blocked bool
+	reason  string
 }
 
 // runDeliveriesList returns the delivery ledger as the wire view (REQ-024/F12).
@@ -93,9 +110,30 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 			reversed[d.ReversalOf] = true
 		}
 	}
+	// The auto-merge deadline and the K-5 blockade live on the tracked pull request, not on the
+	// ledger record — join them by the delivery id the pending PR carries, with the legacy
+	// repo+number fallback for records predating that link. This is the ONE place a surface reads
+	// "is this delivery blocked, and until when does it wait" from, so no view re-derives it.
+	byDelivery := map[string]prFacts{}
+	byRepoNum := map[string]prFacts{}
+	if s.runPRs != nil {
+		if prs, err := s.runPRs.List(); err == nil {
+			for _, p := range prs {
+				f := prFacts{blocked: p.Blocked, reason: p.BlockedReason}
+				if !p.MergeBy.IsZero() {
+					mb := p.MergeBy
+					f.mergeBy = &mb
+				}
+				if p.DeliveryID != "" {
+					byDelivery[p.DeliveryID] = f
+				}
+				byRepoNum[fmt.Sprintf("%s#%d", p.Repo, p.Number)] = f
+			}
+		}
+	}
 	out := make([]deliveryWire, 0, len(all))
 	for _, d := range all {
-		out = append(out, deliveryWire{
+		wire := deliveryWire{
 			Delivery: model.Delivery{
 				ID: d.ID, Repo: d.Repo, Branch: d.Branch,
 				FromCommit: d.FromCommit, ToCommit: d.ToCommit,
@@ -104,7 +142,15 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 				Stage: deliveryStage(d, reversed[d.ID]),
 			},
 			ExecutionID: d.ExecutionID,
-		})
+		}
+		f, ok := byDelivery[d.ID]
+		if !ok && d.PRNumber != 0 {
+			f, ok = byRepoNum[fmt.Sprintf("%s#%d", d.Repo, d.PRNumber)]
+		}
+		if ok {
+			wire.MergeBy, wire.Blocked, wire.BlockedReason = f.mergeBy, f.blocked, f.reason
+		}
+		out = append(out, wire)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deliveries": out})
 }

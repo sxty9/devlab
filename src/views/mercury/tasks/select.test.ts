@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { executionCompleted, outsideHistory, runCompleted, splitOpenHistory } from './select.ts';
+import { executionCompleted, openTodoState, outsideHistory, runCompleted, splitOpenHistory } from './select.ts';
 // Which executions still hold an open delivery is READ off the ledger, where the server states it —
-// these selectors never derive it, so the set comes from the delivery module (B-35).
-import { openDeliveryExecutionIds } from '../deliveries/deliveries.ts';
+// these selectors never derive it, so the set and the delivery facts come from the delivery module
+// (B-35).
+import { openDeliveryExecutionIds, openDeliveryFactsByExecution } from '../deliveries/deliveries.ts';
 import type { Delivery, Run, RunResult } from '../../../types';
 
 const AUTH = { created: { user: 'alice' }, createdAt: '2026-07-26T09:00:00Z', updated: { user: 'alice' }, updatedAt: '2026-07-26T09:00:00Z' };
@@ -77,6 +78,69 @@ test('a todo is done only when one completed execution covered ALL targets', () 
 
   const auto: Run = { id: 'run_auto', kind: 'auto', title: 'A', tuning: {}, authorship: AUTH };
   assert.equal(runCompleted(auto, [result('exec_4', 'run_auto')]), false, 'an auto run recurs — never done');
+});
+
+test('a todo is done when its targets are covered ACROSS executions, matching the startup reconciliation', () => {
+  // Repository A finished in one execution, repository B in the next — the union covers both. A
+  // single-execution rule would keep this todo open for ever though every repository is delivered
+  // and settled; preflight.SyncStartupTodos already counts it done (each target has a merged
+  // delivery of the run), so the surface must agree.
+  const t = todo('run_t', ['a', 'b']);
+  const first = result('exec_1', 'run_t', { repos: [okRepo('a')] });
+  const second = result('exec_2', 'run_t', { repos: [okRepo('b')] });
+
+  assert.equal(runCompleted(t, [first]), false, 'only A covered — still open');
+  assert.equal(runCompleted(t, [first, second]), true, 'A and B covered across two executions — done');
+
+  // But a covering execution whose delivery is still open does NOT count yet (B-8): the todo stays
+  // open until that delivery settles.
+  assert.equal(
+    runCompleted(t, [first, second], new Set(['exec_2'])),
+    false,
+    "B's execution still holds an open delivery — not done",
+  );
+  // A failed second execution never completes what the first left open.
+  const secondFailed = result('exec_2', 'run_t', { repos: [failedRepo('b')] });
+  assert.equal(runCompleted(t, [first, secondFailed]), false, 'B failed — still open');
+});
+
+test('every open todo carries exactly one derived state, and each state reads its own signal', () => {
+  const notRun = todo('run_notrun', ['svc']);
+  const running = todo('run_running', ['svc']);
+  const inflight = todo('run_inflight', ['svc']);
+  const awaiting = todo('run_awaiting', ['svc']);
+  const blocked = todo('run_blocked', ['svc']);
+  const failed = todo('run_failed', ['svc']);
+
+  const liveExec = result('exec_live', 'run_running');
+  const stillRunning = result('exec_run', 'run_inflight', { endedAt: undefined });
+  const awaitingExec = result('exec_awaiting', 'run_awaiting');
+  const blockedExec = result('exec_blocked', 'run_blocked');
+  const failedExec = result('exec_failed', 'run_failed', { repos: [failedRepo('svc')] });
+  const all = [liveExec, stillRunning, awaitingExec, blockedExec, failedExec];
+
+  // The ledger states two open deliveries: one merely waiting out its window, one blocked (K-5).
+  const ledger: Delivery[] = [
+    { ...dlv('dlv_await', 'exec_awaiting', 'open'), mergeBy: '2026-08-08T00:00:00Z' },
+    { ...dlv('dlv_block', 'exec_blocked', 'open'), blocked: true, blockedReason: 'rate limit' },
+  ];
+  const openIds = openDeliveryExecutionIds(ledger);
+  const facts = openDeliveryFactsByExecution(ledger);
+  const live = new Set(['run_running']);
+  const state = (r: Run) => openTodoState(r, all, openIds, facts, live);
+
+  assert.deepEqual(state(notRun), { kind: 'not-run' }, 'no execution at all');
+  assert.deepEqual(state(running), { kind: 'running' }, 'a live run reads from the active set');
+  assert.deepEqual(state(inflight), { kind: 'running' }, 'an execution without an end stamp is running');
+  assert.deepEqual(state(awaiting), { kind: 'awaiting-merge', mergeBy: '2026-08-08T00:00:00Z' }, 'the deadline is named');
+  assert.deepEqual(state(blocked), { kind: 'blocked', reason: 'rate limit' }, 'the blockade outranks the timed wait');
+  assert.deepEqual(state(failed), { kind: 'failed' }, 'ended, settled, uncovered — needs attention');
+
+  // Completeness: every open todo lands on exactly one of the five kinds, no row left mute.
+  const kinds = new Set(['not-run', 'running', 'awaiting-merge', 'blocked', 'failed']);
+  for (const r of [notRun, running, inflight, awaiting, blocked, failed]) {
+    assert.ok(kinds.has(state(r).kind), `${r.id} has an unknown state ${state(r).kind}`);
+  }
 });
 
 test('open deliveries come from the LEDGER, never from a stage name (B-35)', () => {
