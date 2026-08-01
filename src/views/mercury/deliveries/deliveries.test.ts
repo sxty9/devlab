@@ -14,6 +14,7 @@ import {
   groupDeliveriesByRepo,
   isOpenDelivery,
   openDeliveryExecutionIds,
+  openDeliveryFactsByExecution,
   resetConfirmation,
   rollbackConfirmation,
   shortSha,
@@ -27,6 +28,25 @@ const dlv = (over: Partial<Delivery> & Pick<Delivery, 'id' | 'repo' | 'createdAt
   toCommit: '2222222ccccdddd',
   stage: 'open',
   ...over,
+});
+
+test('open-delivery facts fold per execution: blocked wins, the soonest deadline is kept, settled rows are ignored', () => {
+  const facts = openDeliveryFactsByExecution([
+    // Two open deliveries of one execution: the later window and the earlier one — the earlier wins.
+    dlv({ id: 'a1', repo: 'o/one', executionId: 'exec_a', stage: 'open', mergeBy: '2026-08-10T00:00:00Z', createdAt: '2026-07-01T00:00:00Z' }),
+    dlv({ id: 'a2', repo: 'o/one', executionId: 'exec_a', stage: 'open', mergeBy: '2026-08-08T00:00:00Z', createdAt: '2026-07-01T00:00:00Z' }),
+    // A blocked delivery: the block outranks any deadline for its execution.
+    dlv({ id: 'b1', repo: 'o/two', executionId: 'exec_b', stage: 'open', blocked: true, blockedReason: 'rate limit', createdAt: '2026-07-01T00:00:00Z' }),
+    // A merged delivery contributes NOTHING — it holds no live wait.
+    dlv({ id: 'm1', repo: 'o/three', executionId: 'exec_c', stage: 'merged', mergeBy: '2026-08-01T00:00:00Z', createdAt: '2026-07-01T00:00:00Z' }),
+    // A delivery the ledger cannot attribute to an execution is skipped (no key to fold under).
+    dlv({ id: 'x1', repo: 'o/four', stage: 'open', mergeBy: '2026-08-01T00:00:00Z', createdAt: '2026-07-01T00:00:00Z' }),
+  ]);
+
+  assert.deepEqual(facts.get('exec_a'), { blocked: false, mergeBy: '2026-08-08T00:00:00Z' });
+  assert.deepEqual(facts.get('exec_b'), { blocked: true, reason: 'rate limit' });
+  assert.equal(facts.get('exec_c'), undefined, 'a merged delivery holds no live wait');
+  assert.equal(facts.size, 2, 'only the two executions with an OPEN attributed delivery are folded');
 });
 
 test('every lifecycle stage the server states has a label and a tone', () => {

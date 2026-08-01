@@ -921,7 +921,7 @@ Identity` is its armed counterpart.
 `continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
 one table with which the operator is told where to READ each writing call before the first start.
 **What changed:** every anchor was verified against the code and corrected, and each one now carries
-the CALL it points at (`deliver/deliver.go:879 gh.PostCommitStatus`) instead of a bare line number.
+the CALL it points at (`deliver/deliver.go:881 gh.PostCommitStatus`) instead of a bare line number.
 **Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
 **Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
 runbook parts and fails unless the named line really carries the named call — and fails on an anchor
@@ -1254,3 +1254,62 @@ AND that the retired shared branch was never written;
 task's own branch (an interrupted run's unpublished commit survives and is secured);
 `TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault` holds that the merge prunes the task's
 branch and that no shared branch exists.
+
+---
+
+## The open todo list names WHY each todo is still open
+
+**What changed:** the delivery ledger wire view (`GET /api/mercury/runs/deliveries`) carries three
+new fields per delivery — `mergeBy` (the instant the auto-merge is due), `blocked`, and
+`blockedReason` — joined from the tracked pull request by delivery id. The shared `Delivery` type
+mirrors them. On the client a new derived state, `openTodoState`, gives every open todo exactly one
+of five reasons — `not-run`, `running`, `awaiting-merge` (with the deadline), `blocked` (with the
+reason), `failed` — shown as one pill per row. It is read from `outsideHistory` (the partition the
+history is the complement of) plus the ledger facts folded by `openDeliveryFactsByExecution`, so it
+never re-derives a fact the history already states. `runCompleted` now sums a todo's target coverage
+ACROSS its completed executions instead of demanding a single execution carry all targets.
+
+**Why:** a todo whose whole chain has run through, delivered and merged still sat in the open list
+until its pull request merged — up to the seven-day auto-merge window, and while 63 of 64 pull
+requests were blocked, indefinitely. In that list it looked identical to a todo nobody had ever
+started: the list read as though nothing was ever historised. Measured on 2026-08-01: not one todo
+had left the open list, because condition two of historisation — the delivery is settled — was met
+by none. The states were derivable the whole time (the counts `inFlight`/`awaitingDelivery` already
+existed); the list simply did not show them. Separately, `runCompleted` required ONE execution to
+cover all targets, while the startup reconciliation (`preflight.SyncStartupTodos`) already counted a
+todo done when each target had a merged delivery across ANY executions — two answers to one question
+("is this todo finished?") that would disagree for a todo finished repository-by-repository over
+several runs, leaving it open for ever until the next daemon start swept it. Both now sum coverage
+per repository over the run's executions.
+
+**What it does and does not do:** the state is DERIVED and never stored — observed fresh from the
+executions and the ledger on every render, the same discipline the history split already follows. It
+adds no exit and no control: the blocked state's release is the ONE that already exists in the
+notices surface; this only names the state on the row. The `blocked`/`mergeBy` facts flow from the
+tracked-PR pool the delivery maintenance already keeps; the ledger record itself is unchanged, and a
+delivery with no tracked pull request (merged, closed, or never opened) simply carries none of the
+three. One deliberate boundary remains: the client mirror trusts the execution's success flags plus
+a settled delivery, where `SyncStartupTodos` additionally probes that the commit is contained in the
+default branch — the client cannot read git, so the server's synthetic result stays the authority
+that bridges the two. It was already so before this change.
+
+**State of record:**
+
+- `backend/internal/api/handlers_mercury_deliveries.go@f63093e6144e`
+- `src/types.ts@b808af07ce67`
+- `src/views/mercury/deliveries/deliveries.ts@010c595e59f1`
+- `src/views/mercury/tasks/select.ts@e60b782520cd`
+- `src/views/mercury/tasks/logic.ts@d3b318072b31`
+- `src/views/mercury/tasks/TaskList.tsx@048c8e501dc0`
+- `src/views/mercury/tasks/Surface.tsx@f28c91d33335`
+
+**Diff hint:** `git diff cbffed4 -- backend/internal/api/handlers_mercury_deliveries.go src/types.ts
+src/views/mercury/tasks src/views/mercury/deliveries`.
+**Proof:** `src/views/mercury/tasks/select.test.ts`: "every open todo carries exactly one derived
+state, and each state reads its own signal" holds the five-state partition (no row without a
+reason), and "a todo is done when its targets are covered ACROSS executions, matching the startup
+reconciliation" holds the aggregate coverage against the multi-execution case.
+`src/views/mercury/deliveries/deliveries.test.ts`: "open-delivery facts fold per execution" holds
+the ledger join (blocked wins, soonest deadline, settled rows ignored).
+`backend/internal/api/handlers_mercury_deliveries_test.go:TestDeliveriesListCarriesMergeDeadlineAndBlockade`
+holds that the wire carries the deadline and the blockade joined by delivery id.
