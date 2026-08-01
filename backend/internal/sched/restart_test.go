@@ -194,6 +194,160 @@ func TestCompleteBootRestartReleasesQueuedStarts(t *testing.T) {
 	h.waitPhase(live[0].ID, model.PhaseCompleted)
 }
 
+// ── REQ-018 · a queued start is a promise: it survives a restart, whatever it waits on ───
+
+// hasNotice reports whether any collected notice line starts with kind.
+func hasNotice(lines []string, kind string) bool {
+	for _, l := range lines {
+		if len(l) >= len(kind) && l[:len(kind)] == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// A start that waits because its target repository is BUSY is held in a persisted queued
+// document — so it survives a restart of the daemon and fires afterwards, without a human having
+// to notice it went missing (the measured loss of 31.07./01.08.2026). This is the NACHWEIS the
+// task demands: enqueue (repo busy), restart, prove it runs.
+func TestQueuedStartRepoBusySurvivesRestart(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.cap.Store(2)
+	h.addTodo("run_a", "A", "alpha")
+	h.addTodo("run_b", "B", "alpha") // SAME repo — exclusivity makes B wait on A
+
+	outA := h.submit("run_a", nil)
+	if !outA.Started {
+		t.Fatalf("A must start (its repo is free): %+v", outA)
+	}
+	outB := h.submit("run_b", &Placement{Kind: PlacementQueue})
+	if !outB.Queued || outB.ExecutionID == "" {
+		t.Fatalf("B must be held as a queued document while alpha is busy: %+v", outB)
+	}
+	// The waiting start is durable BEFORE any restart: a document on disk, not a process fact.
+	if d, ok, _ := h.docs.Get(outB.ExecutionID); !ok || d.Phase != model.PhaseQueued {
+		t.Fatalf("the queued start must be a persisted document: ok=%v %+v", ok, d)
+	}
+
+	// Restart the daemon over the same state root.
+	h.reboot()
+
+	// The queued start is STILL there, and still visible while it waits.
+	d, ok, _ := h.docs.Get(outB.ExecutionID)
+	if !ok || !d.Live() {
+		t.Fatalf("the queued start must survive the restart: ok=%v %+v", ok, d)
+	}
+	ov, err := h.sch.SlotOverview()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawB := false
+	for _, v := range ov.Active {
+		if v.RunID == "run_b" {
+			sawB = true
+		}
+	}
+	if !sawB {
+		t.Fatalf("the surviving start must be visible in the active view: %+v", ov.Active)
+	}
+
+	// And it actually FIRES after the restart (alpha is free now — A drained out at the restart).
+	h.sch.pass(context.Background(), false)
+	fired := h.waitPhase(outB.ExecutionID, model.PhaseRunning)
+	if fired.ID != outB.ExecutionID {
+		t.Fatalf("the SAME queued start must run, under its own id: %+v", fired)
+	}
+	h.exec.releaseExec(outB.ExecutionID)
+	h.waitPhase(outB.ExecutionID, model.PhaseCompleted)
+}
+
+// The SLOTS-FULL wait reason takes the very same durable path: a queued document that survives
+// the restart and fires when a slot opens.
+func TestQueuedStartSlotsFullSurvivesRestart(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.cap.Store(1)
+	h.addTodo("run_a", "A", "alpha")
+	h.addTodo("run_b", "B", "beta") // different repo — only the single slot makes B wait
+
+	outA := h.submit("run_a", nil)
+	outB := h.submit("run_b", &Placement{Kind: PlacementQueue})
+	if !outA.Started || !outB.Queued {
+		t.Fatalf("A runs, B queues on the full slot: %+v %+v", outA, outB)
+	}
+
+	h.reboot()
+
+	if d, ok, _ := h.docs.Get(outB.ExecutionID); !ok || !d.Live() {
+		t.Fatalf("the slots-full start must survive the restart: ok=%v %+v", ok, d)
+	}
+	h.sch.pass(context.Background(), false)
+	h.waitPhase(outB.ExecutionID, model.PhaseRunning)
+	h.exec.releaseExec(outB.ExecutionID)
+	h.waitPhase(outB.ExecutionID, model.PhaseCompleted)
+}
+
+// Losing a queued start is allowed — silence is not. A start whose run definition vanished while
+// it waited is retired VISIBLY at the next promotion: the document turns discarded with its
+// reason, and an operator notice names which start and why (the restart-queued-start-failed path
+// must not be the only case anyone ever learns anything).
+func TestQueuedStartVanishedRunIsNamed(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.cap.Store(2)
+	h.addTodo("run_a", "A", "alpha")
+	h.addTodo("run_b", "B", "alpha")
+
+	_ = h.submit("run_a", nil)
+	outB := h.submit("run_b", &Placement{Kind: PlacementQueue})
+	if !outB.Queued {
+		t.Fatalf("B must queue behind A on alpha: %+v", outB)
+	}
+	// The run definition disappears while its start waits.
+	if err := h.runs.Delete("run_b"); err != nil {
+		t.Fatal(err)
+	}
+
+	notices := h.reboot()
+	h.sch.pass(context.Background(), false)
+
+	d, ok, _ := h.docs.Get(outB.ExecutionID)
+	if !ok || d.Phase != model.PhaseDiscarded {
+		t.Fatalf("a queued start whose run vanished must be discarded, is %s", d.Phase)
+	}
+	if d.Reason == "" {
+		t.Fatal("the discard must carry its reason")
+	}
+	if !hasNotice(*notices, "execution-abandoned") {
+		t.Fatalf("the loss must be NAMED in a notice, got: %v", *notices)
+	}
+}
+
+// A queued start older than the resume window is reliably abandoned — also visibly, also named.
+func TestQueuedStartBeyondResumeWindowIsNamed(t *testing.T) {
+	h := newHarness(t, Config{ResumeWindow: time.Hour})
+	h.cap.Store(2)
+	h.addTodo("run_a", "A", "alpha")
+	h.addTodo("run_b", "B", "alpha")
+
+	_ = h.submit("run_a", nil)
+	outB := h.submit("run_b", &Placement{Kind: PlacementQueue})
+	if !outB.Queued {
+		t.Fatalf("B must queue behind A on alpha: %+v", outB)
+	}
+
+	notices := h.reboot()
+	// The clock moves past the resume window while B still waits.
+	h.sch.now = func() time.Time { return time.Now().UTC().Add(2 * time.Hour) }
+	h.sch.pass(context.Background(), false)
+
+	d, ok, _ := h.docs.Get(outB.ExecutionID)
+	if !ok || d.Phase != model.PhaseDiscarded {
+		t.Fatalf("an ancient queued start must be abandoned, is %s", d.Phase)
+	}
+	if !hasNotice(*notices, "execution-abandoned") {
+		t.Fatalf("the abandonment must be NAMED in a notice, got: %v", *notices)
+	}
+}
+
 // ── K-2 drain (B-01 share): SIGTERM persists, never blocks the stop budget ───────────────
 
 // A cooperative execution drains: SIGTERM → interrupted with continuation, well within grace.
