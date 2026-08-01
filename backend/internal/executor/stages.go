@@ -95,16 +95,18 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		}
 	}
 
-	// The task's branch is cut from the TOP OF THE STACK — the branch of the task before it in this
-	// repository, or the default branch when none is open. So the tasks build on each other in the
-	// order they ran, and each one's pull request shows only its OWN change against the one before.
-	stackBase, err := rc.Deps.Deliver().NextPRBase(ctx, rc.Repo)
-	if err != nil {
-		return fmt.Errorf("resolve the base of this task's branch: %w", err)
-	}
 	// One branch per TASK, named after the run, in every repository it targets. The name records
 	// the owner, so what lies on the branch can never again be mistaken for somebody else's work.
 	taskBranch := runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
+	// The task's branch is cut from the TOP OF THE STACK — the branch of the task before it in this
+	// repository, or the default branch when none is open. So the tasks build on each other in the
+	// order they ran, and each one's pull request shows only its OWN change against the one before.
+	// Its OWN branch is excluded as the base: a re-run whose earlier delivery is still open must
+	// not stack this task on itself.
+	stackBase, err := rc.Deps.Deliver().NextPRBase(ctx, rc.Repo, taskBranch)
+	if err != nil {
+		return fmt.Errorf("resolve the base of this task's branch: %w", err)
+	}
 	prep, err := wb.Prepare(ctx, taskBranch, stackBase)
 	if err != nil {
 		return fmt.Errorf("prepare workbench: %w", err)
@@ -499,10 +501,14 @@ func pullRequestRun(ctx context.Context, rc *RepoCtx) error {
 		return fmt.Errorf("push delivery branch %s: %w", rc.deliveryBranch, err)
 	}
 
+	// The base is the top of the stack EXCLUDING this delivery's own branch — the head that is
+	// about to be pushed and opened. Without that exclusion an open delivery of this very run
+	// (freshly written to the ledger, or left open by an earlier attempt) would be chosen as the
+	// base, and GitHub rejects head==base with a 422 "No commits between X and X".
 	var base string
 	if err := faultclass.Retry(ctx, &model.Backoff{}, transientMaxAttempts, func() error {
 		var berr error
-		base, berr = rc.Deps.Deliver().NextPRBase(ctx, rc.Repo)
+		base, berr = rc.Deps.Deliver().NextPRBase(ctx, rc.Repo, rc.deliveryBranch)
 		return berr
 	}); err != nil {
 		return fmt.Errorf("resolve PR base: %w", err)

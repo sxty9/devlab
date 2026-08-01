@@ -647,7 +647,7 @@ func (g chainGitHub) CreateRepo(ctx context.Context, repo string, _ bool) error 
 
 type chainDeliver struct{ d *ChainDeps }
 
-func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, error) {
+func (c chainDeliver) NextPRBase(ctx context.Context, repo, head string) (string, error) {
 	if c.d.s.deliveries == nil {
 		return "", errors.New("the delivery ledger is not available")
 	}
@@ -660,11 +660,12 @@ func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, erro
 		return "", err
 	}
 	// The stack top comes from the LEDGER, which is local. GitHub is only needed for the name of
-	// the default branch, and only when no delivery is open — so the common case asks GitHub
-	// nothing at all. This matters because the base is now resolved before every task starts: a
-	// throttled GitHub would otherwise stop the chain from beginning any work, which it did on
-	// 2026-07-31 ("resolve the base of this task's branch: github: 403").
-	if base := deliver.NextPRBase(open, ""); base != "" {
+	// the default branch, and only when no delivery OTHER THAN head is open — so the common case
+	// asks GitHub nothing at all. This matters because the base is now resolved before every task
+	// starts: a throttled GitHub would otherwise stop the chain from beginning any work, which it
+	// did on 2026-07-31 ("resolve the base of this task's branch: github: 403"). head is excluded
+	// by the pure function, so this delivery is never chosen as its own base.
+	if base := deliver.NextPRBase(open, head, ""); base != "" {
 		return base, nil
 	}
 	def, err := github.DefaultBranch(ctx, c.d.token, full)
@@ -678,7 +679,7 @@ func (c chainDeliver) NextPRBase(ctx context.Context, repo string) (string, erro
 		}
 		return "", err
 	}
-	return deliver.NextPRBase(open, def), nil
+	return deliver.NextPRBase(open, head, def), nil
 }
 
 // OpenOrAdoptPR writes the ledger INTENT and then rides deliver.OpenOrAdoptPR — the one PR path

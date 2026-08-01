@@ -205,7 +205,7 @@ type fakeDeliver struct {
 	protections []string
 }
 
-func (d *fakeDeliver) NextPRBase(ctx context.Context, repo string) (string, error) {
+func (d *fakeDeliver) NextPRBase(ctx context.Context, repo, head string) (string, error) {
 	if d.baseErr != nil {
 		return "", d.baseErr
 	}

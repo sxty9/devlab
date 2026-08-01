@@ -994,12 +994,12 @@ func (d *fixtureDeps) protectionOf(repo string) (deliver.Protection, bool) {
 // adapter (api.chainDeliver) does around the same calls.
 type fixtureDeliver struct{ d *fixtureDeps }
 
-func (f fixtureDeliver) NextPRBase(_ context.Context, repo string) (string, error) {
+func (f fixtureDeliver) NextPRBase(_ context.Context, repo, head string) (string, error) {
 	open, err := f.d.e.deliveries.Open(repo)
 	if err != nil {
 		return "", err
 	}
-	return deliver.NextPRBase(open, "main"), nil
+	return deliver.NextPRBase(open, head, "main"), nil
 }
 
 func (f fixtureDeliver) OpenOrAdoptPR(ctx context.Context, in executor.DeliverPRIn) (model.PRRef, bool, error) {

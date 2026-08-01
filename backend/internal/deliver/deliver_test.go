@@ -279,22 +279,60 @@ var t0 = time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
 
 // ── Stacked bases (REQ-024) ──────────────────────────────────────────────────────────────
 
-// TestNextPRBase pins the stacking rule: the last open delivery's branch is the next base;
-// without one the default branch is; empty and workbench branches are never bases.
+// TestNextPRBase pins the stacking rule: the most recent open delivery's branch OTHER THAN head
+// is the next base; without one the default branch is; empty, head, and workbench branches are
+// never bases.
 func TestNextPRBase(t *testing.T) {
-	if got := NextPRBase(nil, "main"); got != "main" {
+	if got := NextPRBase(nil, "fix/head-zzz999", "main"); got != "main" {
 		t.Errorf("empty stack: base = %q, want main", got)
 	}
 	open := []runs.Delivery{
 		{ID: "d1", Branch: "fix/first-aaa111"},
 		{ID: "d2", Branch: "fix/second-bbb222"},
 	}
-	if got := NextPRBase(open, "main"); got != "fix/second-bbb222" {
+	if got := NextPRBase(open, "fix/head-zzz999", "main"); got != "fix/second-bbb222" {
 		t.Errorf("base = %q, want the LAST open delivery's branch", got)
 	}
 	open = append(open, runs.Delivery{ID: "d3", Branch: ""}, runs.Delivery{ID: "d4", Branch: workbench.LegacyShared})
-	if got := NextPRBase(open, "main"); got != "fix/second-bbb222" {
+	if got := NextPRBase(open, "fix/head-zzz999", "main"); got != "fix/second-bbb222" {
 		t.Errorf("base = %q — empty and %s branches must be skipped", got, workbench.LegacyShared)
+	}
+}
+
+// TestNextPRBaseNeverHead is the regression for the self-referential PR (GitHub 422 "No commits
+// between X and X", measured 2026-08-01 in notify): the branch being delivered is the NEWEST open
+// delivery — it was just written to the ledger — yet NextPRBase must never return it as its own
+// base. It skips every same-branch open record and stacks on the one before, or the default when
+// nothing else is open.
+func TestNextPRBaseNeverHead(t *testing.T) {
+	head := "fix/self-cmlmg5"
+	// The head is the single newest open delivery: no other work is open, so the base is the
+	// DEFAULT branch — never the head itself.
+	own := []runs.Delivery{{ID: "d_self", Branch: head}}
+	if got := NextPRBase(own, head, "main"); got != "main" {
+		t.Fatalf("self-referential base = %q — the own branch must never be its own base; want main", got)
+	}
+	if got := NextPRBase(own, head, "main"); got == head {
+		t.Fatalf("base equals head (%q) — a PR would be opened against itself (422)", got)
+	}
+	// The head is the newest, but an EARLIER task is still open: the base is that earlier task's
+	// branch, and the head is skipped even though it sits at the top of the ledger.
+	stack := []runs.Delivery{
+		{ID: "d_prior", Branch: "fix/prior-aaa111"},
+		{ID: "d_self", Branch: head},
+	}
+	if got := NextPRBase(stack, head, "main"); got != "fix/prior-aaa111" {
+		t.Fatalf("base = %q — head must be skipped and the prior open delivery chosen", got)
+	}
+	// Two open records share the head branch (a re-run wrote a second intent for the same branch):
+	// BOTH are skipped, so the base is still the prior task's branch.
+	dupes := []runs.Delivery{
+		{ID: "d_prior", Branch: "fix/prior-aaa111"},
+		{ID: "d_self_1", Branch: head},
+		{ID: "d_self_2", Branch: head},
+	}
+	if got := NextPRBase(dupes, head, "main"); got != "fix/prior-aaa111" {
+		t.Fatalf("base = %q — every same-branch open record must be skipped", got)
 	}
 }
 
@@ -310,11 +348,15 @@ func TestStackedDeliveries(t *testing.T) {
 	if err := ledger.Put(first); err != nil {
 		t.Fatal(err)
 	}
-	base1 := "main"
-	if open, _ := ledger.Open("o/x"); len(open) != 1 {
+	// The first delivery is the only open one and it IS the head — so it bases on main, never
+	// on itself.
+	openNow, _ := ledger.Open("o/x")
+	if len(openNow) != 1 {
 		t.Fatal("precondition: one open delivery")
-	} else if NextPRBase(open[:0], "main") != "main" {
-		t.Fatal("first delivery must base on main")
+	}
+	base1 := NextPRBase(openNow, first.Branch, "main")
+	if base1 != "main" {
+		t.Fatalf("first delivery base = %q, want main (it must not base on itself)", base1)
 	}
 	if _, _, err := OpenOrAdoptPR(ctx, gh, ledger, PRIn{Repo: "o/x", Head: first.Branch, Base: base1, Title: "one", DeliveryID: "dlv_1"}); err != nil {
 		t.Fatal(err)
@@ -324,15 +366,11 @@ func TestStackedDeliveries(t *testing.T) {
 	if err := ledger.Put(second); err != nil {
 		t.Fatal(err)
 	}
+	// The second task's PR bases on the FIRST task's branch: NextPRBase excludes the second's own
+	// branch (head) though it is the newest open delivery, and returns the one before it. No manual
+	// filtering — the function does the exclusion.
 	open, _ := ledger.Open("o/x")
-	// The second PR's base: the stack minus the delivery being opened.
-	var prior []runs.Delivery
-	for _, d := range open {
-		if d.ID != "dlv_2" {
-			prior = append(prior, d)
-		}
-	}
-	base2 := NextPRBase(prior, "main")
+	base2 := NextPRBase(open, second.Branch, "main")
 	if base2 != "fix/one-aaa111" {
 		t.Fatalf("second base = %q, want the first delivery's branch", base2)
 	}

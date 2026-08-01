@@ -75,12 +75,19 @@ type Protection struct {
 	MergeMethods   []string
 }
 
-// NextPRBase is pure: the stacked base of the next PR — the last open delivery's branch, else
-// the default branch (REQ-024). The workbench branch is never a base candidate: it is never a
+// NextPRBase is pure: the stacked base of the next PR — the most recent OPEN delivery's branch
+// OTHER THAN head (the branch being delivered), else the default branch (REQ-024).
+//
+// head is excluded INSIDE the function, never left to the caller. A PR's base is never its own
+// head: the branch being delivered is regularly the newest open delivery — it was just written
+// to the ledger — so a caller that only skipped the workbench branch would hand GitHub head==base
+// and earn a 422 "No commits between X and X", a PR opened against itself. Every same-branch open
+// record is skipped, so a re-run whose earlier delivery is still open stacks on somebody else's
+// work, not on its own. The workbench branch is never a base candidate either: it is never a
 // delivery branch (S9), and a defensive skip keeps a corrupt ledger from ever stacking on it.
-func NextPRBase(open []runs.Delivery, defaultBranch string) string {
+func NextPRBase(open []runs.Delivery, head, defaultBranch string) string {
 	for i := len(open) - 1; i >= 0; i-- {
-		if b := open[i].Branch; b != "" && b != workbench.LegacyShared {
+		if b := open[i].Branch; b != "" && b != head && b != workbench.LegacyShared {
 			return b
 		}
 	}
@@ -368,14 +375,9 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 		if err != nil {
 			return out, err
 		}
-		// The reversal itself is open now; its base must stack on what came BEFORE it.
-		withoutSelf := make([]runs.Delivery, 0, len(open))
-		for _, o := range open {
-			if o.ID != revID {
-				withoutSelf = append(withoutSelf, o)
-			}
-		}
-		base := NextPRBase(withoutSelf, cb.DefaultBranch)
+		// The reversal itself is open now; NextPRBase excludes the branch being delivered
+		// (reversalBranch), so its base stacks on what came BEFORE it — never on itself.
+		base := NextPRBase(open, reversalBranch, cb.DefaultBranch)
 		ref, _, err := OpenOrAdoptPR(ctx, gh, ledger, PRIn{
 			Repo: d.Repo, Head: reversalBranch, Base: base,
 			Title:      "Revert delivery " + d.ID,

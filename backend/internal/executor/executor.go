@@ -89,9 +89,10 @@ type GitHubOps interface {
 
 // DeliverOps is the delivery slice (the ONE PR path + protection on repo creation).
 type DeliverOps interface {
-	// NextPRBase returns the stacked base of the next PR: the last open delivery's branch,
-	// else the default branch (REQ-024).
-	NextPRBase(ctx context.Context, repo string) (string, error)
+	// NextPRBase returns the stacked base of the next PR: the most recent open delivery's branch
+	// OTHER THAN head (the branch being delivered), else the default branch (REQ-024). Passing
+	// head lets the pure function exclude it, so a PR is never opened against itself.
+	NextPRBase(ctx context.Context, repo, head string) (string, error)
 	OpenOrAdoptPR(ctx context.Context, in DeliverPRIn) (model.PRRef, bool, error)
 	// EnsureProtection sets the full branch protection; failing to set it fails the repo
 	// creation (REQ-033.6).
