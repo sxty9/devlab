@@ -51,6 +51,35 @@ export function openDeliveryExecutionIds(list: readonly Delivery[]): ReadonlySet
   return out;
 }
 
+/** The open delivery's maintenance facts an open todo needs to say WHY it waits: whether the
+ *  delivery is blocked (K-5, waiting for a release) and, if not, the instant its auto-merge is due
+ *  (`mergeBy`). Read straight off the ledger the server states — never derived from a chain stage. */
+export interface OpenDeliveryFacts {
+  blocked: boolean;
+  reason?: string;
+  mergeBy?: string;
+}
+
+/** Join the OPEN deliveries by the execution they arose from, folding each execution's open rows
+ *  into one fact: blocked if ANY of them is (with the first reason), and the SOONEST merge deadline
+ *  among them. Only open deliveries carry a live wait, so merged/closed rows are skipped — the same
+ *  `isOpenDelivery` rule the open-delivery set uses, so the two never disagree. Keyed by execution
+ *  id, which is how the open-list derivation looks a waiting execution up (B-8). */
+export function openDeliveryFactsByExecution(list: readonly Delivery[]): Map<string, OpenDeliveryFacts> {
+  const out = new Map<string, OpenDeliveryFacts>();
+  for (const d of list) {
+    if (!d.executionId || !isOpenDelivery(d)) continue;
+    const cur = out.get(d.executionId) ?? { blocked: false };
+    if (d.blocked) {
+      cur.blocked = true;
+      cur.reason ??= d.blockedReason;
+    }
+    if (d.mergeBy && (!cur.mergeBy || d.mergeBy < cur.mergeBy)) cur.mergeBy = d.mergeBy;
+    out.set(d.executionId, cur);
+  }
+  return out;
+}
+
 /** The instant a delivery is ordered by: its creation. Unparseable/absent times yield 0 so the
  *  row sorts last instead of NaN-sorting the whole list away (the old black-screen trap). */
 export function deliveryAt(d: Delivery): number {
