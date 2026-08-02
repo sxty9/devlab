@@ -25,6 +25,14 @@ import (
 // merged | rolled back | closed-with-reason to be distinguishable). ReversalOf, on a REVERSING
 // delivery, points at the delivery it counter-books. ExecutionID ties the delivery to its
 // execution ("" on none, e.g. a reversal issued by hand).
+//
+// FailedAt marks a delivery whose work was committed to its branch but whose delivery did NOT
+// complete — a failed dev delivery, a stale root script, a GitHub rejection. It is the difference
+// between "keine Lieferung" (no record at all) and "Lieferung gescheitert" (recorded, and visibly
+// at the tip): a run that produced commits but could not ship them leaves this mark instead of
+// vanishing, so the next run cannot silently branch past its work. A failed delivery stays
+// UNSETTLED (OpenState true) — its execution is not history-ready and its ToDo stays open — until
+// it is either resolved (re-delivered, which clears the mark) or rolled back (which closes it).
 type Delivery struct {
 	ID           string     `json:"id"`
 	Repo         string     `json:"repo"`
@@ -37,12 +45,23 @@ type Delivery struct {
 	MergedAt     *time.Time `json:"mergedAt,omitempty"`
 	ClosedAt     *time.Time `json:"closedAt,omitempty"`
 	ClosedReason string     `json:"closedReason,omitempty"`
+	FailedAt     *time.Time `json:"failedAt,omitempty"`
+	FailedReason string     `json:"failedReason,omitempty"`
 	ReversalOf   string     `json:"reversalOf,omitempty"`
 	ExecutionID  string     `json:"executionId,omitempty"`
 }
 
-// OpenState reports whether the delivery is still open: neither merged nor closed.
+// OpenState reports whether the delivery is still UNSETTLED: neither merged nor closed. A failed
+// delivery is unsettled too — its work is committed but not shipped, so the B-8 completion rule
+// keeps its execution open until the failure is resolved or rolled back. Whether a delivery is a
+// valid base to STACK on is a different question (a failed one is not); NextPRBase answers that.
 func (d Delivery) OpenState() bool { return d.MergedAt == nil && d.ClosedAt == nil }
+
+// Failed reports the "Lieferung gescheitert" state: the work is on the branch, the delivery did
+// not complete, and it has neither been merged nor rolled back. Such a delivery is the tip of the
+// stack — nothing is branched past it until it is resolved (which clears FailedAt) or rolled back
+// (which sets ClosedAt).
+func (d Delivery) Failed() bool { return d.FailedAt != nil && d.MergedAt == nil && d.ClosedAt == nil }
 
 // NewDeliveryID mints an unguessable delivery id (a record key, never a path segment).
 func NewDeliveryID() string {

@@ -18,7 +18,28 @@ export const DELIVERY_STAGE: Record<string, { label: string; tone: BadgeTone }> 
   merged: { label: 'merged', tone: 'success' },
   closed: { label: 'closed', tone: 'warning' },
   reverted: { label: 'rolled back', tone: 'neutral' },
+  // A delivery whose work was committed but not shipped: the tip a new order does not branch past
+  // until it is resolved (re-run) or rolled back. Its own stage, distinct from a settled one.
+  failed: { label: 'delivery failed', tone: 'danger' },
 };
+
+/** The one stage name that means "committed but not shipped" — the failed tip. Named once so every
+ *  surface asks the same question of the same field. */
+const STAGE_FAILED = 'failed';
+
+/** Whether the server states this delivery as a FAILED tip — its work is on the branch but did not
+ *  ship. Read straight off the server-stamped stage; nothing is derived here (B-35). */
+export function isFailedDelivery(d: Pick<Delivery, 'stage'>): boolean {
+  return (d.stage ?? '').trim() === STAGE_FAILED;
+}
+
+/** Whether the delivery is UNSETTLED — neither merged nor closed nor reverted: a healthy open PR OR
+ *  a failed tip. This is the B-8 question ("does this execution still hold work?"): a failed
+ *  delivery keeps its execution — and thus its ToDo — open, exactly as an open PR does, until it is
+ *  resolved (re-run) or rolled back. */
+export function isUnsettledDelivery(d: Pick<Delivery, 'stage'>): boolean {
+  return isOpenDelivery(d) || isFailedDelivery(d);
+}
 
 /** The one stage name that means "not settled yet". Named once here so every surface asks the same
  *  question of the same field instead of spelling the stage out again. */
@@ -46,7 +67,9 @@ export function deliveryBadge(d: Pick<Delivery, 'stage'>): { label: string; tone
 export function openDeliveryExecutionIds(list: readonly Delivery[]): ReadonlySet<string> {
   const out = new Set<string>();
   for (const d of list) {
-    if (d.executionId && isOpenDelivery(d)) out.add(d.executionId);
+    // Unsettled, not merely PR-open: a FAILED delivery holds its execution open too, so the failed
+    // order stays in the open ToDo list instead of dropping to history unresolved (WHAT-2).
+    if (d.executionId && isUnsettledDelivery(d)) out.add(d.executionId);
   }
   return out;
 }
@@ -68,8 +91,15 @@ export interface OpenDeliveryFacts {
 export function openDeliveryFactsByExecution(list: readonly Delivery[]): Map<string, OpenDeliveryFacts> {
   const out = new Map<string, OpenDeliveryFacts>();
   for (const d of list) {
-    if (!d.executionId || !isOpenDelivery(d)) continue;
+    if (!d.executionId || !isUnsettledDelivery(d)) continue;
     const cur = out.get(d.executionId) ?? { blocked: false };
+    // A FAILED delivery is a wait that needs no clock: it holds the execution open until it is
+    // resolved or rolled back. It reads as blocked, carrying its failure as the reason, so the open
+    // ToDo says WHY it waits — the tip failed — not just that it does.
+    if (isFailedDelivery(d)) {
+      cur.blocked = true;
+      cur.reason ??= d.failedReason ?? 'delivery failed';
+    }
     if (d.blocked) {
       cur.blocked = true;
       cur.reason ??= d.blockedReason;
@@ -105,6 +135,12 @@ export interface RepoDeliveries {
    *  repository itself can attest. */
   latestOpen: Delivery | null;
   openCount: number;
+  /** The failed delivery sitting at the TIP of this repository's stack, or null when the tip is
+   *  sound. It is what lets the surface say — without anyone asking — whether the tip is fine, and if
+   *  not, which layer is broken and on what (WHAT-4). "At the tip" means the newest unsettled
+   *  delivery is a failed one; a failed layer with healthy work stacked on top is not possible,
+   *  because the chain holds a new order before it branches past a failed tip. */
+  failedTip: Delivery | null;
   /** The instant this repository was last delivered to; 0 when it never was (it then sorts last). */
   latestAt: number;
 }
@@ -126,25 +162,30 @@ export function groupDeliveriesByRepo(list: Delivery[], repos: readonly string[]
   }
   const groups: RepoDeliveries[] = [];
   for (const [repo, entries] of byRepo) {
-    const sorted = sortDeliveries(entries);
+    const sorted = sortDeliveries(entries); // newest first
     const open = sorted.filter(isOpenDelivery);
+    // The tip is the newest unsettled delivery; the tip is broken when that delivery is a failed one.
+    const tip = sorted.find(isUnsettledDelivery) ?? null;
     groups.push({
       repo,
       deliveries: sorted,
       latestOpen: open[0] ?? null,
       openCount: open.length,
+      failedTip: tip && isFailedDelivery(tip) ? tip : null,
       latestAt: sorted.length > 0 ? deliveryAt(sorted[0]) : 0,
     });
   }
   return groups.sort((a, b) => (b.latestAt !== a.latestAt ? b.latestAt - a.latestAt : a.repo.localeCompare(b.repo)));
 }
 
-/** Whether a delivery still has an effect left to undo: only an open or a merged one. A closed or
- *  already rolled-back delivery is settled, so its rollback control is not offered at all — no
- *  button into the void (REQ-040.3). A reversal itself is never rolled back again. */
+/** Whether a delivery still has an effect left to undo: an open, a FAILED, or a merged one. A closed
+ *  or already rolled-back delivery is settled, so its rollback control is not offered at all — no
+ *  button into the void (REQ-040.3). A reversal itself is never rolled back again. Rolling back a
+ *  FAILED tip is the second of the two ways back: it dismantles the broken layer so the last sound
+ *  layer becomes the tip again. */
 export function canRollback(d: Delivery): boolean {
   if (d.reversalOf) return false;
-  return isOpenDelivery(d) || (d.stage ?? '').trim() === 'merged';
+  return isUnsettledDelivery(d) || (d.stage ?? '').trim() === 'merged';
 }
 
 /** Short commit sha for display (the ledger stores full shas). */
@@ -170,6 +211,14 @@ export interface Consequence {
 
 export function rollbackConfirmation(d: Delivery): Consequence {
   const merged = d.stage === 'merged';
+  const failed = isFailedDelivery(d);
+  if (failed) {
+    return {
+      effect: `Dismantles the failed tip in ${d.repo}: ${commitRange(d)} is counter-booked off the dev branch. This work never shipped, so there is no pull request to close.`,
+      result: 'The last sound layer becomes the tip again; the failed delivery reads as rolled back and no longer holds new orders.',
+      undo: 'Nothing is rewritten — running the order again delivers it anew.',
+    };
+  }
   return {
     effect: merged
       ? `Counter-books ${commitRange(d)} in ${d.repo}: the reversing commit is opened as its own pull request.`

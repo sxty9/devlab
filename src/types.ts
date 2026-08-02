@@ -439,6 +439,10 @@ export interface Delivery {
   blocked?: boolean;
   /** Why the delivery is blocked, in words a person can act on (only set when `blocked`). */
   blockedReason?: string;
+  /** Why a FAILED delivery ("Lieferung gescheitert") did not ship — set only when `stage` is
+   *  'failed'. It is what lets the ledger surface say which layer at the tip is broken and on what,
+   *  without anyone having to ask (WHAT-4). */
+  failedReason?: string;
 }
 
 export interface PRRef {

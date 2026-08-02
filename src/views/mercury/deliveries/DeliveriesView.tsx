@@ -162,13 +162,16 @@ export function DeliveriesView() {
               <section key={g.repo}>
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <h2 className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
-                  {/* What the LEDGER states — never a claim about the repository's own branches. */}
-                  <span className="text-caption text-text-tertiary">
-                    {g.deliveries.length === 0
-                      ? 'nothing delivered yet'
-                      : g.latestOpen
-                        ? `${g.openCount} open · last delivered ${shortSha(g.latestOpen.toCommit)}`
-                        : 'every delivery settled'}
+                  {/* Whether the TIP is sound is stated first — a failed tip is not the same as a
+                      settled ledger, and the summary says which it is (WHAT-4). */}
+                  <span className={cn('text-caption', g.failedTip ? 'font-medium text-danger' : 'text-text-tertiary')}>
+                    {g.failedTip
+                      ? 'tip failed — no new order branches past it'
+                      : g.deliveries.length === 0
+                        ? 'nothing delivered yet'
+                        : g.latestOpen
+                          ? `${g.openCount} open · last delivered ${shortSha(g.latestOpen.toCommit)}`
+                          : 'every delivery settled'}
                   </span>
                   <Button
                     variant="ghost"
@@ -179,6 +182,16 @@ export function DeliveriesView() {
                     Reset dev state
                   </Button>
                 </div>
+                {/* The broken layer, named with what it klemmt on, so the way back is obvious without a
+                    reload or a question: resolve the tip (re-run the order) or roll it back below. */}
+                {g.failedTip && (
+                  <p className="mb-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-caption text-danger">
+                    Delivery <span className="font-mono">{g.failedTip.id}</span> on{' '}
+                    <span className="font-mono">{g.failedTip.branch}</span> failed and is the tip:{' '}
+                    {g.failedTip.failedReason || 'the delivery did not complete'}. Resolve it by running the order again,
+                    or roll it back to make the last sound layer the tip.
+                  </p>
+                )}
                 {g.deliveries.length > 0 && (
                   <ul className="flex flex-col gap-1.5">
                     {g.deliveries.map((d) => (
@@ -227,6 +240,8 @@ function DeliveryRow({ delivery, onRollback }: { delivery: Delivery; onRollback:
           Roll back
         </Button>
       )}
+      {/* A failed row states, on its own line, WHAT it klemmt on — the reason it did not ship. */}
+      {delivery.failedReason && <span className="w-full text-caption text-danger">{delivery.failedReason}</span>}
     </li>
   );
 }

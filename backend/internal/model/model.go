@@ -293,6 +293,9 @@ type Delivery struct {
 	ReversalOf string `json:"reversalOf,omitempty"`
 	// Stage is the reached stage for the deliveries view (F12).
 	Stage string `json:"stage,omitempty"`
+	// FailedReason names WHY a failed delivery ("Lieferung gescheitert") did not ship, so the ledger
+	// surface can say which layer at the tip is broken and on what — set only when Stage is "failed".
+	FailedReason string `json:"failedReason,omitempty"`
 }
 
 // PRRef references one pull request.

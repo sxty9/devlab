@@ -95,8 +95,8 @@ type Protection struct {
 	MergeMethods   []string
 }
 
-// NextPRBase is pure: the stacked base of the next PR — the most recent OPEN delivery's branch
-// OTHER THAN head (the branch being delivered), else the default branch (REQ-024).
+// NextPRBase is pure: the stacked base of the next PR — the most recent HEALTHY open delivery's
+// branch OTHER THAN head (the branch being delivered), else the default branch (REQ-024).
 //
 // head is excluded INSIDE the function, never left to the caller. A PR's base is never its own
 // head: the branch being delivered is regularly the newest open delivery — it was just written
@@ -105,13 +105,87 @@ type Protection struct {
 // record is skipped, so a re-run whose earlier delivery is still open stacks on somebody else's
 // work, not on its own. The workbench branch is never a base candidate either: it is never a
 // delivery branch (S9), and a defensive skip keeps a corrupt ledger from ever stacking on it.
+//
+// A FAILED delivery is never a base either: its work did not ship, so stacking a new PR on it
+// would inherit an unfinished layer. The chain never reaches this point on a failed tip — the
+// implement stage holds the run BEFORE it branches (FailedTip) — so skipping the failed record
+// here is a defensive belt: were a base ever resolved past one, it would not pick the broken layer.
 func NextPRBase(open []runs.Delivery, head, defaultBranch string) string {
 	for i := len(open) - 1; i >= 0; i-- {
-		if b := open[i].Branch; b != "" && b != head && b != workbench.LegacyShared {
-			return b
+		d := open[i]
+		if d.Branch != "" && d.Branch != head && d.Branch != workbench.LegacyShared && !d.Failed() {
+			return d.Branch
 		}
 	}
 	return defaultBranch
+}
+
+// FailedTip reports the failed delivery sitting at the tip of a repo's stack, or nil when the tip
+// is sound. It is the ledger side of the axiom "a failed order becomes the tip and the stack does
+// not grow past it": the NEWEST unsettled delivery of the repo is the tip, and a tip that is a
+// failed delivery blocks any new branch until it is resolved or rolled back. A repo with no
+// unsettled delivery, or whose newest unsettled delivery is a healthy open one, has a sound tip.
+func FailedTip(ledger *runs.DeliveryStore, repo string) (*runs.Delivery, error) {
+	all, err := ledger.All()
+	if err != nil {
+		return nil, err
+	}
+	// All() is oldest-first, so the last unsettled delivery of the repo is the tip.
+	var tip *runs.Delivery
+	for i := range all {
+		if all[i].Repo == repo && all[i].OpenState() {
+			d := all[i]
+			tip = &d
+		}
+	}
+	if tip != nil && tip.Failed() {
+		return tip, nil
+	}
+	return nil, nil
+}
+
+// FailedDeliveryIn is the record a run leaves when it committed work but could not ship it. The
+// DeliveryID is the one the chain already minted for the (attempted) delivery, so a re-run finds
+// the same record instead of proliferating duplicates.
+type FailedDeliveryIn struct {
+	DeliveryID  string
+	ExecutionID string
+	Repo        string
+	Branch      string
+	FromCommit  string
+	ToCommit    string
+	Reason      string
+}
+
+// RecordFailedDelivery leaves the "Lieferung gescheitert" mark (WHAT-2.1): a durable, visible
+// ledger entry for work that was committed but not shipped. Idempotent by DeliveryID — a re-run
+// that fails again updates the same record. A delivery that has meanwhile been merged or closed is
+// left untouched: the mark is only ever set on an unsettled record, never used to reopen a settled
+// one.
+func RecordFailedDelivery(ledger *runs.DeliveryStore, in FailedDeliveryIn) error {
+	if ledger == nil {
+		return errors.New("deliver: no ledger")
+	}
+	if in.DeliveryID == "" || in.Repo == "" {
+		return errors.New("deliver: a failed-delivery mark needs its delivery id and repo")
+	}
+	now := time.Now().UTC()
+	if d, ok, err := ledger.ByID(in.DeliveryID); err != nil {
+		return err
+	} else if ok {
+		if !d.OpenState() {
+			return nil // already merged or closed — the mark does not resurrect a settled delivery
+		}
+		d.FailedAt = &now
+		d.FailedReason = in.Reason
+		return ledger.Put(d)
+	}
+	return ledger.Put(runs.Delivery{
+		ID: in.DeliveryID, ExecutionID: in.ExecutionID,
+		Repo: in.Repo, Branch: in.Branch,
+		FromCommit: in.FromCommit, ToCommit: in.ToCommit,
+		CreatedAt: now, FailedAt: &now, FailedReason: in.Reason,
+	})
 }
 
 // PRIn describes the PR to open. DeliveryID "" means a HUMAN PR (the IDE route, B-1): no
@@ -217,6 +291,11 @@ func recordPROnDelivery(ledger *runs.DeliveryStore, deliveryID string, ref model
 	}
 	d.PRNumber = ref.Number
 	d.PRURL = ref.URL
+	// The delivery just shipped a pull request — it is a healthy open delivery again. A "Lieferung
+	// gescheitert" mark from an earlier failed attempt is cleared here, at the ONE point a delivery
+	// recovers, so resolving the failure at the tip (re-running the order) needs no separate step.
+	d.FailedAt = nil
+	d.FailedReason = ""
 	return ledger.Put(d)
 }
 
@@ -411,6 +490,12 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 		out.ReversalDeliveryID = revID
 		out.Detail = "merged delivery counter-booked — reversal PR #" + fmt.Sprint(ref.Number) + " runs the same chain"
 	} else {
+		// Both an OPEN and a FAILED delivery take this path — neither is merged, so the same
+		// counter-booking withdraws the work from the dev branch. A failed delivery regularly has no
+		// pull request to close; the close is conditional on one existing, so the wording never
+		// claims a PR that was never opened. Rolling back a failed tip is the axiom's second way back:
+		// the broken layer is dismantled and the last sound layer becomes the tip again.
+		failed := d.Failed()
 		if d.PRNumber != 0 {
 			if err := gh.ClosePullRequest(ctx, d.Repo, d.PRNumber, rollbackCloseReason(d, by)); err != nil {
 				return out, fmt.Errorf("close PR: %w", err)
@@ -418,12 +503,25 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 			out.ClosedPR = &model.PRRef{Number: d.PRNumber, URL: d.PRURL, HeadBranch: d.Branch}
 		}
 		d.ClosedAt = &now
-		d.ClosedReason = rolledBackReasonPrefix + actorName(by) + " — counter-booked on " + workbench.LegacyShared + "@" + shortSHA(cb.After)
+		reasonWhat := "counter-booked"
+		if failed {
+			reasonWhat = "failed delivery rolled back — counter-booked"
+		}
+		d.ClosedReason = rolledBackReasonPrefix + actorName(by) + " — " + reasonWhat + " on " + workbench.LegacyShared + "@" + shortSHA(cb.After)
+		// A failed mark is subsumed by the close: the delivery is now settled (rolled back), not failed.
+		d.FailedAt, d.FailedReason = nil, ""
 		if err := ledger.Put(d); err != nil {
 			return out, err
 		}
 		if out.Detail == "" {
-			out.Detail = "open delivery counter-booked and its PR closed with the justification"
+			switch {
+			case failed && out.ClosedPR != nil:
+				out.Detail = "failed delivery rolled back — its work counter-booked off the dev branch and its pull request closed"
+			case failed:
+				out.Detail = "failed delivery rolled back — its work counter-booked off the dev branch"
+			default:
+				out.Detail = "open delivery counter-booked and its PR closed with the justification"
+			}
 		}
 	}
 	redeliver(ctx, gs, d.Repo, &out)
