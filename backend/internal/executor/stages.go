@@ -121,16 +121,39 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 }
 
 // raiseWrapperQuestion is THE FREED HANDLE (point 5): the self delivery refused because the root
-// wrapper scripts drifted, so the run asks the user to renew them and blocks. It carries the exact
-// difference to the installed scripts so the user sees precisely what would change, and it mints no
-// delivery id (the repo is held by the open question, not by a failed delivery).
+// wrapper scripts drifted from the standard branch, so the run asks the user to approve renewing them
+// and blocks. It offers EXACTLY the merged (standard-branch) content, pinned per file to its checksum,
+// and mints no delivery id (the repo is held by the open question, not by a failed delivery).
 //
-// SAFETY: this raises a QUESTION and blocks — it grants NOTHING. The chain never writes the wrapper
-// scripts (they are its own sudo allowlist). The user renews them with their own sudo via the named
-// one-line script, and on resume the guard re-measures the ACTUAL installed scripts by content: the
-// install proceeds only when they genuinely match, never because a question was approved. So an
-// approval a run could somehow forge still installs nothing — only a real root renewal does.
+// SAFETY (the delta from the prior order, which built the ask but REFUSED the write): approval now
+// DOES install — but only merged content a run cannot author, and only under an approval a run cannot
+// forge, and the root tool re-verifies both itself. The write is applied on resume by
+// applyApprovedWrapperRenewal → DeployOps.RenewApprovedWrappers → `sudo devlab-install
+// --renew-wrapper` (see backend/internal/deploy/wrapperrenew.go). A forged approval installs nothing:
+// the content must still hash to the standard-branch checksum, and the grant the root tool reads sits
+// in a daemon-owned, run-unwritable place. The `drift` argument is the guard's original refusal text,
+// kept only for the log line; the question's Detail is rebuilt from the standard-branch grant set.
 func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
+	// The renewal offers EXACTLY the standard-branch (merged) content — never the working tree. So the
+	// question is built from the difference between the installed wrappers and the standard branch, and
+	// it pins each file to the merged content's checksum (the approval is for one content, task 1/2).
+	grants, derr := rc.Deps.Deploy().MainWrapperDrift(ctx, rc.Repo)
+	if derr != nil {
+		return fmt.Errorf("%w (could not read the standard-branch wrapper scripts: %v)", ErrWrappersStale, derr)
+	}
+	now := rc.Deps.Now().UTC()
+	if len(grants) == 0 {
+		// The installed wrappers already match the standard branch — there is nothing MERGED to renew.
+		// The delivery is blocked because THIS run changed a wrapper script and that change is not yet
+		// on the standard branch; only merged content is ever installed, so it waits until it merges.
+		// We ask no question the user cannot satisfy.
+		rc.consumeWrapperQuestion(ctx)
+		rc.logf("this run changed a root wrapper script, but the change is not yet on the standard branch — only merged content is installed; the delivery waits until it merges")
+		return &faultclass.BlockedError{Backoff: model.Backoff{
+			Reason: "this run changed a root wrapper script under /usr/local/sbin, but that change is not yet on the standard branch — only merged wrapper content is installed, so the delivery waits until it merges",
+			Class:  "awaiting-wrapper-merge", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+		}}
+	}
 	// A prior answer that did not actually renew the scripts is stale — consume it so the surface
 	// shows the ONE current question, not a settled-but-unfixed one.
 	rc.consumeWrapperQuestion(ctx)
@@ -138,25 +161,59 @@ func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error
 		RunID: rc.Run.ID, RunTitle: rc.Run.Title, Kind: rc.Run.Kind,
 		ExecutionID: rc.Doc.ID, Repo: rc.Repo,
 		QKind: runs.QuestionWrapperRenewal, Autonomy: rc.Run.Autonomy.Resolve(),
-		Question: "Renew the root wrapper scripts under /usr/local/sbin so they match this delivery? " +
-			"They no longer match the repository, so the daemon cannot be installed until they are renewed.",
-		Recommendation: "These scripts run as root and are the runner's own permission allowlist — the chain " +
-			"never writes them. Run the one-line script named in the difference below with sudo, then approve. " +
-			"The run re-checks that the installed scripts actually match before it installs anything; your " +
-			"approval alone never writes them.",
-		Detail:  drift,
-		AskedBy: model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+		Question: "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
+			"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed.",
+		Recommendation: "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
+			"version listed below — nothing from this run's working tree, and only the named files with the " +
+			"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing.",
+		Detail:   renderWrapperGrants(grants),
+		Wrappers: grants,
+		AskedBy:  model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
 	}
 	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
 		return fmt.Errorf("%w (the wrapper-renewal question could not be recorded: %v)", ErrWrappersStale, err)
 	}
-	rc.logf("root wrappers drifted — asked the user to renew them (explicit approval required); nothing was installed")
-	now := rc.Deps.Now().UTC()
+	rc.logf("root wrappers differ from the standard branch — asked the user to approve renewing them to the merged version; nothing was installed (guard: %s)", firstLine(drift))
 	return &faultclass.BlockedError{Backoff: model.Backoff{
-		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin — run the " +
-			"named one-line script with sudo, then approve; the run re-verifies the scripts match before it installs",
-		Class: "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin to their standard-branch version — approve on the Blocked surface; the merged content is then installed and verified",
+		Class:  "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
 	}}
+}
+
+// renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
+// would be renewed and the checksum of the standard-branch content it would be renewed to.
+func renderWrapperGrants(grants []runs.WrapperGrant) string {
+	var b strings.Builder
+	b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
+	for _, g := range grants {
+		fmt.Fprintf(&b, "  - %s → sha256 %s\n", g.Name, g.SHA)
+	}
+	b.WriteString("Only these files, with these exact checksums, are installed; the approval is single-use.")
+	return b.String()
+}
+
+// applyApprovedWrapperRenewal is the WRITE half's trigger on resume: if this execution's own
+// wrapper-renewal question was answered AND approved, install the approved standard-branch wrappers
+// through the root tool BEFORE the delivery re-checks the guard. It is idempotent — a renewal already
+// applied (or partly applied) is skipped per file in the deploy layer — and a failure never marks the
+// approval consumed, so the delivery simply re-checks and may ask again.
+func (rc *RepoCtx) applyApprovedWrapperRenewal(ctx context.Context) {
+	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
+	if err != nil || q == nil || q.QKind != runs.QuestionWrapperRenewal || !q.Approved || len(q.Wrappers) == 0 {
+		return
+	}
+	if err := rc.Deps.Deploy().RenewApprovedWrappers(ctx, rc.Repo, *q); err != nil {
+		rc.logf("could not renew the approved root wrapper scripts (%v) — the delivery re-checks and may ask again; your approval is not spent", err)
+		return
+	}
+	names := make([]string, len(q.Wrappers))
+	for i, g := range q.Wrappers {
+		names[i] = g.Name
+	}
+	rc.logf("renewed root wrapper scripts from the standard branch under your approval: %s", strings.Join(names, ", "))
+	if err := rc.Deps.Questions().Resolve(ctx, q.ID); err != nil {
+		rc.logf("root wrappers renewed but the question could not be marked resolved: %v", err)
+	}
 }
 
 // consumeWrapperQuestion marks this execution's answered wrapper-renewal question consumed, so it
@@ -594,6 +651,11 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 		})
 		return fmt.Errorf("code-structure violation: %s", det.Evidence)
 	}
+
+	// THE WRITE HALF: if the user approved renewing the root wrapper scripts, install the approved
+	// standard-branch versions through the root tool BEFORE the delivery re-checks its guard. Once the
+	// installed wrappers match the merged code again, the delivery below proceeds on the same attempt.
+	rc.applyApprovedWrapperRenewal(ctx)
 
 	out, err := rc.Deps.Deploy().DeliverDev(ctx, rc.Repo)
 	if err != nil {

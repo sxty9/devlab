@@ -912,6 +912,60 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	}, err
 }
 
+// MainWrapperDrift reports which root wrappers' installed copies differ from the STANDARD BRANCH
+// (merged content). Only the self repo ships the root wrappers, so a foreign repo has none.
+func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+	if repoShort(repo) != selfRepo() {
+		return nil, nil
+	}
+	_, wt, err := c.d.bench(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	drifts, err := deploy.MainWrapperDrift(wt)
+	if err != nil {
+		return nil, err
+	}
+	grants := make([]runs.WrapperGrant, 0, len(drifts))
+	for _, d := range drifts {
+		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA})
+	}
+	return grants, nil
+}
+
+// RenewApprovedWrappers is the daemon side of the WRITE half: for each wrapper the user approved, it
+// re-reads the merged content from the standard branch, stages a run-unwritable grant, and calls the
+// root tool (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved
+// checksum (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
+func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
+	if repoShort(repo) != selfRepo() {
+		return fmt.Errorf("refusing wrapper renewal for non-self repository %q", repo)
+	}
+	_, wt, err := c.d.bench(ctx, repo)
+	if err != nil {
+		return err
+	}
+	grantDir := c.d.s.paths.WrapperGrants()
+	renewer := deploy.SudoWrapperRenewer{}
+	by := q.AnsweredBy.User
+	if by == "" {
+		by = q.AnsweredBy.OnBehalfOf
+	}
+	at := ""
+	if q.AnsweredAt != nil {
+		at = q.AnsweredAt.UTC().Format(time.RFC3339)
+	}
+	for _, g := range q.Wrappers {
+		if deploy.InstalledWrapperMatches(g.Name, g.SHA) {
+			continue // already renewed to this exact content — do not spend the single-use approval again
+		}
+		if err := deploy.RenewMergedWrapper(ctx, renewer, wt, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ── the agent stream ─────────────────────────────────────────────────────────────────────
 
 // agentStream turns the blocking agent primitive (which streams stdout through a callback) into the

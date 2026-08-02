@@ -1151,6 +1151,16 @@ func (f fixtureDeploy) DeliverDev(_ context.Context, repo string) (executor.Depl
 	return r.deployOut, nil
 }
 
+// The root-wrapper renewal seams are inert in the integration world (no root, no drift): the tests
+// that exercise the write half live in package deploy (the bash tool) and package executor (the
+// stage flow). Here they only need to satisfy the interface.
+func (f fixtureDeploy) MainWrapperDrift(_ context.Context, _ string) ([]runs.WrapperGrant, error) {
+	return nil, nil
+}
+func (f fixtureDeploy) RenewApprovedWrappers(_ context.Context, _ string, _ runs.Question) error {
+	return nil
+}
+
 // runIDOf resolves the run behind an execution id (the ledger record needs it).
 func (e *env) runIDOf(execID string) string {
 	if d, ok, err := e.docs.Get(execID); err == nil && ok {

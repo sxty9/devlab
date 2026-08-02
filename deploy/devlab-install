@@ -2,6 +2,10 @@
 # devlab-install — the generic, install-only root wrapper (S11; replaces the retired
 # per-repo devlab-deploy mechanics, B-44). Invoked ONLY via the pinned sudoers grant:
 #     sudo -n /usr/local/sbin/devlab-install <repo> <artifact-dir> <env> [--port <n>] [--handover] [--check]
+#     sudo -n /usr/local/sbin/devlab-install --renew-wrapper <name> <content-file> <grant-file>
+# The second form is the WRITE half of the root-wrapper renewal — the ONE path that writes
+# /usr/local/sbin, gated by merged content + a single-use user approval it re-verifies itself
+# (see the "renew ONE root wrapper" block below and backend/internal/deploy/wrapperrenew.go).
 # It installs BOTH halves a service needs — its program (binary/unit/route/rights) AND its dashboard
 # UI — so a green delivery never stands over a half-installed service.
 #
@@ -127,15 +131,16 @@ docker containerd kubelet etcd snapd holistic"
 log() { logger -t devlab-install -- "$*" 2>/dev/null || true; echo "devlab-install: $*"; }
 die() { printf 'devlab-install: error: %s\n' "$1" >&2; exit "${2:-2}"; }
 
-CHECK=0; HANDOVER=0; PORT=0
+CHECK=0; HANDOVER=0; PORT=0; RENEW=0
 POSITIONAL=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --check)    CHECK=1 ;;
-    --handover) HANDOVER=1 ;;
-    --port)     shift; PORT="${1:-}" ;;
-    --*)        die "unknown flag: $1" 2 ;;
-    *)          POSITIONAL+=("$1") ;;
+    --check)          CHECK=1 ;;
+    --handover)       HANDOVER=1 ;;
+    --renew-wrapper)  RENEW=1 ;;
+    --port)           shift; PORT="${1:-}" ;;
+    --*)              die "unknown flag: $1" 2 ;;
+    *)                POSITIONAL+=("$1") ;;
   esac
   shift
 done
@@ -145,6 +150,121 @@ run() {
   if [ "$CHECK" = 1 ]; then echo "PLAN: $*"; return 0; fi
   "$@"
 }
+
+# ── the write half: renew ONE root wrapper from merged, user-approved content ─────────────────────
+# Invoked ONLY by the devlab service (user `devlab`) AFTER the user explicitly approved renewing a
+# named wrapper with a named checksum:
+#     sudo -n /usr/local/sbin/devlab-install --renew-wrapper <name> <content-file> <grant-file>
+# This is the ONE path that writes /usr/local/sbin. It re-derives EVERY check itself and trusts
+# nothing the caller says (E §7.4). The four names below are the authoritative list — never the call.
+RENEWABLE="devlab-exec devlab-install devlab-mkworkspace devlab-restart-when-free"
+# Destination of the wrappers. Pinned; the env seam is stripped by sudo's env_reset in production
+# exactly like every other seam in this wrapper, so it only ever moves the target in a direct-
+# invocation test — it grants no privilege.
+SBIN_DIR="${DEVLAB_SBIN_DIR:-/usr/local/sbin}"
+# The tamper-evident audit: the single-use ledger + the backup of every replaced wrapper. It lives
+# OUTSIDE the daemon-owned state root, root-owned, so not even the (trusted) daemon can rewrite the
+# record of what root installed or what was there before (task point 5). Env seam for tests.
+WRENEW_AUDIT_DIR="${DEVLAB_WRAPPER_AUDIT_DIR:-/var/lib/devlab-wrapper-audit}"
+
+# own_root sets root:root ownership when we ARE root (production, via sudo). In a direct-invocation
+# test the tool runs as the unprivileged test user and the files stay that user's — the security
+# property (root-owned) holds in production, where the tool always runs as root.
+own_root() { [ "$(id -u)" -eq 0 ] && chown root:root -- "$@" || true; }
+
+renew_wrapper() {
+  [ "${#POSITIONAL[@]}" -eq 3 ] \
+    || die "usage: devlab-install --renew-wrapper <name> <content-file> <grant-file>" 2
+  local name="${POSITIONAL[0]}" contentf="${POSITIONAL[1]}" grantf="${POSITIONAL[2]}"
+
+  # 1) THE NAME IS ONE OF THE FOUR — the list lives here, not in the call (task point 4). No path,
+  #    no pattern, no extension beyond the list.
+  local ok=0 w
+  for w in $RENEWABLE; do [ "$name" = "$w" ] && ok=1; done
+  [ "$ok" = 1 ] || die "refusing '$name': not one of the four renewable root wrappers ($RENEWABLE)" 2
+
+  # 2) THE SOURCE MUST BE RUN-UNWRITABLE (task point 1: no file a run produced is ever a source). The
+  #    grant + content must resolve under the daemon-owned state root and NOT under the run-writable
+  #    workspaces subtree (the only place an agent run can write). realpath collapses '..' and every
+  #    symlink, so a link out of the workspace cannot smuggle a run-authored file past this.
+  local troot wroot p greal creal
+  troot="$(realpath -e -- "$STATE_DIR" 2>/dev/null)" || die "state root missing: $STATE_DIR" 5
+  wroot="$troot/workspaces"
+  greal="$(realpath -e -- "$grantf" 2>/dev/null)"   || die "grant file does not resolve: $grantf" 2
+  creal="$(realpath -e -- "$contentf" 2>/dev/null)" || die "content file does not resolve: $contentf" 2
+  for p in "$greal" "$creal"; do
+    case "$p/" in "$troot"/*) : ;; *) die "source '$p' is outside the state root $troot — refusing" 2 ;; esac
+    case "$p/" in "$wroot"/*) die "source '$p' is under the run-writable workspaces tree — a run must not supply the content" 2 ;; esac
+    [ -f "$p" ] || die "source '$p' is not a regular file" 2
+  done
+
+  # 3) READ THE APPROVAL GRANT — the daemon rendered it from the user's explicit approval; a run
+  #    cannot write here. It names the file and the checksum the approval covers.
+  local g_name g_sha g_id g_by g_at
+  g_name="$(sed -n 's/^name=//p'       "$greal" | head -n1)"
+  g_sha="$( sed -n 's/^sha256=//p'     "$greal" | head -n1)"
+  g_id="$(  sed -n 's/^approvalId=//p' "$greal" | head -n1)"
+  g_by="$(  sed -n 's/^approvedBy=//p' "$greal" | head -n1)"
+  g_at="$(  sed -n 's/^approvedAt=//p' "$greal" | head -n1)"
+  [ -n "$g_name" ] && [ -n "$g_sha" ] && [ -n "$g_id" ] || die "grant is incomplete (need name, sha256, approvalId)" 2
+  [ "$g_name" = "$name" ] || die "grant is for '$g_name', not '$name' — refusing" 2
+  [[ "$g_sha" =~ ^[0-9a-f]{64}$ ]]            || die "grant checksum is not a sha256: $g_sha" 2
+  [[ "$g_id"  =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]  || die "grant approvalId has an unexpected shape: $g_id" 2
+
+  # 4) THE CONTENT IS EXACTLY THE APPROVED CHECKSUM (task points 2/3). This is what makes "approve
+  #    content A, then hand content B" install nothing.
+  local actual
+  actual="$(sha256sum -- "$creal" | awk '{print $1}')"
+  [ "$actual" = "$g_sha" ] \
+    || die "content checksum $actual does not match the approved $g_sha — refusing (the approval is for exactly one content)" 2
+
+  # 5) SINGLE-USE. The root-owned ledger records every consumed approval; a second use installs
+  #    nothing (task point 2). We create the audit tree here (root-owned) before reading it.
+  install -d -m 0700 -- "$WRENEW_AUDIT_DIR"          || die "cannot create audit dir $WRENEW_AUDIT_DIR" 4
+  install -d -m 0700 -- "$WRENEW_AUDIT_DIR/backups"  || die "cannot create backups dir" 4
+  own_root "$WRENEW_AUDIT_DIR" "$WRENEW_AUDIT_DIR/backups"
+  local ledger="$WRENEW_AUDIT_DIR/installed.log"
+  if [ -f "$ledger" ] && grep -qF "approvalId=$g_id " "$ledger"; then
+    die "approval $g_id was already used — refusing to install it a second time (single-use)" 5
+  fi
+
+  # 6) RECORD WHAT WAS THERE BEFORE, so a return to the previous stand is possible (task point 5).
+  local dest="$SBIN_DIR/$name" oldsha="(absent)" ts backup="none"
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [ -f "$dest" ]; then
+    oldsha="$(sha256sum -- "$dest" | awk '{print $1}')"
+    backup="$WRENEW_AUDIT_DIR/backups/${name}.${ts}.${oldsha}"
+  fi
+
+  if [ "$CHECK" = 1 ]; then
+    echo "PLAN: renew $name -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha) from $creal"
+    return 0
+  fi
+
+  [ "$backup" = none ] || { cp -p -- "$dest" "$backup" || die "cannot back up the current $name" 4; own_root "$backup"; }
+
+  # 7) INSTALL ATOMICALLY — stage a copy in the destination dir, set mode + owner, then rename over
+  #    the target. rename replaces the directory entry, not the inode a running process holds open, so
+  #    renewing devlab-install while THIS very invocation runs is safe.
+  local tmp
+  tmp="$(mktemp "$SBIN_DIR/.${name}.XXXXXX")" || die "cannot stage a temp file in $SBIN_DIR" 4
+  cp -- "$creal" "$tmp" || { rm -f -- "$tmp"; die "cannot write staged wrapper" 4; }
+  chmod 0755 "$tmp"; own_root "$tmp"
+  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; die "cannot move the new $name into place" 4; }
+
+  # 8) APPEND THE TAMPER-EVIDENT RECORD: who approved what, what was installed, what was there before,
+  #    and where the rollback copy sits (task point 5).
+  printf 'installedAt=%s approvalId=%s name=%s newSha=%s oldSha=%s approvedBy=%s approvedAt=%s backup=%s\n' \
+    "$ts" "$g_id" "$name" "$g_sha" "$oldsha" "${g_by:-unknown}" "${g_at:-unknown}" "$backup" >> "$ledger"
+  chmod 0600 "$ledger"; own_root "$ledger"
+  log "renewed root wrapper $name -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha; backup $backup)"
+  echo "RENEWED: name=$name newSha=$g_sha oldSha=$oldsha approvalId=$g_id"
+}
+
+if [ "$RENEW" = 1 ]; then
+  renew_wrapper
+  exit 0
+fi
 
 # ── validation cascade (every step BEFORE any effect) ────────────────────────────────────────────
 [ "${#POSITIONAL[@]}" -eq 3 ] || die "usage: devlab-install <repo> <artifact-dir> <env> [--port <n>] [--handover] [--check]" 2

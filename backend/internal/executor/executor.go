@@ -171,6 +171,19 @@ var ErrWrappersStale = errors.New("delivery incomplete: installed root wrappers 
 type DeployOps interface {
 	Detect(ctx context.Context, repo string) (Detection, error)
 	DeliverDev(ctx context.Context, repo string) (DeployOutcome, error)
+	// MainWrapperDrift reports which root wrappers' installed copies differ from the STANDARD BRANCH
+	// (merged content), each carrying the sha256 of the merged content — the exact (file, checksum)
+	// set a wrapper-renewal question offers for the user's explicit approval. Empty means the installed
+	// wrappers already match the standard branch, so there is nothing MERGED to renew (a self delivery
+	// still blocked while this is empty is blocked by the run's OWN not-yet-merged wrapper change).
+	MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error)
+	// RenewApprovedWrappers is the WRITE half: it installs the user-approved wrappers from the standard
+	// branch through the root tool. The approved question carries the (file, checksum) set, who
+	// approved and when; the daemon re-reads the merged content, refuses if it no longer hashes to the
+	// approved checksum (the approval is for one content), and the root tool re-verifies name,
+	// provenance, checksum and single-use itself. It is idempotent — a file already at the approved
+	// checksum is skipped, so a retry after a partial renewal never trips the single-use ledger.
+	RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error
 }
 
 // QuestionOps is the blocking-question slice (the Blocked surface). It reuses the SAME halt as a

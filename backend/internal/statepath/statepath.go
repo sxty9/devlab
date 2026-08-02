@@ -71,6 +71,13 @@ func (p *Paths) NoticesFile() string { return filepath.Join(p.Mercury(), "runs-n
 // open question a run raised (the Blocked surface) plus its answer once given.
 func (p *Paths) QuestionsFile() string { return filepath.Join(p.Mercury(), "runs-questions.json") }
 
+// WrapperGrants is where the daemon stages the run-unwritable renewal grant + merged content the
+// root wrapper-install tool verifies before it writes /usr/local/sbin: <root>/mercury/wrapper-grants.
+// It lives under the daemon-owned state root (devlab:devlab, mode 0750), which an agent run — a
+// different OS account confined to <root>/workspaces/<user> — cannot write, so a run can neither
+// forge a grant nor supply the content that gets installed.
+func (p *Paths) WrapperGrants() string { return filepath.Join(p.Mercury(), "wrapper-grants") }
+
 // Settings is the service-settings pool (slot capacity, default time budget, automerge
 // window): <root>/mercury/settings.json.
 func (p *Paths) Settings() string { return filepath.Join(p.Mercury(), "settings.json") }

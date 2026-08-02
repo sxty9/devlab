@@ -52,6 +52,12 @@ type WrapperDrift struct {
 	RepoPath  string // deploy/<name> in the checkout — the intended content
 	Installed string // <sbin>/<name> — what runs today
 	Reason    string // why it drifted ("not installed" | "installed copy differs …")
+
+	// WantSHA and WantContent are set ONLY by MainWrapperDrift: the sha256 (hex) and bytes of the
+	// STANDARD-BRANCH copy of the wrapper — the merged content that a renewal would install. They stay
+	// empty for the working-tree drift probe (CheckWrapperDrift), which only reports a mismatch.
+	WantSHA     string
+	WantContent []byte
 }
 
 // ErrWrappersStale is the named refusal of a self delivery whose installed root wrappers no longer
