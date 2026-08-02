@@ -32,21 +32,26 @@ sudo systemctl stop devlabd
 sudo install -d -m0700 "$BAK"
 #    0a) Der Zustand unter dem State-Root, ausser workspaces (Arbeitsbäume, jederzeit neu klonbar):
 #        mercury (Läufe/Executions), links (Token-Store), chats, comments, www (die ALTE SPA, die
-#        Schritt 4 überschreibt) und axioms (der Verfassungs-Klon; ein nicht gepushter Stand darin
-#        existiert sonst nirgends). --ignore-failed-read: ein noch nicht angelegtes Verzeichnis ist
-#        kein Fehler.
+#        Schritt 4 überschreibt), axioms (der Verfassungs-Klon; ein nicht gepushter Stand darin
+#        existiert sonst nirgends) und prod-known_hosts (die beim ersten Produktions-Versand
+#        abgelegte Rechnerkennung des Zielrechners — eine Datei, kein Verzeichnis). --ignore-failed-read:
+#        ein noch nicht angelegtes Verzeichnis ist kein Fehler.
 #        Der Tarball trägt einen FESTEN Namen: $BAK trägt den Zeitstempel bereits, und ein zweiter
 #        Anlauf in dasselbe $BAK ersetzt damit die eine Sicherung, statt eine zweite danebenzulegen.
 #        Ein Glob über zwei Tarbälle hätte `tar -tzf` zwei Argumente gegeben — tar liest das zweite
 #        dann als Mitglied IM ersten, und die Prüfung unten wäre fälschlich fehlgeschlagen.
 sudo tar -C "$STATE_DIR" --ignore-failed-read -czf "$STATE_TAR" \
-    mercury links chats comments www axioms
+    mercury links chats comments www axioms prod-known_hosts
 #        Prüfen, dass die Sicherung jedes Glied wirklich enthält (sonst ist der Rückweg
 #        unvollständig, und das merkt man erst, wenn man ihn braucht):
 for d in mercury links chats comments www axioms; do
   sudo tar -tzf "$STATE_TAR" | grep -q "^$d/" \
     && echo "gesichert: $d" || echo "NICHT im Tarball (fehlt oder ist leer): $d"
 done
+#        prod-known_hosts ist eine Datei, kein Verzeichnis — ohne Slash geprüft. Fehlt sie, ist sie
+#        schlicht noch nie angelegt worden (kein Produktions-Versand lief bisher), kein Mangel:
+sudo tar -tzf "$STATE_TAR" | grep -q "^prod-known_hosts$" \
+  && echo "gesichert: prod-known_hosts" || echo "nicht im Tarball (noch nie angelegt): prod-known_hosts"
 #    0b) Jedes GETEILTE Artefakt, das Schritt 1, 2 und 4 überschreiben oder entfernen — die Wrapper
 #        (mit dem Runner geteilt), die beiden sudoers-Dateien (maschinenweit wirksam), das Binary,
 #        die Unit und das Drop-in. Der Pfad bleibt im Sicherungsbaum erhalten, damit der Rückweg ein
@@ -404,7 +409,7 @@ dieses Durchgangs.
        echo "NICHT im Tarball — bleibt stehen, Entfernen wäre Verlust: $d"
      fi
    done
-   # 3c) Zustand zurückspielen; der Tarball enthält mercury links chats comments www axioms
+   # 3c) Zustand zurückspielen; der Tarball enthält mercury links chats comments www axioms prod-known_hosts
    sudo tar -C "$STATE_DIR" -xzf "$BAK/devlab-state.tar.gz"
    # 3d) Beweis, dass nichts aus dem Neubau übrig ist — die Liste MUSS leer sein
    sudo find "$STATE_DIR/mercury" -maxdepth 1 \

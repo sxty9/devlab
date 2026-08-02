@@ -32,36 +32,59 @@ func TestFromEnvSystemdFallbackAndError(t *testing.T) {
 func TestPathLiterals(t *testing.T) {
 	p := &Paths{Root: "/r"}
 	got := map[string]string{
-		p.Mercury():       "/r/mercury",
-		p.Runs():          "/r/mercury/runs.json",
-		p.Executions():    "/r/mercury/executions",
-		p.Execution("e1"): "/r/mercury/executions/e1",
-		p.Deliveries():    "/r/mercury/runs-deliveries.json",
-		p.PRs():           "/r/mercury/runs-prs.json",
-		p.NoticesFile():   "/r/mercury/runs-notices.json",
-		p.Settings():      "/r/mercury/settings.json",
-		p.HistoryDir():    "/r/mercury/runs-history",
-		p.Attachments():   "/r/mercury/attachments",
-		p.AxiomAuthors():  "/r/mercury/axiom-authors.json",
-		p.AxiomChecks():   "/r/mercury/axiom-checks.json",
-		p.DailyReports():  "/r/mercury/daily-reports.json",
-		p.AiUsage():       "/r/mercury/ai-usage.json",
-		p.RestartMarker(): "/r/mercury/restart.json",
-		p.UsageLimit():    "/r/mercury/usage-limit.json",
-		p.ReadySocket():   "/r/restart-ready.sock",
-		p.LegacyResults(): "/r/mercury/runs-results",
-		p.Links():         "/r/links",
-		p.Chats():         "/r/chats",
-		p.Comments():      "/r/comments",
-		p.Workspaces():    "/r/workspaces",
-		p.Www():           "/r/www",
-		p.AxiomsClone():   "/r/axioms",
-		p.MercuryOrder():  "/r/mercury/order.json",
+		p.Mercury():        "/r/mercury",
+		p.Runs():           "/r/mercury/runs.json",
+		p.Executions():     "/r/mercury/executions",
+		p.Execution("e1"):  "/r/mercury/executions/e1",
+		p.Deliveries():     "/r/mercury/runs-deliveries.json",
+		p.PRs():            "/r/mercury/runs-prs.json",
+		p.NoticesFile():    "/r/mercury/runs-notices.json",
+		p.Settings():       "/r/mercury/settings.json",
+		p.HistoryDir():     "/r/mercury/runs-history",
+		p.Attachments():    "/r/mercury/attachments",
+		p.AxiomAuthors():   "/r/mercury/axiom-authors.json",
+		p.AxiomChecks():    "/r/mercury/axiom-checks.json",
+		p.DailyReports():   "/r/mercury/daily-reports.json",
+		p.AiUsage():        "/r/mercury/ai-usage.json",
+		p.RestartMarker():  "/r/mercury/restart.json",
+		p.UsageLimit():     "/r/mercury/usage-limit.json",
+		p.ReadySocket():    "/r/restart-ready.sock",
+		p.LegacyResults():  "/r/mercury/runs-results",
+		p.Links():          "/r/links",
+		p.Chats():          "/r/chats",
+		p.Comments():       "/r/comments",
+		p.Workspaces():     "/r/workspaces",
+		p.Www():            "/r/www",
+		p.AxiomsClone():    "/r/axioms",
+		p.MercuryOrder():   "/r/mercury/order.json",
+		p.ProdKnownHosts(): "/r/prod-known_hosts",
 	}
 	for have, want := range got {
 		if have != want {
 			t.Errorf("path = %q, want %q", have, want)
 		}
+	}
+}
+
+// WHAT-6(c): the recorded host key survives a service restart. The known-hosts file lives under the
+// state root (durable), and a fresh Paths derived from the SAME root after a "restart" resolves to
+// the identical path with the recorded key still present — it is never a per-process or /tmp file.
+func TestProdKnownHostsSurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	first := &Paths{Root: root}
+	if err := os.WriteFile(first.ProdKnownHosts(), []byte("prod.example.com ssh-ed25519 AAAA...\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A restart re-derives Paths from the same configured root; the file is still there.
+	restarted := &Paths{Root: root}
+	if restarted.ProdKnownHosts() != first.ProdKnownHosts() {
+		t.Fatalf("known-hosts path is not stable across a restart: %q vs %q",
+			restarted.ProdKnownHosts(), first.ProdKnownHosts())
+	}
+	got, err := os.ReadFile(restarted.ProdKnownHosts())
+	if err != nil || len(got) == 0 {
+		t.Fatalf("recorded host key did not survive the restart: %v", err)
 	}
 }
 

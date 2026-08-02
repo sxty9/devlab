@@ -113,6 +113,12 @@ func (p *Paths) MercuryOrder() string { return filepath.Join(p.Mercury(), "order
 // It answers 204 (free) / 423 (busy); the tunnel never routes it.
 func (p *Paths) ReadySocket() string { return filepath.Join(p.Root, "restart-ready.sock") }
 
+// ProdKnownHosts is where the production send records the target machine's host key on first
+// contact and re-checks it afterwards: <root>/prod-known_hosts. It lives under the state root —
+// owned and writable by the service user, and durable across a service restart (systemd's
+// StateDirectory persists it) — because the service user has no home ssh directory of its own.
+func (p *Paths) ProdKnownHosts() string { return filepath.Join(p.Root, "prod-known_hosts") }
+
 // LegacyResults is the read-only archive of pre-rebuild execution results:
 // <root>/mercury/runs-results. Nothing is ever written here again (REQ-027.3).
 func (p *Paths) LegacyResults() string { return filepath.Join(p.Mercury(), "runs-results") }
