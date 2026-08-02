@@ -20,6 +20,7 @@ import { ExecutionsView } from './exec/ExecutionsView';
 import { ActiveList } from './exec/ActiveList';
 import { DeliveriesView } from './deliveries/DeliveriesView';
 import { NoticesPanel } from './NoticesPanel';
+import { BlockedPanel } from './BlockedPanel';
 import { attentionCount } from './notices';
 import GlobalCalendarView from '@/views/GlobalCalendarView';
 import MercuryChat from './MercuryChat';
@@ -30,6 +31,7 @@ type Section =
   | 'runs'
   | 'todos'
   | 'active'
+  | 'blocked'
   | 'executions'
   | 'deliveries'
   | 'calendar'
@@ -41,6 +43,7 @@ const SECTIONS: { id: Section; label: string }[] = [
   { id: 'runs', label: 'Runs' },
   { id: 'todos', label: 'Todos' },
   { id: 'active', label: 'Active' },
+  { id: 'blocked', label: 'Blocked' },
   { id: 'executions', label: 'History' },
   { id: 'deliveries', label: 'Deliveries' },
   { id: 'calendar', label: 'Calendar' },
@@ -77,6 +80,7 @@ function MercurySections() {
   // before the live stream is wired (a tick would trigger the same refetch).
   const [refreshKey, setRefreshKey] = useState(0);
   const attention = useAttentionNotices();
+  const blocked = useBlockedCount();
 
   const setSection = (s: Section) => {
     setSectionState(s);
@@ -107,6 +111,11 @@ function MercurySections() {
               {s.id === 'notices' && attention > 0 && (
                 <span className="rounded-full bg-danger/15 px-1.5 text-caption font-semibold text-danger">{attention}</span>
               )}
+              {/* How many runs wait for a decision — an unanswered question blocks its repository,
+                  so the number sits on the tab, visible from every other one. */}
+              {s.id === 'blocked' && blocked > 0 && (
+                <span className="rounded-full bg-danger/15 px-1.5 text-caption font-semibold text-danger">{blocked}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -116,6 +125,7 @@ function MercurySections() {
           {section === 'runs' && <RunsView />}
           {section === 'todos' && <TodosView />}
           {section === 'active' && <ActiveList />}
+          {section === 'blocked' && <BlockedPanel />}
           {section === 'executions' && <ExecutionsView />}
           {section === 'deliveries' && <DeliveriesView />}
           {section === 'calendar' && <GlobalCalendarView />}
@@ -151,4 +161,28 @@ function useAttentionNotices(): number {
   useLiveTopic('notices', () => void load());
 
   return attention;
+}
+
+/** How many runs are blocked on an unanswered question — read through the ONE Blocked access point,
+ *  refreshed on the questions topic, and left at the last known count on a failed read (a transient
+ *  read never clears a real blockade). */
+function useBlockedCount(): number {
+  const source = useMemo(() => getDataSource(), []);
+  const [count, setCount] = useState(0);
+
+  const load = useCallback(async () => {
+    try {
+      const { questions } = await source.mercuryRunQuestions();
+      setCount(questions.filter((q) => !q.answeredAt).length);
+    } catch {
+      /* keep the last known count */
+    }
+  }, [source]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+  useLiveTopic('questions', () => void load());
+
+  return count;
 }

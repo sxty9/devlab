@@ -38,6 +38,7 @@ import type {
   RunKind,
   RunList,
   RunNotice,
+  RunQuestion,
   RunPlan,
   RunProposal,
   RunProposalAction,
@@ -184,6 +185,14 @@ export interface DataSource {
   mercuryRunNotices(): Promise<{ notices: RunNotice[] }>;
   mercuryDismissRunNotice(id: string): Promise<void>;
   mercuryClearRunNotices(): Promise<void>;
+  /** The Blocked surface: every run that stopped on an open question, and the answer that resumes
+   *  it. approve is the single-use green light a wrapper-renewal question needs. */
+  mercuryRunQuestions(): Promise<{ questions: RunQuestion[] }>;
+  mercuryAnswerRunQuestion(
+    id: string,
+    answer: string,
+    approve: boolean,
+  ): Promise<{ question: RunQuestion; resumed: boolean }>;
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;

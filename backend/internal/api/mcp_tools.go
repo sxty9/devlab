@@ -879,6 +879,14 @@ var mcpOmittedOps = []MCPException{
 		Subject: "events",
 		Reason:  "Opens the one live-update stream; MCP carries its own notification channel, so a second stream would be a parallel path.",
 	},
+	{
+		Subject: "mercuryRunQuestions",
+		Reason:  "The Blocked surface is a human-decision list; a run's open question already surfaces as its execution's block reason, which the execution tools show.",
+	},
+	{
+		Subject: "mercuryAnswerRunQuestion",
+		Reason:  "Answering a run's blocking question is the user's decision by definition — an agent answering its own question would defeat the whole mechanism.",
+	},
 }
 
 // mcpUntooledRoutes are the routes of the frozen route table that deliberately carry no tool.

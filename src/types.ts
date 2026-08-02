@@ -593,6 +593,10 @@ export interface RunTuning {
   timeBudget?: string;
 }
 
+/** How self-reliant a run works (model.AutonomyLevel) — WHEN it stops and asks instead of deciding
+ *  for itself. Empty resolves to 'autonomous'. */
+export type AutonomyLevel = 'collaborative' | 'balanced' | 'autonomous';
+
 /** A run definition (runs.Run) — SLIM (B-20): no state flags; every execution fact is a
  *  projection over the execution documents and results. */
 export interface Run {
@@ -605,6 +609,7 @@ export interface Run {
   active?: boolean;
   targets?: RunTarget[];
   dueAt?: string;
+  autonomy?: AutonomyLevel;
   tuning: RunTuning;
   promptSnapshot?: string;
   promptInputHash?: string;
@@ -622,6 +627,7 @@ export interface RunInput {
   active?: boolean;
   targets?: RunTarget[];
   dueAt?: string | null;
+  autonomy?: AutonomyLevel;
   tuning?: RunTuning;
 }
 
@@ -648,6 +654,32 @@ export interface RunNotice {
   axiomIds: string[];
   axioms: string[];
   reason?: string;
+}
+
+/** One blocking question on the Blocked surface (runs.Question): a run that stopped and asked, plus
+ *  the answer once given. qKind 'wrapper-renewal' is the one guarded handle whose detail carries the
+ *  exact difference to the installed root scripts and whose freeing needs explicit approval. */
+export interface RunQuestion {
+  id: string;
+  runId: string;
+  runTitle?: string;
+  kind?: RunKind;
+  executionId: string;
+  repo: string;
+  qKind: 'decision' | 'wrapper-renewal';
+  autonomy?: AutonomyLevel;
+  question: string;
+  recommendation?: string;
+  progress?: string;
+  detail?: string;
+  askedAt: string;
+  askedBy: Actor;
+  answer?: string;
+  approved?: boolean;
+  answeredAt?: string;
+  answeredBy?: Actor;
+  resolved?: boolean;
+  resolvedAt?: string;
 }
 
 export interface PlannedRun {
