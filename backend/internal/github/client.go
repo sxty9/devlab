@@ -22,10 +22,22 @@ import (
 )
 
 const (
-	apiBase    = "https://api.github.com"
 	apiVersion = "2022-11-28"
 	userAgent  = "devlab"
 )
+
+// apiBase is the GitHub REST root. It is a var, not a const, so a test in ANOTHER package can point
+// the whole delivery chain at a fixture GitHub through SetAPIBase (the in-package tests rewrite the
+// http client directly). Production never changes it.
+var apiBase = "https://api.github.com"
+
+// SetAPIBase overrides the GitHub API root and returns a restore func — a test-only seam for
+// cross-package end-to-end tests that must not reach the network. Not for production use.
+func SetAPIBase(base string) func() {
+	old := apiBase
+	apiBase = base
+	return func() { apiBase = old }
+}
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 

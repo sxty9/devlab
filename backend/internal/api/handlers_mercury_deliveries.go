@@ -396,11 +396,19 @@ func (s *Server) resolveRunnerRepo(ctx context.Context, token, repoID string) (s
 	return "", false
 }
 
-// runnerBench prepares the runner's workspace of one repo and opens a workbench on it.
+// runnerBench prepares the runner's workspace of one repo and opens a workbench on it. The repo may
+// be named in EITHER form the chain carries — the bare run-target id the motor holds, or the
+// ledger's "owner/repo" full name a ledger-driven pass reads (the production send, a rollback). The
+// workspace is addressed by the bare id ALONE: its own name grammar rejects a slash, so the full
+// name would bounce ("invalid user/repo"). Reducing to the bare id happens HERE, at the single
+// workspace-preparation choke point every stage funnels through, so no caller has to remember it and
+// none can mis-key the workspace — the 02.08.2026 production standstill was exactly this, a merged
+// ledger entry's full name reaching the workbench and being refused before the first step ran.
 func (s *Server) runnerBench(ctx context.Context, user, token, repoID, full string) (*workbench.Bench, string, func(), error) {
 	if s.workspaces == nil {
 		return nil, "", nil, errors.New("no workspace manager")
 	}
+	repoID = repoShort(repoID)
 	if _, err := s.workspaces.Ensure(ctx, user, repoID, full, token, true); err != nil {
 		return nil, "", nil, err
 	}
@@ -442,8 +450,8 @@ func (g runnerGitSide) CounterBook(ctx context.Context, d runs.Delivery, reversa
 	if user == "" {
 		return res, errors.New("no runner account configured (DEVLAB_RUNS_USER)")
 	}
-	repoID := repoShort(d.Repo)
-	bench, wt, unlock, err := g.s.runnerBench(ctx, user, g.token, repoID, d.Repo)
+	// The ledger stores the full name; runnerBench reduces it to the bare workspace id itself.
+	bench, wt, unlock, err := g.s.runnerBench(ctx, user, g.token, d.Repo, d.Repo)
 	if err != nil {
 		return res, err
 	}
