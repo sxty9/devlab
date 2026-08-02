@@ -120,6 +120,54 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 	}}
 }
 
+// raiseWrapperQuestion is THE FREED HANDLE (point 5): the self delivery refused because the root
+// wrapper scripts drifted, so the run asks the user to renew them and blocks. It carries the exact
+// difference to the installed scripts so the user sees precisely what would change, and it mints no
+// delivery id (the repo is held by the open question, not by a failed delivery).
+//
+// SAFETY: this raises a QUESTION and blocks — it grants NOTHING. The chain never writes the wrapper
+// scripts (they are its own sudo allowlist). The user renews them with their own sudo via the named
+// one-line script, and on resume the guard re-measures the ACTUAL installed scripts by content: the
+// install proceeds only when they genuinely match, never because a question was approved. So an
+// approval a run could somehow forge still installs nothing — only a real root renewal does.
+func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
+	// A prior answer that did not actually renew the scripts is stale — consume it so the surface
+	// shows the ONE current question, not a settled-but-unfixed one.
+	rc.consumeWrapperQuestion(ctx)
+	q := runs.Question{
+		RunID: rc.Run.ID, RunTitle: rc.Run.Title, Kind: rc.Run.Kind,
+		ExecutionID: rc.Doc.ID, Repo: rc.Repo,
+		QKind: runs.QuestionWrapperRenewal, Autonomy: rc.Run.Autonomy.Resolve(),
+		Question: "Renew the root wrapper scripts under /usr/local/sbin so they match this delivery? " +
+			"They no longer match the repository, so the daemon cannot be installed until they are renewed.",
+		Recommendation: "These scripts run as root and are the runner's own permission allowlist — the chain " +
+			"never writes them. Run the one-line script named in the difference below with sudo, then approve. " +
+			"The run re-checks that the installed scripts actually match before it installs anything; your " +
+			"approval alone never writes them.",
+		Detail:  drift,
+		AskedBy: model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+	}
+	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
+		return fmt.Errorf("%w (the wrapper-renewal question could not be recorded: %v)", ErrWrappersStale, err)
+	}
+	rc.logf("root wrappers drifted — asked the user to renew them (explicit approval required); nothing was installed")
+	now := rc.Deps.Now().UTC()
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin — run the " +
+			"named one-line script with sudo, then approve; the run re-verifies the scripts match before it installs",
+		Class: "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
+// consumeWrapperQuestion marks this execution's answered wrapper-renewal question consumed, so it
+// leaves the Blocked surface once the renewal has actually taken effect (best-effort).
+func (rc *RepoCtx) consumeWrapperQuestion(ctx context.Context) {
+	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
+	if err == nil && q != nil && q.QKind == runs.QuestionWrapperRenewal {
+		_ = rc.Deps.Questions().Resolve(ctx, q.ID)
+	}
+}
+
 // answerContinuation frames the user's answer as the next turn of the run's own agent conversation.
 // The agent already holds the full context (the conversation is resumed), so this is only the answer
 // plus the reminder that the same ask policy still applies — a further genuine fork may ask again.
@@ -280,7 +328,7 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// conversation with that answer as its next turn — not the whole prompt again — so the run picks
 	// up exactly where it stopped. The question is marked consumed once the agent has taken it.
 	if resumingImplement {
-		if q, aerr := deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo); aerr == nil && q != nil {
+		if q, aerr := deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo); aerr == nil && q != nil && q.QKind == runs.QuestionDecision {
 			prompt = answerContinuation(*q)
 			rc.answeredQuestionID = q.ID
 			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))
@@ -553,6 +601,15 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 			rc.logf("already delivered and running: %s", firstLine(err.Error()))
 			return nil
 		}
+		// THE FREED HANDLE: the self delivery refused because the root wrapper scripts drifted. The
+		// chain never writes those scripts — they are the runner's own sudo allowlist, and writing them
+		// would be a self-escalation. Instead the stage asks the user to renew them (with the exact
+		// difference) and blocks until they do; the guard that raised this refusal re-measures the
+		// actual scripts on resume, so nothing installs until they genuinely match — the approval alone
+		// never writes them and never bypasses the content check.
+		if errors.Is(err, ErrWrappersStale) {
+			return rc.raiseWrapperQuestion(ctx, out.WrapperDrift)
+		}
 		// Both halves are named even when the stage fails: a UI half that could not be built in
 		// (unconfigured/failed) still leaves the program installed — the stage fails BENANNT, but the
 		// program's own result is not swallowed by the interface's failure.
@@ -562,6 +619,10 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 		}
 		return err // named failure, exactly one attempt — e.g. "delivery not yet set up" (K-4)
 	}
+	// The self delivery succeeded: if a wrapper-renewal question led here, the user renewed the
+	// scripts and the guard just confirmed the match — the question has done its job and leaves the
+	// Blocked surface.
+	rc.consumeWrapperQuestion(ctx)
 	rc.deliveredCommit = rc.head
 	rc.logf("program: installed and running on port %d — delivered state %s@%s", out.Port, rc.branchName(), short(rc.head))
 	if out.Detail != "" {

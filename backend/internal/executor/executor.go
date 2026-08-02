@@ -153,7 +153,18 @@ type DeployOutcome struct {
 	// UIDetail carries the reason when another service blocks the shared dashboard build.
 	UI       string
 	UIDetail string
+	// WrapperDrift carries the exact difference between the repository's root wrapper scripts and the
+	// installed ones, set ONLY when the self delivery refused because they drifted (ErrWrappersStale).
+	// The stage turns it into the wrapper-renewal question the user must explicitly approve.
+	WrapperDrift string
 }
+
+// ErrWrappersStale is the named refusal of a self delivery whose installed root wrapper scripts under
+// /usr/local/sbin no longer match the repository. The chain NEVER writes those scripts (they are the
+// runner's own sudo allowlist — writing them would be a self-escalation); the deliver-dev stage
+// turns this refusal into a wrapper-renewal question, and it installs only once the scripts actually
+// match again (a content check it re-measures, never the approval flag).
+var ErrWrappersStale = errors.New("delivery incomplete: installed root wrappers are stale")
 
 // DeployOps is the deploy slice (S11): detection and the one dev delivery (build as user,
 // install-only as root, honest running gate — all inside the deploy package).

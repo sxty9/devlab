@@ -265,6 +265,9 @@ type fakeDeploy struct {
 	out          DeployOutcome
 	deliverErr   func(call int) error
 	deliverCalls int
+	// wrapperDrift, when set, makes DeliverDev refuse with ErrWrappersStale carrying this drift — the
+	// self-delivery guard's refusal the deliver-dev stage turns into a wrapper-renewal question.
+	wrapperDrift string
 }
 
 func (d *fakeDeploy) Detect(ctx context.Context, repo string) (Detection, error) {
@@ -280,6 +283,10 @@ func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.deliverCalls++
+	if d.wrapperDrift != "" {
+		return DeployOutcome{Self: true, WrapperDrift: d.wrapperDrift},
+			fmt.Errorf("%w: %s", ErrWrappersStale, d.wrapperDrift)
+	}
 	if d.deliverErr != nil {
 		if err := d.deliverErr(d.deliverCalls); err != nil {
 			return DeployOutcome{}, err

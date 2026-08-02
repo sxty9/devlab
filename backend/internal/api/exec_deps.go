@@ -889,7 +889,13 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 		// A drift is a NAMED failure that installs nothing (no half state, K-4); it names each stale
 		// wrapper and the one line a human runs to make them current, then resumes the execution.
 		if err := deploy.GuardWrappersCurrent(wt); err != nil {
-			return executor.DeployOutcome{Self: true}, err
+			// The refusal is real — nothing is installed. Instead of failing silently every night, the
+			// deliver-dev stage turns it into a wrapper-renewal question the user must approve. We name
+			// the refusal with the motor's sentinel and carry the exact difference; the guard above STILL
+			// gates the install, so a resume proceeds only once the scripts genuinely match again — the
+			// approval never writes them and never bypasses this content check.
+			return executor.DeployOutcome{Self: true, WrapperDrift: err.Error()},
+				fmt.Errorf("%w: %s", executor.ErrWrappersStale, err.Error())
 		}
 		if err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact); err != nil {
 			return executor.DeployOutcome{Self: true}, err

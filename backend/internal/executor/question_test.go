@@ -180,3 +180,51 @@ func TestAnswerResumesSameRun(t *testing.T) {
 		t.Fatalf("resumed run should deliver, got %+v", pr)
 	}
 }
+
+// THE FREED HANDLE (point 5): a drifted root wrapper is presented as an approval question that blocks
+// — regardless of autonomy level — and NOTHING is installed. The chain re-measures on resume: only
+// once the scripts genuinely match does the install proceed and the question leave the surface.
+func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	drift := "root wrapper(s) devlab-install are stale — run and then resume: sudo /w/service setup"
+	deps.deploy.wrapperDrift = drift
+	sink := newFakeSink()
+
+	// Even at the autonomous level the wrapper renewal asks — it is a security gate, not a decision.
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), sink); err == nil {
+		t.Fatalf("expected the delivery to block on the wrapper drift")
+	}
+	rp, _ := sink.done("org/devlab")
+	if rp.Block == nil || rp.Block.Class != "awaiting-wrapper-approval" {
+		t.Fatalf("expected a wrapper-approval block, got %+v", rp.Block)
+	}
+	if len(deps.questions.raised) != 1 || deps.questions.raised[0].QKind != runs.QuestionWrapperRenewal {
+		t.Fatalf("expected a wrapper-renewal question, got %+v", deps.questions.raised)
+	}
+	if !strings.Contains(deps.questions.raised[0].Detail, "service setup") {
+		t.Fatalf("the question must carry the exact difference, got %q", deps.questions.raised[0].Detail)
+	}
+	// The implement stage delivered nothing to install-over: the deliver-dev stage failed, so the
+	// install never ran a second time on an unapproved drift.
+	if dd, ok := sink.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepFailed {
+		t.Fatalf("deliver-dev should have failed on the drift, got %+v", dd)
+	}
+
+	// The user renews the scripts (their own sudo) and approves — the drift is now gone.
+	deps.questions.answer(deps.questions.raised[0].ID, "Renewed via service setup.")
+	deps.deploy.wrapperDrift = ""
+
+	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
+	sink2 := newFakeSink()
+	if err := Execute(context.Background(), deps, req, sink2); err != nil {
+		t.Fatalf("resume should deliver once the scripts match, got %v", err)
+	}
+	if dd, ok := sink2.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepExecuted {
+		t.Fatalf("deliver-dev should succeed after the renewal, got %+v", dd)
+	}
+	// The wrapper question was consumed once the guard confirmed the match.
+	if len(deps.questions.resolve) == 0 {
+		t.Fatalf("the wrapper question should be resolved after a successful delivery")
+	}
+}
