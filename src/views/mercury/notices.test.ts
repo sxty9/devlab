@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  attentionCount,
   humanizeKind,
+  isDisturbance,
   isUnread,
   maintenanceHold,
   noticeAxioms,
@@ -36,6 +38,7 @@ test('every notice kind renders a defined state', () => {
     'delivery-selfcheck',
     'code-structure-violation',
     'delivery-held',
+    'github-quota',
     'protection-deviation',
     'admin-override',
     'startup-reconcile',
@@ -101,6 +104,29 @@ test('the text falls back from text to reason to the record’s own facts', () =
   );
   assert.deepEqual(noticeAxioms(notice({ kind: 'assigned', axioms: ['Alpha'] })), ['Alpha']);
   assert.deepEqual(noticeAxioms(notice()), []);
+});
+
+// What DEMANDS ATTENTION is an unread DISTURBANCE — a fault, not routine operational noise. Reading a
+// disturbance removes it from the count (a dismissed hint no longer nags), and a routine note never
+// added to it. The exhausted-quota finding — the one that once lay unread for ~30h — reads as a
+// disturbance so it is counted, not as a quiet note.
+test('attention counts unread disturbances, not routine notes or read hints', () => {
+  assert.equal(isDisturbance(notice({ kind: 'delivery-blocked' })), true);
+  assert.equal(isDisturbance(notice({ kind: 'github-quota' })), true, 'the exhausted quota is a disturbance');
+  assert.equal(noticeTone(notice({ kind: 'github-quota' })), 'alarm', 'the quota finding reads as an alarm');
+  assert.equal(isDisturbance(notice({ kind: 'restart-completed' })), false);
+  assert.equal(isDisturbance(notice({ kind: 'assigned' })), false);
+
+  const list: NoticeRecord[] = [
+    notice({ id: 'a', kind: 'delivery-blocked', read: false }), // unread disturbance — counts
+    notice({ id: 'b', kind: 'github-quota', read: false }), // unread disturbance — counts
+    notice({ id: 'c', kind: 'delivery-alarm', read: true }), // read disturbance — no longer nags
+    notice({ id: 'd', kind: 'restart-completed', read: false }), // unread, but routine noise — no nag
+    notice({ id: 'e', kind: 'assigned', read: false }), // unread, but routine noise — no nag
+  ];
+  assert.equal(attentionCount(list), 2);
+  // Every hint is still unread-countable; attention is the narrower, fault-only signal.
+  assert.equal(unreadCount(list), 4);
 });
 
 // REQ-032.5: a bundled notice states its count and its period; a single occurrence states nothing.

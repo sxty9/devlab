@@ -3,10 +3,12 @@
 // view subscribes to the one live stream (W5). The Mercury-wide AI chat docks at the right
 // edge and applies its proposals through the same DataSource the sections use (B-37).
 //
-// The shell carries ONE piece of information of its own: how many hints are still unread. A hint is
-// the service speaking up about itself — a delivery that never happened is reported there
-// (REQ-031.2) — and an alarm that only shows once the notices section happens to be opened does not
-// reach anybody. So the count sits on the section, where it is visible from every other one.
+// The shell carries ONE piece of information of its own: how many DISTURBANCES still demand
+// attention. A disturbance is the service reporting a fault about itself — a delivery that never
+// happened, an exhausted request budget — and an alarm that only shows once the notices section
+// happens to be opened does not reach anybody. So the count sits on the section, visible from every
+// other one. Routine operational notes (a restart, an assignment) are recorded but do not nag, so the
+// badge stays a real "something is stuck" signal rather than lighting up on ordinary lifecycle chatter.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
 import { LiveProvider, useLiveTopic } from '@/state/live';
@@ -18,7 +20,7 @@ import { ExecutionsView } from './exec/ExecutionsView';
 import { ActiveList } from './exec/ActiveList';
 import { DeliveriesView } from './deliveries/DeliveriesView';
 import { NoticesPanel } from './NoticesPanel';
-import { unreadCount } from './notices';
+import { attentionCount } from './notices';
 import GlobalCalendarView from '@/views/GlobalCalendarView';
 import MercuryChat from './MercuryChat';
 
@@ -74,7 +76,7 @@ function MercurySections() {
   // Bumped when the chat applied an action: remounts the active section so it refetches even
   // before the live stream is wired (a tick would trigger the same refetch).
   const [refreshKey, setRefreshKey] = useState(0);
-  const unread = useUnreadNotices();
+  const attention = useAttentionNotices();
 
   const setSection = (s: Section) => {
     setSectionState(s);
@@ -100,10 +102,10 @@ function MercurySections() {
               }
             >
               {s.label}
-              {/* What is unread is stated where it can be seen, in the tone of an alarm — no number
-                  is shown once everything has been read. */}
-              {s.id === 'notices' && unread > 0 && (
-                <span className="rounded-full bg-danger/15 px-1.5 text-caption font-semibold text-danger">{unread}</span>
+              {/* What still demands attention is stated where it can be seen, in the tone of an
+                  alarm — no number is shown once every disturbance has been read. */}
+              {s.id === 'notices' && attention > 0 && (
+                <span className="rounded-full bg-danger/15 px-1.5 text-caption font-semibold text-danger">{attention}</span>
               )}
             </button>
           ))}
@@ -126,18 +128,18 @@ function MercurySections() {
   );
 }
 
-/** How many hints are unread — read through the ONE notices access point and counted by the ONE
- *  rule the notices surface itself applies (notices.ts), so the badge and the list can never
- *  disagree. It refreshes on the notices topic and asks nothing while nothing happens (REQ-034);
- *  a failed read leaves the last known count instead of inventing a quiet zero. */
-function useUnreadNotices(): number {
+/** How many disturbances still demand attention — read through the ONE notices access point and
+ *  counted by the ONE rule the notices surface itself applies (notices.ts), so the badge and the list
+ *  can never disagree. It refreshes on the notices topic and asks nothing while nothing happens
+ *  (REQ-034); a failed read leaves the last known count instead of inventing a quiet zero. */
+function useAttentionNotices(): number {
   const source = useMemo(() => getDataSource(), []);
-  const [unread, setUnread] = useState(0);
+  const [attention, setAttention] = useState(0);
 
   const load = useCallback(async () => {
     try {
       const { notices } = await source.mercuryRunNotices();
-      setUnread(unreadCount(notices));
+      setAttention(attentionCount(notices));
     } catch {
       /* keep the last known count — a transient read never clears an alarm */
     }
@@ -148,5 +150,5 @@ function useUnreadNotices(): number {
   }, [load]);
   useLiveTopic('notices', () => void load());
 
-  return unread;
+  return attention;
 }

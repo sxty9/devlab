@@ -113,6 +113,21 @@ const noticeCap = 50
 type NoticeStore struct {
 	path string
 	mu   sync.Mutex
+	// onNew is fired ONCE per genuinely new record — after it is persisted, never for a coalesced
+	// repeat — so a consumer can react to a finding the pool has not held before (the notice
+	// dispatcher delivers it outward). It reports a STRUCTURAL fact of the write (append vs
+	// coalesce), not an interpretation of what the notice means, so the pool stays passive: every
+	// evaluation of the record happens inside the hook, outside the pool. Optional; nil = nobody
+	// listens.
+	onNew func(Notice)
+}
+
+// SetOnNew installs the hook fired once per genuinely new record (see the field). Wired at boot; a
+// second call replaces the first. Concurrency-safe.
+func (s *NoticeStore) SetOnNew(f func(Notice)) {
+	s.mu.Lock()
+	s.onNew = f
+	s.mu.Unlock()
 }
 
 func NewNoticeStore(p *statepath.Paths) *NoticeStore { return &NoticeStore{path: noticesPath(p)} }
@@ -180,11 +195,24 @@ func (s *NoticeStore) List() ([]Notice, error) {
 // cap so the feed stays portioned. The store owns identity (id) and, when the caller supplies
 // none, the timestamps; the caller supplies only the meaning.
 func (s *NoticeStore) Coalesce(n Notice) (Notice, error) {
+	stored, created, err := s.write(n)
+	// The hook fires OUTSIDE the store lock and ONLY for a genuinely new record: a coalesced repeat
+	// (same finding again) updates the existing record and delivers nothing further, so a fault
+	// recurring every 20s reaches the user once and is only bundled afterwards.
+	if err == nil && created {
+		s.fireNew(stored)
+	}
+	return stored, err
+}
+
+// write is the locked half of Coalesce: it records one occurrence and reports whether it appended a
+// NEW record (created=true) or bundled an unchanged repeat onto an existing one (created=false).
+func (s *NoticeStore) write(n Notice) (Notice, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, err := s.load()
 	if err != nil {
-		return Notice{}, err
+		return Notice{}, false, err
 	}
 	normalizeNotice(&n, time.Now().UTC())
 
@@ -207,14 +235,25 @@ func (s *NoticeStore) Coalesce(n Notice) (Notice, error) {
 		next = append(next, merged)
 		next = append(next, cur[:i]...)
 		next = append(next, cur[i+1:]...)
-		return merged, s.save(next)
+		return merged, false, s.save(next)
 	}
 
 	next := append([]Notice{n}, cur...)
 	if len(next) > noticeCap {
 		next = next[:noticeCap]
 	}
-	return n, s.save(next)
+	return n, true, s.save(next)
+}
+
+// fireNew invokes the on-new hook, if one is installed, reading it under the lock but calling it
+// released so a slow consumer never holds up the pool.
+func (s *NoticeStore) fireNew(n Notice) {
+	s.mu.Lock()
+	f := s.onNew
+	s.mu.Unlock()
+	if f != nil {
+		f(n)
+	}
 }
 
 // Add records one occurrence. It is the name the raising packages call and does exactly what
