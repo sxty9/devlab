@@ -139,7 +139,8 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 				FromCommit: d.FromCommit, ToCommit: d.ToCommit,
 				PRNumber: d.PRNumber, PRURL: d.PRURL,
 				CreatedAt: d.CreatedAt, MergedAt: d.MergedAt, ReversalOf: d.ReversalOf,
-				Stage: deliveryStage(d, reversed[d.ID]),
+				Stage:        deliveryStage(d, reversed[d.ID]),
+				FailedReason: d.FailedReason,
 			},
 			ExecutionID: d.ExecutionID,
 		}
@@ -156,7 +157,9 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 }
 
 // deliveryStage derives the ledger lifecycle stage for the deliveries view (F12):
-// open → merged/closed; a counter-booked delivery reads "reverted" whatever it was before.
+// open → merged/closed; a counter-booked delivery reads "reverted" whatever it was before; a
+// delivery whose work was committed but not shipped reads "failed" — the tip a new order does not
+// branch past until it is resolved or rolled back.
 func deliveryStage(d runs.Delivery, hasReversal bool) string {
 	switch {
 	case hasReversal || (d.ClosedAt != nil && strings.HasPrefix(d.ClosedReason, "rolled back by ")):
@@ -165,6 +168,8 @@ func deliveryStage(d runs.Delivery, hasReversal bool) string {
 		return "merged"
 	case d.ClosedAt != nil:
 		return "closed"
+	case d.Failed():
+		return "failed"
 	default:
 		return "open"
 	}

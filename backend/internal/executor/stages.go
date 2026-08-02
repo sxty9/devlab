@@ -13,6 +13,7 @@ import (
 	"devlab/backend/internal/faultclass"
 	"devlab/backend/internal/mercury"
 	"devlab/backend/internal/model"
+	"devlab/backend/internal/preflight"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/telemetry"
 )
@@ -33,6 +34,29 @@ func asBlocked(err error) *faultclass.BlockedError {
 		return be
 	}
 	return nil
+}
+
+// ownsFailedTip reports whether the failed tip is THIS order's own work — the resolve-at-the-tip
+// case. Preflight surfaces the order's own unsettled delivery as OpenDelivery (joined by run, not
+// by execution), so a tip whose id matches it belongs to this order and must not hold it: the rest
+// path adopts it and re-delivers. Any other failed tip belongs to an earlier order and holds this one.
+func ownsFailedTip(f preflight.Finding, tip *runs.Delivery) bool {
+	return f.OpenDelivery != nil && tip != nil && f.OpenDelivery.ID == tip.ID
+}
+
+// heldOnFailedTip holds an order whose repository's tip is another order's failed delivery. It is a
+// deliberate wait, not a fault: the order sits blocked with a named reason (the two ways back are
+// spelled out) and stays in the open ToDo list until the tip is resolved or rolled back. It reuses
+// the honest-blockade surfacing (K-5) so no second held state stands beside it.
+func heldOnFailedTip(rc *RepoCtx, tip *runs.Delivery) error {
+	now := rc.Deps.Now().UTC()
+	reason := fmt.Sprintf(
+		"held before branching: the delivery at the tip of %s failed and is not resolved yet — delivery %s on branch %s (%s). "+
+			"No new order is branched past a failed layer. Resolve it by re-running the failed order, or roll it back in Deliveries, then resume this order.",
+		rc.Repo, tip.ID, tip.Branch, nonEmpty(tip.FailedReason, "delivery failed"))
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: reason, Class: "held-on-failed-tip", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
 }
 
 // ── preflight ────────────────────────────────────────────────────────────────────────────
@@ -93,6 +117,16 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		if err := ensureRepoCreated(ctx, rc); err != nil {
 			return err
 		}
+	}
+
+	// A failed order becomes the tip and the stack does not grow past it: BEFORE this order branches,
+	// the tip is measured. A failed tip that is NOT this order's own work HOLDS the order — it waits,
+	// named, in the open ToDo list — instead of silently branching past the failed layer onto an
+	// older, incomplete state (the very gap that let six orders sit on six branches with none carrying
+	// all). This order's OWN failed tip is the resolve-at-the-tip path: the rest path below adopts it
+	// and re-delivers, so it is never held by it.
+	if tip, terr := deps.Deliver().FailedTip(ctx, rc.Repo); terr == nil && tip != nil && !ownsFailedTip(rc.Finding, tip) {
+		return heldOnFailedTip(rc, tip)
 	}
 
 	// One branch per TASK, named after the run, in every repository it targets. The name records

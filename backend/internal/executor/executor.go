@@ -100,6 +100,27 @@ type DeliverOps interface {
 	// EnsureProtection sets the full branch protection; failing to set it fails the repo
 	// creation (REQ-033.6).
 	EnsureProtection(ctx context.Context, repo string) error
+	// FailedTip reports the failed delivery sitting at the tip of the repo's stack, or nil when the
+	// tip is sound. The implement stage consults it BEFORE it branches, so no new order is cut past
+	// a failed layer: "a failed order becomes the tip and the stack does not grow past it."
+	FailedTip(ctx context.Context, repo string) (*runs.Delivery, error)
+	// RecordFailedDelivery leaves the durable, visible "Lieferung gescheitert" mark on a delivery
+	// whose work was committed but could not be shipped, so the next order cannot silently branch
+	// past its work. Idempotent by DeliveryID.
+	RecordFailedDelivery(ctx context.Context, in DeliverFailedIn) error
+}
+
+// DeliverFailedIn mirrors the failed-delivery mark across the seam: the delivery the chain minted
+// for this repo's (attempted) delivery, plus the span its work occupies and the reason it did not
+// ship.
+type DeliverFailedIn struct {
+	DeliveryID  string
+	ExecutionID string
+	Repo        string
+	Branch      string
+	FromCommit  string
+	ToCommit    string
+	Reason      string
 }
 
 // DeliverPRIn mirrors deliver's PR input across the seam (kept local so the seam stays
@@ -564,7 +585,7 @@ func runRepo(ctx context.Context, rc *RepoCtx) (model.RepoPipeline, error) {
 		finishStage(rc, &sv, &views)
 	}
 
-	rp := rc.finishRepo(views, block)
+	rp := rc.finishRepo(ctx, views, block)
 	if budgetErr != nil {
 		return rp, budgetErr
 	}
@@ -590,9 +611,19 @@ func finishStage(rc *RepoCtx, sv *model.StageView, views *[]model.StageView) {
 // stage-vocabulary: `views` are the stages this run just walked, named by the chain itself. The
 // executor reads no stored execution document, so an archived one — which carries the retired
 // stage names — cannot reach this comparison.
-func (rc *RepoCtx) finishRepo(views []model.StageView, block *model.Backoff) model.RepoPipeline {
+func (rc *RepoCtx) finishRepo(ctx context.Context, views []model.StageView, block *model.Backoff) model.RepoPipeline {
 	rp := model.RepoPipeline{Repo: rc.Repo, Stages: views, TaskState: rc.Finding.State, Block: block}
 	rp.Done, rp.Succeeded = model.PipelineSucceeded(views)
+
+	// A failed order becomes the tip: an order that produced commits but did NOT ship them leaves a
+	// durable "Lieferung gescheitert" mark in the ledger, so the next order sees the work at the tip
+	// instead of branching past it (the gap that let six branches carry six orders with none carrying
+	// all). Marked exactly when work exists and the pull-request stage did not execute — a shipped
+	// delivery already carries a healthy open ledger entry, and a held order (no commits) has nothing
+	// to mark.
+	if rc.deliveryCommits > 0 && rc.deliveryID != "" && !deliveryShipped(views) {
+		rc.recordFailedDelivery(ctx, views)
+	}
 
 	if rc.workAdvanced() {
 		for _, sv := range views {
@@ -613,6 +644,57 @@ func (rc *RepoCtx) finishRepo(views []model.StageView, block *model.Backoff) mod
 	}
 	rc.Sink.RepoDone(rp)
 	return rp
+}
+
+// deliveryShipped reports whether the pull-request stage executed — the one stage whose success
+// means the delivery reached the ledger as a healthy open entry with its PR. Anything else (failed,
+// not-executed) means the committed work did not ship and is a failed delivery.
+//
+// stage-vocabulary: `views` are the stages THIS run just walked, named by the live chain itself. The
+// executor reads no stored/archived execution document (which alone carries the retired stage names),
+// so no archived vocabulary ever reaches this comparison — same reasoning as finishRepo above.
+func deliveryShipped(views []model.StageView) bool {
+	for _, sv := range views {
+		if sv.Stage == model.StagePullRequest {
+			return sv.State == model.StepExecuted
+		}
+	}
+	return false
+}
+
+// recordFailedDelivery leaves the durable "Lieferung gescheitert" mark for work that was committed
+// but not shipped. Best-effort with a NAMED fallback: a mark that could not be written is announced
+// as a notice, never dropped silently — a lost mark is exactly how the next order branches past the
+// work unseen.
+func (rc *RepoCtx) recordFailedDelivery(ctx context.Context, views []model.StageView) {
+	branch := rc.deliveryBranch
+	if branch == "" {
+		branch = runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
+	}
+	reason := "delivery did not complete"
+	for _, sv := range views {
+		if sv.State == model.StepFailed {
+			reason = fmt.Sprintf("%s stage failed: %s", sv.Stage, firstLine(sv.Reason))
+			break
+		}
+	}
+	err := rc.Deps.Deliver().RecordFailedDelivery(ctx, DeliverFailedIn{
+		DeliveryID:  rc.deliveryID,
+		ExecutionID: rc.Doc.ID,
+		Repo:        rc.Repo,
+		Branch:      branch,
+		FromCommit:  rc.deliveryBase,
+		ToCommit:    rc.head,
+		Reason:      reason,
+	})
+	if err != nil {
+		rc.Sink.Notice(NoticeEvent{
+			Kind:     deliveryAlarmNotice,
+			Repo:     rc.Repo,
+			Text:     "committed work could not be marked as a failed delivery: " + firstLine(err.Error()),
+			NextStep: "the next order may branch past this work — record the failed delivery by hand or roll the branch back",
+		})
+	}
 }
 
 func (rc *RepoCtx) budgetOverrunReason() string {

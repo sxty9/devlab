@@ -210,6 +210,10 @@ type fakeDeliver struct {
 	openCalls   []DeliverPRIn
 	protectErr  error
 	protections []string
+	// failedTip is the failed delivery the fake reports at the tip (nil = sound tip); failedCalls
+	// records every RecordFailedDelivery the motor makes.
+	failedTip   *runs.Delivery
+	failedCalls []DeliverFailedIn
 }
 
 func (d *fakeDeliver) NextPRBase(ctx context.Context, repo, head string) (string, error) {
@@ -241,6 +245,17 @@ func (d *fakeDeliver) EnsureProtection(ctx context.Context, repo string) error {
 	defer d.mu.Unlock()
 	d.protections = append(d.protections, repo)
 	return d.protectErr
+}
+func (d *fakeDeliver) FailedTip(ctx context.Context, repo string) (*runs.Delivery, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.failedTip, nil
+}
+func (d *fakeDeliver) RecordFailedDelivery(ctx context.Context, in DeliverFailedIn) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failedCalls = append(d.failedCalls, in)
+	return nil
 }
 
 type fakeDeploy struct {

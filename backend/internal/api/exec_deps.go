@@ -741,6 +741,42 @@ func (c chainDeliver) OpenOrAdoptPR(ctx context.Context, in executor.DeliverPRIn
 	return ref, adopted, err
 }
 
+// FailedTip resolves the repo's full name (the ledger's key) and reports the failed delivery at the
+// tip, or nil when the tip is sound — the ledger side of "a failed order becomes the tip". The
+// stack top is read from the LOCAL ledger, so the check the implement stage runs before every order
+// makes no network call.
+func (c chainDeliver) FailedTip(ctx context.Context, repo string) (*runs.Delivery, error) {
+	if c.d.s.deliveries == nil {
+		return nil, errors.New("the delivery ledger is not available")
+	}
+	full, err := c.d.fullName(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	return deliver.FailedTip(c.d.s.deliveries, full)
+}
+
+// RecordFailedDelivery leaves the durable "Lieferung gescheitert" mark and ticks the deliveries
+// topic so the ledger surface shows the failed tip without a reload.
+func (c chainDeliver) RecordFailedDelivery(ctx context.Context, in executor.DeliverFailedIn) error {
+	if c.d.s.deliveries == nil {
+		return errors.New("the delivery ledger is not available")
+	}
+	full, err := c.d.fullName(ctx, in.Repo)
+	if err != nil {
+		return err
+	}
+	if err := deliver.RecordFailedDelivery(c.d.s.deliveries, deliver.FailedDeliveryIn{
+		DeliveryID: in.DeliveryID, ExecutionID: in.ExecutionID,
+		Repo: full, Branch: in.Branch,
+		FromCommit: in.FromCommit, ToCommit: in.ToCommit, Reason: in.Reason,
+	}); err != nil {
+		return err
+	}
+	c.d.s.publish(live.TopicDeliveries)
+	return nil
+}
+
 func (c chainDeliver) EnsureProtection(ctx context.Context, repo string) error {
 	full, err := c.d.fullName(ctx, repo)
 	if err != nil {

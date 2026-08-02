@@ -12,7 +12,9 @@ import {
   deliveryAt,
   deliveryBadge,
   groupDeliveriesByRepo,
+  isFailedDelivery,
   isOpenDelivery,
+  isUnsettledDelivery,
   openDeliveryExecutionIds,
   openDeliveryFactsByExecution,
   resetConfirmation,
@@ -201,4 +203,40 @@ test('the view gives EVERY managed repository a section and claims nothing about
   assert.doesNotMatch(src, /dev equals the default branch/);
   assert.doesNotMatch(src, /dev serves/);
   assert.doesNotMatch(code, /devServes/);
+});
+
+test('a failed delivery is the tip, is unsettled, and keeps its execution open (WHAT-1/2/4)', () => {
+  const failed = dlv({ id: 'f', repo: 'o/one', stage: 'failed', failedReason: 'deliver-dev stage failed: stale root script', createdAt: '2026-07-05T00:00:00Z', executionId: 'exec_f' });
+  // A failed delivery reads as failed, is unsettled (holds work), but is NOT a healthy PR-open one.
+  assert.equal(isFailedDelivery(failed), true);
+  assert.equal(isUnsettledDelivery(failed), true);
+  assert.equal(isOpenDelivery(failed), false);
+  // Its badge is its own — distinct from a settled one and never a blank chip.
+  assert.equal(deliveryBadge(failed).label, 'delivery failed');
+  // It keeps its execution in the open ToDo list (B-8), and the open ToDo says WHY it waits.
+  assert.deepEqual([...openDeliveryExecutionIds([failed])], ['exec_f']);
+  assert.deepEqual(openDeliveryFactsByExecution([failed]).get('exec_f'), {
+    blocked: true,
+    reason: 'deliver-dev stage failed: stale root script',
+  });
+});
+
+test('groupDeliveriesByRepo names the failed tip, and it can be rolled back (the second way back)', () => {
+  const [g] = groupDeliveriesByRepo([
+    dlv({ id: 'base', repo: 'o/one', stage: 'merged', createdAt: '2026-07-01T00:00:00Z' }),
+    dlv({ id: 'f', repo: 'o/one', stage: 'failed', failedReason: 'GitHub rejected the pull request', createdAt: '2026-07-02T00:00:00Z' }),
+  ]);
+  assert.equal(g.failedTip?.id, 'f');
+  assert.equal(g.openCount, 0, 'a failed tip is not a healthy open PR');
+  // A failed tip offers its rollback; a sound repo has none.
+  assert.equal(canRollback(g.failedTip!), true);
+  const [sound] = groupDeliveriesByRepo([dlv({ id: 'm', repo: 'o/two', stage: 'merged', createdAt: '2026-07-01T00:00:00Z' })]);
+  assert.equal(sound.failedTip, null);
+});
+
+test('rolling back a failed tip has its own consequence — no PR to close, the last sound layer returns', () => {
+  const c = rollbackConfirmation(dlv({ id: 'f', repo: 'o/one', stage: 'failed', createdAt: '2026-07-02T00:00:00Z' }));
+  assert.match(c.effect, /failed tip/);
+  assert.match(c.effect, /no pull request to close/);
+  assert.match(c.result, /last sound layer becomes the tip/);
 });

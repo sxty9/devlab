@@ -1043,6 +1043,18 @@ func (f fixtureDeliver) EnsureProtection(ctx context.Context, repo string) error
 	return err
 }
 
+func (f fixtureDeliver) FailedTip(_ context.Context, repo string) (*runs.Delivery, error) {
+	return deliver.FailedTip(f.d.e.deliveries, repo)
+}
+
+func (f fixtureDeliver) RecordFailedDelivery(_ context.Context, in executor.DeliverFailedIn) error {
+	return deliver.RecordFailedDelivery(f.d.e.deliveries, deliver.FailedDeliveryIn{
+		DeliveryID: in.DeliveryID, ExecutionID: in.ExecutionID,
+		Repo: in.Repo, Branch: in.Branch,
+		FromCommit: in.FromCommit, ToCommit: in.ToCommit, Reason: in.Reason,
+	})
+}
+
 // ── the deploy seam: the host edge (root), the repository read for real ───────────────────────
 
 type fixtureDeploy struct{ d *fixtureDeps }
