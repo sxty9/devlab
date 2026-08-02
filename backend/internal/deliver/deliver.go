@@ -53,6 +53,26 @@ type GitHubOps interface {
 	GetProtection(ctx context.Context, repo string) (Protection, error)
 	PostCommitStatus(ctx context.Context, repo, sha, statusContext, state, desc string) error
 	DefaultBranch(ctx context.Context, repo string) (string, error)
+	// RateBudget reports the last observed GitHub request budget of the token's hourly window, so
+	// the maintenance can stop reading BEFORE the budget is spent. It makes no network call.
+	RateBudget() RateBudget
+}
+
+// RateBudget is the maintenance view of the shared, finite request window: how much of the hourly
+// budget is left and when it refills. It is a property of the TOKEN, not of any single pull request,
+// which is why an empty budget is one shared standstill rather than a blockade on each entry.
+type RateBudget struct {
+	Known     bool      // false until a real response was observed (a cold start reads normally)
+	Remaining int       // requests left in the current window
+	Limit     int       // the window's size
+	Reset     time.Time // when the window refills — the moment a standstill ends by itself
+}
+
+// Exhausted reports whether the budget is at or below the reserve floor and the window has not reset
+// yet: the maintenance must stand down until Reset. A budget never observed (Known false) is NOT
+// exhausted — the first read learns the true figure.
+func (b RateBudget) Exhausted(now time.Time, floor int) bool {
+	return b.Known && b.Remaining <= floor && now.Before(b.Reset)
 }
 
 // PRState is the maintenance view of one pull request: whether it is open, merged (and when),
@@ -757,6 +777,66 @@ func reportMaintainStandstill(prs *runs.PRStore, ledger *runs.DeliveryStore, n *
 	return nil
 }
 
+// The maintenance reads GitHub sparingly. Three reasons bound the read count, and each names why
+// it holds:
+//
+//   - rateFloor is the reserve the pass keeps UNUSED. It stops reading once fewer than this many
+//     requests remain in the hourly window, so the budget is never discovered empty by a rejected
+//     request, and enough is left for the chain's own writes (pushes, PR creation, protection).
+//   - recheckMin/recheckMax bound the per-pull-request recheck cadence, and recheckDivisor DERIVES it
+//     from the merge deadline: a pull request due in T is re-read about once every T/recheckDivisor,
+//     clamped to [recheckMin, recheckMax]. A deadline weeks away therefore yields a coarse cadence
+//     (capped at recheckMax) and a near one a fine cadence (floored at recheckMin) — the frequency
+//     follows the deadline, never a flat number, and a not-yet-due pull request is not read every tick.
+const (
+	rateFloor      = 200
+	recheckMin     = 2 * time.Minute
+	recheckMax     = 30 * time.Minute
+	recheckDivisor = 4
+)
+
+// recheckInterval derives, FROM the merge deadline, how often a not-yet-due pull request is re-read
+// to notice a human merge or close: about once every (time-until-due)/recheckDivisor, clamped to
+// [recheckMin, recheckMax].
+func recheckInterval(mergeBy, now time.Time) time.Duration {
+	remaining := mergeBy.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	iv := remaining / recheckDivisor
+	if iv < recheckMin {
+		return recheckMin
+	}
+	if iv > recheckMax {
+		return recheckMax
+	}
+	return iv
+}
+
+// dueForRead reports whether a tracked pull request warrants a GitHub read THIS pass. A due,
+// un-gated pull request is read — it is about to be merged and needs its authoritative state. Any
+// other is read only once its deadline-derived recheck interval has elapsed since the last read;
+// until then a GitHub read cannot change the outcome, so it is skipped. This is the single point
+// that turns "N reads every tick" into "N reads at most once per recheck interval".
+func dueForRead(p runs.PendingPR, gated bool, now time.Time) bool {
+	if !now.Before(p.MergeBy) && !gated {
+		return true
+	}
+	return now.Sub(p.LastChecked) >= recheckInterval(p.MergeBy, now)
+}
+
+// maintainQuotaText states the shared budget standstill. The reset time is stable for the whole
+// window, so the message coalesces into ONE record per exhaustion episode instead of a row per pass.
+func maintainQuotaText(reset time.Time) string {
+	when := "as soon as GitHub refills it"
+	if !reset.IsZero() {
+		when = "at " + reset.UTC().Format(time.RFC3339)
+	}
+	return "GitHub's hourly request budget is exhausted, so pull-request maintenance pauses and " +
+		"resumes by itself " + when + ". No pull request is blocked — an empty budget is a property " +
+		"of the shared request window, not of any single pull request."
+}
+
 // Maintain is the recurring PR maintenance: auto-merge after the window (method EXCLUSIVELY
 // "merge"); the SAME place merges AND deletes the delivery branch (F14/REQ-026.4; branch 404 =
 // Satisfied); sets Result.MergedAt per the B-8 rule; backoff/blockade at the PR record;
@@ -779,11 +859,21 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 	if gh == nil {
 		return errors.New("deliver: the armed maintenance writes into foreign repositories and has no GitHub identity to do it with")
 	}
+	now := time.Now().UTC()
+
+	// The shared, self-ending budget standstill: if the last observed budget is at or below the
+	// reserve and the window has not reset, the WHOLE pass stands down before spending a request. An
+	// empty budget is a property of the request window shared by all pull requests, so it is one
+	// standstill, not a blockade filed on each of 78 entries — and it ends by itself at Reset.
+	if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) {
+		notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
+		return nil
+	}
+
 	tracked, err := prs.List()
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
 
 	// Auto-merge strictly in creation order per repo: an older open PR gates the younger ones
 	// (the stack collapses front to back), whatever the individual outcome.
@@ -803,9 +893,28 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 			queueBlocked[p.Repo] = true
 			continue
 		}
+		// Read only when a read can change the outcome. A not-yet-due pull request rechecked recently
+		// keeps its repo gated and costs no request — this is what stops N reads per tick.
+		if !dueForRead(p, queueBlocked[p.Repo], now) {
+			queueBlocked[p.Repo] = true
+			continue
+		}
+		// Stop before the reserve is touched: the remaining pull requests wait for the next pass (or
+		// the window reset), and none of them is blocked for it.
+		if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) {
+			notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
+			break
+		}
 
 		st, err := gh.GetPullRequest(ctx, p.Repo, p.Number)
+		_ = prs.Touch(p.Repo, p.Number, now) // record the read time so the recheck cadence advances
 		if err != nil {
+			// An exhausted budget is the shared standstill, never THIS pull request's fault: the failed
+			// read already refreshed the observed budget, so consult it before faulting the record.
+			if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) {
+				notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
+				break
+			}
 			recordFault(prs, n, p, "reading the pull request failed: "+err.Error(), err, now)
 			queueBlocked[p.Repo] = true
 			if firstErr == nil {
@@ -856,7 +965,12 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 	}
 
 	// Origin-status pass: every open PR of the managed repos (tracked ∪ open ledger entries)
-	// carries the ledger-derived status — a hand-PR gets its explained rejection here.
+	// carries the ledger-derived status — a hand-PR gets its explained rejection here. It, too, is
+	// behind the reserve: an exhausted budget defers the restamp to the next armed pass rather than
+	// spending the last requests and hitting the empty-quota rejection.
+	if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) {
+		return firstErr
+	}
 	if all, err := ledger.All(); err == nil {
 		for _, d := range all {
 			if d.OpenState() {

@@ -84,6 +84,7 @@ func (f *fakeDeliverOps) CounterBook(_ context.Context, _ runs.Delivery, _ strin
 	return cb, nil
 }
 func (f *fakeDeliverOps) RedeliverDev(context.Context, string) error { return nil }
+func (f *fakeDeliverOps) RateBudget() deliver.RateBudget            { return deliver.RateBudget{} }
 
 func itoa(n int) string { return strconv.Itoa(n) }
 

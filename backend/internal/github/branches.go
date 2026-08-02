@@ -88,18 +88,28 @@ func (p pullWire) toState() PullState {
 	}
 }
 
-// GetPullState fetches one PR's maintenance state (typed errors for faultclass).
+// GetPullState fetches one PR's maintenance state (typed errors for faultclass). It is CONDITIONAL:
+// the last ETag is replayed as If-None-Match, so an unchanged pull request answers 304 and the read
+// costs nothing against the request budget — the maintenance re-reads the same PRs on every pass, and
+// most of those reads find nothing changed.
 func GetPullState(ctx context.Context, token, fullName string, number int) (PullState, error) {
 	owner, name, err := splitFullName(fullName)
 	if err != nil {
 		return PullState{}, err
 	}
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number)
+	etag, cached, hasCache := pullConditional.get(url)
 	var p pullWire
-	res, gerr := do(ctx, token, fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number), &p)
+	res, notModified, gerr := doCond(ctx, token, url, etag, &p)
 	if gerr != nil {
 		return PullState{}, typed(res, gerr)
 	}
-	return p.toState(), nil
+	if notModified && hasCache {
+		return cached, nil
+	}
+	st := p.toState()
+	pullConditional.put(url, res.Header.Get("ETag"), st)
+	return st, nil
 }
 
 // ListOpenPullHeads returns every OPEN pull request on fullName with its head ref AND head SHA
