@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,11 @@ const OriginStatusContext = "devlab/delivery-origin"
 // is gone, the rights are missing, the request is invalid) is a different matter: it is stilled at
 // once and waits for a person, since no repetition can change it.
 const maintainMaxBackoff = time.Hour
+
+// prunePrefix opens the fault reason recorded when the delivery-branch prune fails. It is a named
+// constant because the startup revive sweep (ReviveStaleBlocks) matches against it to recognise a
+// block that was only ever a prune whose branch had already vanished — a goal reached, not a fault.
+const prunePrefix = "pruning the delivery branch failed: "
 
 // The K-5 classification seams. They default to the ONE classification point (faultclass);
 // they exist as variables solely so this package's tests stay deterministic while faultclass
@@ -1133,7 +1139,7 @@ func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger
 		if err := gh.DeleteBranch(ctx, p.Repo, branch); err != nil && !isSatisfiedDelete(err) {
 			// The delete stays owed: keep the record tracked with a backoff so the next tick
 			// retries the prune (the merge itself is already mirrored — re-finalizing is safe).
-			recordFault(prs, n, p, "pruning the delivery branch failed: "+err.Error(), err, now)
+			recordFault(prs, n, p, prunePrefix+err.Error(), err, now)
 			return err
 		}
 	}
@@ -1271,10 +1277,17 @@ func recordFault(prs *runs.PRStore, n *runs.NoticeStore, p runs.PendingPR, reaso
 	}
 }
 
-// isSatisfiedDelete reports the delete-like Satisfied: the branch is already gone (404).
+// isSatisfiedDelete reports the delete-like Satisfied: the branch is ALREADY GONE, which is the
+// goal of the prune — never a fault. GitHub reports an already-gone ref two ways, and both mean
+// the same thing: a 404, or — just as often for a ref delete — a 422 "Reference does not exist".
+// Before this second form was recognised, five merged deliveries were stilled for reaching exactly
+// what the prune was meant to reach.
 func isSatisfiedDelete(err error) bool {
 	var se *github.StatusError
-	return errors.As(err, &se) && se.Status == 404
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Status == 404 || (se.Status == 422 && strings.Contains(se.Msg, "Reference does not exist"))
 }
 
 // isRateLimited reports GitHub's explicit "too many requests" (429): the request window is spent.
@@ -1285,6 +1298,98 @@ func isSatisfiedDelete(err error) bool {
 func isRateLimited(err error) bool {
 	var se *github.StatusError
 	return errors.As(err, &se) && se.Status == 429
+}
+
+// ReviveStaleBlocks lifts, at service start, every persisted delivery block whose reason is NO
+// LONGER a durable fault under the current classification (point 4 of the order). A block is a
+// terminal state that a stored record keeps forever until a person releases it — so a record
+// stilled by the OLD, wrong reading (a prune that reached its goal, a timeout that ends by itself)
+// stays stilled across restarts and still needs a human, which was the very problem. This sweep
+// re-decides each stored block from the reason it kept and releases the ones that are no longer
+// blocks; a genuine durable fault (missing rights, a gone pull request) stays. It talks to no
+// GitHub — it only re-reads the local records — so it is safe on the boot path.
+//
+// It returns how many records it released.
+func ReviveStaleBlocks(prs *runs.PRStore) (int, error) {
+	if prs == nil {
+		return 0, nil
+	}
+	cur, err := prs.List()
+	if err != nil {
+		return 0, err
+	}
+	revived := 0
+	for _, p := range cur {
+		if !p.Blocked || !blockNowStale(p.BlockedReason) {
+			continue
+		}
+		freed, err := prs.ResumeBlocked(p.Repo, p.Number)
+		if err != nil {
+			return revived, err
+		}
+		revived += len(freed)
+	}
+	return revived, nil
+}
+
+// blockNowStale reports whether an ALREADY-recorded block would, under the current classification,
+// not be a block at all. It replays the two decisions recordFault makes, from the reason string the
+// block preserved (the only thing a persisted block keeps): first the delete-satisfied rule — a
+// prune that failed only because the branch was already gone reached its goal — then
+// faultclass.Classify on the error reconstructed from the reason. Anything that is not Permanent (a
+// timeout, a dropped connection, a secondary-rate-limit 403) is self-ending and no longer a block.
+func blockNowStale(reason string) bool {
+	err := errorFromReason(reason)
+	if err == nil {
+		return false
+	}
+	if strings.HasPrefix(reason, prunePrefix) && isSatisfiedDelete(err) {
+		return true
+	}
+	return classify(err) != faultclass.Permanent
+}
+
+// errorFromReason rebuilds a representative error from a stored fault reason so the ONE classifier
+// (faultclass.Classify) decides its class — the reclassification adds no parallel set of rules, it
+// only turns the preserved text back into the kind of error it named. A wait cut short (deadline,
+// client timeout, canceled) becomes the matching context error; a "github: status NNN:" reason
+// becomes that StatusError; anything else stays an opaque error (Transient by default).
+func errorFromReason(reason string) error {
+	if reason == "" {
+		return nil
+	}
+	switch {
+	case strings.Contains(reason, "context deadline exceeded"), strings.Contains(reason, "Client.Timeout"):
+		return context.DeadlineExceeded
+	case strings.Contains(reason, "context canceled"):
+		return context.Canceled
+	}
+	if status, ok := statusFromReason(reason); ok {
+		return &github.StatusError{Status: status, Msg: reason}
+	}
+	return errors.New(reason)
+}
+
+// statusFromReason extracts the HTTP status a StatusError reason carries ("...status NNN:...").
+func statusFromReason(reason string) (int, bool) {
+	const marker = "status "
+	i := strings.Index(reason, marker)
+	if i < 0 {
+		return 0, false
+	}
+	j := i + len(marker)
+	k := j
+	for k < len(reason) && reason[k] >= '0' && reason[k] <= '9' {
+		k++
+	}
+	if k == j {
+		return 0, false
+	}
+	n, err := strconv.Atoi(reason[j:k])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // ── Emergency override (REQ-033.4) ───────────────────────────────────────────────────────

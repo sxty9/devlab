@@ -8,6 +8,7 @@ package faultclass
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"devlab/backend/internal/github"
@@ -49,28 +50,42 @@ var (
 	MaxDelay  = 15 * time.Minute
 )
 
-// Classify classifies an error:
+// Classify classifies an error. The whole system's durable-vs-self-ending distinction is made
+// HERE and nowhere else (K-5), so a caller never needs a special case of its own.
+//
 //   - nil or (wrapping) ErrSatisfied ⇒ Satisfied — the goal already holds.
-//   - github.StatusError with a definitive client status (404 not found, 403 forbidden,
-//     401 unauthorized, 410 gone, 422 unprocessable) ⇒ Permanent — the object does not exist,
-//     permission is missing, or the request is invalid; repeating cannot change that. A 404 on
-//     a delete-like operation is the CALLER's Satisfied (wrap ErrSatisfied there).
+//   - A wait cut short before an answer arrives — a deadline or the HTTP client's own
+//     Client.Timeout, a canceled request, a dropped connection, no network ⇒ Transient. Such a
+//     wait ENDS BY ITSELF: the next attempt may well succeed, so it earns the growing backoff,
+//     never a standstill. (The maintenance loop still returns on its parent ctx.Err() before it
+//     records any fault, so a genuine shutdown never turns into a retry here.)
+//   - github.StatusError with a definitive client status (404 not found, 401 unauthorized,
+//     410 gone, 422 unprocessable) ⇒ Permanent — the object does not exist, permission is
+//     missing, or the request is invalid; repeating cannot change that. A 404 on a delete-like
+//     operation is the CALLER's Satisfied (wrap ErrSatisfied, or recognise it at the call site).
+//   - github.StatusError 403 ⇒ Permanent (missing rights) UNLESS it is GitHub's SECONDARY (abuse)
+//     rate limit — a self-ending obstacle GitHub flags with a Retry-After header or a body that
+//     names a "rate limit" or "abuse detection". That form ⇒ Transient. (The primary 403 rate
+//     limit, with an empty X-RateLimit-Remaining, is caught earlier by the request-budget reserve.)
 //   - github.StatusError 429 or any 5xx ⇒ Transient (rate limiting, server hiccups).
-//   - context cancellation/deadline ⇒ Permanent for the classification's purpose: the caller
-//     decided to stop; a retry loop must not spin on a dead context.
-//   - everything else (connectivity, DNS, timeouts, unclassified failures) ⇒ Transient —
-//     bounded by Retry's attempt cap, never endless (K-5).
+//   - everything else (connectivity, DNS, unclassified failures) ⇒ Transient — a self-ending
+//     obstacle backed off with a growing, visible interval, never endless silence (K-5).
 func Classify(err error) Class {
 	if err == nil || errors.Is(err, ErrSatisfied) {
 		return Satisfied
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return Permanent
+		return Transient
 	}
 	var se *github.StatusError
 	if errors.As(err, &se) {
 		switch {
-		case se.Status == 401 || se.Status == 403 || se.Status == 404 || se.Status == 410 || se.Status == 422:
+		case se.Status == 403:
+			if se.RetryAfter != "" || mentionsRateLimit(se.Msg) {
+				return Transient
+			}
+			return Permanent
+		case se.Status == 401 || se.Status == 404 || se.Status == 410 || se.Status == 422:
 			return Permanent
 		case se.Status == 429 || se.Status >= 500:
 			return Transient
@@ -81,6 +96,14 @@ func Classify(err error) Class {
 		}
 	}
 	return Transient
+}
+
+// mentionsRateLimit reports whether a GitHub error body names a rate limit or the abuse-detection
+// mechanism — the two wordings of the SECONDARY 403 rate limit, which is self-ending, not a
+// missing right.
+func mentionsRateLimit(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "rate limit") || strings.Contains(m, "abuse")
 }
 
 // Delay returns the growing interval before attempt n (1-based): BaseDelay*2^(n-1), capped at max.
