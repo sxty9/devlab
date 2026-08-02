@@ -137,7 +137,7 @@ function QuestionRow({
   const canSend = wrapper ? confirmed : text.trim().length > 0;
   const send = () => {
     if (!canSend) return;
-    const body = wrapper ? text.trim() || 'Root wrapper scripts renewed with sudo — approved.' : text.trim();
+    const body = wrapper ? text.trim() || 'Approved renewing the root wrapper scripts to their standard-branch version.' : text.trim();
     void onAnswer(q, body, wrapper);
   };
 
@@ -174,7 +174,7 @@ function QuestionRow({
 
       {wrapper && q.detail && (
         <details className="mt-2" open>
-          <summary className="cursor-pointer text-caption text-danger">Exact difference to the installed root scripts</summary>
+          <summary className="cursor-pointer text-caption text-danger">What would be installed (the standard-branch version)</summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-fill/[0.04] px-2.5 py-1.5 text-caption text-text-secondary">
             {q.detail}
           </pre>
@@ -198,8 +198,8 @@ function QuestionRow({
               className="mt-0.5"
             />
             <span>
-              I have renewed the root scripts myself with sudo (the one-line script named above). This approval is
-              single-use; the run re-checks the scripts before it installs.
+              I approve installing the standard-branch (merged) version of these root scripts. This approval is
+              single-use and covers only the files and checksums shown above; the run installs and re-verifies them.
             </span>
           </label>
         )}

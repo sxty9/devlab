@@ -28,6 +28,27 @@ func run(repo string, args ...string) (string, error) {
 	return strings.TrimRight(string(out), "\n"), err
 }
 
+// runRaw is run() WITHOUT the trailing-newline trim: it returns stdout byte-for-byte. Content whose
+// checksum must match a file on disk (the root-wrapper renewal compares the committed blob against
+// the installed wrapper) cannot be trimmed — a stripped final newline would change the hash.
+func runRaw(repo string, args ...string) ([]byte, error) {
+	full := append([]string{"--no-optional-locks", "-c", "safe.directory=*", "-C", repo}, args...)
+	return exec.Command("git", full...).Output()
+}
+
+// FileAtRefBytes returns the committed content of a repo-relative path at a git ref (e.g.
+// "origin/main"), byte-for-byte, and whether the path exists there. It reads committed HISTORY, never
+// the working tree — the ref names a merged stand, which is the only admissible source for a
+// root-wrapper renewal (only content that traversed the full chain and was merged). The bytes equal
+// the blob, so their sha256 equals that of a file installed verbatim from the same blob.
+func FileAtRefBytes(repo, ref, rel string) ([]byte, bool) {
+	b, err := runRaw(repo, "show", ref+":"+rel)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // Lang maps a path to a Monaco language id (mirrors frontend src/lib/lang.ts).
 func Lang(path string) string {
 	name := path

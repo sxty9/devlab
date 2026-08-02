@@ -69,10 +69,26 @@ type Question struct {
 	AnsweredAt *time.Time  `json:"answeredAt,omitempty"`
 	AnsweredBy model.Actor `json:"answeredBy,omitempty"`
 
+	// Wrappers pins EXACTLY WHICH root wrapper scripts (by name) and WHICH content (by sha256) the
+	// user's approval covers — one entry per file. It is set only on a wrapper-renewal question and is
+	// derived from the STANDARD BRANCH (merged content), never from the run's working tree. The
+	// approval frees the renewal of these named files with these exact checksums and nothing else: if
+	// the merged content changes after the approval, the recorded sha no longer matches and the
+	// renewal is refused (the approval is single-use and content-pinned, never a blanket permission).
+	Wrappers []WrapperGrant `json:"wrappers,omitempty"`
+
 	// Resolved marks a question whose answer the resumed run has already consumed, so a later resume
 	// does not feed the same answer to the agent twice.
 	Resolved   bool       `json:"resolved,omitempty"`
 	ResolvedAt *time.Time `json:"resolvedAt,omitempty"`
+}
+
+// WrapperGrant names ONE root wrapper the user approved for renewal and the exact content (sha256)
+// the approval covers. The bytes are not stored here — they are re-read from the standard branch at
+// install time and must still hash to SHA, so a stale approval installs nothing.
+type WrapperGrant struct {
+	Name string `json:"name"` // one of the four renewable wrappers (the authoritative list lives in the root tool)
+	SHA  string `json:"sha"`  // sha256 (hex) of the standard-branch content the user approved
 }
 
 // Open reports whether the question still waits for an answer.

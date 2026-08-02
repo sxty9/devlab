@@ -268,6 +268,12 @@ type fakeDeploy struct {
 	// wrapperDrift, when set, makes DeliverDev refuse with ErrWrappersStale carrying this drift — the
 	// self-delivery guard's refusal the deliver-dev stage turns into a wrapper-renewal question.
 	wrapperDrift string
+	// mainGrants is what MainWrapperDrift returns — the standard-branch (file, checksum) set the
+	// renewal question offers. Empty means the installed wrappers already match the standard branch.
+	mainGrants []runs.WrapperGrant
+	// renewErr, when set, makes RenewApprovedWrappers fail; renewed records the questions it applied.
+	renewErr error
+	renewed  []runs.Question
 }
 
 func (d *fakeDeploy) Detect(ctx context.Context, repo string) (Detection, error) {
@@ -278,6 +284,23 @@ func (d *fakeDeploy) Detect(ctx context.Context, repo string) (Detection, error)
 		return Detection{Kind: "service", Evidence: "conforming service CLI at ./service"}, nil
 	}
 	return d.det, nil
+}
+func (d *fakeDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mainGrants, nil
+}
+func (d *fakeDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.renewErr != nil {
+		return d.renewErr
+	}
+	d.renewed = append(d.renewed, q)
+	// A successful renewal makes the installed wrappers match the standard branch: clear the drift so
+	// the next DeliverDev proceeds, mirroring the real guard re-check on the same attempt.
+	d.wrapperDrift = ""
+	return nil
 }
 func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome, error) {
 	d.mu.Lock()
@@ -362,13 +385,21 @@ func (q *fakeQuestions) Resolve(ctx context.Context, id string) error {
 }
 
 // answer marks a stored question answered (test helper for the resume path).
-func (q *fakeQuestions) answer(id, answer string) {
+func (q *fakeQuestions) answer(id, answer string) { q.answerApproved(id, answer, false) }
+
+// approve marks a stored question answered AND approved — the single-use green light a wrapper
+// renewal needs before the write half installs anything.
+func (q *fakeQuestions) approve(id, answer string) { q.answerApproved(id, answer, true) }
+
+func (q *fakeQuestions) answerApproved(id, answer string, approved bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for i := range q.items {
 		if q.items[i].ID == id {
 			now := time.Now().UTC()
 			q.items[i].Answer = answer
+			q.items[i].Approved = approved
+			q.items[i].AnsweredBy = model.Actor{User: "operator"}
 			q.items[i].AnsweredAt = &now
 		}
 	}

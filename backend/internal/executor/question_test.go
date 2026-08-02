@@ -187,8 +187,10 @@ func TestAnswerResumesSameRun(t *testing.T) {
 func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
-	drift := "root wrapper(s) devlab-install are stale — run and then resume: sudo /w/service setup"
+	drift := "root wrapper(s) devlab-install differ from the standard branch"
 	deps.deploy.wrapperDrift = drift
+	// The renewal offers EXACTLY the standard-branch content — one file, one checksum.
+	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
 	sink := newFakeSink()
 
 	// Even at the autonomous level the wrapper renewal asks — it is a security gate, not a decision.
@@ -202,29 +204,59 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	if len(deps.questions.raised) != 1 || deps.questions.raised[0].QKind != runs.QuestionWrapperRenewal {
 		t.Fatalf("expected a wrapper-renewal question, got %+v", deps.questions.raised)
 	}
-	if !strings.Contains(deps.questions.raised[0].Detail, "service setup") {
-		t.Fatalf("the question must carry the exact difference, got %q", deps.questions.raised[0].Detail)
+	// The question pins the standard-branch (file, checksum) set the approval covers.
+	if got := deps.questions.raised[0].Wrappers; len(got) != 1 || got[0].Name != "devlab-install" {
+		t.Fatalf("the question must carry the standard-branch grant set, got %+v", got)
+	}
+	if !strings.Contains(deps.questions.raised[0].Detail, "devlab-install") {
+		t.Fatalf("the question must show the exact difference, got %q", deps.questions.raised[0].Detail)
 	}
 	// The implement stage delivered nothing to install-over: the deliver-dev stage failed, so the
-	// install never ran a second time on an unapproved drift.
+	// install never ran on an unapproved drift.
 	if dd, ok := sink.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepFailed {
 		t.Fatalf("deliver-dev should have failed on the drift, got %+v", dd)
 	}
 
-	// The user renews the scripts (their own sudo) and approves — the drift is now gone.
-	deps.questions.answer(deps.questions.raised[0].ID, "Renewed via service setup.")
-	deps.deploy.wrapperDrift = ""
+	// The user APPROVES (the single-use green light). The write half now installs the approved
+	// standard-branch content through the root tool — the drift is gone on the same resume.
+	deps.questions.approve(deps.questions.raised[0].ID, "Approved renewing devlab-install.")
 
 	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
 	sink2 := newFakeSink()
 	if err := Execute(context.Background(), deps, req, sink2); err != nil {
-		t.Fatalf("resume should deliver once the scripts match, got %v", err)
+		t.Fatalf("resume should deliver once the write half renewed the wrappers, got %v", err)
+	}
+	// The write half was invoked with the approved question.
+	if len(deps.deploy.renewed) != 1 || len(deps.deploy.renewed[0].Wrappers) != 1 {
+		t.Fatalf("the approved renewal should have been applied through the root tool, got %+v", deps.deploy.renewed)
 	}
 	if dd, ok := sink2.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepExecuted {
 		t.Fatalf("deliver-dev should succeed after the renewal, got %+v", dd)
 	}
-	// The wrapper question was consumed once the guard confirmed the match.
+	// The wrapper question was consumed once the renewal took effect.
 	if len(deps.questions.resolve) == 0 {
-		t.Fatalf("the wrapper question should be resolved after a successful delivery")
+		t.Fatalf("the wrapper question should be resolved after a successful renewal")
+	}
+}
+
+// A run that changes a root wrapper but whose change is NOT yet on the standard branch cannot renew
+// anything (only merged content is a source). It blocks honestly with the merge-wait reason and asks
+// no question the user cannot satisfy — the run's own delivery waits until its wrapper change merges.
+func TestWrapperChangeNotYetMergedBlocksWithoutQuestion(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "installed devlab-exec differs from this run's working tree"
+	deps.deploy.mainGrants = nil // nothing on the standard branch differs from what is installed
+	sink := newFakeSink()
+
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), sink); err == nil {
+		t.Fatalf("expected the delivery to block")
+	}
+	rp, _ := sink.done("org/devlab")
+	if rp.Block == nil || rp.Block.Class != "awaiting-wrapper-merge" {
+		t.Fatalf("expected an awaiting-wrapper-merge block, got %+v", rp.Block)
+	}
+	if len(deps.questions.raised) != 0 {
+		t.Fatalf("no wrapper-renewal question is raised when nothing merged can be renewed, got %+v", deps.questions.raised)
 	}
 }
