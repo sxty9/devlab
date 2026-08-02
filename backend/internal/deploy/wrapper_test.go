@@ -280,16 +280,25 @@ func TestInstallCheckUIConfiguredPlansWireInBuildAndServe(t *testing.T) {
 		t.Fatalf("a configured ui check must exit 0, got %d\n%s", res.exit, res.out)
 	}
 	for _, want := range []string{
-		"external/svc-a",           // (1) the wire-in
-		"AS THE CHECKOUT OWNER",    // (2) the rebuild runs unprivileged — root never builds
-		"DELIVER the built bundle", // (3) the delivery step that was missing
-		www,                        // …to the serve root the browser fetches from
-		"ARRIVED",                  // built is gated on arrival, not on the build
+		"external/svc-a",              // (1) the wire-in
+		"AS THE CHECKOUT OWNER",       // (2) the rebuild runs unprivileged — root never builds
+		"DELIVER the built bundle",    // (3) the delivery step that was missing
+		www,                           // …to the serve root the browser fetches from
+		"ARRIVED",                     // built is gated on arrival, not on the build
+		"readable by its PUBLIC ROLE", // (a) private source still delivered readable
+		"PROVEN readable",             // (b) an unreadable start page fails BENANNT
 		"MERCURY-UI: planned", "foreign-blocked",
 	} {
 		if !strings.Contains(res.out, want) {
 			t.Errorf("the ui plan should mention %q: %s", want, res.out)
 		}
+	}
+	// The two readable-PLAN lines are printed ONLY after the --check simulation has, on a throwaway
+	// pair, (a) delivered a PRIVATE source readable and (b) refused an unreadable start page. Their
+	// presence with exit 0 is the acceptance of points 1+2 of the task: the serve root is readable by
+	// its role, not the builder's umask, and a served tree the webserver cannot read is not green.
+	if strings.Contains(res.out, "MERCURY-UI: would-fail") {
+		t.Errorf("the readability simulation must not fault on a sound serve step: %s", res.out)
 	}
 	// The old confusion, guarded against: the plan must NOT stop at the build as the last word on the
 	// ui half — the serve root has to be the measure.

@@ -504,9 +504,48 @@ wire_ui_copy() {  # <src> <dst>
 # the serve root the browser fetches. Install-only (a plain copy of already-built bytes — root does
 # not build here), so both the real path and the --check simulation call this ONE function and the
 # acceptance guards exactly the copy that ships.
+#
+# THE SERVE ROOT IS READABLE BY ITS ROLE, NOT BY THE BUILDER'S UMASK. `rsync -a` carries the SOURCE's
+# permission bits, and the source is the build tree in the ERBAUER's checkout: whoever built decided,
+# via their umask, whether the delivered files were world-readable. That is exactly how the served tree
+# ended up rw-r----- / rwxr-x--- and the webserver — a different account entirely — answered 404 over a
+# page that was present. A serve root is not a private directory: it is public by role, because the
+# browser fetches every byte of it. So after the copy the permissions are DERIVED FROM THAT ROLE —
+# directories betretbar, files lesbar for every reader (`a+rX`) — regardless of who built or under which
+# umask. World-read (rather than adding the webserver to a group) needs no knowledge of the webserver's
+# account, which is instance configuration this template does not and should not carry; it makes the
+# tree reachable for ANY webserver identity.
 serve_dashboard() {  # <built-bundle-dir> <serve-root>
   install -d -m 0755 "$2"
   rsync -a --delete "$1/" "$2/"
+  chmod -R a+rX "$2"
+}
+
+# serve_readable proves the delivered serve root is actually reachable by the webserver — point (2):
+# a delivery whose result the webserver cannot read is NOT complete and must say so, never a silent
+# green (F10 — proven, not assumed; the honesty rule the caller already enforces on the program half).
+# The webserver's account is INSTANCE configuration this template does not carry, so we prove the ROLE
+# property that makes the page readable for every possible account: an unprivileged reader with no
+# special rights can read the start page. Running as root (production, via sudo) we DROP to `nobody` —
+# the nologin account present on every host — and read index.html: if `nobody` can read it, the
+# webserver can too, whatever its account. Without root (the direct-invocation test seam, id != 0, where
+# no privilege drop is possible) we check the same property on the mode bits: the other-read bit must be
+# set. Either way a serve root the webserver could not read fails BENANNT.
+# It echoes the named reason to stderr and RETURNS non-zero (it does not die), so each caller decides
+# what to report first — the real path prints `MERCURY-UI: failed` before failing, the --check
+# simulation only records the outcome.
+serve_readable() {  # <serve-root>  → 0 if the webserver can read the start page, else 1 (reason on stderr)
+  local index="$1/index.html"
+  [ -f "$index" ] || { echo "devlab-install: error: serve root $1 has no index.html after delivery — the browser has no start page to fetch (delivery incomplete)" >&2; return 1; }
+  if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null 2>&1 && getent passwd nobody >/dev/null 2>&1; then
+    runuser -u nobody -- test -r "$index" && return 0
+    echo "devlab-install: error: the delivered start page $index is NOT readable by an unprivileged reader ('nobody') — the webserver would answer 404 over a present page; the serve root's permissions do not match its public role (delivery incomplete)" >&2
+    return 1
+  fi
+  local mode; mode="$(stat -c %a "$index" 2>/dev/null || echo 0)"
+  [ "$(( 8#${mode:-0} & 4 ))" = 4 ] && return 0
+  echo "devlab-install: error: the delivered start page $index lacks other-read (mode $mode) — the webserver could not read it (delivery incomplete)" >&2
+  return 1
 }
 
 # serve_stamp is the before/after proof of arrival: the newest file mtime under the serve root. The
@@ -540,9 +579,17 @@ if [ "$CHECK" = 1 ]; then
   sim="$(mktemp -d)"
   wire_ui_copy "$UI_SRC" "$sim/ext"
   leaked="$(cd "$sim/ext" && ls tsconfig.json tsconfig.*.json 2>/dev/null || true)"
+  # A PRIVATE source bundle — the very shape (builder umask → rw-------/rwx------) that made the served
+  # tree unreadable to the webserver. serve_dashboard must deliver it readable anyway, by its role.
   mkdir -p "$sim/dist"; echo "sentinel" > "$sim/dist/index.html"
+  chmod 700 "$sim/dist"; chmod 600 "$sim/dist/index.html"
   serve_dashboard "$sim/dist" "$sim/www"
   arrived=no; if [ -f "$sim/www/index.html" ]; then arrived=yes; fi
+  # (a) the private source is nonetheless delivered readable (serve_readable passes on the throwaway root)
+  readable=no; if serve_readable "$sim/www" >/dev/null 2>&1; then readable=yes; fi
+  # (b) a serve root whose start page is NOT readable is REFUSED by name (serve_readable returns non-zero)
+  mkdir -p "$sim/unreadable"; echo x > "$sim/unreadable/index.html"; chmod 640 "$sim/unreadable/index.html"
+  refused=no; if ! serve_readable "$sim/unreadable" >/dev/null 2>&1; then refused=yes; fi
   rm -rf -- "$sim"
   if [ -n "$leaked" ]; then
     echo "PLAN: FAULT — an editor tsconfig would be copied into external/$REPO and break the dashboard build: $leaked"
@@ -554,6 +601,18 @@ if [ "$CHECK" = 1 ]; then
     echo "MERCURY-UI: would-fail"
     exit 2
   fi
+  if [ "$readable" != yes ]; then
+    echo "PLAN: FAULT — the serve step delivered the bundle but the serve root was not readable by the webserver's role (the browser would get 404 over a present page)"
+    echo "MERCURY-UI: would-fail"
+    exit 2
+  fi
+  if [ "$refused" != yes ]; then
+    echo "PLAN: FAULT — an unreadable start page was NOT refused; a serve root the webserver cannot read would be reported green"
+    echo "MERCURY-UI: would-fail"
+    exit 2
+  fi
+  echo "PLAN: the serve root is made readable by its PUBLIC ROLE (a+rX), not by the builder's umask — a private source is delivered readable (verified on a throwaway pair)"
+  echo "PLAN: after delivery the start page is PROVEN readable by the webserver's role (an unreadable one fails BENANNT), so a served tree the browser cannot read is never reported green"
   echo "PLAN: editor-only tsconfig is neutralised (not copied) — the dashboard's own build config governs external/$REPO"
   echo "PLAN: rebuild the shared dashboard in $FRONT AS THE CHECKOUT OWNER '$CO_OWNER' (runuser — root never builds; no root-owned file lands in the operator's checkout)"
   echo "PLAN: DELIVER the built bundle $DIST_DIR -> the serve root $HOLISTIC_WWW (rsync --delete + chown to its owner) — this is what the browser fetches; serve-copy verified on a throwaway pair (bundle arrived)"
@@ -594,6 +653,14 @@ if build_out="$(build_dashboard)"; then
     echo "MERCURY-UI: failed"
     die "the serve-copy delivered nothing to the serve root $HOLISTIC_WWW — the browser would keep serving the old bundle" 4
   }
+  # The delivery PROVES the webserver can read what it just delivered (point 2). serve_dashboard set the
+  # role permissions; the chown above may have changed the owner but not the readability. A serve root
+  # the webserver cannot read is an incomplete delivery, not green — so fail BENANNT if the start page is
+  # unreadable rather than let the browser answer 404 over a present page.
+  if ! serve_readable "$HOLISTIC_WWW"; then
+    echo "MERCURY-UI: failed"    # serve_readable printed the named reason to stderr
+    die "the delivered dashboard at the serve root $HOLISTIC_WWW is not readable by the webserver — see the reason above; the delivery is incomplete, not green" 4
+  fi
   www_after="$(serve_stamp "$HOLISTIC_WWW")"
   echo "MERCURY-UI: built"
   log "service '$REPO' ui wired into $EXT; dashboard rebuilt as '$CO_OWNER' (root never built); bundle delivered to the serve root $HOLISTIC_WWW — the browser now serves the new dashboard (serve root: was [$www_before], now [$www_after])"
