@@ -59,8 +59,8 @@ type Question struct {
 
 	// AskedAt is when the question was raised; the surface shows "waiting since" from it (REQ:
 	// an unanswered question names since when it waits).
-	AskedAt time.Time    `json:"askedAt"`
-	AskedBy model.Actor  `json:"askedBy"`
+	AskedAt time.Time   `json:"askedAt"`
+	AskedBy model.Actor `json:"askedBy"`
 
 	// Answer is the user's reply once given. Approved is the explicit green light for a guarded
 	// handle (wrapper renewal): a question of that kind only frees its action when Approved is true.

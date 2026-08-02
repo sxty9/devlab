@@ -79,16 +79,16 @@ type Run struct {
 // RunInput is the create/update request shape (the ONE parse target of the runs handler and the
 // run MCP tools).
 type RunInput struct {
-	Kind     model.RunKind `json:"kind,omitempty"`
-	Title    string        `json:"title"`
-	Task     string        `json:"task,omitempty"`
-	AxiomIDs []string      `json:"axiomIds,omitempty"`
-	Schedule *ScheduleSpec `json:"schedule,omitempty"`
-	Active   *bool         `json:"active,omitempty"`
-	Targets  []Target      `json:"targets,omitempty"`
-	DueAt    *time.Time    `json:"dueAt,omitempty"`
+	Kind     model.RunKind       `json:"kind,omitempty"`
+	Title    string              `json:"title"`
+	Task     string              `json:"task,omitempty"`
+	AxiomIDs []string            `json:"axiomIds,omitempty"`
+	Schedule *ScheduleSpec       `json:"schedule,omitempty"`
+	Active   *bool               `json:"active,omitempty"`
+	Targets  []Target            `json:"targets,omitempty"`
+	DueAt    *time.Time          `json:"dueAt,omitempty"`
 	Autonomy model.AutonomyLevel `json:"autonomy,omitempty"`
-	Tuning   *Tuning       `json:"tuning,omitempty"`
+	Tuning   *Tuning             `json:"tuning,omitempty"`
 }
 
 // AttachmentRef is metadata for one media file attached to a run. The bytes live in the passive

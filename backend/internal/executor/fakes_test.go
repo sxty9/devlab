@@ -387,16 +387,16 @@ type pauseCall struct {
 }
 
 type fakeDeps struct {
-	mu       sync.Mutex
-	benches  map[string]*fakeBench
+	mu        sync.Mutex
+	benches   map[string]*fakeBench
 	gh        *fakeGH
 	deliver   *fakeDeliver
 	deploy    *fakeDeploy
 	questions *fakeQuestions
-	agentFn  func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
-	attsFn   func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
-	findings map[string]preflight.Finding
-	findErr  error
+	agentFn   func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
+	attsFn    func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
+	findings  map[string]preflight.Finding
+	findErr   error
 
 	agentCalls   []agentCall
 	restartBy    []model.Actor
@@ -420,7 +420,7 @@ type scopeRecord struct {
 
 func newFakeDeps(repos ...string) *fakeDeps {
 	d := &fakeDeps{
-		benches:  map[string]*fakeBench{},
+		benches:   map[string]*fakeBench{},
 		gh:        &fakeGH{},
 		deliver:   &fakeDeliver{},
 		deploy:    &fakeDeploy{},
@@ -459,10 +459,10 @@ func (d *fakeDeps) StageAttachments(ctx context.Context, repo string, atts []run
 	}
 	return "", func() error { return nil }, nil
 }
-func (d *fakeDeps) GitHub() GitHubOps       { return d.gh }
-func (d *fakeDeps) Deliver() DeliverOps     { return d.deliver }
-func (d *fakeDeps) Deploy() DeployOps       { return d.deploy }
-func (d *fakeDeps) Questions() QuestionOps  { return d.questions }
+func (d *fakeDeps) GitHub() GitHubOps      { return d.gh }
+func (d *fakeDeps) Deliver() DeliverOps    { return d.deliver }
+func (d *fakeDeps) Deploy() DeployOps      { return d.deploy }
+func (d *fakeDeps) Questions() QuestionOps { return d.questions }
 func (d *fakeDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	if d.findErr != nil {
 		return preflight.Finding{State: model.TaskUnknown}, d.findErr
