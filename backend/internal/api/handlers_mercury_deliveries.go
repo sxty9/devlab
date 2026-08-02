@@ -601,6 +601,15 @@ func (s *Server) MaintainDeliveries(ctx context.Context) error {
 	return err
 }
 
+// ReviveStaleDeliveryBlocks lifts, at service start, every persisted delivery block whose reason is
+// no longer a durable fault under the current classification (a prune that reached its goal, a
+// timeout that ends by itself). Without it a block recorded under an old, wrong reading stays put
+// across restarts and still needs a person — the very problem that stilled seven records on
+// 2026-08-02. It reads only local records (no GitHub), so it is safe on the boot path.
+func (s *Server) ReviveStaleDeliveryBlocks() (int, error) {
+	return deliver.ReviveStaleBlocks(s.runPRs)
+}
+
 // MaintainProdDeliveries runs the production pass (deliver.MaintainProd): it ships every merged
 // delivery that still owes production to the production host and proves it running there. It needs
 // the runner identity to build and ship; without it there is no chain running and hence no merged

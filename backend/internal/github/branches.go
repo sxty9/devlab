@@ -13,11 +13,14 @@ import (
 )
 
 // StatusError is a typed GitHub API failure — the classification input for faultclass
-// (404/403/422 ⇒ Permanent at the classifier; a 404 on a delete-like call is the caller's
-// Satisfied).
+// (404/422 ⇒ Permanent at the classifier; a 404 on a delete-like call is the caller's
+// Satisfied). RetryAfter carries GitHub's Retry-After header when present: it is the signal
+// that a 403 is the SECONDARY (abuse) rate limit — a self-ending obstacle — rather than a
+// missing right, so faultclass can tell the two 403 forms apart.
 type StatusError struct {
-	Status int
-	Msg    string
+	Status     int
+	Msg        string
+	RetryAfter string
 }
 
 func (e *StatusError) Error() string {
@@ -32,7 +35,7 @@ func typed(res *http.Response, err error) error {
 		return nil
 	}
 	if res != nil && res.StatusCode >= 400 {
-		return &StatusError{Status: res.StatusCode, Msg: err.Error()}
+		return &StatusError{Status: res.StatusCode, Msg: err.Error(), RetryAfter: res.Header.Get("Retry-After")}
 	}
 	return err
 }

@@ -178,6 +178,14 @@ func main() {
 	} else {
 		log.Printf("devlabd: pull-request maintenance HELD — it reports and writes nothing; arm it with %s=1", deliver.EnvMaintainEnforce)
 	}
+	// Lift any delivery block that a corrected classification no longer counts as a fault (a prune
+	// that reached its goal, a timeout that ends by itself), so it does not outlive the fix and keep
+	// waiting for a person. Local records only, so it never delays the boot.
+	if revived, err := server.ReviveStaleDeliveryBlocks(); err != nil {
+		log.Printf("devlabd: reviving stale delivery blocks deferred: %v", err)
+	} else if revived > 0 {
+		log.Printf("devlabd: lifted %d delivery block(s) whose reason is no longer a fault", revived)
+	}
 	if err := scheduler.Start(rootCtx); err != nil {
 		log.Printf("devlabd: scheduler start: %v", err)
 	}

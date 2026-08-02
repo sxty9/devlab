@@ -953,6 +953,109 @@ func TestMaintainBranchAlreadyGone(t *testing.T) {
 	}
 }
 
+// TestMaintainBranchAlreadyGone422 (NACHWEIS point 5a): GitHub answers the delete of an
+// already-gone ref with 422 "Reference does not exist" just as often as with 404 — both mean the
+// branch is gone, which IS the goal of the prune. The record completes; it is NOT stilled.
+func TestMaintainBranchAlreadyGone422(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d.Branch, HeadSHA: "c1"}
+	gh.deleteErr = &github.StatusError{Status: 422, Msg: `github: status 422: {"message":"Reference does not exist"}`}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("a 422 \"Reference does not exist\" on the prune is Satisfied, got %v", err)
+	}
+	if left, _ := prs.List(); len(left) != 0 {
+		t.Errorf("the record must complete despite the already-gone branch, left %+v", left)
+	}
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			t.Errorf("reaching the prune's goal must raise no blockade notice, got %+v", note)
+		}
+	}
+}
+
+// TestMaintainTimeoutBacksOffNotBlocked (NACHWEIS point 5b): a read that times out — the HTTP
+// client's own deadline while awaiting an answer — is a SELF-ENDING obstacle. It earns a growing
+// backoff, never a standstill. This test runs the REAL classifier (no stub) so it proves the
+// distinction where it is actually made.
+func TestMaintainTimeoutBacksOffNotBlocked(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	// The GitHub read times out: the client's Client.Timeout fires while awaiting headers, which
+	// wraps context.DeadlineExceeded — exactly the FALL-2 error observed in production.
+	gh.getPRErr = fmt.Errorf(`Get "https://api.github.com/repos/o/x/pulls/5": %w (Client.Timeout exceeded while awaiting headers)`, context.DeadlineExceeded)
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err == nil {
+		t.Fatalf("a failing read must be reported")
+	}
+	cur, _ := prs.List()
+	if len(cur) != 1 {
+		t.Fatalf("the record must stay tracked, got %+v", cur)
+	}
+	if cur[0].Blocked {
+		t.Fatalf("a timeout must NEVER still a record — it ends by itself, got %+v", cur[0])
+	}
+	if cur[0].Backoff == nil || cur[0].Backoff.NextAt.IsZero() {
+		t.Fatalf("a timeout must earn a growing backoff with a next attempt, got %+v", cur[0])
+	}
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			t.Errorf("a self-ending timeout must raise no blockade notice, got %+v", note)
+		}
+	}
+}
+
+// TestReviveStaleBlocks (NACHWEIS points 5c + 5d): at service start, a block whose reason the
+// corrected classification no longer counts as a fault is lifted — a prune that reached its goal
+// (422 "Reference does not exist"), a timeout that ends by itself — while a genuine durable fault
+// (a missing right, a gone pull request) stays blocked and still waits for a person.
+func TestReviveStaleBlocks(t *testing.T) {
+	prs := tempPRs(t)
+	block := func(number int, reason string) runs.PendingPR {
+		return runs.PendingPR{Repo: "o/x", Number: number, CreatedAt: t0, Blocked: true, BlockedReason: reason, BlockedAt: t0}
+	}
+	_ = prs.Add(block(5, prunePrefix+`github: status 422: {"message":"Reference does not exist"}`))
+	_ = prs.Add(block(6, `reading the pull request failed: Get "https://api.github.com/repos/o/x/pulls/6": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`))
+	_ = prs.Add(block(7, `reading the pull request failed: github: status 403: {"message":"Resource not accessible"}`)) // genuine missing right
+	_ = prs.Add(block(8, `auto-merge failed: github: status 404: {"message":"Not Found"}`))                             // the pull request is gone
+
+	revived, err := ReviveStaleBlocks(prs)
+	if err != nil {
+		t.Fatalf("ReviveStaleBlocks: %v", err)
+	}
+	if revived != 2 {
+		t.Fatalf("revived = %d, want 2 (the prune-goal and the timeout)", revived)
+	}
+	byNumber := map[int]runs.PendingPR{}
+	cur, _ := prs.List()
+	for _, p := range cur {
+		byNumber[p.Number] = p
+	}
+	if byNumber[5].Blocked {
+		t.Errorf("the prune that reached its goal must be lifted, got %+v", byNumber[5])
+	}
+	if byNumber[6].Blocked {
+		t.Errorf("the self-ending timeout must be lifted, got %+v", byNumber[6])
+	}
+	if !byNumber[7].Blocked {
+		t.Errorf("a genuine missing right must stay blocked, got %+v", byNumber[7])
+	}
+	if !byNumber[8].Blocked {
+		t.Errorf("a gone pull request must stay blocked, got %+v", byNumber[8])
+	}
+}
+
 // TestMaintainNeverPrunesWorkbench: mercury-dev never falls under the prune — even when a
 // corrupt record names it.
 func TestMaintainNeverPrunesWorkbench(t *testing.T) {

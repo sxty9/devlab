@@ -13,6 +13,12 @@ import (
 
 func status(code int) error { return &github.StatusError{Status: code, Msg: "x"} }
 
+func statusMsg(code int, msg string) error { return &github.StatusError{Status: code, Msg: msg} }
+
+func statusRetryAfter(code int, retryAfter string) error {
+	return &github.StatusError{Status: code, Msg: "x", RetryAfter: retryAfter}
+}
+
 func TestClassify(t *testing.T) {
 	cases := []struct {
 		name string
@@ -23,7 +29,10 @@ func TestClassify(t *testing.T) {
 		{"satisfied sentinel", ErrSatisfied, Satisfied},
 		{"wrapped satisfied", fmt.Errorf("delete branch: %w", ErrSatisfied), Satisfied},
 		{"404", status(404), Permanent},
-		{"403", status(403), Permanent},
+		{"403 missing rights", status(403), Permanent},
+		{"403 secondary rate limit body", statusMsg(403, "You have exceeded a secondary rate limit."), Transient},
+		{"403 abuse body", statusMsg(403, "You have triggered an abuse detection mechanism."), Transient},
+		{"403 retry-after header", statusRetryAfter(403, "60"), Transient},
 		{"422", status(422), Permanent},
 		{"401", status(401), Permanent},
 		{"410", status(410), Permanent},
@@ -32,8 +41,10 @@ func TestClassify(t *testing.T) {
 		{"other 4xx", status(400), Permanent},
 		{"wrapped status", fmt.Errorf("create pr: %w", status(422)), Permanent},
 		{"generic connectivity", errors.New("dial tcp: connection refused"), Transient},
-		{"context canceled", context.Canceled, Permanent},
-		{"context deadline", context.DeadlineExceeded, Permanent},
+		// A wait cut short ends by itself — it earns the growing backoff, never a standstill.
+		{"context canceled", context.Canceled, Transient},
+		{"context deadline", context.DeadlineExceeded, Transient},
+		{"client timeout wrapping deadline", fmt.Errorf("Get %q: %w (Client.Timeout exceeded while awaiting headers)", "https://api.github.com", context.DeadlineExceeded), Transient},
 	}
 	for _, c := range cases {
 		if got := Classify(c.err); got != c.want {
