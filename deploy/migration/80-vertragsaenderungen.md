@@ -921,7 +921,7 @@ Identity` is its armed counterpart.
 `continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
 one table with which the operator is told where to READ each writing call before the first start.
 **What changed:** every anchor was verified against the code and corrected, and each one now carries
-the CALL it points at (`deliver/deliver.go:879 gh.PostCommitStatus`) instead of a bare line number.
+the CALL it points at (`deliver/deliver.go:881 gh.PostCommitStatus`) instead of a bare line number.
 **Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
 **Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
 runbook parts and fails unless the named line really carries the named call — and fails on an anchor
@@ -1254,3 +1254,131 @@ AND that the retired shared branch was never written;
 task's own branch (an interrupted run's unpublished commit survives and is secured);
 `TestDeliveryLoopMergesPrunesAndBecomesObservableInDefault` holds that the merge prunes the task's
 branch and that no shared branch exists.
+
+---
+
+## The open todo list names WHY each todo is still open
+
+**What changed:** the delivery ledger wire view (`GET /api/mercury/runs/deliveries`) carries three
+new fields per delivery — `mergeBy` (the instant the auto-merge is due), `blocked`, and
+`blockedReason` — joined from the tracked pull request by delivery id. The shared `Delivery` type
+mirrors them. On the client a new derived state, `openTodoState`, gives every open todo exactly one
+of five reasons — `not-run`, `running`, `awaiting-merge` (with the deadline), `blocked` (with the
+reason), `failed` — shown as one pill per row. It is read from `outsideHistory` (the partition the
+history is the complement of) plus the ledger facts folded by `openDeliveryFactsByExecution`, so it
+never re-derives a fact the history already states. `runCompleted` now sums a todo's target coverage
+ACROSS its completed executions instead of demanding a single execution carry all targets.
+
+**Why:** a todo whose whole chain has run through, delivered and merged still sat in the open list
+until its pull request merged — up to the seven-day auto-merge window, and while 63 of 64 pull
+requests were blocked, indefinitely. In that list it looked identical to a todo nobody had ever
+started: the list read as though nothing was ever historised. Measured on 2026-08-01: not one todo
+had left the open list, because condition two of historisation — the delivery is settled — was met
+by none. The states were derivable the whole time (the counts `inFlight`/`awaitingDelivery` already
+existed); the list simply did not show them. Separately, `runCompleted` required ONE execution to
+cover all targets, while the startup reconciliation (`preflight.SyncStartupTodos`) already counted a
+todo done when each target had a merged delivery across ANY executions — two answers to one question
+("is this todo finished?") that would disagree for a todo finished repository-by-repository over
+several runs, leaving it open for ever until the next daemon start swept it. Both now sum coverage
+per repository over the run's executions.
+
+**What it does and does not do:** the state is DERIVED and never stored — observed fresh from the
+executions and the ledger on every render, the same discipline the history split already follows. It
+adds no exit and no control: the blocked state's release is the ONE that already exists in the
+notices surface; this only names the state on the row. The `blocked`/`mergeBy` facts flow from the
+tracked-PR pool the delivery maintenance already keeps; the ledger record itself is unchanged, and a
+delivery with no tracked pull request (merged, closed, or never opened) simply carries none of the
+three. One deliberate boundary remains: the client mirror trusts the execution's success flags plus
+a settled delivery, where `SyncStartupTodos` additionally probes that the commit is contained in the
+default branch — the client cannot read git, so the server's synthetic result stays the authority
+that bridges the two. It was already so before this change.
+
+**State of record:**
+
+- `backend/internal/api/handlers_mercury_deliveries.go@f63093e6144e`
+- `src/types.ts@b808af07ce67`
+- `src/views/mercury/deliveries/deliveries.ts@010c595e59f1`
+- `src/views/mercury/tasks/select.ts@e60b782520cd`
+- `src/views/mercury/tasks/logic.ts@d3b318072b31`
+- `src/views/mercury/tasks/TaskList.tsx@048c8e501dc0`
+- `src/views/mercury/tasks/Surface.tsx@f28c91d33335`
+
+**Diff hint:** `git diff cbffed4 -- backend/internal/api/handlers_mercury_deliveries.go src/types.ts
+src/views/mercury/tasks src/views/mercury/deliveries`.
+**Proof:** `src/views/mercury/tasks/select.test.ts`: "every open todo carries exactly one derived
+state, and each state reads its own signal" holds the five-state partition (no row without a
+reason), and "a todo is done when its targets are covered ACROSS executions, matching the startup
+reconciliation" holds the aggregate coverage against the multi-execution case.
+`src/views/mercury/deliveries/deliveries.test.ts`: "open-delivery facts fold per execution" holds
+the ledger join (blocked wins, soonest deadline, settled rows ignored).
+`backend/internal/api/handlers_mercury_deliveries_test.go:TestDeliveriesListCarriesMergeDeadlineAndBlockade`
+holds that the wire carries the deadline and the blockade joined by delivery id.
+
+## Wave 7 — a dev delivery ships all a service needs, not only its program
+
+### `deploy/devlab-exec`, `deploy/devlab-install`, `backend/internal/deploy/deliver.go`, `backend/internal/api/exec_deps.go`, `backend/internal/executor/executor.go`, `backend/internal/executor/stages.go` — the dashboard UI becomes part of the delivery
+
+**Who:** wave 7 (the green path with no result).
+
+**Reason (measured, 2026-07-31):** a dev delivery built ONLY the Go program. `presentr` got a file
+upload; the chain reported "installed and running on port 8783", every stage green, the PR open —
+and the user saw nothing for four days, because the dashboard bundle under `/opt/holistic/www` was
+from the 27th. The interface was never built and never delivered. Worse: because it was never built,
+nobody noticed it was not BUILDABLE — three faults sat undiscovered in it (a package name the
+dashboard no longer knows, a `tsconfig` path to a folder that no longer exists, a raw HTML element the
+dashboard rules forbid). No stage could catch them, because no stage ever touched the interface. A
+green path over no result is exactly the dishonesty this rebuild exists against (K-4, "Kein stummes
+Ausbleiben").
+
+**What changed:**
+
+* `devlab-exec` (`artifact-build`): a repository that carries a `ui/` directory now has that UI
+  SOURCE staged into the artifact under `ui/` (node_modules/dist/build excluded). It is NOT built
+  here — a service ui may use only `@holistic/ui`, `react`, `react-dom` or relative files, so it has
+  no deps of its own and cannot be built in isolation. A repository WITHOUT `ui/` is untouched: no
+  repo is turned into a UI service artificially.
+* `devlab-install` (foreign path): after the program is installed, a staged `ui/` is wired into the
+  instance's holistic dashboard at `<holistic>/<frontend>/external/<repo>` (a validated COPY, never a
+  symlink into the user-writable workspace) and the SHARED dashboard is rebuilt. That rebuild IS the
+  check: the dashboard's lint + typecheck + vite decide whether the interface is delivered. The
+  dashboard path is INSTANCE configuration (`DEVLAB_HOLISTIC_REPO` / the root-owned
+  `/etc/devlab/holistic-repo`), exactly like `DEVLAB_HOLISTIC_PERMS` for the rights directory — never
+  a literal in the repo. Absent config is a NAMED deficiency (exit 5, `MERCURY-UI: unconfigured`), not
+  a silent skip. The shared build runs ONCE per UI-bearing delivery (the minimal cadence that still
+  proves "the user sees it"); a program-only update never rebuilds it. A build failure that names
+  `external/<repo>` is THIS service's — the stage fails with the real toolchain text and the wired-in
+  copy is removed; a failure that names another service is reported (`MERCURY-UI: foreign-blocked`) but
+  never charged to this delivery. The half's outcome rides on one `MERCURY-UI:` line.
+* `deliver.go`: `RootInstaller.Install` now returns `(InstallResult, error)`; `Outcome` and
+  `executor.DeployOutcome` carry the UI half (`UI`, `UIDetail`). `SudoInstaller` parses the wrapper's
+  `MERCURY-UI:` line (`parseUILine`). The `deliver-dev` stage reports BOTH halves — program AND
+  interface, each with its own result; a service without a ui says so ausdrücklich.
+* `stages.go` / `executor.go`: the stage protocol lines named the constant `mercury-dev` for the
+  branch, while every job long since works on its OWN branch (measured: run `exec_20260731-183341`
+  logged "1 commit(s) on mercury-dev@ea2aab2d" while the branch was in truth
+  `fix/presentr_zu_grosse_dateien_werden-run_hshsc5oyhfwon4cb`). The branch is now MEASURED from the
+  working tree (`WorkbenchOps.CurrentBranch`, `rc.branchName()`), so the lines name the branch that
+  actually carried the work. `workbenchBranch` remains only as the fallback when no measurement exists.
+
+**Consequence for operation:** a service with a `ui/` is only green once its interface builds into the
+dashboard. An instance that has not provisioned `DEVLAB_HOLISTIC_REPO` sees the program installed and
+the UI half named as NOT built in, with the reason — never a green stage over a half service. No
+existing caller of a program-only service (no `ui/`) changes; its half-report reads `MERCURY-UI: none`.
+
+**State of record:**
+
+- `deploy/devlab-exec` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+- `deploy/devlab-install` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+- `backend/internal/deploy/deliver.go` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+- `backend/internal/api/exec_deps.go` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+- `backend/internal/executor/executor.go` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+- `backend/internal/executor/stages.go` (this delivery, branch fix/devlab_eine_auslieferung_liefert_alles-run_khhmd74zxy5gwv5k)
+
+**Diff hint:** `git diff main -- deploy/devlab-exec deploy/devlab-install backend/internal/deploy backend/internal/executor backend/internal/api/exec_deps.go`.
+**Proof:** `backend/internal/deploy/deploy_test.go` (`TestDeliverDevReportsUIHalf`,
+`TestDeliverDevUIFailureFailsStageButNamesProgram`, `TestDeliverDevForeignBlockedUIStillDelivers`,
+`TestParseUILine`) and `backend/internal/deploy/wrapper_test.go` (`TestInstallCheckNoUIReportsNone`,
+`TestInstallCheckUIUnconfiguredIsNamed`, `TestInstallCheckUIConfiguredPlansWireInBuildAndServe`) — the
+wrapper tests run the real `deploy/devlab-install` under `--check`, so the security cascade still
+precedes the UI step, and the plan now covers the wire-in, the owner-run rebuild AND the delivery to
+the serve root the browser reads (`built` is gated on arrival there, not on the build).

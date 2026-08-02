@@ -649,6 +649,7 @@ func (o benchOps) Prepare(ctx context.Context, branch, base string) (executor.Pr
 
 func (o benchOps) CleanUntracked(ctx context.Context) error { return o.b.CleanUntracked(ctx) }
 func (o benchOps) Head(ctx context.Context) (string, error) { return o.b.Head(ctx) }
+func (o benchOps) CurrentBranch(ctx context.Context) string { return o.b.CurrentBranch(ctx) }
 
 func (o benchOps) CommitsAhead(ctx context.Context, since string) (int, error) {
 	return o.b.CommitsAhead(ctx, since)
@@ -685,6 +686,7 @@ func (x brokenBench) Prepare(context.Context, string, string) (executor.PrepareI
 }
 func (x brokenBench) CleanUntracked(context.Context) error              { return x.err }
 func (x brokenBench) Head(context.Context) (string, error)              { return "", x.err }
+func (x brokenBench) CurrentBranch(context.Context) string              { return "" }
 func (x brokenBench) CommitsAhead(context.Context, string) (int, error) { return 0, x.err }
 func (x brokenBench) HasUncommitted(context.Context) (bool, error)      { return false, x.err }
 func (x brokenBench) CommitAll(context.Context, string) (string, error) { return "", x.err }

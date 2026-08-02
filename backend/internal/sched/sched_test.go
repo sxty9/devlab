@@ -205,6 +205,45 @@ func (h *harness) addTodo(id, title string, repos ...string) runs.Run {
 	return r
 }
 
+// reboot simulates a full devlabd restart over the SAME state root (the persisted execution
+// documents ARE the truth; the process is mortal). It tears the running goroutines down as
+// SIGTERM would, opens a FRESH store and scheduler over the same paths, and runs the boot steps
+// cmd/devlabd runs in order: ghost exorcism (3), restart completion (4) and resume enqueue (7).
+// Notices emitted during the boot are collected into the returned slice's pointer.
+func (h *harness) reboot() *[]string {
+	h.t.Helper()
+	h.exec.releaseAll()
+	h.waitIdle()
+
+	docs, err := execstate.Open(h.paths)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	h.docs = docs
+	h.exec = newFakeExec()
+	sch := New(h.sch.cfg, docs, h.runs, h.res, nil, nil, h.exec.fn, nil, h.pub)
+	sch.settings = func() (runs.Settings, error) {
+		return runs.Settings{MaxConcurrency: int(h.cap.Load())}, nil
+	}
+	notices := &[]string{}
+	sch.SetNoticeFunc(func(kind, text string) { *notices = append(*notices, kind+": "+text) })
+	h.sch = sch
+
+	// Boot step 3: exorcise ghosts (running → interrupted) BEFORE anything serves.
+	if _, err := docs.MarkInterruptedAtBoot(time.Now().UTC()); err != nil {
+		h.t.Fatal(err)
+	}
+	// Boot step 4: restart completion (releases any starts queued on the marker).
+	if _, err := sch.CompleteBootRestart(context.Background()); err != nil {
+		h.t.Fatal(err)
+	}
+	// Boot step 7: re-queue interrupted executions.
+	if err := sch.enqueueInterruptedAtBoot(); err != nil {
+		h.t.Fatal(err)
+	}
+	return notices
+}
+
 func (h *harness) submit(runID string, placement *Placement) model.StartOutcome {
 	h.t.Helper()
 	out, err := h.sch.Submit(context.Background(), StartRequest{RunID: runID, By: model.Actor{User: "ada"}, Placement: placement})

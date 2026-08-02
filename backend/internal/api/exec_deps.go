@@ -212,12 +212,19 @@ func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.Resol
 		return nil, err
 	}
 	ex := workspace.Executor{User: d.user, PerUser: true}
-	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, prompt, t, sess)), nil
+	// Name the branch the working tree is ACTUALLY on — each run works on its own order branch, so a
+	// preamble that always said "mercury-dev" told the agent a falsehood about where its commits land.
+	// The workbench constant is only the fallback when the measurement yields nothing (bare/detached).
+	branch := ex.CurrentBranch(ctx, wt)
+	if branch == "" || branch == "HEAD" {
+		branch = workbench.LegacyShared
+	}
+	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, branch, prompt, t, sess)), nil
 }
 
 // chainAgentArgs is the agent invocation of ONE stage, as a value — the seam that lets the
 // invocation be verified without a workspace and without root.
-func chainAgentArgs(repo, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
+func chainAgentArgs(repo, branch, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
 	args := []string{
 		"-p", prompt,
 		"--output-format", "stream-json",
@@ -242,7 +249,7 @@ func chainAgentArgs(repo, prompt string, t runs.ResolvedTuning, sess executor.Ag
 			args = append(args, "--session-id", sessionUUID(sess.Key, repo))
 		}
 	}
-	return append(args, "--append-system-prompt", chainPreamble(repo, t.Effort))
+	return append(args, "--append-system-prompt", chainPreamble(repo, branch, t.Effort))
 }
 
 // chainEffort maps the run's effort onto the CLI ladder. "ultracode" is DevLab's own maximal tier:
@@ -257,9 +264,12 @@ func chainEffort(effort string) string {
 // chainPreamble tells the agent what it is: the autonomous DevLab runner working on the workbench
 // of one repository. The constitution itself is NEVER composed here — it rides in the prompt
 // snapshot (REQ-002.1).
-func chainPreamble(repo, effort string) string {
+func chainPreamble(repo, branch, effort string) string {
+	if branch == "" {
+		branch = workbench.LegacyShared
+	}
 	s := "You are the autonomous DevLab runner. You work in the checked-out workspace of the " +
-		"repository \"" + repo + "\" on its long-lived working branch " + workbench.LegacyShared + ". " +
+		"repository \"" + repo + "\" on its working branch " + branch + ". " +
 		"Implement what the task asks for, commit your work with clear messages, and state plainly " +
 		"what you did and what you did not do."
 	if effort == "ultracode" {
@@ -524,6 +534,14 @@ func (o benchOps) Head(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return b.Head(ctx)
+}
+
+func (o benchOps) CurrentBranch(ctx context.Context) string {
+	b, _, err := o.d.bench(ctx, o.repo)
+	if err != nil {
+		return ""
+	}
+	return b.CurrentBranch(ctx)
 }
 
 func (o benchOps) CommitsAhead(ctx context.Context, since string) (int, error) {
@@ -799,6 +817,7 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	out, err := deploy.DeliverDev(ctx, deploy.SudoInstaller{}, deploy.LivePorts{}, deploy.DefaultGate(), det, repoShort(repo), artifact)
 	return executor.DeployOutcome{
 		Installed: out.Installed, Running: out.Running, Port: out.Port, Detail: out.Detail,
+		UI: string(out.UI), UIDetail: out.UIDetail,
 	}, err
 }
 

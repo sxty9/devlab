@@ -128,6 +128,10 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// The delivery base is the head AFTER the fold, so the span holds exactly the agent's own
 	// commits — the range a counter-booking later reverses.
 	rc.deliveryBase, rc.head = head, head
+	// Measure the branch actually worked on so every log line names the truth, not a constant.
+	if b := wb.CurrentBranch(ctx); b != "" {
+		rc.branch = b
+	}
 
 	// Rest path (K-3/REQ-020.3): already implemented ⇒ create nothing new; only establish the
 	// span of the existing, undelivered work so the remaining stages can walk it. EXCEPTION:
@@ -262,12 +266,12 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	rc.report = out.ResultText
 	switch {
 	case n > 0:
-		rc.logf("%d commit(s) on %s@%s — published", n, workbenchBranch, short(rc.head))
+		rc.logf("%d commit(s) on %s@%s — published", n, rc.branchName(), short(rc.head))
 	case rc.devAdvanced():
 		rc.logf("no own contribution — %s advanced only by folding the default branch (%s@%s)",
-			workbenchBranch, workbenchBranch, short(rc.head))
+			rc.branchName(), rc.branchName(), short(rc.head))
 	default:
-		rc.logf("no new changes — %s@%s unchanged", workbenchBranch, short(rc.head))
+		rc.logf("no new changes — %s@%s unchanged", rc.branchName(), short(rc.head))
 	}
 	if out.ResultText != "" {
 		rc.logf("%s", clip(out.ResultText))
@@ -293,7 +297,7 @@ func implementRestPath(ctx context.Context, rc *RepoCtx, wb WorkbenchOps) error 
 			return fmt.Errorf("count undelivered commits: %w", err)
 		}
 		rc.deliveryBase, rc.deliveryCommits = base, n
-		rc.logf("already implemented — nothing new created; %d undelivered commit(s) on %s@%s", n, workbenchBranch, short(rc.head))
+		rc.logf("already implemented — nothing new created; %d undelivered commit(s) on %s@%s", n, rc.branchName(), short(rc.head))
 	}
 	for _, ev := range rc.Finding.Evidence {
 		rc.logf("evidence: %s", ev)
@@ -373,7 +377,7 @@ func deliverDevApplies(ctx context.Context, rc *RepoCtx) (bool, string) {
 		}
 	}
 	if rc.prepared && rc.deliveryCommits == 0 && !rc.devAdvanced() {
-		return false, fmt.Sprintf("workbench unchanged (%s@%s already delivered previously)", workbenchBranch, short(rc.head))
+		return false, fmt.Sprintf("workbench unchanged (%s@%s already delivered previously)", rc.branchName(), short(rc.head))
 	}
 	return true, ""
 }
@@ -401,12 +405,31 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 			rc.logf("already delivered and running: %s", firstLine(err.Error()))
 			return nil
 		}
+		// Both halves are named even when the stage fails: a UI half that could not be built in
+		// (unconfigured/failed) still leaves the program installed — the stage fails BENANNT, but the
+		// program's own result is not swallowed by the interface's failure.
+		if out.Installed && (out.UI == "failed" || out.UI == "unconfigured") {
+			rc.logf("program: installed on port %d (%s@%s); interface: %s — the stage fails on the interface half",
+				out.Port, rc.branchName(), short(rc.head), out.UI)
+		}
 		return err // named failure, exactly one attempt — e.g. "delivery not yet set up" (K-4)
 	}
 	rc.deliveredCommit = rc.head
-	rc.logf("installed and running on port %d — delivered state %s@%s", out.Port, workbenchBranch, short(rc.head))
+	rc.logf("program: installed and running on port %d — delivered state %s@%s", out.Port, rc.branchName(), short(rc.head))
 	if out.Detail != "" {
 		rc.logf("%s", clip(out.Detail))
+	}
+	// The delivery reports BOTH halves a service needs: program (above) and dashboard UI (here). A
+	// service without a ui says so ausdrücklich — the half is not silently omitted.
+	switch out.UI {
+	case "", "none":
+		rc.logf("interface: none — this service ships no dashboard face")
+	case "built":
+		rc.logf("interface: built and delivered to the serve root the browser reads — the new dashboard is what users now fetch")
+	case "foreign-blocked":
+		rc.logf("interface: verified and wired in, but the shared dashboard build is blocked by another service: %s", clip(out.UIDetail))
+	default:
+		rc.logf("interface: %s", clip(out.UI))
 	}
 	if out.Self {
 		// B-2/B-3: the self repo's restart is a HANDOVER — the motor only requests it; sched
@@ -456,7 +479,7 @@ func publishRun(ctx context.Context, rc *RepoCtx) error {
 	if err != nil {
 		return fmt.Errorf("publish workbench: %w", err)
 	}
-	rc.logf("workbench %s@%s published", workbenchBranch, short(rc.head))
+	rc.logf("workbench %s@%s published", rc.branchName(), short(rc.head))
 	return nil
 }
 
@@ -473,9 +496,9 @@ func pullRequestApplies(ctx context.Context, rc *RepoCtx) (bool, string) {
 	if rc.deliveryCommits == 0 {
 		if rc.devAdvanced() {
 			return false, fmt.Sprintf("no own contribution: %s advanced only by folding the default branch (%s@%s)",
-				workbenchBranch, workbenchBranch, short(rc.head))
+				rc.branchName(), rc.branchName(), short(rc.head))
 		}
-		return false, fmt.Sprintf("no delivery: no commits beyond %s@%s", workbenchBranch, short(rc.head))
+		return false, fmt.Sprintf("no delivery: no commits beyond %s@%s", rc.branchName(), short(rc.head))
 	}
 	return true, ""
 }
@@ -548,7 +571,7 @@ func prBody(rc *RepoCtx) string {
 	b.WriteString("Delivery of the Mercury execution ")
 	b.WriteString(rc.Doc.ID)
 	b.WriteString(" (" + string(rc.Run.Kind) + " \"" + rc.Run.Title + "\").\n\n")
-	b.WriteString("Span " + short(rc.deliveryBase) + ".." + short(rc.head) + " on " + workbenchBranch + ".\n")
+	b.WriteString("Span " + short(rc.deliveryBase) + ".." + short(rc.head) + " on " + rc.branchName() + ".\n")
 
 	// What the CHAIN itself did, stated by the chain. Without this line the reader is left with
 	// the agent's account alone — and the agent writes it at the END OF IMPLEMENT, from a sandbox
