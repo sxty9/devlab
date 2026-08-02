@@ -284,7 +284,7 @@ func (rp *Reporter) recordFault(rec Record, day string, executions int, cause er
 	if rec.Backoff != nil {
 		b = *rec.Backoff
 	}
-	b, blocked := advanceBackoff(b, now, attemptCap(class))
+	b, blocked := advanceBackoff(b, now, attemptCap(class), faultclass.MaxDelay)
 	b.Reason, b.Class = cause.Error(), class.String()
 	if blocked {
 		// A blocked record has NO next attempt: it waits for a person, not for a timer. A future

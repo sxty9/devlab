@@ -25,9 +25,14 @@ import (
 // OriginStatusContext is the one status-context constant of the delivery origin (REQ-033).
 const OriginStatusContext = "devlab/delivery-origin"
 
-// maintainMaxAttempts bounds the transient retries of one maintenance action before the PR
-// record is honestly blocked (K-5) and waits for an explicit resume.
-const maintainMaxAttempts = 5
+// maintainMaxBackoff caps the growing interval between retries of a SELF-ENDING obstacle (a server
+// hiccup, a dropped connection, a passing rate limit). Such an obstacle is never given up on — there
+// is no attempt count that stills the record — but the wait between attempts grows toward this named
+// ceiling and never past it, so a repository full of stuck deliveries cannot itself storm the shared
+// request budget the way 67 entries did on 2026-07-31. A DURABLE obstacle (the pull request or repo
+// is gone, the rights are missing, the request is invalid) is a different matter: it is stilled at
+// once and waits for a person, since no repetition can change it.
+const maintainMaxBackoff = time.Hour
 
 // The K-5 classification seams. They default to the ONE classification point (faultclass);
 // they exist as variables solely so this package's tests stay deterministic while faultclass
@@ -1007,9 +1012,15 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 		st, err := gh.GetPullRequest(ctx, p.Repo, p.Number)
 		_ = prs.Touch(p.Repo, p.Number, now) // record the read time so the recheck cadence advances
 		if err != nil {
-			// An exhausted budget is the shared standstill, never THIS pull request's fault: the failed
-			// read already refreshed the observed budget, so consult it before faulting the record.
-			if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) {
+			// A canceled pass is a shutdown, not this pull request's fault — stop cleanly, fault nothing.
+			if ctx.Err() != nil {
+				return firstErr
+			}
+			// An exhausted budget — or an explicit rate-limit rejection (429) — is the shared,
+			// self-ending standstill, never THIS pull request's fault. The failed read already refreshed
+			// the observed budget, so consult it (and the status) before faulting the record: a quota
+			// that ends by itself must not be filed as a blockade on each of 67 entries.
+			if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) || isRateLimited(err) {
 				notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
 				break
 			}
@@ -1050,6 +1061,13 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 			// failed one leaves the older PR open — either way the queue behind it waits.
 			queueBlocked[p.Repo] = true
 			if err := gh.MergePullRequest(ctx, p.Repo, p.Number, "merge"); err != nil {
+				if ctx.Err() != nil {
+					return firstErr // a shutdown mid-merge is not this pull request's fault
+				}
+				if budget := gh.RateBudget(); budget.Exhausted(now, rateFloor) || isRateLimited(err) {
+					notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
+					break
+				}
 				recordFault(prs, n, p, "auto-merge failed: "+err.Error(), err, now)
 				if firstErr == nil {
 					firstErr = err
@@ -1208,9 +1226,19 @@ func SettleExecution(ledger *runs.DeliveryStore, res *runs.ResultStore, executio
 	return res.Put(r)
 }
 
-// recordFault advances the K-5 state at the PR record: a transient fault backs off with
-// growing intervals; exhausted attempts (or a permanent fault) block the record honestly —
-// reason, time, attempts — until an explicit resume.
+// recordFault advances the K-5 state at the PR record. It splits obstacles by their NATURE, not by
+// a retry count — because the two kinds ask for opposite reactions:
+//
+//   - A DURABLE obstacle ends only when a person acts: the pull request or repository is gone
+//     (404/410), the rights are missing (401/403), or the request is malformed (422 or another 4xx).
+//     Each of these is decided in faultclass.Classify as Permanent. Repetition cannot change it, so
+//     the record is STILLED at once (blocked: reason, time) and waits for an explicit resume.
+//   - A SELF-ENDING obstacle ends on its own: a server hiccup (5xx), a dropped connection, a passing
+//     rate limit. Giving up here turns a minute's wait into a standstill — exactly what stilled 67
+//     entries for 30 hours on 2026-07-31. So it is NEVER given up on: the record backs off with a
+//     growing interval capped at maintainMaxBackoff and keeps retrying indefinitely. No attempt count
+//     stills it. It stays fully visible (reason, attempts, first seen, next attempt) — visibility is
+//     what the give-up was poorly standing in for, so it replaces it rather than needing it.
 func recordFault(prs *runs.PRStore, n *runs.NoticeStore, p runs.PendingPR, reason string, cause error, now time.Time) {
 	permanent := classify(cause) == faultclass.Permanent
 	_, _ = prs.Update(p.Repo, p.Number, func(rec *runs.PendingPR) {
@@ -1218,6 +1246,7 @@ func recordFault(prs *runs.PRStore, n *runs.NoticeStore, p runs.PendingPR, reaso
 			rec.Blocked = true
 			rec.BlockedReason = reason
 			rec.BlockedAt = now
+			rec.Backoff = nil
 			return
 		}
 		b := model.Backoff{Reason: reason, Class: "transient", FirstAt: now}
@@ -1225,19 +1254,22 @@ func recordFault(prs *runs.PRStore, n *runs.NoticeStore, p runs.PendingPR, reaso
 			b = *rec.Backoff
 			b.Reason = reason
 		}
-		next, blocked := advanceBackoff(b, now, maintainMaxAttempts)
+		// maxAttempts 0 = never block: a self-ending obstacle is retried for ever, only ever more
+		// slowly, up to maintainMaxBackoff between attempts.
+		next, _ := advanceBackoff(b, now, 0, maintainMaxBackoff)
 		rec.Backoff = &next
-		if blocked {
-			rec.Blocked = true
-			rec.BlockedReason = fmt.Sprintf("%s (after %d attempts)", reason, next.Attempts)
-			rec.BlockedAt = now
-		}
 	})
-	// Surface a fresh blockade in the notices (portioned: only the transition, not every retry).
+	// A fresh block is a DISTURBANCE the user must see (a person is the only way out), surfaced once —
+	// only the transition, never a retry. A self-ending obstacle raises NO notice: it clears itself,
+	// and its retry state stays visible in the delivery surface (the backoff record) without alarming
+	// anyone for something that fixes itself.
+	if !permanent {
+		return
+	}
 	if cur, err := prs.List(); err == nil {
 		for _, rec := range cur {
 			if rec.Repo == p.Repo && rec.Number == p.Number && rec.Blocked && !p.Blocked {
-				notify(n, "delivery-blocked", p.Repo, fmt.Sprintf("pull request #%d is blocked: %s", p.Number, rec.BlockedReason))
+				notify(n, runs.NoticeDeliveryBlocked, p.Repo, fmt.Sprintf("pull request #%d is blocked: %s", p.Number, rec.BlockedReason))
 			}
 		}
 	}
@@ -1247,6 +1279,16 @@ func recordFault(prs *runs.PRStore, n *runs.NoticeStore, p runs.PendingPR, reaso
 func isSatisfiedDelete(err error) bool {
 	var se *github.StatusError
 	return errors.As(err, &se) && se.Status == 404
+}
+
+// isRateLimited reports GitHub's explicit "too many requests" (429): the request window is spent.
+// This is the shared, self-ending standstill — a property of the token's hourly budget, not of any
+// single pull request — so it must never be filed as a fault on an individual entry. A primary limit
+// GitHub answers with 403 and an empty X-RateLimit-Remaining is caught by the budget reserve instead
+// (RateBudget.Exhausted); this covers the 429 form the reserve cannot see coming.
+func isRateLimited(err error) bool {
+	var se *github.StatusError
+	return errors.As(err, &se) && se.Status == 429
 }
 
 // ── Emergency override (REQ-033.4) ───────────────────────────────────────────────────────

@@ -242,6 +242,26 @@ function DeliveryRow({ delivery, onRollback }: { delivery: Delivery; onRollback:
       )}
       {/* A failed row states, on its own line, WHAT it klemmt on — the reason it did not ship. */}
       {delivery.failedReason && <span className="w-full text-caption text-danger">{delivery.failedReason}</span>}
+      {/* A SELF-ENDING obstacle: the pull request is being retried, not given up on. The line states
+          what is stuck, since when, how often it has been tried and when the next attempt falls — so
+          the wait is visible without alarming anyone, because it clears itself. */}
+      {delivery.retrying && (
+        <span className="w-full text-caption text-warning">
+          Retrying — {delivery.retryReason || 'a passing obstacle'}
+          {typeof delivery.retryAttempts === 'number' ? `; attempt ${delivery.retryAttempts}` : ''}
+          {delivery.retrySince ? `, since ${fmtDateTime(delivery.retrySince)}` : ''}
+          {delivery.retryNextAt ? `, next ${fmtDateTime(delivery.retryNextAt)}` : ''}. It clears itself once the obstacle
+          passes — no action needed.
+        </span>
+      )}
+      {/* A DURABLE obstacle: no repetition can clear it, so the pull request waits for a person to
+          release it. Stated plainly so the one delivery that truly needs a hand is not lost among the
+          retrying ones. */}
+      {delivery.blocked && (
+        <span className="w-full text-caption text-danger">
+          Blocked — {delivery.blockedReason || 'a durable obstacle a person must resolve'}. Waiting for a release.
+        </span>
+      )}
     </li>
   );
 }

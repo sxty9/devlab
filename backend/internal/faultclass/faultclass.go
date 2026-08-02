@@ -39,8 +39,11 @@ func (c Class) String() string {
 // error wrapping it) to Satisfied, which Retry treats as success (REQ-032.2).
 var ErrSatisfied = errors.New("already in the desired state")
 
-// Backoff schedule: growing intervals, base*2^(attempts-1) capped at the maximum. The two
-// values are package variables so tests can shrink them; production leaves the defaults.
+// Backoff schedule: growing intervals, base*2^(attempts-1) capped at a maximum. BaseDelay is the
+// first interval; MaxDelay is the DEFAULT ceiling Retry uses and the one a caller passes when it has
+// no ceiling of its own. Both are package variables so tests can shrink them; production leaves the
+// defaults. A caller that wants a different ceiling (the PR maintenance retries a self-ending
+// obstacle no more often than once an hour) passes it explicitly to Delay/Next.
 var (
 	BaseDelay = 10 * time.Second
 	MaxDelay  = 15 * time.Minute
@@ -80,36 +83,43 @@ func Classify(err error) Class {
 	return Transient
 }
 
-// Delay returns the growing interval before attempt n (1-based): BaseDelay*2^(n-1), capped at
-// MaxDelay. Exposed so tests can prove the intervals grow (K-5).
-func Delay(attempt int) time.Duration {
+// Delay returns the growing interval before attempt n (1-based): BaseDelay*2^(n-1), capped at max.
+// Exposed so tests can prove the intervals grow (K-5). The cap is a parameter, not a fixed global,
+// so a caller that must retry a self-ending obstacle indefinitely can space the retries out to its
+// own ceiling (e.g. one hour) rather than the package default.
+func Delay(attempt int, max time.Duration) time.Duration {
 	if attempt < 1 {
 		attempt = 1
 	}
 	d := BaseDelay
 	for i := 1; i < attempt; i++ {
 		d *= 2
-		if d >= MaxDelay {
-			return MaxDelay
+		if d >= max {
+			return max
 		}
 	}
-	if d > MaxDelay {
-		return MaxDelay
+	if d > max {
+		return max
 	}
 	return d
 }
 
 // Next advances a backoff state by one failed attempt at `now`: attempts increment, the
-// first/last timestamps are kept honest, and NextAt moves out by the growing interval.
-// blocked is true once maxAttempts is reached — the record then waits for an EXPLICIT
-// resume in the surface (REQ-032.3), never for another silent retry.
-func Next(b model.Backoff, now time.Time, maxAttempts int) (model.Backoff, bool) {
+// first/last timestamps are kept honest, and NextAt moves out by the growing interval, capped at
+// maxDelay.
+//
+// blocked is true once maxAttempts is reached — the record then waits for an EXPLICIT resume in the
+// surface (REQ-032.3), never for another silent retry. A maxAttempts of 0 (or less) means the
+// schedule NEVER blocks: the obstacle is one that ends by itself, so it is retried indefinitely,
+// only ever more slowly (up to maxDelay between attempts). There is then no attempt count that
+// gives up — the growing, visible backoff record IS the reaction, not a countdown to a standstill.
+func Next(b model.Backoff, now time.Time, maxAttempts int, maxDelay time.Duration) (model.Backoff, bool) {
 	b.Attempts++
 	if b.FirstAt.IsZero() {
 		b.FirstAt = now
 	}
 	b.LastAt = now
-	b.NextAt = now.Add(Delay(b.Attempts))
+	b.NextAt = now.Add(Delay(b.Attempts, maxDelay))
 	return b, maxAttempts > 0 && b.Attempts >= maxAttempts
 }
 
@@ -174,7 +184,7 @@ func Retry(ctx context.Context, b *model.Backoff, maxAttempts int, op func() err
 		case Permanent:
 			return err
 		}
-		next, blocked := Next(*b, time.Now().UTC(), maxAttempts)
+		next, blocked := Next(*b, time.Now().UTC(), maxAttempts, MaxDelay)
 		next.Reason = err.Error()
 		next.Class = Transient.String()
 		*b = next
