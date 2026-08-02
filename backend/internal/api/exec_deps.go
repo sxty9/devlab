@@ -960,7 +960,7 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 
 	// The production target comes EXCLUSIVELY from server-side configuration (never a request). A
 	// missing target is a deficiency: it is reported as a failure that keeps retrying, not a skip.
-	cfg, cfgErr := prodConfigFromEnv()
+	cfg, cfgErr := prodConfigFromEnv(c.d.s.paths.ProdKnownHosts())
 	if cfgErr != nil {
 		return deliver.ProdOutcome{Detail: cfgErr.Error()}, cfgErr
 	}
@@ -979,18 +979,25 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 }
 
 // prodConfigFromEnv assembles the production send from server-side configuration only (E §7.4): the
-// rsync staging target and the receiver the forced-command install fires on. BOTH are required —
-// arming production means naming where it goes; a half-configured target is a deficiency, not a
-// partial delivery. Instance values live ONLY here in the runtime environment (Keine Instanz-Spezifika).
-func prodConfigFromEnv() (deploy.ProdConfig, error) {
+// rsync staging target, the receiver the forced-command install fires on, and the deploy key BOTH
+// calls authenticate with. All three are required — arming production means naming where it goes AND
+// how it signs in; a half-configured target is a deficiency, not a partial delivery. The key is
+// NAMED here exactly like the target and receiver (one place, one key, no second path beside it);
+// its file content stays out of the process — only the path is handled. The known-hosts location is
+// the durable state-root file the service user can write, because that user has no home ssh
+// directory. Instance values live ONLY here in the runtime environment (Keine Instanz-Spezifika).
+func prodConfigFromEnv(knownHosts string) (deploy.ProdConfig, error) {
 	target := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_TARGET"))
 	recv := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_RECV"))
-	if target == "" || recv == "" {
+	key := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_KEY"))
+	if target == "" || recv == "" || key == "" {
 		return deploy.ProdConfig{}, errors.New("production delivery is not configured — set DEVLAB_RUNS_PROD_TARGET " +
-			"(the rsync staging target) and DEVLAB_RUNS_PROD_RECV (the deploy-key receiver host); until then the " +
-			"merged work reaches the default branch but not production")
+			"(the rsync staging target), DEVLAB_RUNS_PROD_RECV (the deploy-key receiver host), and DEVLAB_RUNS_PROD_KEY " +
+			"(the deploy private key both calls sign in with); until then the merged work reaches the default branch " +
+			"but not production")
 	}
-	return deploy.ProdConfig{RsyncTarget: target, Trigger: deploy.SSHTrigger(recv)}, nil
+	id := deploy.ProdIdentity{KeyFile: key, KnownHostsFile: knownHosts}
+	return deploy.ProdConfig{RsyncTarget: target, Identity: id, Trigger: deploy.SSHTrigger(recv, id)}, nil
 }
 
 // MainWrapperDrift reports which root wrappers' installed copies differ from the STANDARD BRANCH

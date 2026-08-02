@@ -4,10 +4,111 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"devlab/backend/internal/workspace"
 )
+
+// writeKey drops a fixture private key whose bytes carry a sentinel, so a test can prove the key
+// MATERIAL never leaks into any argument or message (only the path is ever handled).
+func writeKey(t *testing.T, sentinel string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "prod-deploy-key")
+	if err := os.WriteFile(p, []byte("-----BEGIN KEY-----\n"+sentinel+"\n-----END KEY-----\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// WHAT-1 + WHAT-6(a): the file transport and the install trigger authenticate with the ONE
+// configured key and the ONE durable known-hosts file — the same identity feeds both.
+func TestProdBothCallsUseConfiguredKey(t *testing.T) {
+	id := ProdIdentity{KeyFile: "/etc/somewhere/prod-key", KnownHostsFile: "/var/state/prod-known_hosts"}
+
+	send := strings.Join(rsyncArgs(ProdConfig{Identity: id}, "src/", "dest/"), " ")
+	trig := strings.Join(triggerCmdArgs(id, "user@host", "svc-a"), " ")
+
+	for _, c := range []struct{ name, args string }{{"rsync", send}, {"trigger", trig}} {
+		if !strings.Contains(c.args, id.KeyFile) {
+			t.Errorf("%s call does not name the configured key: %s", c.name, c.args)
+		}
+		if !strings.Contains(c.args, "UserKnownHostsFile="+id.KnownHostsFile) {
+			t.Errorf("%s call does not point at the durable known-hosts file: %s", c.name, c.args)
+		}
+	}
+	// A local-directory fixture target (no key) must NOT inject an ssh transport.
+	if got := strings.Join(rsyncArgs(ProdConfig{}, "src/", "dest/"), " "); strings.Contains(got, "-e") {
+		t.Errorf("the fixture path (no key) must not set an ssh transport: %s", got)
+	}
+}
+
+// WHAT-3 + WHAT-6(b): a missing or unreadable key surfaces its OWN reason, not a masked
+// "connection failed" from a later transport.
+func TestProdMissingKeyNamesItsOwnReason(t *testing.T) {
+	art := t.TempDir()
+	if err := os.WriteFile(filepath.Join(art, "x"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	absent := filepath.Join(t.TempDir(), "no-such-key")
+	cfg := ProdConfig{
+		RsyncTarget: t.TempDir(),
+		Identity:    ProdIdentity{KeyFile: absent, KnownHostsFile: filepath.Join(t.TempDir(), "kh")},
+		Trigger:     func(context.Context, string) error { t.Fatal("trigger must never fire on an unusable key"); return nil },
+	}
+	err := SendProd(context.Background(), cfg, "svc-a", art)
+	if err == nil {
+		t.Fatal("a missing key must refuse")
+	}
+	if !strings.Contains(err.Error(), "deploy key") || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("error must name the missing key by its own reason, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "send failed") || strings.Contains(err.Error(), "trigger failed") {
+		t.Fatalf("a missing key must not read as a connection/transport failure, got: %v", err)
+	}
+}
+
+func TestProdUnreadableKeyNamesItsOwnReason(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads every file regardless of mode; the permission gate cannot be exercised as root")
+	}
+	key := writeKey(t, "SECRET-KEY-MATERIAL")
+	if err := os.Chmod(key, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	err := ProdIdentity{KeyFile: key, KnownHostsFile: "/tmp/kh"}.checkReadable()
+	if err == nil {
+		t.Fatal("an unreadable key must be refused")
+	}
+	if !strings.Contains(err.Error(), "not readable") {
+		t.Fatalf("error must name the read failure, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "SECRET-KEY-MATERIAL") {
+		t.Fatalf("key material leaked into the error: %v", err)
+	}
+}
+
+// WHAT-5 + WHAT-6(d): no key material appears in any argument or message; only the path is handled.
+func TestProdNoKeyMaterialInOutput(t *testing.T) {
+	const sentinel = "SECRET-KEY-MATERIAL"
+	key := writeKey(t, sentinel)
+	id := ProdIdentity{KeyFile: key, KnownHostsFile: filepath.Join(t.TempDir(), "kh")}
+
+	surfaces := []string{
+		strings.Join(id.sshOpts(), " "),
+		strings.Join(rsyncArgs(ProdConfig{Identity: id}, "src/", "dest/"), " "),
+		strings.Join(triggerCmdArgs(id, "user@host", "svc-a"), " "),
+	}
+	// A readable key passes checkReadable without ever reading its bytes.
+	if err := id.checkReadable(); err != nil {
+		t.Fatalf("a readable key must pass: %v", err)
+	}
+	for _, s := range surfaces {
+		if strings.Contains(s, sentinel) {
+			t.Fatalf("key material leaked into an argument surface: %s", s)
+		}
+	}
+}
 
 // The prod send runs ONLY against a fixture target in this phase: the artifact lands in the
 // staging directory, and with a nil Trigger nothing is ever installed — the path is implemented

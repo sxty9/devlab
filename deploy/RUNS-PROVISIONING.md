@@ -69,6 +69,7 @@ prints its decision without touching the host, so the security logic is verifiab
 | `DEVLAB_PORT_BAND` | port band for first-time service setup proposals (Atlas) |
 | `DEVLAB_RUNS_PROD_TARGET` | rsync staging target of the production send (`user@host:path`) — server-side only |
 | `DEVLAB_RUNS_PROD_RECV` | ssh destination of the install-only receiver's deploy key (`user@host`) |
+| `DEVLAB_RUNS_PROD_KEY` | path to the deploy private key BOTH prod calls (file send + trigger) sign in with — readable by the service user; the file content never enters a log |
 
 **Removed from the contract (do not set):** the operating-mode ladder (REQ-027.1 — the one
 chain always runs preflight → implement → deliver-dev → publish → pull-request), any cost
@@ -109,10 +110,29 @@ Stop admissions by setting the slot capacity to 0 in the service configuration
   the target (the SAME honest gate the dev delivery uses, executed server-side). A task is done — and
   historized — only once its production step is proven; a merge alone never finishes it.
   - **Armed by configuration, not a switch.** Production is a real step of the chain, never one
-    "permanently switched off" (Kein stummes Ausbleiben). It is armed by NAMING where it goes:
-    `DEVLAB_RUNS_PROD_TARGET` (the rsync staging) and `DEVLAB_RUNS_PROD_RECV` (the receiver host). A
-    MISSING target is a deficiency, not a legitimate off-state: it is reported as a failed production
-    delivery (a disturbance the user sees) and retried, never a silent skip.
+    "permanently switched off" (Kein stummes Ausbleiben). It is armed by NAMING where it goes and how
+    it signs in: `DEVLAB_RUNS_PROD_TARGET` (the rsync staging), `DEVLAB_RUNS_PROD_RECV` (the receiver
+    host), and `DEVLAB_RUNS_PROD_KEY` (the deploy private key). A MISSING one of the three is a
+    deficiency, not a legitimate off-state: it is reported as a failed production delivery (a
+    disturbance the user sees) and retried, never a silent skip.
+  - **One key, both calls, no default identity.** The file send and the forced-command trigger both
+    authenticate with the ONE configured key (`ssh -i … -o IdentitiesOnly=yes`); the service user has
+    no default ssh identity to fall back on. The key is named in the runtime configuration exactly
+    like the target and receiver — never in the repository, never a file discovered beside it. A key
+    that is missing or unreadable by the service user is reported with its OWN reason (which key, and
+    whether it is absent or unreadable), not a masked "connection failed"; its file content never
+    enters any message, log, or error.
+  - **First contact records the host key durably.** On the first send ssh must record the target
+    machine's host key; the service user has no home ssh directory. It is written to
+    `<DEVLAB_STATE_DIR>/prod-known_hosts` — under the state root the service owns and that survives a
+    restart (systemd's `StateDirectory`) — and CHECKED on every later contact
+    (`StrictHostKeyChecking=accept-new` is trust-on-first-use, not "trust everything").
+  - **Operator one-off: make the key readable by the service user.** The key file typically lands
+    root-owned. DevLab never changes permissions under `/etc` itself. If the service user cannot read
+    the configured key, grant it group read the same way the other service secrets are shared — e.g.
+    `chgrp <service-group> <key> && chmod 640 <key>` — so the root-owned key stays owner-only for
+    writes but group-readable for the service. (ssh does not reject a group-readable key it does not
+    own, so this is safe.)
   - **A failed send is a matter of its own, after the stack (WHAT-3).** It never invalidates the
     merged layer beneath it: the task simply stays open, reports itself (`prod-undelivered` notice),
     and the send retries by itself on a growing backoff that is never given up on — while the stack
