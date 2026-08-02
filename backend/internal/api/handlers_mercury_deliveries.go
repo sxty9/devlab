@@ -160,8 +160,13 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 				FromCommit: d.FromCommit, ToCommit: d.ToCommit,
 				PRNumber: d.PRNumber, PRURL: d.PRURL,
 				CreatedAt: d.CreatedAt, MergedAt: d.MergedAt, ReversalOf: d.ReversalOf,
-				Stage:        deliveryStage(d, reversed[d.ID]),
-				FailedReason: d.FailedReason,
+				Stage:            deliveryStage(d, reversed[d.ID]),
+				FailedReason:     d.FailedReason,
+				ProdStage:        prodDeliveryStage(d),
+				ProdDeployedAt:   d.ProdDeployedAt,
+				ProdFailedReason: d.ProdFailedReason,
+				ProdRetryNextAt:  prodRetryNextAt(d),
+				ProdEvidence:     d.ProdEvidence,
 			},
 			ExecutionID: d.ExecutionID,
 		}
@@ -206,6 +211,38 @@ func deliveryStage(d runs.Delivery, hasReversal bool) string {
 	default:
 		return "open"
 	}
+}
+
+// prodDeliveryStage derives the PRODUCTION lifecycle of a delivery for the PROD deliveries view
+// (WHAT-1), distinct from the dev/PR stage above. Production is reached only after a merge, so an
+// unmerged delivery has no production stage; a merged one is not-applicable (no service), live
+// (proven running in production), failed (a send that did not land, retrying) or pending (merged,
+// production not yet done). A rolled-back/closed delivery owes no production and reports none.
+func prodDeliveryStage(d runs.Delivery) string {
+	switch {
+	case d.ClosedAt != nil:
+		return ""
+	case d.ProdNotApplicable:
+		return "not-applicable"
+	case d.MergedAt == nil:
+		return ""
+	case d.ProdDeployedAt != nil:
+		return "live"
+	case d.ProdFailedAt != nil:
+		return "failed"
+	default:
+		return "pending"
+	}
+}
+
+// prodRetryNextAt exposes when a failed production send is next attempted, so the PROD view can say
+// the retry is timed rather than stuck. nil unless a production backoff is currently in effect.
+func prodRetryNextAt(d runs.Delivery) *time.Time {
+	if d.ProdBackoff != nil && !d.ProdBackoff.NextAt.IsZero() {
+		t := d.ProdBackoff.NextAt
+		return &t
+	}
+	return nil
 }
 
 // runDeliveryRollback counter-books one delivery (REQ-025) via deliver.Rollback.
@@ -554,7 +591,34 @@ func (s *Server) MaintainDeliveries(ctx context.Context) error {
 	if s.broker != nil {
 		pub = s.broker
 	}
-	return deliver.Maintain(ctx, ops, s.runPRs, s.deliveries, s.results, s.runNotices, pub)
+	err := deliver.Maintain(ctx, ops, s.runPRs, s.deliveries, s.results, s.runNotices, pub)
+	// The production step is the LAST step of the chain (WHAT-1): a SEPARATE pass after the stack, so
+	// a production failure is a matter of its own and never invalidates a merged layer (WHAT-3). It
+	// runs on the same maintenance tick, right after the merges this pass just performed.
+	if perr := s.MaintainProdDeliveries(ctx); perr != nil && err == nil {
+		err = perr
+	}
+	return err
+}
+
+// MaintainProdDeliveries runs the production pass (deliver.MaintainProd): it ships every merged
+// delivery that still owes production to the production host and proves it running there. It needs
+// the runner identity to build and ship; without it there is no chain running and hence no merged
+// delivery that could owe production, so the pass is a no-op rather than a failure.
+func (s *Server) MaintainProdDeliveries(ctx context.Context) error {
+	if s.deliveries == nil || s.workspaces == nil {
+		return nil
+	}
+	if _, err := s.runnerToken(); err != nil {
+		return nil
+	}
+	deps := s.ChainDeps(ChainHooks{})
+	defer deps.Close()
+	var pub live.Publisher
+	if s.broker != nil {
+		pub = s.broker
+	}
+	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.results, s.runNotices, pub)
 }
 
 // protectionEnforcementArmed reports whether the operator has armed protection WRITES.

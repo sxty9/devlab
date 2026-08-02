@@ -912,6 +912,87 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	}, err
 }
 
+// DeployProd is the production step — the LAST step of the chain (WHAT-1), reached only after a
+// delivery has MERGED. It ships the MERGED state (the default branch, never the dev branch — prod is
+// fed exclusively from the default branch) and proves the service running on the target through the
+// SAME honest gate the dev delivery uses (WHAT-2), executed server-side by the receiver. A repository
+// that is no service is a PROVEN not-applicable outcome; a missing production configuration is a
+// deficiency reported as a failure, never a silent skip ("Kein stummes Ausbleiben").
+func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdOutcome, error) {
+	bench, wt, err := c.d.bench(ctx, repo)
+	if err != nil {
+		return deliver.ProdOutcome{}, err
+	}
+	full, err := c.d.fullName(ctx, repo)
+	if err != nil {
+		return deliver.ProdOutcome{}, err
+	}
+
+	// The merged state lives on the default branch: fetch and check its tip out (detached) so the
+	// artifact is built from exactly what merged, never from the dev branch's newer, unmerged layers.
+	def, err := github.DefaultBranch(ctx, c.d.token, full)
+	if err != nil || def == "" {
+		return deliver.ProdOutcome{}, fmt.Errorf("deploy: resolve default branch of %s: %v", repo, err)
+	}
+	ex := workspace.Executor{User: c.d.user, PerUser: true}
+	if err := ex.Fetch(ctx, wt, c.d.token); err != nil {
+		return deliver.ProdOutcome{}, fmt.Errorf("deploy: fetch %s: %w", repo, err)
+	}
+	if err := ex.Checkout(ctx, wt, "origin/"+def); err != nil {
+		return deliver.ProdOutcome{}, fmt.Errorf("deploy: check out the merged state (origin/%s) of %s: %w", def, repo, err)
+	}
+	_ = bench // the checkout above pins the worktree to the merged tip for the build below
+
+	// A repository that is no service proves production inapplicable — a not-applicable outcome, never
+	// a failure. A structure violation is a failure (there is a service shape but it does not reduce).
+	det, err := deploy.Detect(wt)
+	if err != nil {
+		return deliver.ProdOutcome{}, err
+	}
+	switch det.Kind {
+	case deploy.KindLibrary, deploy.KindExcluded, deploy.KindTemplate:
+		return deliver.ProdOutcome{NotApplicable: true, Evidence: det.Evidence,
+			Detail: "not a service — nothing to run in production"}, nil
+	case deploy.KindNonconforming:
+		return deliver.ProdOutcome{Detail: det.Evidence},
+			fmt.Errorf("%w: %s", deploy.ErrNonconforming, det.Evidence)
+	}
+
+	// The production target comes EXCLUSIVELY from server-side configuration (never a request). A
+	// missing target is a deficiency: it is reported as a failure that keeps retrying, not a skip.
+	cfg, cfgErr := prodConfigFromEnv()
+	if cfgErr != nil {
+		return deliver.ProdOutcome{Detail: cfgErr.Error()}, cfgErr
+	}
+
+	artifact, err := deploy.Build(ctx, ex, wt)
+	if err != nil {
+		return deliver.ProdOutcome{}, fmt.Errorf("deploy: build the production artifact of %s: %w", repo, err)
+	}
+	if err := deploy.SendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
+		return deliver.ProdOutcome{Detail: err.Error()}, err
+	}
+	// The receiver installed the prebuilt artifact AND proved the service running on the target, so a
+	// clean send is the honest running proof (F10), executed on the second machine.
+	return deliver.ProdOutcome{Running: true,
+		Detail: "shipped to production and proven running on the target"}, nil
+}
+
+// prodConfigFromEnv assembles the production send from server-side configuration only (E §7.4): the
+// rsync staging target and the receiver the forced-command install fires on. BOTH are required —
+// arming production means naming where it goes; a half-configured target is a deficiency, not a
+// partial delivery. Instance values live ONLY here in the runtime environment (Keine Instanz-Spezifika).
+func prodConfigFromEnv() (deploy.ProdConfig, error) {
+	target := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_TARGET"))
+	recv := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_RECV"))
+	if target == "" || recv == "" {
+		return deploy.ProdConfig{}, errors.New("production delivery is not configured — set DEVLAB_RUNS_PROD_TARGET " +
+			"(the rsync staging target) and DEVLAB_RUNS_PROD_RECV (the deploy-key receiver host); until then the " +
+			"merged work reaches the default branch but not production")
+	}
+	return deploy.ProdConfig{RsyncTarget: target, Trigger: deploy.SSHTrigger(recv)}, nil
+}
+
 // MainWrapperDrift reports which root wrappers' installed copies differ from the STANDARD BRANCH
 // (merged content). Only the self repo ships the root wrappers, so a foreign repo has none.
 func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {

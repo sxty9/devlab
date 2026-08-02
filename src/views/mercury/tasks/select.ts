@@ -110,8 +110,39 @@ export type OpenTodoState =
   | { kind: 'not-run' }
   | { kind: 'running' }
   | { kind: 'awaiting-merge'; mergeBy?: string }
+  | { kind: 'awaiting-prod'; retrying?: boolean; reason?: string }
   | { kind: 'blocked'; reason?: string }
   | { kind: 'failed' };
+
+/** The FIVE lifecycle tabs a task lives in — the real "Lebenslauf" of a task (WHAT-4). Every open
+ *  task sits in exactly ONE of these, derived from its `OpenTodoState`; a done task historizes and
+ *  is shown in History instead. This is the ONE partition every tab reads, so no task can be in two
+ *  tabs or in none:
+ *
+ *   - `todo`    — created and NEVER executed yet.
+ *   - `active`  — being implemented OR a delivery is running RIGHT NOW (not: a delivery is pending).
+ *   - `blocked` — a failed layer, or a run stopped to ask a question.
+ *   - `pending` — the work is done and delivered; it only waits for the automated tail: the pull
+ *                 request's merge window, or the production step after the merge. */
+export type TaskBucket = 'todo' | 'active' | 'blocked' | 'pending';
+
+/** Which lifecycle tab an open task's state belongs to — the pure partition WHAT-4 asks for. A
+ *  production wait ('awaiting-prod') is a Pending state, never Blocked: the work merged, the stack is
+ *  valid, and it only waits for (or retries) the last automated step — the user is not asked anything. */
+export function taskBucket(state: OpenTodoState): TaskBucket {
+  switch (state.kind) {
+    case 'not-run':
+      return 'todo';
+    case 'running':
+      return 'active';
+    case 'awaiting-merge':
+    case 'awaiting-prod':
+      return 'pending';
+    case 'blocked':
+    case 'failed':
+      return 'blocked';
+  }
+}
 
 export function openTodoState(
   run: Run,
@@ -128,12 +159,17 @@ export function openTodoState(
   if (outside.inFlight.length > 0) return { kind: 'running' };
 
   if (outside.awaitingDelivery.length > 0) {
-    // Read the blockade and the deadline off exactly the executions that await a delivery — the
-    // facts the caller joined from the ledger. A blocked delivery outranks the timed wait: it does
-    // not move on its own.
+    // Read the blockade, the merge deadline and the production wait off exactly the executions that
+    // await a delivery — the facts the caller joined from the ledger. The order of precedence is the
+    // order of the lifecycle: a blocked delivery (a person is the only way out) outranks everything;
+    // a merge still pending outranks a production wait, because a delivery only reaches production
+    // AFTER it merges; a production wait is the last thing left.
     let reason: string | undefined;
     let blocked = false;
     let mergeBy: string | undefined;
+    let prodPending = false;
+    let prodFailed = false;
+    let prodReason: string | undefined;
     for (const res of outside.awaitingDelivery) {
       const f = deliveryFacts.get(res.id);
       if (!f) continue;
@@ -142,8 +178,15 @@ export function openTodoState(
         reason ??= f.reason;
       }
       if (f.mergeBy && (!mergeBy || f.mergeBy < mergeBy)) mergeBy = f.mergeBy;
+      if (f.prodPending) prodPending = true;
+      if (f.prodFailed) {
+        prodFailed = true;
+        prodReason ??= f.prodReason;
+      }
     }
     if (blocked) return { kind: 'blocked', reason };
+    if (mergeBy) return { kind: 'awaiting-merge', mergeBy };
+    if (prodPending) return { kind: 'awaiting-prod', retrying: prodFailed, reason: prodReason };
     return { kind: 'awaiting-merge', mergeBy };
   }
 

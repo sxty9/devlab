@@ -254,7 +254,9 @@ func TestSyncStartupTodosChecksOff(t *testing.T) {
 	}
 	src := &fakeSources{
 		deliveries: map[string][]runs.Delivery{"run_a/org/app": {{
+			// Merged AND delivered to production (WHAT-1): only a settled delivery is checked off.
 			ID: "dlv_1", Repo: "org/app", ToCommit: "feedcafe", MergedAt: ts("2026-07-27T09:00:00Z"),
+			ProdDeployedAt: ts("2026-07-27T09:05:00Z"),
 		}}},
 		contained: map[string]bool{"feedcafe": true},
 	}
@@ -335,7 +337,10 @@ func TestSyncStartupTodosDefersOnUnreachable(t *testing.T) {
 	}
 	src := &fakeSources{
 		deliveries: map[string][]runs.Delivery{"run_c/org/app": {{
+			// Settled (merged + in production), so the reconciliation reaches the default-branch probe
+			// — where the unreachable GitHub is a NAMED deferral, not a guess.
 			ID: "dlv_1", ToCommit: "beef", MergedAt: ts("2026-07-27T09:00:00Z"),
+			ProdDeployedAt: ts("2026-07-27T09:05:00Z"),
 		}}},
 		containErr: errors.New("github unreachable"),
 	}

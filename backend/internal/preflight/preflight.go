@@ -191,7 +191,11 @@ func SyncStartupTodos(ctx context.Context, src Sources, rs *runs.Store, res *run
 					merged = &dels[i]
 				}
 			}
-			if merged == nil {
+			// WHAT-1: a merge is not the end — production is. A todo is checked off only once its
+			// delivery is SETTLED (production delivered, or proven not a service), never on the merge
+			// alone. A merged delivery still owing production is left for the production pass
+			// (deliver.MaintainProd) and the settlement rule to check off — "Vorher nie".
+			if merged == nil || !merged.Settled() {
 				arrived = false
 				break
 			}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/fsatomic"
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/statepath"
 )
 
@@ -49,6 +50,26 @@ type Delivery struct {
 	FailedReason string     `json:"failedReason,omitempty"`
 	ReversalOf   string     `json:"reversalOf,omitempty"`
 	ExecutionID  string     `json:"executionId,omitempty"`
+
+	// ── The production step (WHAT-1): the LAST step of the chain, AFTER the merge ──────────────
+	//
+	// A merged delivery has reached the dev branch AND the default branch, but the work is not with
+	// the user until it RUNS IN PRODUCTION. These fields track that final step, which the production
+	// pass (deliver.MaintainProd) performs after the merge. It is a step of its own, after the stack:
+	// a failed production send never invalidates the merged layer it belongs to (WHAT-3), it only
+	// keeps the task out of the history until the service runs in production.
+	//
+	// ProdDeployedAt is set once the service is PROVEN running in production (the same honest gate the
+	// dev delivery uses, executed on the target). ProdFailedAt/ProdFailedReason mark the last failed
+	// attempt — an unreachable receiver, or a deficiency such as an unconfigured prod target.
+	// ProdBackoff is the self-ending retry of that failure (never given up on). ProdNotApplicable is
+	// set ONLY from a PROVEN property of the repository (it is not a service); ProdEvidence attests it.
+	ProdDeployedAt    *time.Time     `json:"prodDeployedAt,omitempty"`
+	ProdFailedAt      *time.Time     `json:"prodFailedAt,omitempty"`
+	ProdFailedReason  string         `json:"prodFailedReason,omitempty"`
+	ProdBackoff       *model.Backoff `json:"prodBackoff,omitempty"`
+	ProdNotApplicable bool           `json:"prodNotApplicable,omitempty"`
+	ProdEvidence      string         `json:"prodEvidence,omitempty"`
 }
 
 // OpenState reports whether the delivery is still UNSETTLED: neither merged nor closed. A failed
@@ -62,6 +83,50 @@ func (d Delivery) OpenState() bool { return d.MergedAt == nil && d.ClosedAt == n
 // stack — nothing is branched past it until it is resolved (which clears FailedAt) or rolled back
 // (which sets ClosedAt).
 func (d Delivery) Failed() bool { return d.FailedAt != nil && d.MergedAt == nil && d.ClosedAt == nil }
+
+// NeedsProd reports whether the delivery is merged and still owes a PRODUCTION delivery — the work
+// list of the production pass (deliver.MaintainProd). A closed or rolled-back delivery owes nothing;
+// a delivery proven not-applicable (the repository is no service) needs no prod; one already
+// deployed to production is done. This is exactly the merged-but-not-live state.
+func (d Delivery) NeedsProd() bool {
+	return d.MergedAt != nil && d.ClosedAt == nil && !d.ProdNotApplicable && d.ProdDeployedAt == nil
+}
+
+// Settled reports whether the delivery is finished for HISTORIZATION (B-8 + WHAT-1). It is a
+// STRICTER question than "is it a valid base to stack on" (OpenState answers that): a merged
+// delivery stops blocking the PR stack the instant it merges, but the task it belongs to is not
+// done — and does not drop into the history — until its production step has also succeeded (the
+// service runs in production) or is proven not applicable. So:
+//   - closed / rolled back      → settled (the work was withdrawn, nothing more is owed).
+//   - merged AND prod done       → settled (deployed to production, or proven no service).
+//   - merged AND prod outstanding → NOT settled (it still owes the last step of the chain).
+//   - open / dev-failed          → NOT settled.
+func (d Delivery) Settled() bool {
+	if d.ClosedAt != nil {
+		return true
+	}
+	if d.MergedAt == nil {
+		return false
+	}
+	return d.ProdNotApplicable || d.ProdDeployedAt != nil
+}
+
+// SettleTime is the instant the delivery FINISHED for the completion rule — the moment its last
+// owed step actually happened, so a settled execution's end stamp names when the work truly landed
+// (B-8). For a closed delivery that is ClosedAt; for a merged delivery it is the production instant
+// where one exists (production is the last step), else the merge instant.
+func (d Delivery) SettleTime() (time.Time, bool) {
+	switch {
+	case d.ClosedAt != nil:
+		return *d.ClosedAt, true
+	case d.MergedAt != nil && d.ProdDeployedAt != nil:
+		return *d.ProdDeployedAt, true
+	case d.MergedAt != nil:
+		return *d.MergedAt, true
+	default:
+		return time.Time{}, false
+	}
+}
 
 // NewDeliveryID mints an unguessable delivery id (a record key, never a path segment).
 func NewDeliveryID() string {

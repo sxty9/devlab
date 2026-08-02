@@ -28,11 +28,18 @@ import {
   commitRange,
   deliveryBadge,
   groupDeliveriesByRepo,
+  hasProdStage,
+  prodBadge,
   resetConfirmation,
   rollbackConfirmation,
   shortSha,
   type Consequence,
 } from './deliveries';
+
+/** The two stands a delivery has: DEV (the growing dev branch and its pull request) and PROD (what
+ *  runs on the production host, reached only after a merge, WHAT-1). They are shown apart because
+ *  they differ: a delivery can be merged on DEV yet still only awaiting its production step on PROD. */
+type Stand = 'dev' | 'prod';
 
 /** Uniform error-to-string, mirroring the rest of the Mercury surface. */
 const msg = (e: unknown) => String((e as Error)?.message ?? e);
@@ -50,6 +57,7 @@ export function DeliveriesView() {
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
   const [hold, setHold] = useState<NoticeRecord | null>(null);
+  const [stand, setStand] = useState<Stand>('dev');
 
   const gotRef = useRef(false);
 
@@ -139,70 +147,113 @@ export function DeliveriesView() {
 
   // A repository is named the way the ledger names it — its GitHub full name — so the ledger's rows
   // and the managed set land in ONE section per repository instead of two under two spellings.
-  const groups = groupDeliveriesByRepo(list, repos.map((r) => r.fullName));
+  const repoNames = repos.map((r) => r.fullName);
+  const devGroups = groupDeliveriesByRepo(list, repoNames);
+  // PROD shows only what has reached production at all — i.e. what merged (hasProdStage). An open or
+  // failed dev delivery that never merged has no production stand and does not appear on PROD.
+  const prodGroups = groupDeliveriesByRepo(list.filter(hasProdStage), []);
 
   return (
     <div className="dl-scroll min-h-0 w-full flex-1 overflow-y-auto bg-bg-base">
       <div className="mx-auto max-w-4xl px-8 py-7">
-        <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Deliveries</h1>
+        <div className="flex flex-wrap items-center gap-3">
+          <h1 className="text-title3 font-semibold tracking-tight text-text-primary">Deliveries</h1>
+          {/* DEV vs PROD are two different stands (WHAT-4): what is on the dev branch and its pull
+              request, versus what actually runs in production. They are toggled here, never merged. */}
+          <div className="ml-auto inline-flex overflow-hidden rounded-md border border-separator text-caption">
+            {(['dev', 'prod'] as Stand[]).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStand(s)}
+                className={cn(
+                  'px-3 py-1',
+                  stand === s ? 'bg-bg-raised text-text-primary' : 'text-text-secondary hover:text-text-primary',
+                )}
+              >
+                {s === 'dev' ? 'Dev' : 'Production'}
+              </button>
+            ))}
+          </div>
+        </div>
 
         {/* The standstill, in the service's own words and with the moment it last reported it — so
             nobody has to guess why open deliveries stay open. */}
-        {hold && (
+        {stand === 'dev' && hold && (
           <p className="mt-4 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-caption text-warning">
             {noticeText(hold)} <span className="text-text-tertiary">Last reported {fmtDateTime(noticeAt(hold))}.</span>
           </p>
         )}
 
-        {groups.length === 0 ? (
-          <p className="mt-4 text-footnote text-text-tertiary">No repository to deliver to yet.</p>
+        {stand === 'dev' ? (
+          devGroups.length === 0 ? (
+            <p className="mt-4 text-footnote text-text-tertiary">No repository to deliver to yet.</p>
+          ) : (
+            <div className="mt-5 flex flex-col gap-5">
+              {devGroups.map((g) => (
+                <section key={g.repo}>
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <h2 className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
+                    {/* Whether the TIP is sound is stated first — a failed tip is not the same as a
+                        settled ledger, and the summary says which it is (WHAT-4). */}
+                    <span className={cn('text-caption', g.failedTip ? 'font-medium text-danger' : 'text-text-tertiary')}>
+                      {g.failedTip
+                        ? 'tip failed — no new order branches past it'
+                        : g.deliveries.length === 0
+                          ? 'nothing delivered yet'
+                          : g.latestOpen
+                            ? `${g.openCount} open · last delivered ${shortSha(g.latestOpen.toCommit)}`
+                            : 'every delivery settled'}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-auto"
+                      onClick={() => setPending({ kind: 'reset', repo: g.repo, consequence: resetConfirmation(g.repo) })}
+                    >
+                      Reset dev state
+                    </Button>
+                  </div>
+                  {/* The broken layer, named with what it klemmt on, so the way back is obvious without a
+                      reload or a question: resolve the tip (re-run the order) or roll it back below. */}
+                  {g.failedTip && (
+                    <p className="mb-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-caption text-danger">
+                      Delivery <span className="font-mono">{g.failedTip.id}</span> on{' '}
+                      <span className="font-mono">{g.failedTip.branch}</span> failed and is the tip:{' '}
+                      {g.failedTip.failedReason || 'the delivery did not complete'}. Resolve it by running the order again,
+                      or roll it back to make the last sound layer the tip.
+                    </p>
+                  )}
+                  {g.deliveries.length > 0 && (
+                    <ul className="flex flex-col gap-1.5">
+                      {g.deliveries.map((d) => (
+                        <DeliveryRow
+                          key={d.id}
+                          delivery={d}
+                          onRollback={() => setPending({ kind: 'rollback', delivery: d, consequence: rollbackConfirmation(d) })}
+                        />
+                      ))}
+                    </ul>
+                  )}
+                </section>
+              ))}
+            </div>
+          )
+        ) : prodGroups.length === 0 ? (
+          <p className="mt-4 text-footnote text-text-tertiary">
+            Nothing has reached production yet. A delivery appears here once its pull request has merged; the production
+            step then ships it and proves it running on the target.
+          </p>
         ) : (
           <div className="mt-5 flex flex-col gap-5">
-            {groups.map((g) => (
+            {prodGroups.map((g) => (
               <section key={g.repo}>
-                <div className="mb-2 flex flex-wrap items-center gap-2">
-                  <h2 className="min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
-                  {/* Whether the TIP is sound is stated first — a failed tip is not the same as a
-                      settled ledger, and the summary says which it is (WHAT-4). */}
-                  <span className={cn('text-caption', g.failedTip ? 'font-medium text-danger' : 'text-text-tertiary')}>
-                    {g.failedTip
-                      ? 'tip failed — no new order branches past it'
-                      : g.deliveries.length === 0
-                        ? 'nothing delivered yet'
-                        : g.latestOpen
-                          ? `${g.openCount} open · last delivered ${shortSha(g.latestOpen.toCommit)}`
-                          : 'every delivery settled'}
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="ml-auto"
-                    onClick={() => setPending({ kind: 'reset', repo: g.repo, consequence: resetConfirmation(g.repo) })}
-                  >
-                    Reset dev state
-                  </Button>
-                </div>
-                {/* The broken layer, named with what it klemmt on, so the way back is obvious without a
-                    reload or a question: resolve the tip (re-run the order) or roll it back below. */}
-                {g.failedTip && (
-                  <p className="mb-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-caption text-danger">
-                    Delivery <span className="font-mono">{g.failedTip.id}</span> on{' '}
-                    <span className="font-mono">{g.failedTip.branch}</span> failed and is the tip:{' '}
-                    {g.failedTip.failedReason || 'the delivery did not complete'}. Resolve it by running the order again,
-                    or roll it back to make the last sound layer the tip.
-                  </p>
-                )}
-                {g.deliveries.length > 0 && (
-                  <ul className="flex flex-col gap-1.5">
-                    {g.deliveries.map((d) => (
-                      <DeliveryRow
-                        key={d.id}
-                        delivery={d}
-                        onRollback={() => setPending({ kind: 'rollback', delivery: d, consequence: rollbackConfirmation(d) })}
-                      />
-                    ))}
-                  </ul>
-                )}
+                <h2 className="mb-2 min-w-0 truncate font-mono text-footnote font-medium text-text-primary">{g.repo}</h2>
+                <ul className="flex flex-col gap-1.5">
+                  {g.deliveries.map((d) => (
+                    <ProdRow key={d.id} delivery={d} />
+                  ))}
+                </ul>
               </section>
             ))}
           </div>
@@ -260,6 +311,40 @@ function DeliveryRow({ delivery, onRollback }: { delivery: Delivery; onRollback:
       {delivery.blocked && (
         <span className="w-full text-caption text-danger">
           Blocked — {delivery.blockedReason || 'a durable obstacle a person must resolve'}. Waiting for a release.
+        </span>
+      )}
+    </li>
+  );
+}
+
+/** One delivery's PRODUCTION stand (WHAT-1): what runs on the production host and since when. The
+ *  same delivery may read "merged" on DEV and only "awaiting production" here — that difference is
+ *  exactly why the two stands are shown apart. A live one names since when it has answered; a failed
+ *  one names why and when it retries; a not-applicable one names the property that made it so. */
+function ProdRow({ delivery }: { delivery: Delivery }) {
+  const badge = prodBadge(delivery);
+  const stage = (delivery.prodStage ?? '').trim();
+  return (
+    <li className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-card border border-separator bg-surface px-3 py-2">
+      <span className={cn('shrink-0 rounded px-1.5 py-0.5 text-caption font-medium', badgeTone[badge.tone])}>{badge.label}</span>
+      <span className="shrink-0 font-mono text-caption text-text-secondary">{commitRange(delivery)}</span>
+      <span className="min-w-0 flex-1 truncate font-mono text-caption text-text-tertiary">{delivery.branch}</span>
+      {stage === 'live' && delivery.prodDeployedAt && (
+        <span className="shrink-0 text-caption text-text-tertiary">live since {fmtDateTime(delivery.prodDeployedAt)}</span>
+      )}
+      {stage === 'not-applicable' && delivery.prodEvidence && (
+        <span className="w-full text-caption text-text-tertiary">No service — {delivery.prodEvidence}.</span>
+      )}
+      {stage === 'pending' && (
+        <span className="w-full text-caption text-text-secondary">
+          Merged — waiting to run in production (the last step of the chain).
+        </span>
+      )}
+      {stage === 'failed' && (
+        <span className="w-full text-caption text-danger">
+          Production delivery failed — {delivery.prodFailedReason || 'the send did not land'}. It retries by itself
+          {delivery.prodRetryNextAt ? `, next ${fmtDateTime(delivery.prodRetryNextAt)}` : ''} and is never given up on; the
+          merged work is unaffected.
         </span>
       )}
     </li>

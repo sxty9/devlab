@@ -41,8 +41,24 @@ func TestExecutionCompleted(t *testing.T) {
 	merged := open
 	mt := now.Add(time.Hour)
 	merged.MergedAt = &mt
-	if !ExecutionCompleted(res, []Delivery{merged}) {
-		t.Fatal("all deliveries merged ⇒ history-ready")
+	// WHAT-1: a merge is not the end — production is. A merged delivery still owing its production
+	// step keeps its execution out of the history.
+	if ExecutionCompleted(res, []Delivery{merged}) {
+		t.Fatal("a merged delivery still owing production must keep the execution open (WHAT-1)")
+	}
+
+	live := merged
+	pt := mt.Add(time.Hour)
+	live.ProdDeployedAt = &pt
+	if !ExecutionCompleted(res, []Delivery{live}) {
+		t.Fatal("a merged, production-delivered delivery ⇒ history-ready")
+	}
+
+	// A repository proven to be no service needs no production — its merged delivery settles at once.
+	napp := merged
+	napp.ProdNotApplicable = true
+	if !ExecutionCompleted(res, []Delivery{napp}) {
+		t.Fatal("a merged, not-a-service delivery needs no production ⇒ history-ready")
 	}
 
 	closed := open
@@ -53,7 +69,7 @@ func TestExecutionCompleted(t *testing.T) {
 	}
 
 	foreign := Delivery{ID: "dlv_x", Repo: "svc", ExecutionID: "exec_other", CreatedAt: now}
-	if !ExecutionCompleted(res, []Delivery{merged, foreign}) {
+	if !ExecutionCompleted(res, []Delivery{live, foreign}) {
 		t.Fatal("another execution's open delivery must not block this one")
 	}
 }

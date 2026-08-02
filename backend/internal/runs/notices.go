@@ -71,6 +71,11 @@ const (
 	NoticeDeliveryBlocked    = "delivery-blocked"
 	NoticeDeliverySelfCheck  = "delivery-selfcheck"
 	NoticeStructureViolation = "code-structure-violation"
+	// A merged delivery could not be delivered to PRODUCTION — the last step of the chain (WHAT-1).
+	// The task is not done until it runs in production, so a failed production send reports itself
+	// here (a disturbance the user sees) while the send is retried by itself. It never blocks the
+	// stack: the merged layer stays valid, only the task waits for its production step.
+	NoticeProdUndelivered = "prod-undelivered"
 	// The standstill of the delivery maintenance: its writing half is not armed, so nothing is
 	// merged, pruned or stamped. A STATE the operator ends, and the reason nothing moves.
 	NoticeDeliveryHeld = "delivery-held"

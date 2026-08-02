@@ -6,14 +6,17 @@ package runs
 import "devlab/backend/internal/model"
 
 // ExecutionCompleted reports whether an execution is history-ready: it ended AND every delivery
-// that arose from it is merged, rolled back, or closed with a reason (B-8). Until then the
-// execution stays in the open list.
+// that arose from it is SETTLED (B-8 + WHAT-1). A delivery is settled when it is closed, rolled
+// back, or merged AND its production step has succeeded (or is proven not applicable). A merged
+// delivery whose work is not yet running in production keeps its execution — and thus its ToDo —
+// out of the history: production is the last step of the chain, and "done" means proven live there,
+// not merely merged.
 func ExecutionCompleted(res Result, deliveries []Delivery) bool {
 	if res.EndedAt == nil {
 		return false
 	}
 	for _, d := range deliveries {
-		if d.ExecutionID == res.ID && d.OpenState() {
+		if d.ExecutionID == res.ID && !d.Settled() {
 			return false
 		}
 	}

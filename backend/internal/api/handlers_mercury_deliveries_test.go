@@ -349,8 +349,11 @@ func TestMaintainDeliveriesComposition(t *testing.T) {
 	if left, _ := s.runPRs.List(); len(left) != 0 {
 		t.Errorf("the tracked PR must be untracked, left %+v", left)
 	}
-	if r, _, _ := s.results.Get("exec_1"); r.MergedAt == nil {
-		t.Errorf("B-8: the execution result must settle, got %+v", r)
+	// WHAT-1: a merge is not the end — production is. After the merge the delivery owes its production
+	// step, so the execution has NOT settled yet (the production pass, deliver.MaintainProd, is a no-op
+	// here without a workspace manager). It settles only once production succeeds.
+	if r, _, _ := s.results.Get("exec_1"); r.MergedAt != nil {
+		t.Errorf("a merged delivery still owes production, so its execution must not settle on merge: %+v", r)
 	}
 }
 

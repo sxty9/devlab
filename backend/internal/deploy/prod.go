@@ -53,10 +53,33 @@ func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) err
 	}
 
 	if cfg.Trigger == nil {
-		return nil // staged only — the prod path is implemented but NOT armed in this phase
+		return nil // staged only — no receiver fired (used by fixtures; the armed path always sets it)
 	}
 	if err := cfg.Trigger(ctx, repo); err != nil {
 		return fmt.Errorf("deploy: prod install trigger failed: %w", err)
 	}
 	return nil
+}
+
+// SSHTrigger fires the install-only receiver on the production host over the root-held deploy key:
+// `ssh <recv> <repo>`. The receiver is the forced command behind that key, so the request reaches
+// it as $SSH_ORIGINAL_COMMAND and it installs the staged artifact AND proves the service running on
+// the target (the same honest gate the dev delivery uses, WHAT-2). A non-zero exit — a failed
+// install or a service that did not come up — is therefore the production failure, surfaced by name.
+// BatchMode keeps a misconfigured key from hanging on a password prompt; the host key is trusted
+// (accept-new) so a first contact does not wedge on an interactive fingerprint prompt.
+func SSHTrigger(recv string) func(ctx context.Context, repo string) error {
+	return func(ctx context.Context, repo string) error {
+		if !prodRepoRe.MatchString(repo) {
+			return fmt.Errorf("deploy: invalid repo name %q", repo)
+		}
+		cmd := exec.CommandContext(ctx, "ssh",
+			"-o", "BatchMode=yes",
+			"-o", "StrictHostKeyChecking=accept-new",
+			recv, repo)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
+		}
+		return nil
+	}
 }
