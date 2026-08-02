@@ -32,6 +32,11 @@ import (
 // from main() with a cancelable context.
 func (s *Server) StartReporter(ctx context.Context) {
 	s.startSelfCheck(ctx)
+	// The outward voice: a disturbance the service records about itself is DELIVERED to the run
+	// owner, not left unread in the pool (S14). Armed here beside the self-check because both are the
+	// "speak up about itself" side of the service; it installs the pool's on-new hook and needs no
+	// context of its own (each delivery carries its own deadline).
+	s.StartNoticeDelivery()
 
 	user := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_USER"))
 	if user == "" {

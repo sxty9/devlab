@@ -33,6 +33,10 @@ const KINDS: Record<string, { label: string; tone: NoticeTone }> = {
   'delivery-selfcheck': { label: 'Self-check', tone: 'alarm' },
   'code-structure-violation': { label: 'Code structure', tone: 'alarm' },
   [HOLD_KIND]: { label: 'Maintenance held', tone: 'alarm' },
+  // The shared, self-ending standstill of an exhausted GitHub request budget — the very finding that
+  // once lay unread for ~30h while its cause was hunted by hand. It reads as an alarm so it counts
+  // toward what demands attention, not as a quiet note.
+  'github-quota': { label: 'GitHub quota', tone: 'alarm' },
   // Delivery-origin findings.
   'protection-deviation': { label: 'Protection deviation', tone: 'alarm' },
   'admin-override': { label: 'Emergency override', tone: 'alarm' },
@@ -105,6 +109,21 @@ export function isUnread(n: NoticeRecord): boolean {
 
 export function unreadCount(list: readonly NoticeRecord[]): number {
   return list.filter(isUnread).length;
+}
+
+/** A DISTURBANCE is a notice that reports a fault demanding attention — the same split the service
+ *  draws to decide what it delivers outward. On this side it IS the alarm tone: an alarm asks for
+ *  action, a note (a routine restart, an automatic assignment) only informs. Reusing the tone keeps
+ *  one classification, so the badge and the outward delivery can never disagree about what counts. */
+export function isDisturbance(n: NoticeRecord): boolean {
+  return noticeTone(n) === 'alarm';
+}
+
+/** What still DEMANDS ATTENTION: unread disturbances. Routine operational notes are recorded but do
+ *  not nag, and a hint that has been read has left the count — so a dashboard badge built on this
+ *  shows "something is stuck", not merely "something was logged". */
+export function attentionCount(list: readonly NoticeRecord[]): number {
+  return list.filter((n) => isUnread(n) && isDisturbance(n)).length;
 }
 
 /** The standing standstill of the delivery maintenance, or null — read off the feed the service
