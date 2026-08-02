@@ -49,7 +49,7 @@ func TestNextGrowingIntervals(t *testing.T) {
 	var prev time.Duration
 	for i := 1; i <= 5; i++ {
 		var blocked bool
-		b, blocked = Next(b, now, 10)
+		b, blocked = Next(b, now, 10, MaxDelay)
 		if blocked {
 			t.Fatalf("blocked at attempt %d with maxAttempts 10", i)
 		}
@@ -72,7 +72,7 @@ func TestNextBlocksAtMax(t *testing.T) {
 	var b model.Backoff
 	var blocked bool
 	for i := 0; i < 3; i++ {
-		b, blocked = Next(b, now, 3)
+		b, blocked = Next(b, now, 3, MaxDelay)
 	}
 	if !blocked {
 		t.Fatalf("not blocked after maxAttempts")
@@ -82,12 +82,41 @@ func TestNextBlocksAtMax(t *testing.T) {
 	}
 }
 
+// A self-ending obstacle is retried indefinitely: with maxAttempts 0 the schedule NEVER blocks,
+// however many times it fails, and the growing interval is capped at the caller's own ceiling.
+func TestNextNeverBlocksWithZeroCap(t *testing.T) {
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	cap := time.Hour
+	var b model.Backoff
+	for i := 1; i <= 50; i++ {
+		var blocked bool
+		b, blocked = Next(b, now, 0, cap)
+		if blocked {
+			t.Fatalf("a zero cap must never block, blocked at attempt %d", i)
+		}
+		if d := b.NextAt.Sub(now); d > cap {
+			t.Fatalf("attempt %d: interval %v exceeds the ceiling %v", i, d, cap)
+		}
+	}
+	if b.Attempts != 50 {
+		t.Fatalf("attempts = %d, want 50", b.Attempts)
+	}
+	// The tail settles exactly at the ceiling, not beyond it.
+	if got := b.NextAt.Sub(now); got != cap {
+		t.Fatalf("the settled interval = %v, want the ceiling %v", got, cap)
+	}
+}
+
 func TestDelayCapped(t *testing.T) {
-	if d := Delay(100); d != MaxDelay {
+	if d := Delay(100, MaxDelay); d != MaxDelay {
 		t.Fatalf("Delay(100) = %v, want cap %v", d, MaxDelay)
 	}
-	if Delay(1) != BaseDelay {
-		t.Fatalf("Delay(1) = %v, want base %v", Delay(1), BaseDelay)
+	if Delay(1, MaxDelay) != BaseDelay {
+		t.Fatalf("Delay(1) = %v, want base %v", Delay(1, MaxDelay), BaseDelay)
+	}
+	// The ceiling is the caller's: a one-hour cap lets the interval grow past the 15-minute default.
+	if d := Delay(100, time.Hour); d != time.Hour {
+		t.Fatalf("Delay(100, 1h) = %v, want 1h", d)
 	}
 }
 

@@ -83,14 +83,28 @@ type deliveryWire struct {
 	MergeBy       *time.Time `json:"mergeBy,omitempty"`
 	Blocked       bool       `json:"blocked,omitempty"`
 	BlockedReason string     `json:"blockedReason,omitempty"`
+	// A SELF-ENDING obstacle currently being retried (K-5): unlike Blocked, this never waits for a
+	// person — the maintenance keeps trying and it clears itself once the obstacle passes (a passing
+	// rate limit, a server hiccup, a dropped connection). Present only while the pull request is
+	// backing off. RetryReason states WHAT is stuck, RetrySince since WHEN, RetryAttempts how OFTEN it
+	// has been tried and RetryNextAt when the NEXT attempt falls — the four facts the chain surface
+	// shows so the wait is visible instead of the delivery silently giving up.
+	Retrying      bool       `json:"retrying,omitempty"`
+	RetryReason   string     `json:"retryReason,omitempty"`
+	RetryAttempts int        `json:"retryAttempts,omitempty"`
+	RetrySince    *time.Time `json:"retrySince,omitempty"`
+	RetryNextAt   *time.Time `json:"retryNextAt,omitempty"`
 }
 
 // prFacts is the maintenance state one pending pull request contributes to its delivery's wire
-// view: the auto-merge deadline and the honest blockade (K-5).
+// view: the auto-merge deadline, the honest blockade, and the growing retry of a self-ending
+// obstacle (K-5). A record carries EITHER a blockade (a person is the way out) OR a retry (it clears
+// itself), never both — the maintenance stills a durable fault and retries a passing one.
 type prFacts struct {
 	mergeBy *time.Time
 	blocked bool
 	reason  string
+	retry   *model.Backoff
 }
 
 // runDeliveriesList returns the delivery ledger as the wire view (REQ-024/F12).
@@ -124,6 +138,13 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 					mb := p.MergeBy
 					f.mergeBy = &mb
 				}
+				// A backing-off pull request is being retried, not stilled — surface its retry so the
+				// wait is visible. A blocked one carries no backoff (it waits for a person), so the two
+				// never both appear.
+				if p.Backoff != nil && !p.Blocked {
+					b := *p.Backoff
+					f.retry = &b
+				}
 				if p.DeliveryID != "" {
 					byDelivery[p.DeliveryID] = f
 				}
@@ -150,6 +171,18 @@ func (s *Server) runDeliveriesList(w http.ResponseWriter, _ *http.Request) {
 		}
 		if ok {
 			wire.MergeBy, wire.Blocked, wire.BlockedReason = f.mergeBy, f.blocked, f.reason
+			if f.retry != nil {
+				since, next := f.retry.FirstAt, f.retry.NextAt
+				wire.Retrying = true
+				wire.RetryReason = f.retry.Reason
+				wire.RetryAttempts = f.retry.Attempts
+				if !since.IsZero() {
+					wire.RetrySince = &since
+				}
+				if !next.IsZero() {
+					wire.RetryNextAt = &next
+				}
+			}
 		}
 		out = append(out, wire)
 	}

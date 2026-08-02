@@ -434,11 +434,25 @@ export interface Delivery {
    *  names so a todo waiting only for its merge shows that it waits, and until when. Absent when no
    *  tracked pull request carries a deadline (already merged, closed, or never opened). */
   mergeBy?: string;
-  /** Whether this delivery's pull request is BLOCKED — the honest terminal state after the merge
-   *  retries are spent, waiting for an explicit release rather than for the clock (K-5). */
+  /** Whether this delivery's pull request is BLOCKED — the honest terminal state after a DURABLE
+   *  obstacle (the pull request or repo is gone, the rights are missing, the request is invalid),
+   *  waiting for an explicit release rather than for the clock (K-5). */
   blocked?: boolean;
   /** Why the delivery is blocked, in words a person can act on (only set when `blocked`). */
   blockedReason?: string;
+  /** Whether this delivery's pull request is being RETRIED after a SELF-ENDING obstacle (a passing
+   *  rate limit, a server hiccup, a dropped connection). Unlike `blocked`, this never waits for a
+   *  person — the maintenance keeps trying and it clears itself once the obstacle passes. A record is
+   *  either blocked OR retrying, never both. */
+  retrying?: boolean;
+  /** What is stuck — the retry's reason (only set when `retrying`). */
+  retryReason?: string;
+  /** How often the retry has been attempted so far (only set when `retrying`). */
+  retryAttempts?: number;
+  /** Since when the obstacle has stood — the first failed attempt (only set when `retrying`). */
+  retrySince?: string;
+  /** When the next attempt falls (only set when `retrying`). */
+  retryNextAt?: string;
   /** Why a FAILED delivery ("Lieferung gescheitert") did not ship — set only when `stage` is
    *  'failed'. It is what lets the ledger surface say which layer at the tip is broken and on what,
    *  without anyone having to ask (WHAT-4). */

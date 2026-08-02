@@ -84,7 +84,7 @@ func (f *fakeDeliverOps) CounterBook(_ context.Context, _ runs.Delivery, _ strin
 	return cb, nil
 }
 func (f *fakeDeliverOps) RedeliverDev(context.Context, string) error { return nil }
-func (f *fakeDeliverOps) RateBudget() deliver.RateBudget            { return deliver.RateBudget{} }
+func (f *fakeDeliverOps) RateBudget() deliver.RateBudget             { return deliver.RateBudget{} }
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
@@ -557,9 +557,16 @@ func TestDeliveriesListCarriesMergeDeadlineAndBlockade(t *testing.T) {
 	mergeBy := tD.Add(7 * 24 * time.Hour)
 	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_wait", Repo: "o/a", Branch: "fix/a-1", PRNumber: 11, CreatedAt: tD, ExecutionID: "exec_wait"})
 	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_block", Repo: "o/a", Branch: "fix/a-2", PRNumber: 12, CreatedAt: tD, ExecutionID: "exec_block"})
-	// One tracked PR waits out its window; the other is blocked with a reason.
+	_ = s.deliveries.Put(runs.Delivery{ID: "dlv_retry", Repo: "o/a", Branch: "fix/a-3", PRNumber: 13, CreatedAt: tD, ExecutionID: "exec_retry"})
+	// One tracked PR waits out its window; one is blocked (a durable obstacle waits for a person); one
+	// is being retried after a SELF-ENDING obstacle — visible, but never waiting for anyone.
+	firstAt := tD.Add(-time.Hour)
+	nextAt := tD.Add(15 * time.Minute)
 	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 11, DeliveryID: "dlv_wait", CreatedAt: tD, MergeBy: mergeBy})
-	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 12, DeliveryID: "dlv_block", CreatedAt: tD, MergeBy: mergeBy, Blocked: true, BlockedReason: "rate limit"})
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 12, DeliveryID: "dlv_block", CreatedAt: tD, MergeBy: mergeBy, Blocked: true, BlockedReason: "the pull request was deleted"})
+	_ = s.runPRs.Add(runs.PendingPR{Repo: "o/a", Number: 13, DeliveryID: "dlv_retry", CreatedAt: tD, MergeBy: mergeBy, Backoff: &model.Backoff{
+		Reason: "reading the pull request failed: connection reset", Class: "transient", Attempts: 7, FirstAt: firstAt, NextAt: nextAt,
+	}})
 
 	rec := httptest.NewRecorder()
 	s.runDeliveriesList(rec, authedReq(http.MethodGet, "/api/mercury/runs/deliveries", nil, "alice"))
@@ -572,6 +579,11 @@ func TestDeliveriesListCarriesMergeDeadlineAndBlockade(t *testing.T) {
 			MergeBy       *time.Time `json:"mergeBy"`
 			Blocked       bool       `json:"blocked"`
 			BlockedReason string     `json:"blockedReason"`
+			Retrying      bool       `json:"retrying"`
+			RetryReason   string     `json:"retryReason"`
+			RetryAttempts int        `json:"retryAttempts"`
+			RetrySince    *time.Time `json:"retrySince"`
+			RetryNextAt   *time.Time `json:"retryNextAt"`
 		} `json:"deliveries"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
@@ -581,19 +593,38 @@ func TestDeliveriesListCarriesMergeDeadlineAndBlockade(t *testing.T) {
 		MergeBy       *time.Time
 		Blocked       bool
 		BlockedReason string
+		Retrying      bool
+		RetryReason   string
+		RetryAttempts int
+		RetrySince    *time.Time
+		RetryNextAt   *time.Time
 	}{}
 	for _, d := range out.Deliveries {
 		byID[d.ID] = struct {
 			MergeBy       *time.Time
 			Blocked       bool
 			BlockedReason string
-		}{d.MergeBy, d.Blocked, d.BlockedReason}
+			Retrying      bool
+			RetryReason   string
+			RetryAttempts int
+			RetrySince    *time.Time
+			RetryNextAt   *time.Time
+		}{d.MergeBy, d.Blocked, d.BlockedReason, d.Retrying, d.RetryReason, d.RetryAttempts, d.RetrySince, d.RetryNextAt}
 	}
-	if w := byID["dlv_wait"]; w.MergeBy == nil || !w.MergeBy.Equal(mergeBy) || w.Blocked {
-		t.Errorf("waiting delivery = %+v, want the merge deadline and no block", w)
+	if w := byID["dlv_wait"]; w.MergeBy == nil || !w.MergeBy.Equal(mergeBy) || w.Blocked || w.Retrying {
+		t.Errorf("waiting delivery = %+v, want the merge deadline and no block/retry", w)
 	}
-	if b := byID["dlv_block"]; !b.Blocked || b.BlockedReason != "rate limit" {
-		t.Errorf("blocked delivery = %+v, want blocked with its reason", b)
+	if b := byID["dlv_block"]; !b.Blocked || b.BlockedReason != "the pull request was deleted" || b.Retrying {
+		t.Errorf("blocked delivery = %+v, want blocked with its reason and NOT retrying", b)
+	}
+	// The retry carries the four visible facts and is NOT blocked — a self-ending obstacle waits for
+	// no one.
+	r := byID["dlv_retry"]
+	if r.Blocked || !r.Retrying || r.RetryAttempts != 7 || r.RetryReason == "" {
+		t.Errorf("retrying delivery = %+v, want retrying with reason and attempts, not blocked", r)
+	}
+	if r.RetrySince == nil || !r.RetrySince.Equal(firstAt) || r.RetryNextAt == nil || !r.RetryNextAt.Equal(nextAt) {
+		t.Errorf("retrying delivery must carry since=%v next=%v, got %+v", firstAt, nextAt, r)
 	}
 }
 

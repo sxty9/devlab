@@ -54,7 +54,8 @@ type fakeGH struct {
 	redelivered  []string
 	redeliverErr error
 
-	budget RateBudget // the observed request budget the maintenance consults before reading
+	budget        RateBudget // the observed request budget the maintenance consults before reading
+	budgetPerRead int        // >0: every read draws this many requests from the window, as GitHub's real headers do
 }
 
 func newFakeGH() *fakeGH {
@@ -95,6 +96,11 @@ func (f *fakeGH) GetPullRequest(_ context.Context, repo string, number int) (PRS
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.getPRCalls++
+	// A real response — success OR failure — carries the window's updated headers, so a read draws
+	// the budget down either way. This is what lets a test model the token's finite hourly window.
+	if f.budgetPerRead > 0 && f.budget.Known {
+		f.budget.Remaining -= f.budgetPerRead
+	}
 	if f.getPRErr != nil {
 		return PRState{}, f.getPRErr
 	}
@@ -271,14 +277,18 @@ func stubClassification(t *testing.T) {
 		}
 		return faultclass.Transient
 	}
-	advanceBackoff = func(b model.Backoff, now time.Time, maxAttempts int) (model.Backoff, bool) {
+	advanceBackoff = func(b model.Backoff, now time.Time, maxAttempts int, maxDelay time.Duration) (model.Backoff, bool) {
 		b.Attempts++
 		b.LastAt = now
 		if b.FirstAt.IsZero() {
 			b.FirstAt = now
 		}
-		b.NextAt = now.Add(time.Duration(b.Attempts) * time.Minute)
-		return b, b.Attempts >= maxAttempts
+		iv := time.Duration(b.Attempts) * time.Minute
+		if iv > maxDelay {
+			iv = maxDelay
+		}
+		b.NextAt = now.Add(iv)
+		return b, maxAttempts > 0 && b.Attempts >= maxAttempts
 	}
 	t.Cleanup(func() { classify, advanceBackoff = oldClassify, oldNext })
 }
@@ -1006,10 +1016,85 @@ func TestMaintainBlockedSkipped(t *testing.T) {
 	}
 }
 
-// TestMaintainBackoffThenBlock (K-5): a transient fault backs off with growing intervals at
-// the PR record; exhausted attempts block it honestly (reason, time, attempts) and the
-// blockade is surfaced as a notice.
-func TestMaintainBackoffThenBlock(t *testing.T) {
+// TestMaintainTransientNeverBlocks is the NACHWEIS point 7(a): an obstacle that ends by itself is
+// retried for ever. After TWENTY failed attempts the record is STILL not stilled — it carries a
+// visible, growing backoff (reason, attempts, first seen, next attempt) — and once the obstacle
+// passes the very next pass merges it, with no human release in between.
+func TestMaintainTransientNeverBlocks(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour))) // overdue — a healthy pass WOULD merge it
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d.Branch, HeadSHA: "c1"}
+	_ = res.Put(runs.Result{ID: "exec_1", RunID: "run_1", Kind: model.KindTodo, StartedAt: t0})
+	// A self-ending obstacle: the read keeps failing with a connectivity error (classified Transient).
+	gh.getPRErr = errors.New("dial tcp: connection refused")
+
+	const attempts = 20
+	var firstSeen time.Time
+	for i := 0; i < attempts; i++ {
+		// Rewind the backoff gate so each pass actually retries (the growing interval would otherwise
+		// hold it back — which is the point, but here we prove the retries never give up).
+		_, _ = prs.Update("o/x", 5, func(p *runs.PendingPR) {
+			if p.Backoff != nil {
+				p.Backoff.NextAt = time.Now().Add(-time.Second)
+			}
+		})
+		if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err == nil {
+			t.Fatalf("pass %d: a failing read must be reported, got nil", i)
+		}
+		cur, _ := prs.List()
+		if cur[0].Blocked {
+			t.Fatalf("a self-ending obstacle must NEVER be stilled — blocked after %d attempts: %+v", i+1, cur[0])
+		}
+		if cur[0].Backoff == nil {
+			t.Fatalf("pass %d: the retry must stay visible as a backoff record, got %+v", i, cur[0])
+		}
+		if i == 0 {
+			firstSeen = cur[0].Backoff.FirstAt
+		}
+	}
+	cur, _ := prs.List()
+	// Visible: what klemmt, since when, how often, when next.
+	if cur[0].Backoff.Attempts != attempts {
+		t.Errorf("attempts = %d, want %d — every retry counted", cur[0].Backoff.Attempts, attempts)
+	}
+	if cur[0].Backoff.Reason == "" || !cur[0].Backoff.FirstAt.Equal(firstSeen) || cur[0].Backoff.NextAt.IsZero() {
+		t.Errorf("the retry must state reason, since-when and next attempt, got %+v", cur[0].Backoff)
+	}
+	// No blocked NOTICE was ever raised — a self-ending obstacle does not alarm anyone.
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			t.Errorf("a self-ending obstacle must raise no blockade notice, got %+v", note)
+		}
+	}
+
+	// The obstacle passes — the next pass succeeds on its own, no human release needed.
+	gh.getPRErr = nil
+	_, _ = prs.Update("o/x", 5, func(p *runs.PendingPR) {
+		if p.Backoff != nil {
+			p.Backoff.NextAt = time.Now().Add(-time.Second)
+		}
+	})
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("once the obstacle passes the retry must succeed: %v", err)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != "o/x|5|merge" {
+		t.Fatalf("the recovered pass must merge what is due, merges = %v", gh.mergeCalls)
+	}
+	if left, _ := prs.List(); len(left) != 0 {
+		t.Errorf("the merged pull request must be dropped from tracking, left %+v", left)
+	}
+}
+
+// TestMaintainPermanentBlocks is the NACHWEIS point 7(b): a DURABLE obstacle — one no repetition can
+// change — is stilled at once and waits for an explicit release, and the blockade surfaces as a
+// disturbance the user is told about.
+func TestMaintainPermanentBlocks(t *testing.T) {
 	armMaintain(t)
 	stubClassification(t)
 	gh := newFakeGH()
@@ -1017,40 +1102,28 @@ func TestMaintainBackoffThenBlock(t *testing.T) {
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
 	_ = ledger.Put(d)
 	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
-	gh.getPRErr = errors.New("dial tcp: connection refused")
+	// The pull request is gone (404) — a durable obstacle a person alone can resolve.
+	gh.getPRErr = &github.StatusError{Status: 404, Msg: "no such pull request"}
 
-	// First fault: a backoff appears, not yet blocked.
-	_ = Maintain(context.Background(), gh, prs, ledger, res, n, pub)
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err == nil {
+		t.Fatalf("a permanent fault must be reported")
+	}
 	cur, _ := prs.List()
-	if cur[0].Backoff == nil || cur[0].Backoff.Attempts != 1 || cur[0].Blocked {
-		t.Fatalf("first transient fault must back off, got %+v", cur[0])
-	}
-	prevNext := cur[0].Backoff.NextAt
-
-	// Drive the record to exhaustion (the backoff gate is bypassed by rewinding NextAt).
-	for i := 0; i < maintainMaxAttempts; i++ {
-		_, _ = prs.Update("o/x", 5, func(p *runs.PendingPR) { p.Backoff.NextAt = time.Now().Add(-time.Second) })
-		_ = Maintain(context.Background(), gh, prs, ledger, res, n, pub)
-	}
-	cur, _ = prs.List()
 	if !cur[0].Blocked || cur[0].BlockedReason == "" || cur[0].BlockedAt.IsZero() {
-		t.Fatalf("exhausted attempts must block honestly (reason/time/attempts), got %+v", cur[0])
+		t.Fatalf("a durable obstacle must be stilled honestly (reason/time), got %+v", cur[0])
 	}
-	if cur[0].Backoff.Attempts < maintainMaxAttempts {
-		t.Errorf("attempts = %d, want ≥ %d", cur[0].Backoff.Attempts, maintainMaxAttempts)
+	if cur[0].Backoff != nil {
+		t.Errorf("a stilled record carries no retry timer — it waits for a person, got %+v", cur[0].Backoff)
 	}
-	if !cur[0].Backoff.NextAt.After(prevNext.Add(-time.Hour)) {
-		t.Errorf("the backoff must carry growing intervals")
-	}
-	notes, _ := n.List()
 	found := false
+	notes, _ := n.List()
 	for _, note := range notes {
-		if note.Kind == "delivery-blocked" && strings.Contains(note.Reason, "o/x") {
+		if note.Kind == runs.NoticeDeliveryBlocked && strings.Contains(note.Reason, "o/x") {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("the blockade must surface as a notice, got %+v", notes)
+		t.Errorf("the blockade must surface as a %q notice", runs.NoticeDeliveryBlocked)
 	}
 }
 
@@ -1125,6 +1198,79 @@ func TestMaintainThrottlesReadsByDeadline(t *testing.T) {
 	}
 	if left, _ := prs.List(); len(left) != nPRs {
 		t.Errorf("every pull request must stay tracked, left %d of %d", len(left), nPRs)
+	}
+}
+
+// TestMaintainSixtySevenEntriesStayUnderHourlyCap is the NACHWEIS point 7(d): 67 entries whose reads
+// keep failing (the 2026-07-31 shape) cannot themselves storm the request window. However hard the
+// maintenance is driven, the reserve stops it before the hourly budget is spent — reads stay under
+// the NAMED bound (the window minus the reserve) — the standstill is stated, and NOT ONE entry is
+// stilled: a self-ending obstacle is retried, never given up on.
+func TestMaintainSixtySevenEntriesStayUnderHourlyCap(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+
+	const nPRs = 67
+	// A finite window modelled small so the drain is quick; the mechanism (a reserve the pass never
+	// spends) is identical at the real 5000. The named bound proven is limit − rateFloor.
+	const limit = rateFloor + 400
+	now := time.Now()
+	// A finite hourly window that the reads draw down, exactly as the token's real one does.
+	gh.budget = RateBudget{Known: true, Remaining: limit, Limit: limit, Reset: now.Add(time.Hour)}
+	gh.budgetPerRead = 1
+	// The obstacle that ends by itself: every read fails with connectivity (classified Transient).
+	gh.getPRErr = errors.New("dial tcp: connection refused")
+	for i := 1; i <= nPRs; i++ {
+		// Each in its OWN repo, so no per-repo gate hides the storm — all 67 are candidates every tick.
+		repo := fmt.Sprintf("o/r%d", i)
+		d := runs.Delivery{ID: fmt.Sprintf("dlv_%d", i), Repo: repo, Branch: fmt.Sprintf("fix/n%d-aaa111", i), PRNumber: i, CreatedAt: t0.Add(time.Duration(i) * time.Second)}
+		_ = ledger.Put(d)
+		_ = prs.Add(trackedPR(d, now.Add(-time.Hour))) // overdue — read every tick unless gated
+	}
+
+	// Drive the maintenance far more often than any scheduler would within an hour, rewinding the
+	// backoff each tick so the retries are never what limits the reads — only the reserve is. Ceil of
+	// (limit − reserve)/nPRs ticks drains the window; a margin past that proves it then stands still.
+	for tick := 0; tick < 20; tick++ {
+		_ = Maintain(context.Background(), gh, prs, ledger, res, n, pub)
+		all, _ := prs.List()
+		for _, p := range all {
+			if p.Backoff != nil {
+				_, _ = prs.Update(p.Repo, p.Number, func(rec *runs.PendingPR) { rec.Backoff.NextAt = now.Add(-time.Second) })
+			}
+		}
+	}
+
+	// The NAMED hourly bound: the reserve is never spent, so the window is never discovered empty by a
+	// rejected request. Reads stay strictly under (limit − rateFloor).
+	if gh.getPRCalls > limit-rateFloor {
+		t.Fatalf("the reserve was spent: %d reads, must stay under %d (limit %d − reserve %d)", gh.getPRCalls, limit-rateFloor, limit, rateFloor)
+	}
+	// The shared, self-ending standstill is stated — once the drawn-down window hits the reserve.
+	sawQuota := false
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeGitHubQuota {
+			sawQuota = true
+		}
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			t.Errorf("a self-ending obstacle must block no entry, got %+v", note)
+		}
+	}
+	if !sawQuota {
+		t.Errorf("the shared %q standstill must be stated when the window is drawn down", runs.NoticeGitHubQuota)
+	}
+	// Not one of the 67 is stilled — every one is retried, none waits for a person.
+	left, _ := prs.List()
+	if len(left) != nPRs {
+		t.Fatalf("every entry must stay tracked and retrying, left %d of %d", len(left), nPRs)
+	}
+	for _, p := range left {
+		if p.Blocked {
+			t.Fatalf("no entry may be stilled by a self-ending obstacle, got %+v", p)
+		}
 	}
 }
 
