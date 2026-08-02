@@ -177,6 +177,10 @@ export function openTodoStatePill(state: OpenTodoState): { label: string; tone: 
       return { label: 'running', tone: 'warning', pulse: true };
     case 'awaiting-merge':
       return { label: 'awaiting merge', tone: 'accent' };
+    case 'awaiting-prod':
+      // The work merged and is waiting for (or retrying) its production step — a calm blue, because
+      // it clears itself; not amber, because nothing is blocked and the user is asked nothing.
+      return { label: state.retrying ? 'production retrying' : 'awaiting production', tone: 'accent' };
     case 'blocked':
       return { label: 'blocked', tone: 'warning' };
     case 'failed':
@@ -190,6 +194,14 @@ export function openTodoStatePill(state: OpenTodoState): { label: string; tone: 
 export function openTodoStateNote(state: OpenTodoState, at: (iso: string) => string): string {
   if (state.kind === 'awaiting-merge') {
     return state.mergeBy ? `Merges automatically after ${at(state.mergeBy)}` : 'Merges automatically once its window elapses';
+  }
+  if (state.kind === 'awaiting-prod') {
+    if (state.retrying) {
+      return state.reason
+        ? `Merged — the production delivery is retrying: ${state.reason}`
+        : 'Merged — the production delivery is retrying by itself';
+    }
+    return 'Merged — waiting to run in production (the last step of the chain)';
   }
   if (state.kind === 'blocked') {
     return state.reason ? `Blocked: ${state.reason}` : 'Blocked — waits for a release';

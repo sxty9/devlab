@@ -10,7 +10,8 @@ export function TodosView() {
     <TaskSurface
       kind="todo"
       newLabel="New todo"
-      emptyText="No open todos. Create one for an ad-hoc fix or a new service."
+      buckets={['todo']}
+      emptyText="No new todos. Create one for an ad-hoc fix or a new service — running, waiting and stuck todos move to Active, Pending and Blocked."
     />
   );
 }

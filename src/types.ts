@@ -457,6 +457,21 @@ export interface Delivery {
    *  'failed'. It is what lets the ledger surface say which layer at the tip is broken and on what,
    *  without anyone having to ask (WHAT-4). */
   failedReason?: string;
+
+  // ── The production step (WHAT-1) — the PROD view of the deliveries surface reads these ──────
+  /** The PRODUCTION lifecycle of a MERGED delivery, distinct from the dev/PR `stage` above.
+   *  '' (not merged, production not reached), 'not-applicable' (the repo is no service), 'pending'
+   *  (merged, production not yet done), 'failed' (last production send failed, retrying) or 'live'
+   *  (proven running in production). The PROD view shows only merged deliveries and reads this. */
+  prodStage?: string;
+  /** When the service was proven running in production — the "since when" the PROD view shows. */
+  prodDeployedAt?: string;
+  /** Why the last production send failed — shown while `prodStage` is 'failed'. */
+  prodFailedReason?: string;
+  /** When the production send is next attempted (a self-ending failure retries by itself). */
+  prodRetryNextAt?: string;
+  /** The attested property behind a not-applicable production step (the repo is no service). */
+  prodEvidence?: string;
 }
 
 export interface PRRef {

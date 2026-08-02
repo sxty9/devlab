@@ -16,6 +16,7 @@ import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { fmtDateTime } from '@/lib/format';
 import type { RunQuestion } from '@/types';
+import { BlockedTasks } from './BlockedTasks';
 
 const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
 
@@ -102,18 +103,24 @@ export function BlockedPanel() {
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        {/* A failed layer is a blocker too (WHAT-4): the stuck todos stand here alongside the
+            questions. This section hides itself when nothing is stuck. */}
+        <BlockedTasks />
         {questions === null ? (
           <p className="px-2.5 py-3 text-caption text-text-tertiary">Loading…</p>
         ) : open.length === 0 ? (
           <p className="px-2.5 py-3 text-caption text-text-tertiary">
-            Nothing is blocked. When a run stops to ask a decision, it waits here until you answer.
+            No question is waiting. When a run stops to ask a decision, it waits here until you answer.
           </p>
         ) : (
-          <ul className="flex flex-col gap-3">
-            {open.map((q) => (
-              <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} />
-            ))}
-          </ul>
+          <>
+            <h3 className="mb-2 text-caption font-medium uppercase tracking-wide text-text-tertiary">Questions</h3>
+            <ul className="flex flex-col gap-3">
+              {open.map((q) => (
+                <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} />
+              ))}
+            </ul>
+          </>
         )}
       </div>
     </div>

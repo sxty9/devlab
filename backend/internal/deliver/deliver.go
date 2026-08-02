@@ -1181,9 +1181,11 @@ func settleExecutionOf(ledger *runs.DeliveryStore, res *runs.ResultStore, p runs
 	}
 }
 
-// SettleExecution applies the B-8 rule: once ALL deliveries of an execution are merged, rolled
-// back or closed with a reason, the execution's Result.MergedAt is the time of the LAST one —
-// and only then. Idempotent; a still-open delivery leaves the result untouched.
+// SettleExecution applies the B-8 + WHAT-1 rule: once ALL deliveries of an execution are SETTLED
+// (rolled back, closed with a reason, or merged AND delivered to production), the execution's
+// Result.MergedAt is the time of the LAST settling — and only then. A merged delivery whose
+// production step is still outstanding is NOT settled, so it keeps the execution in the open list:
+// the task is done only when it runs in production, never merely on merge. Idempotent.
 func SettleExecution(ledger *runs.DeliveryStore, res *runs.ResultStore, executionID string) error {
 	if res == nil || executionID == "" {
 		return nil
@@ -1199,17 +1201,11 @@ func SettleExecution(ledger *runs.DeliveryStore, res *runs.ResultStore, executio
 			continue
 		}
 		found = true
-		switch {
-		case d.MergedAt != nil:
-			if d.MergedAt.After(last) {
-				last = *d.MergedAt
-			}
-		case d.ClosedAt != nil:
-			if d.ClosedAt.After(last) {
-				last = *d.ClosedAt
-			}
-		default:
-			return nil // one delivery still open — the execution stays in the list (B-8)
+		if !d.Settled() {
+			return nil // one delivery still owes a step (merge or production) — execution stays open
+		}
+		if t, ok := d.SettleTime(); ok && t.After(last) {
+			last = t
 		}
 	}
 	if !found {

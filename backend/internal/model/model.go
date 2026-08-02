@@ -337,6 +337,25 @@ type Delivery struct {
 	// FailedReason names WHY a failed delivery ("Lieferung gescheitert") did not ship, so the ledger
 	// surface can say which layer at the tip is broken and on what — set only when Stage is "failed".
 	FailedReason string `json:"failedReason,omitempty"`
+
+	// ── The production step (WHAT-1) — what the PROD view of the deliveries surface renders ──────
+	//
+	// ProdStage is the production lifecycle of a MERGED delivery, distinct from the dev/PR Stage above:
+	// "" (not merged, production not reached), "not-applicable" (the repo is no service),
+	// "pending" (merged, production not yet done), "failed" (last production send failed, retrying),
+	// or "live" (proven running in production). The PROD view shows only merged deliveries and reads
+	// this; the DEV view keeps reading Stage.
+	ProdStage string `json:"prodStage,omitempty"`
+	// ProdDeployedAt is when the service was proven running in production — the "since when" the PROD
+	// view shows for a live delivery.
+	ProdDeployedAt *time.Time `json:"prodDeployedAt,omitempty"`
+	// ProdFailedReason names why the last production send failed — shown while ProdStage is "failed".
+	ProdFailedReason string `json:"prodFailedReason,omitempty"`
+	// ProdRetryNextAt is when the production send is next attempted (a self-ending failure retries by
+	// itself). Present only while retrying, so the surface can say the wait is timed, not stuck.
+	ProdRetryNextAt *time.Time `json:"prodRetryNextAt,omitempty"`
+	// ProdEvidence attests the property behind a not-applicable production step (the repo is no service).
+	ProdEvidence string `json:"prodEvidence,omitempty"`
 }
 
 // PRRef references one pull request.

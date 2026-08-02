@@ -11,12 +11,17 @@ import {
   commitRange,
   deliveryAt,
   deliveryBadge,
+  PROD_STAGE,
   groupDeliveriesByRepo,
+  hasProdStage,
+  holdsExecutionOpen,
   isFailedDelivery,
   isOpenDelivery,
+  isProdLive,
   isUnsettledDelivery,
   openDeliveryExecutionIds,
   openDeliveryFactsByExecution,
+  prodBadge,
   resetConfirmation,
   rollbackConfirmation,
   shortSha,
@@ -197,7 +202,8 @@ test('the view gives EVERY managed repository a section and claims nothing about
   // The managed set comes through the ONE repo access point and decides the sections, so a
   // repository with committed-but-undelivered work still has its dev reset.
   assert.match(code, /source\.repos\(/);
-  assert.match(code, /groupDeliveriesByRepo\(list, repos\.map\(\(r\) => r\.fullName\)\)/);
+  assert.match(code, /repos\.map\(\(r\) => r\.fullName\)/);
+  assert.match(code, /groupDeliveriesByRepo\(list, repoNames\)/);
   // What is stated is what the LEDGER holds. The dev branch's own content is not on this wire, so
   // the view must not put a sentence about it on screen.
   assert.doesNotMatch(src, /dev equals the default branch/);
@@ -239,4 +245,33 @@ test('rolling back a failed tip has its own consequence — no PR to close, the 
   assert.match(c.effect, /failed tip/);
   assert.match(c.effect, /no pull request to close/);
   assert.match(c.result, /last sound layer becomes the tip/);
+});
+
+// ── The production stand (WHAT-1): DEV and PROD are two different stands of one delivery ──────────
+
+test('a merged delivery still owing production holds its execution open, and its two stands differ', () => {
+  // DEV says "merged"; PROD says "awaiting production" — the same delivery, two different stands.
+  const d: Delivery = {
+    id: 'dlv_1', repo: 'o/svc', branch: 'fix/a', fromCommit: 'c0', toCommit: 'c1',
+    createdAt: '2026-07-26T11:30:00Z', mergedAt: '2026-07-26T12:00:00Z',
+    stage: 'merged', prodStage: 'pending', executionId: 'exec_1',
+  };
+  assert.equal(deliveryBadge(d).label, DELIVERY_STAGE.merged.label, 'DEV stand: merged');
+  assert.equal(prodBadge(d).label, PROD_STAGE.pending.label, 'PROD stand: awaiting production');
+  assert.equal(hasProdStage(d), true, 'a merged delivery has a production stand');
+
+  // It holds its execution OPEN (not history-ready) — a task is done only once it runs in production.
+  assert.equal(holdsExecutionOpen(d), true);
+  assert.deepEqual([...openDeliveryExecutionIds([d])], ['exec_1']);
+
+  // Once live in production, both settle and the PROD view shows it live.
+  const live: Delivery = { ...d, prodStage: 'live', prodDeployedAt: '2026-07-26T12:05:00Z' };
+  assert.equal(holdsExecutionOpen(live), false);
+  assert.deepEqual([...openDeliveryExecutionIds([live])], []);
+  assert.equal(prodBadge(live).label, PROD_STAGE.live.label);
+  assert.equal(isProdLive(live), true);
+
+  // An unmerged delivery has NO production stand — the PROD view never shows it.
+  const open: Delivery = { ...d, mergedAt: undefined, stage: 'open', prodStage: '' };
+  assert.equal(hasProdStage(open), false);
 });

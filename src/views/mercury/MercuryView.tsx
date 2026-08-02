@@ -16,6 +16,7 @@ import { AxiomTree } from './tree/AxiomTree';
 import { CoverageView } from './tree/CoverageView';
 import { RunsView } from './tasks/RunsView';
 import { TodosView } from './tasks/TodosView';
+import { PendingView } from './tasks/PendingView';
 import { ExecutionsView } from './exec/ExecutionsView';
 import { ActiveList } from './exec/ActiveList';
 import { DeliveriesView } from './deliveries/DeliveriesView';
@@ -32,11 +33,15 @@ type Section =
   | 'todos'
   | 'active'
   | 'blocked'
+  | 'pending'
   | 'executions'
   | 'deliveries'
   | 'calendar'
   | 'notices';
 
+// The task lifecycle tabs (WHAT-4) sit in their real order — ToDo → Active → Blocked → Pending →
+// (History) — so the row reads as the life of a task: created, being worked, stuck, waiting for its
+// automated tail, then delivered.
 const SECTIONS: { id: Section; label: string }[] = [
   { id: 'axioms', label: 'Constitution' },
   { id: 'coverage', label: 'Coverage' },
@@ -44,6 +49,7 @@ const SECTIONS: { id: Section; label: string }[] = [
   { id: 'todos', label: 'Todos' },
   { id: 'active', label: 'Active' },
   { id: 'blocked', label: 'Blocked' },
+  { id: 'pending', label: 'Pending' },
   { id: 'executions', label: 'History' },
   { id: 'deliveries', label: 'Deliveries' },
   { id: 'calendar', label: 'Calendar' },
@@ -126,6 +132,7 @@ function MercurySections() {
           {section === 'todos' && <TodosView />}
           {section === 'active' && <ActiveList />}
           {section === 'blocked' && <BlockedPanel />}
+          {section === 'pending' && <PendingView />}
           {section === 'executions' && <ExecutionsView />}
           {section === 'deliveries' && <DeliveriesView />}
           {section === 'calendar' && <GlobalCalendarView />}

@@ -23,6 +23,29 @@ export const DELIVERY_STAGE: Record<string, { label: string; tone: BadgeTone }> 
   failed: { label: 'delivery failed', tone: 'danger' },
 };
 
+/** The production-lifecycle badges the server states, for the PROD view of the deliveries surface
+ *  (WHAT-1). Distinct from DELIVERY_STAGE above: those track a delivery's dev/PR life, these track
+ *  what runs on the SECOND machine — production — which is reached only after a merge. */
+export const PROD_STAGE: Record<string, { label: string; tone: BadgeTone }> = {
+  pending: { label: 'awaiting production', tone: 'accent' },
+  failed: { label: 'production failed — retrying', tone: 'danger' },
+  live: { label: 'live in production', tone: 'success' },
+  'not-applicable': { label: 'no service', tone: 'neutral' },
+};
+
+/** The production badge of one delivery — total, so an unstamped stage still yields a defined chip. */
+export function prodBadge(d: Pick<Delivery, 'prodStage'>): { label: string; tone: BadgeTone } {
+  const s = (d.prodStage ?? '').trim();
+  return PROD_STAGE[s] ?? { label: s || 'not merged yet', tone: 'neutral' };
+}
+
+/** Whether this delivery has reached the production step at all — i.e. it MERGED. The PROD view
+ *  shows only these (production happens after the merge), so an open or failed dev delivery that
+ *  never merged does not appear there. */
+export function hasProdStage(d: Pick<Delivery, 'prodStage'>): boolean {
+  return (d.prodStage ?? '').trim() !== '';
+}
+
 /** The one stage name that means "committed but not shipped" — the failed tip. Named once so every
  *  surface asks the same question of the same field. */
 const STAGE_FAILED = 'failed';
@@ -39,6 +62,28 @@ export function isFailedDelivery(d: Pick<Delivery, 'stage'>): boolean {
  *  resolved (re-run) or rolled back. */
 export function isUnsettledDelivery(d: Pick<Delivery, 'stage'>): boolean {
   return isOpenDelivery(d) || isFailedDelivery(d);
+}
+
+/** Whether the server states this delivery as still owing its PRODUCTION step (WHAT-1): merged, but
+ *  not yet running in production ('pending') or with its last production send failed and retrying
+ *  ('failed'). Read straight off the server-stamped `prodStage`; nothing is derived here (B-35). */
+export function isProdPending(d: Pick<Delivery, 'prodStage'>): boolean {
+  const s = (d.prodStage ?? '').trim();
+  return s === 'pending' || s === 'failed';
+}
+
+/** Whether this delivery has been proven RUNNING in production — the last step of the chain done. */
+export function isProdLive(d: Pick<Delivery, 'prodStage'>): boolean {
+  return (d.prodStage ?? '').trim() === 'live';
+}
+
+/** Whether a delivery still holds its execution OPEN (not history-ready) — the client mirror of the
+ *  server's completion rule (runs.Delivery.Settled, B-8 + WHAT-1). It is broader than the dev/stack
+ *  question `isUnsettledDelivery`: a MERGED delivery that still owes production keeps its execution —
+ *  and thus its ToDo — open too, because a task is done only once it runs in production, not on the
+ *  merge. */
+export function holdsExecutionOpen(d: Pick<Delivery, 'stage' | 'prodStage'>): boolean {
+  return isUnsettledDelivery(d) || isProdPending(d);
 }
 
 /** The one stage name that means "not settled yet". Named once here so every surface asks the same
@@ -67,9 +112,10 @@ export function deliveryBadge(d: Pick<Delivery, 'stage'>): { label: string; tone
 export function openDeliveryExecutionIds(list: readonly Delivery[]): ReadonlySet<string> {
   const out = new Set<string>();
   for (const d of list) {
-    // Unsettled, not merely PR-open: a FAILED delivery holds its execution open too, so the failed
-    // order stays in the open ToDo list instead of dropping to history unresolved (WHAT-2).
-    if (d.executionId && isUnsettledDelivery(d)) out.add(d.executionId);
+    // Holds the execution open: an unsettled dev delivery (PR open or a FAILED tip, WHAT-2) OR a
+    // merged delivery still owing its production step (WHAT-1) — a task historizes only once it runs
+    // in production, never on the merge alone.
+    if (d.executionId && holdsExecutionOpen(d)) out.add(d.executionId);
   }
   return out;
 }
@@ -81,6 +127,14 @@ export interface OpenDeliveryFacts {
   blocked: boolean;
   reason?: string;
   mergeBy?: string;
+  /** The delivery is merged and awaiting its PRODUCTION step (WHAT-1): the work reached the default
+   *  branch, but it is not with the user until it runs in production. */
+  prodPending?: boolean;
+  /** The last production send FAILED and is being retried by itself (never given up on). The task
+   *  stays open and reports itself, but the stack is untouched — this is not a dev-delivery failure. */
+  prodFailed?: boolean;
+  /** Why the production send failed (only meaningful when `prodFailed`). */
+  prodReason?: string;
 }
 
 /** Join the OPEN deliveries by the execution they arose from, folding each execution's open rows
@@ -91,7 +145,7 @@ export interface OpenDeliveryFacts {
 export function openDeliveryFactsByExecution(list: readonly Delivery[]): Map<string, OpenDeliveryFacts> {
   const out = new Map<string, OpenDeliveryFacts>();
   for (const d of list) {
-    if (!d.executionId || !isUnsettledDelivery(d)) continue;
+    if (!d.executionId || !holdsExecutionOpen(d)) continue;
     const cur = out.get(d.executionId) ?? { blocked: false };
     // A FAILED delivery is a wait that needs no clock: it holds the execution open until it is
     // resolved or rolled back. It reads as blocked, carrying its failure as the reason, so the open
@@ -103,6 +157,16 @@ export function openDeliveryFactsByExecution(list: readonly Delivery[]): Map<str
     if (d.blocked) {
       cur.blocked = true;
       cur.reason ??= d.blockedReason;
+    }
+    // Merged and awaiting production (WHAT-1): the work reached the default branch but is not running
+    // in production yet. A failed production send is retrying — the task stays open and reports it,
+    // but this is NOT a dev-delivery failure, so it never reads as blocked (the stack is untouched).
+    if (isProdPending(d)) {
+      cur.prodPending = true;
+      if ((d.prodStage ?? '').trim() === 'failed') {
+        cur.prodFailed = true;
+        cur.prodReason ??= d.prodFailedReason;
+      }
     }
     if (d.mergeBy && (!cur.mergeBy || d.mergeBy < cur.mergeBy)) cur.mergeBy = d.mergeBy;
     out.set(d.executionId, cur);

@@ -43,6 +43,20 @@ WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
 
+# The honest running gate (F10), executed HERE on the production host — the SAME proof the dev
+# delivery uses (deploy.VerifyRunning), just run on the target: "installed and started" is reported
+# only once the unit is genuinely ACTIVE. A restart is not a start; a unit that installs but does not
+# come up is a FAILED production delivery, and this receiver exits non-zero so the sending side sees
+# it (WHAT-2). It polls for up to ~15s, matching the dev gate's window. Exit code 11 = did not come up.
+prove_running() {
+  local unit="$1" deadline=$((SECONDS + 15))
+  while :; do
+    if systemctl is-active --quiet "$unit"; then log "prod gate: unit '$unit' is active"; return 0; fi
+    (( SECONDS >= deadline )) && die "prod gate: unit '$unit' is NOT active after restart — delivery failed" 11
+    sleep 1
+  done
+}
+
 mkdir -p "$STAGING_ROOT"
 
 # The client command: forced-command path uses $SSH_ORIGINAL_COMMAND; a direct/local run uses argv.
@@ -95,6 +109,7 @@ case "$REPO" in
     mkdir -p "$WWW_DIR"
     rsync -a --delete "$WEB"/ "$WWW_DIR"/
     systemctl restart devlabd
+    prove_running devlabd
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
@@ -105,6 +120,7 @@ case "$REPO" in
     install -d -o root -g root -m 0755 "/opt/$REPO/bin"
     install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
     systemctl restart "$REPO"
+    prove_running "$REPO"
     ;;
 esac
 

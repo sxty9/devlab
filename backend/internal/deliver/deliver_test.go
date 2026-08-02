@@ -888,9 +888,15 @@ func TestMaintainMergesAndPrunes(t *testing.T) {
 	if left, _ := prs.List(); len(left) != 0 {
 		t.Errorf("the pool entry must be gone, left %+v", left)
 	}
+	// WHAT-1: a merge is NOT the end of the chain — production is. The merge pass mirrors MergedAt onto
+	// the ledger and drops the pool entry, but the execution stays OUT of the history until its
+	// production step succeeds (the separate deliver.MaintainProd pass), so Result.MergedAt is still nil.
 	r, _, _ := res.Get("exec_1")
-	if r.MergedAt == nil {
-		t.Errorf("B-8: all deliveries terminal ⇒ Result.MergedAt set, got %+v", r)
+	if r.MergedAt != nil {
+		t.Errorf("a merged delivery still owes production, so its execution must not settle on merge: %+v", r)
+	}
+	if got, _, _ := ledger.ByID("dlv_1"); !got.NeedsProd() {
+		t.Errorf("after the merge the delivery must owe production, got %+v", got)
 	}
 	pub.mu.Lock()
 	ticks := len(pub.topics)
@@ -1329,7 +1335,9 @@ func TestMaintainQuotaExhaustedIsSharedAndSelfEnding(t *testing.T) {
 func TestSettleExecution(t *testing.T) {
 	ledger, res := tempLedger(t), tempResults(t)
 	m1 := t0.Add(time.Hour)
-	_ = ledger.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", CreatedAt: t0, ExecutionID: "exec_1", MergedAt: &m1})
+	// dlv_1 is merged AND its production step is done (ProdNotApplicable — o/x is no service here), so
+	// it is settled; this test is about the merge/close mechanics, not the production step (WHAT-1).
+	_ = ledger.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", CreatedAt: t0, ExecutionID: "exec_1", MergedAt: &m1, ProdNotApplicable: true})
 	_ = ledger.Put(runs.Delivery{ID: "dlv_2", Repo: "o/y", Branch: "fix/two-bbb222", CreatedAt: t0, ExecutionID: "exec_1"})
 	_ = res.Put(runs.Result{ID: "exec_1", RunID: "run_1", Kind: model.KindTodo, StartedAt: t0})
 

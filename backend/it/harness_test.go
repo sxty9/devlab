@@ -68,6 +68,10 @@ type env struct {
 	adminGr string
 	// mergeWindow is the auto-merge window the fixture delivery path stamps (default: at once).
 	mergeWindow time.Duration
+	// prod is the fixture production deployer the maintenance tick runs after the merges (WHAT-1). It
+	// defaults to a healthy host (every merged delivery runs there); a test that wants a production
+	// failure sets prod.fail.
+	prod fixtureProd
 
 	// ctx is the daemon's root context: cancelled on cleanup, which drains the scheduler so no
 	// execution goroutine outlives its test (and its temporary state root).
@@ -155,7 +159,25 @@ func (e *env) mergeNow() { e.mergeWindow = 0 }
 // the fixture GitHub. Wiring it is what puts auto-merge, branch pruning, the origin status and the
 // K-5 blockade of a failing pull request under test at all.
 func (e *env) maintain(ctx context.Context) error {
-	return deliver.Maintain(ctx, fixtureGH{d: e.deps}, e.prs, e.deliveries, e.results, e.notices, e.broker)
+	if err := deliver.Maintain(ctx, fixtureGH{d: e.deps}, e.prs, e.deliveries, e.results, e.notices, e.broker); err != nil {
+		return err
+	}
+	// The production step is the LAST step of the chain (WHAT-1): the same maintenance tick, after the
+	// merges, ships every merged delivery to production and proves it running there. The fixture
+	// deployer models a healthy production host — a delivery that merged runs there and answers — so
+	// the loop reaches "done" exactly as it will in production, and the execution historizes only then.
+	return deliver.MaintainProd(ctx, e.prod, e.deliveries, e.results, e.notices, e.broker)
+}
+
+// fixtureProd is the harness ProdDeployer: it models a healthy production host by proving every
+// merged delivery running. A test that wants a production FAILURE flips fail to true.
+type fixtureProd struct{ fail bool }
+
+func (p fixtureProd) DeployProd(_ context.Context, repo string) (deliver.ProdOutcome, error) {
+	if p.fail {
+		return deliver.ProdOutcome{Detail: "fixture production host unreachable"}, fmt.Errorf("fixture prod down for %s", repo)
+	}
+	return deliver.ProdOutcome{Running: true, Detail: "fixture: proven running in production"}, nil
 }
 
 // newEnvAt composes the system over an EXISTING state root (a fresh one on the first call).

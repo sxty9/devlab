@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { executionCompleted, openTodoState, outsideHistory, runCompleted, splitOpenHistory } from './select.ts';
+import { executionCompleted, openTodoState, outsideHistory, runCompleted, splitOpenHistory, taskBucket } from './select.ts';
 // Which executions still hold an open delivery is READ off the ledger, where the server states it —
 // these selectors never derive it, so the set and the delivery facts come from the delivery module
 // (B-35).
@@ -213,5 +213,54 @@ test('open ∩ history = ∅ (REQ-011.2)', () => {
     for (const res of split.history) {
       assert.ok(!(res.runId === r.id && runCompleted(r, [res])), `${r.id} is open AND completed by ${res.id}`);
     }
+  }
+});
+
+// ── The lifecycle tabs (WHAT-4): each open task in exactly one of the five states, one tab each ──
+
+test('a merged delivery still owing production reads awaiting-prod, and lands in the Pending tab (WHAT-1)', () => {
+  const t = todo('run_prod', ['svc']);
+  const merged = result('exec_prod', 'run_prod');
+  // The ledger states a MERGED delivery whose production step is still pending.
+  const ledger: Delivery[] = [{ ...dlv('dlv_prod', 'exec_prod', 'merged'), prodStage: 'pending' }];
+  const openIds = openDeliveryExecutionIds(ledger);
+  const facts = openDeliveryFactsByExecution(ledger);
+  const state = openTodoState(t, [merged], openIds, facts, new Set());
+  assert.deepEqual(state, { kind: 'awaiting-prod', retrying: false, reason: undefined });
+  assert.equal(taskBucket(state), 'pending');
+
+  // A merged delivery whose production step is pending keeps its execution OUT of the history.
+  assert.equal(openIds.has('exec_prod'), true, 'a merged-but-not-in-production delivery holds its execution open');
+  assert.equal(executionCompleted(merged, openIds), false);
+
+  // A FAILED production send reads as a retrying production wait — still Pending, never Blocked: the
+  // stack is untouched and the user is asked nothing.
+  const failing: Delivery[] = [{ ...dlv('dlv_prod', 'exec_prod', 'merged'), prodStage: 'failed', prodFailedReason: 'receiver down' }];
+  const fFacts = openDeliveryFactsByExecution(failing);
+  const fState = openTodoState(t, [merged], openDeliveryExecutionIds(failing), fFacts, new Set());
+  assert.deepEqual(fState, { kind: 'awaiting-prod', retrying: true, reason: 'receiver down' });
+  assert.equal(taskBucket(fState), 'pending');
+});
+
+test('taskBucket partitions the five lifecycle states across exactly four live tabs (WHAT-4 test c)', () => {
+  // ONE case per state, and each lands in exactly one bucket — never two, never none.
+  assert.equal(taskBucket({ kind: 'not-run' }), 'todo');
+  assert.equal(taskBucket({ kind: 'running' }), 'active');
+  assert.equal(taskBucket({ kind: 'awaiting-merge', mergeBy: '2026-08-08T00:00:00Z' }), 'pending');
+  assert.equal(taskBucket({ kind: 'awaiting-prod', retrying: false }), 'pending');
+  assert.equal(taskBucket({ kind: 'blocked', reason: 'x' }), 'blocked');
+  assert.equal(taskBucket({ kind: 'failed' }), 'blocked');
+
+  // Every bucket a task can be in is one of the four live tabs (History is the fifth, done state).
+  const buckets = new Set(['todo', 'active', 'blocked', 'pending']);
+  for (const s of [
+    { kind: 'not-run' as const },
+    { kind: 'running' as const },
+    { kind: 'awaiting-merge' as const },
+    { kind: 'awaiting-prod' as const },
+    { kind: 'blocked' as const },
+    { kind: 'failed' as const },
+  ]) {
+    assert.ok(buckets.has(taskBucket(s)), `${s.kind} maps to an unknown tab`);
   }
 });

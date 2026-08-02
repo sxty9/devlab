@@ -18,7 +18,7 @@ import { TaskForm } from './TaskForm';
 import { TaskList } from './TaskList';
 import { TaskDetail } from './TaskDetail';
 import { errMsg } from './logic';
-import { openTodoState, splitOpenHistory, type OpenTodoState } from './select';
+import { openTodoState, splitOpenHistory, taskBucket, type OpenTodoState, type TaskBucket } from './select';
 import { openDeliveryExecutionIds, openDeliveryFactsByExecution } from '../deliveries/deliveries';
 import type { Delivery, Repo, RunCoverage, RunKind, RunList, RunResult } from '@/types';
 
@@ -26,11 +26,16 @@ export interface SurfaceProps {
   kind: RunKind;
   newLabel: string;
   emptyText: string;
+  /** Which lifecycle tabs (WHAT-4) this surface shows. When set (the todo lifecycle tabs), the open
+   *  list is narrowed to todos whose derived state falls in one of these buckets, so a task appears
+   *  in exactly ONE tab. Absent = show every open task (the auto-runs surface, which has no such
+   *  lifecycle). */
+  buckets?: TaskBucket[];
   /** Extra toolbar actions of this surface (the auto surface adds its AI planning). */
   toolbar?: (ctx: { reload: () => Promise<void>; coverage: RunCoverage | null }) => ReactNode;
 }
 
-export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps) {
+export function TaskSurface({ kind, newLabel, emptyText, buckets, toolbar }: SurfaceProps) {
   const source = useMemo(() => getDataSource(), []);
   const { toast } = useToast();
   const isTodo = kind === 'todo';
@@ -162,7 +167,6 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
   // History section. An open delivery keeps its execution — and so its todo — open (B-8).
   const openDeliveryIds = openDeliveryExecutionIds(deliveries);
   const { open } = splitOpenHistory(ofKind, executions, openDeliveryIds);
-  const shownBase = isTodo ? open : ofKind;
 
   // WHY each open todo is still open — one derived state per row (REQ-011.2), read from the same
   // partition the history is the complement of (outsideHistory) plus the ledger's own delivery
@@ -174,6 +178,15 @@ export function TaskSurface({ kind, newLabel, emptyText, toolbar }: SurfaceProps
     stateByRun = {};
     for (const r of open) stateByRun[r.id] = openTodoState(r, executions, openDeliveryIds, facts, liveRunIds);
   }
+
+  // WHAT-4: a todo lives in exactly ONE lifecycle tab. When this surface names its buckets, the open
+  // list is narrowed to the todos whose derived state falls in one of them — the ONE partition every
+  // lifecycle tab reads, so nothing is in two tabs or in none.
+  const openInBuckets =
+    isTodo && buckets && stateByRun
+      ? open.filter((r) => buckets.includes(taskBucket(stateByRun![r.id])))
+      : open;
+  const shownBase = isTodo ? openInBuckets : ofKind;
 
   const lastStarted: Record<string, string> = {};
   for (const res of executions) {

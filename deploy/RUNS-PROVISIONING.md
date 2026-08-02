@@ -67,6 +67,8 @@ prints its decision without touching the host, so the security logic is verifiab
 | `DEVLAB_RUNS_RESUME_WINDOW` | how old an interrupted execution may be and still auto-resume (default 240h) |
 | `DEVLAB_RESTART_POLL` / `DEVLAB_RESTART_MAXWAIT` | ready-socket poll interval / hard cap of the handover restart |
 | `DEVLAB_PORT_BAND` | port band for first-time service setup proposals (Atlas) |
+| `DEVLAB_RUNS_PROD_TARGET` | rsync staging target of the production send (`user@host:path`) — server-side only |
+| `DEVLAB_RUNS_PROD_RECV` | ssh destination of the install-only receiver's deploy key (`user@host`) |
 
 **Removed from the contract (do not set):** the operating-mode ladder (REQ-027.1 — the one
 chain always runs preflight → implement → deliver-dev → publish → pull-request), any cost
@@ -100,6 +102,23 @@ Stop admissions by setting the slot capacity to 0 in the service configuration
   (`$DEVLAB_STATE_DIR/restart-ready.sock`: 204 free · 423 busy · dead ⇒ free) and restarts
   when free — or after `DEVLAB_RESTART_MAXWAIT`, logged. A failed handover fails the stage;
   nothing ever restarts inline.
-- **prod (not armed):** the prod send (rsync into the rrsync-confined staging behind the
-  forced-command receiver `devlab-deploy-recv`, target server-side only) is implemented and
-  fixture-tested, but not armed in this phase.
+- **prod (the LAST step of the chain, WHAT-1):** after a delivery MERGES, the production pass
+  (`deliver.MaintainProd`, run on the maintenance tick right after the merges) ships the MERGED state
+  — the default branch, never dev — into the rrsync-confined staging and fires the forced-command
+  receiver `devlab-deploy-recv`, which installs the prebuilt artifact AND proves the unit ACTIVE on
+  the target (the SAME honest gate the dev delivery uses, executed server-side). A task is done — and
+  historized — only once its production step is proven; a merge alone never finishes it.
+  - **Armed by configuration, not a switch.** Production is a real step of the chain, never one
+    "permanently switched off" (Kein stummes Ausbleiben). It is armed by NAMING where it goes:
+    `DEVLAB_RUNS_PROD_TARGET` (the rsync staging) and `DEVLAB_RUNS_PROD_RECV` (the receiver host). A
+    MISSING target is a deficiency, not a legitimate off-state: it is reported as a failed production
+    delivery (a disturbance the user sees) and retried, never a silent skip.
+  - **A failed send is a matter of its own, after the stack (WHAT-3).** It never invalidates the
+    merged layer beneath it: the task simply stays open, reports itself (`prod-undelivered` notice),
+    and the send retries by itself on a growing backoff that is never given up on — while the stack
+    builds on. The only proven not-applicable is a repository that is no service.
+  - **The first armed run** ships one merged delivery's default-branch artifact and installs it on the
+    second machine; **an unreachable receiver** fails the ssh trigger, so the delivery reads
+    prod-failed and retries; a **half-installed target** cannot arise, because the receiver reports
+    success ONLY after the unit is proven active — a receiver that installs but does not come up exits
+    non-zero, so the sending side records a failure rather than a green half-delivery.
