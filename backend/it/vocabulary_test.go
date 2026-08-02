@@ -322,8 +322,8 @@ func TestChainVocabularyIsClosed(t *testing.T) {
 	if terminal != 4 {
 		t.Errorf("%d terminal step states, the contract names 4", terminal)
 	}
-	if len(live.Topics()) != 8 {
-		t.Errorf("%d live topics, the contract names exactly 8", len(live.Topics()))
+	if len(live.Topics()) != 9 {
+		t.Errorf("%d live topics, the contract names exactly 9", len(live.Topics()))
 	}
 	// The success formula, stated as a table so a change to it is visible here.
 	for _, tc := range []struct {

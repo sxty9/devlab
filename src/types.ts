@@ -809,4 +809,5 @@ export type LiveTopic =
   | 'deliveries'
   | 'notices'
   | 'slots'
-  | 'restart';
+  | 'restart'
+  | 'questions';

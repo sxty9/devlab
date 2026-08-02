@@ -2054,6 +2054,14 @@
       "reason": "The MCP endpoint itself — a tool for it would be a loop."
     },
     {
+      "subject": "GET /api/mercury/runs/questions",
+      "reason": "The Blocked surface is a human-decision list; a run's open question already surfaces as its execution's block reason, so the agent tools show it there."
+    },
+    {
+      "subject": "POST /api/mercury/runs/questions/answer",
+      "reason": "Answering a run's blocking question is the user's decision by definition — an agent answering its own question would defeat the whole mechanism."
+    },
+    {
       "subject": "/",
       "reason": "Delivery of the web surface."
     }

@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// Topic is one of the EXACTLY EIGHT topics (the closed set; REQ-034).
+// Topic is one of the EXACTLY NINE topics (the closed set; REQ-034).
 type Topic string
 
 const (
@@ -20,11 +20,14 @@ const (
 	TopicNotices    Topic = "notices"
 	TopicSlots      Topic = "slots"
 	TopicRestart    Topic = "restart"
+	// TopicQuestions ticks when a blocking question is raised, answered or resolved — so the Blocked
+	// surface refreshes without polling.
+	TopicQuestions Topic = "questions"
 )
 
 // Topics returns the closed topic set (for guards and tests).
 func Topics() []Topic {
-	return []Topic{TopicAxioms, TopicRuns, TopicActive, TopicProgress, TopicDeliveries, TopicNotices, TopicSlots, TopicRestart}
+	return []Topic{TopicAxioms, TopicRuns, TopicActive, TopicProgress, TopicDeliveries, TopicNotices, TopicSlots, TopicRestart, TopicQuestions}
 }
 
 // Publisher is the injection seam the writers (handlers, sched, recorder, deliver) publish

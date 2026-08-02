@@ -49,6 +49,7 @@ type Server struct {
 	results      *runs.ResultStore
 	runPRs       *runs.PRStore
 	runNotices   *runs.NoticeStore
+	runQuestions *runs.QuestionStore
 	deliveries   *runs.DeliveryStore
 	attachments  *runs.AttachmentStore
 	axiomChecks  *runs.AxiomChecks
@@ -102,6 +103,7 @@ func New(v *auth.Verifier, paths *statepath.Paths) *Server {
 		results:      runs.NewResultStore(paths),
 		runPRs:       runs.NewPRStore(paths),
 		runNotices:   runs.NewNoticeStore(paths),
+		runQuestions: runs.NewQuestionStore(paths),
 		deliveries:   runs.NewDeliveryStore(paths),
 		attachments:  runs.NewAttachmentStore(paths),
 		axiomChecks:  runs.NewAxiomChecks(paths),
@@ -294,6 +296,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/mercury/runs/history/restore", s.guardCSRF(s.runsHistoryRestore))
 	mux.HandleFunc("POST /api/mercury/runs/notices/dismiss", s.guardCSRF(s.runsNoticeDismiss))
 	mux.HandleFunc("POST /api/mercury/runs/notices/clear", s.guardCSRF(s.runsNoticesClear))
+
+	// Mercury: the Blocked surface — every run stopped on an open question, and the answer that
+	// resumes it.
+	mux.HandleFunc("GET /api/mercury/runs/questions", s.guard(s.runsQuestionsList))
+	mux.HandleFunc("POST /api/mercury/runs/questions/answer", s.guardCSRF(s.runsQuestionAnswer))
 
 	// Mercury: deliveries (S10).
 	mux.HandleFunc("GET /api/mercury/runs/deliveries", s.guard(s.runDeliveriesList))

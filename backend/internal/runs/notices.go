@@ -81,6 +81,9 @@ const (
 	// Delivery-origin findings (REQ-033): a protection that drifted, and a deliberate override.
 	NoticeProtectionDeviation = "protection-deviation"
 	NoticeAdminOverride       = "admin-override"
+	// A run stopped and asked the user a question (the Blocked surface). It is a disturbance: the run
+	// waits, and its repository is blocked, until the user answers.
+	NoticeQuestion = "question"
 )
 
 // Message is the notice's display text: Text when set, else Reason. Repo, when present, is a

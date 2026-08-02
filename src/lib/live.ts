@@ -6,7 +6,7 @@
 // endpoints, so a dropped tick is always safe.
 import type { LiveTopic } from '@/types';
 
-/** The EXACTLY EIGHT topics — runtime mirror of the LiveTopic union (and of the Go
+/** The EXACTLY NINE topics — runtime mirror of the LiveTopic union (and of the Go
  *  constants in backend/internal/live). `satisfies` rejects junk entries; the completeness
  *  assertion below rejects a union member missing from this list. */
 export const LIVE_TOPICS = [
@@ -18,6 +18,7 @@ export const LIVE_TOPICS = [
   'notices',
   'slots',
   'restart',
+  'questions',
 ] as const satisfies readonly LiveTopic[];
 
 type MissingTopic = Exclude<LiveTopic, (typeof LIVE_TOPICS)[number]>;

@@ -321,6 +321,9 @@ func (d *ChainDeps) Deliver() executor.DeliverOps { return chainDeliver{d: d} }
 // Deploy is the delivery-to-host machinery (S11).
 func (d *ChainDeps) Deploy() executor.DeployOps { return chainDeploy{d: d} }
 
+// Questions is the blocking-question slice (the Blocked surface).
+func (d *ChainDeps) Questions() executor.QuestionOps { return chainQuestions{d: d} }
+
 // Preflight observes one repo for one run — the same derivation the admission gate uses.
 func (d *ChainDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	return preflight.Derive(ctx, d, repo, run)
@@ -786,6 +789,52 @@ func (c chainDeliver) EnsureProtection(ctx context.Context, repo string) error {
 	if err := ops.ProtectDefaultBranch(ctx, full, deliver.OriginStatusContext); err != nil {
 		return err
 	}
+	return nil
+}
+
+// ── the question shim ────────────────────────────────────────────────────────────────────
+
+type chainQuestions struct{ d *ChainDeps }
+
+// OpenForRepo resolves the repo's full name (the pool stores questions under the target as the run
+// named it, but a full name may reach it too) and reports the open question holding it, if any.
+func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return nil, nil
+	}
+	return c.d.s.runQuestions.OpenForRepo(repo, exceptExecutionID)
+}
+
+func (c chainQuestions) AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return nil, nil
+	}
+	return c.d.s.runQuestions.AnsweredForExec(executionID, repo)
+}
+
+// Raise records the question and ticks the Blocked surface. Outward delivery to the user rides the
+// question pool's on-new hook (StartQuestionDelivery), which records a disturbance notice — the SAME
+// path the sister order built for disturbances, never a second one.
+func (c chainQuestions) Raise(ctx context.Context, q runs.Question) (runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return runs.Question{}, errors.New("the question pool is not available")
+	}
+	saved, err := c.d.s.runQuestions.Raise(q)
+	if err != nil {
+		return runs.Question{}, err
+	}
+	c.d.s.publish(live.TopicQuestions)
+	return saved, nil
+}
+
+func (c chainQuestions) Resolve(ctx context.Context, id string) error {
+	if c.d.s.runQuestions == nil {
+		return nil
+	}
+	if err := c.d.s.runQuestions.Resolve(id); err != nil {
+		return err
+	}
+	c.d.s.publish(live.TopicQuestions)
 	return nil
 }
 

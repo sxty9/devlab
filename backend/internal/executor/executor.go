@@ -162,6 +162,24 @@ type DeployOps interface {
 	DeliverDev(ctx context.Context, repo string) (DeployOutcome, error)
 }
 
+// QuestionOps is the blocking-question slice (the Blocked surface). It reuses the SAME halt as a
+// failed delivery tip: an OPEN question holds a repository — the implement stage consults
+// OpenForRepo BEFORE it branches, so no new order is cut past an unanswered question. An ANSWERED
+// question feeds its answer back into the SAME agent conversation, so the run continues where it
+// stopped instead of starting over.
+type QuestionOps interface {
+	// OpenForRepo returns an unanswered question holding this repository, raised by an execution
+	// OTHER than exceptExecutionID (so a run is never held by its own question), or nil.
+	OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error)
+	// AnsweredForExec returns this execution's own answered, not-yet-consumed question for the repo,
+	// whose answer the resumed agent session is fed — nil when none waits.
+	AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error)
+	// Raise records a new open question (the Blocked surface + the disturbance delivery).
+	Raise(ctx context.Context, q runs.Question) (runs.Question, error)
+	// Resolve marks an answered question consumed, so a later resume does not re-inject the answer.
+	Resolve(ctx context.Context, id string) error
+}
+
 // AgentSession names the agent conversation of ONE repository inside ONE execution. Key is the
 // stable name of that conversation, so a later resume finds the SAME conversation again; Resume
 // says whether this call continues it or opens it. The name must be settled when the conversation
@@ -182,6 +200,7 @@ type Deps interface {
 	GitHub() GitHubOps
 	Deliver() DeliverOps
 	Deploy() DeployOps
+	Questions() QuestionOps
 	Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error)
 	// AxiomScope names the stand THIS repository was last examined against, per axiom of the run —
 	// the section that makes an execution incremental instead of re-reading whole repositories
@@ -309,6 +328,9 @@ type RepoCtx struct {
 	detectErr       error
 	report          string
 	usage           *usageTotal
+	// answeredQuestionID names this repo's own answered question whose answer was fed to the resumed
+	// agent session; it is marked consumed once the agent has taken it.
+	answeredQuestionID string
 
 	logBuf  []string
 	failLog string // F11: transcript tail shown as the failed stage's log

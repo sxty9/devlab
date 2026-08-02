@@ -60,6 +60,11 @@ type Run struct {
 	Targets []Target   `json:"targets,omitempty"`
 	DueAt   *time.Time `json:"dueAt,omitempty"`
 
+	// Autonomy fixes HOW SELF-RELIANT the run works — when it stops to ask instead of deciding for
+	// itself (model.AutonomyLevel). Empty RESOLVES to Autonomous, so an existing run keeps today's
+	// never-ask behavior.
+	Autonomy model.AutonomyLevel `json:"autonomy,omitempty"`
+
 	Tuning Tuning `json:"tuning"`
 
 	// PromptSnapshot is the ONE composed prompt (constitution included); PromptInputHash
@@ -82,6 +87,7 @@ type RunInput struct {
 	Active   *bool         `json:"active,omitempty"`
 	Targets  []Target      `json:"targets,omitempty"`
 	DueAt    *time.Time    `json:"dueAt,omitempty"`
+	Autonomy model.AutonomyLevel `json:"autonomy,omitempty"`
 	Tuning   *Tuning       `json:"tuning,omitempty"`
 }
 

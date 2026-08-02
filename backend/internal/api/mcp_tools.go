@@ -890,6 +890,8 @@ var mcpUntooledRoutes = []MCPException{
 	{Subject: "GET /api/repos/{id}/pty", Reason: "Bidirectional terminal stream (WebSocket)."},
 	{Subject: "GET /api/events", Reason: "The one live-update stream (server-sent events)."},
 	{Subject: "POST /api/mcp", Reason: "The MCP endpoint itself — a tool for it would be a loop."},
+	{Subject: "GET /api/mercury/runs/questions", Reason: "The Blocked surface is a human-decision list; a run's open question already surfaces as its execution's block reason, so the agent tools show it there."},
+	{Subject: "POST /api/mercury/runs/questions/answer", Reason: "Answering a run's blocking question is the user's decision by definition — an agent answering its own question would defeat the whole mechanism."},
 	{Subject: "/", Reason: "Delivery of the web surface."},
 }
 

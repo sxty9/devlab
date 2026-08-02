@@ -292,6 +292,81 @@ func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome
 	return out, nil
 }
 
+// ── fake questions ───────────────────────────────────────────────────────────────────────
+
+// fakeQuestions is the in-memory blocking-question pool the motor holds and resumes against.
+type fakeQuestions struct {
+	mu      sync.Mutex
+	items   []runs.Question
+	raised  []runs.Question
+	resolve []string
+}
+
+func (q *fakeQuestions) OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.items {
+		it := q.items[i]
+		if it.Open() && it.Repo == repo && it.ExecutionID != exceptExecutionID {
+			return &it, nil
+		}
+	}
+	return nil, nil
+}
+
+func (q *fakeQuestions) AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.items {
+		it := q.items[i]
+		if it.Answered() && it.ExecutionID == executionID && it.Repo == repo {
+			return &it, nil
+		}
+	}
+	return nil, nil
+}
+
+func (q *fakeQuestions) Raise(ctx context.Context, in runs.Question) (runs.Question, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if in.ID == "" {
+		in.ID = fmt.Sprintf("qst_%d", len(q.items)+1)
+	}
+	if in.AskedAt.IsZero() {
+		in.AskedAt = time.Now().UTC()
+	}
+	q.items = append(q.items, in)
+	q.raised = append(q.raised, in)
+	return in, nil
+}
+
+func (q *fakeQuestions) Resolve(ctx context.Context, id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.resolve = append(q.resolve, id)
+	for i := range q.items {
+		if q.items[i].ID == id {
+			now := time.Now().UTC()
+			q.items[i].Resolved = true
+			q.items[i].ResolvedAt = &now
+		}
+	}
+	return nil
+}
+
+// answer marks a stored question answered (test helper for the resume path).
+func (q *fakeQuestions) answer(id, answer string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.items {
+		if q.items[i].ID == id {
+			now := time.Now().UTC()
+			q.items[i].Answer = answer
+			q.items[i].AnsweredAt = &now
+		}
+	}
+}
+
 // ── fake Deps ────────────────────────────────────────────────────────────────────────────
 
 type agentCall struct {
@@ -307,9 +382,10 @@ type pauseCall struct {
 type fakeDeps struct {
 	mu       sync.Mutex
 	benches  map[string]*fakeBench
-	gh       *fakeGH
-	deliver  *fakeDeliver
-	deploy   *fakeDeploy
+	gh        *fakeGH
+	deliver   *fakeDeliver
+	deploy    *fakeDeploy
+	questions *fakeQuestions
 	agentFn  func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
 	attsFn   func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
 	findings map[string]preflight.Finding
@@ -338,10 +414,11 @@ type scopeRecord struct {
 func newFakeDeps(repos ...string) *fakeDeps {
 	d := &fakeDeps{
 		benches:  map[string]*fakeBench{},
-		gh:       &fakeGH{},
-		deliver:  &fakeDeliver{},
-		deploy:   &fakeDeploy{},
-		findings: map[string]preflight.Finding{},
+		gh:        &fakeGH{},
+		deliver:   &fakeDeliver{},
+		deploy:    &fakeDeploy{},
+		questions: &fakeQuestions{},
+		findings:  map[string]preflight.Finding{},
 	}
 	for _, r := range repos {
 		b := newFakeBench()
@@ -375,9 +452,10 @@ func (d *fakeDeps) StageAttachments(ctx context.Context, repo string, atts []run
 	}
 	return "", func() error { return nil }, nil
 }
-func (d *fakeDeps) GitHub() GitHubOps   { return d.gh }
-func (d *fakeDeps) Deliver() DeliverOps { return d.deliver }
-func (d *fakeDeps) Deploy() DeployOps   { return d.deploy }
+func (d *fakeDeps) GitHub() GitHubOps       { return d.gh }
+func (d *fakeDeps) Deliver() DeliverOps     { return d.deliver }
+func (d *fakeDeps) Deploy() DeployOps       { return d.deploy }
+func (d *fakeDeps) Questions() QuestionOps  { return d.questions }
 func (d *fakeDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	if d.findErr != nil {
 		return preflight.Finding{State: model.TaskUnknown}, d.findErr

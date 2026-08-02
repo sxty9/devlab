@@ -286,6 +286,8 @@ type fixtureDeps struct {
 	findings map[string]preflight.Finding
 	// aigentic is the fixture AI service the API layer proxies to.
 	aigentic *httptest.Server
+	// questions is the in-memory Blocked surface the motor raises and resumes against.
+	questions []runs.Question
 }
 
 // fixturePR is one pull request on the fixture GitHub.
@@ -506,9 +508,10 @@ func (d *fixtureDeps) StageAttachments(_ context.Context, _ string, atts []runs.
 	return "attachments: " + strings.Join(names, ", "), func() error { return nil }, nil
 }
 
-func (d *fixtureDeps) GitHub() executor.GitHubOps   { return fixtureRepoOps{d: d} }
-func (d *fixtureDeps) Deliver() executor.DeliverOps { return fixtureDeliver{d: d} }
-func (d *fixtureDeps) Deploy() executor.DeployOps   { return fixtureDeploy{d: d} }
+func (d *fixtureDeps) GitHub() executor.GitHubOps      { return fixtureRepoOps{d: d} }
+func (d *fixtureDeps) Deliver() executor.DeliverOps    { return fixtureDeliver{d: d} }
+func (d *fixtureDeps) Deploy() executor.DeployOps      { return fixtureDeploy{d: d} }
+func (d *fixtureDeps) Questions() executor.QuestionOps { return fixtureQuestions{d: d} }
 
 func (d *fixtureDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	d.mu.Lock()
@@ -1053,6 +1056,59 @@ func (f fixtureDeliver) RecordFailedDelivery(_ context.Context, in executor.Deli
 		Repo: in.Repo, Branch: in.Branch,
 		FromCommit: in.FromCommit, ToCommit: in.ToCommit, Reason: in.Reason,
 	})
+}
+
+// fixtureQuestions is the motor's QuestionOps over the fixture's in-memory Blocked surface.
+type fixtureQuestions struct{ d *fixtureDeps }
+
+func (f fixtureQuestions) OpenForRepo(_ context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+	f.d.mu.Lock()
+	defer f.d.mu.Unlock()
+	for i := range f.d.questions {
+		q := f.d.questions[i]
+		if q.Open() && q.Repo == repo && q.ExecutionID != exceptExecutionID {
+			return &q, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f fixtureQuestions) AnsweredForExec(_ context.Context, executionID, repo string) (*runs.Question, error) {
+	f.d.mu.Lock()
+	defer f.d.mu.Unlock()
+	for i := range f.d.questions {
+		q := f.d.questions[i]
+		if q.Answered() && q.ExecutionID == executionID && q.Repo == repo {
+			return &q, nil
+		}
+	}
+	return nil, nil
+}
+
+func (f fixtureQuestions) Raise(_ context.Context, q runs.Question) (runs.Question, error) {
+	f.d.mu.Lock()
+	defer f.d.mu.Unlock()
+	if q.ID == "" {
+		q.ID = runs.NewQuestionID()
+	}
+	if q.AskedAt.IsZero() {
+		q.AskedAt = time.Now().UTC()
+	}
+	f.d.questions = append(f.d.questions, q)
+	return q, nil
+}
+
+func (f fixtureQuestions) Resolve(_ context.Context, id string) error {
+	f.d.mu.Lock()
+	defer f.d.mu.Unlock()
+	for i := range f.d.questions {
+		if f.d.questions[i].ID == id {
+			now := time.Now().UTC()
+			f.d.questions[i].Resolved = true
+			f.d.questions[i].ResolvedAt = &now
+		}
+	}
+	return nil
 }
 
 // ── the deploy seam: the host edge (root), the repository read for real ───────────────────────
