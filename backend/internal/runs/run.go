@@ -60,6 +60,11 @@ type Run struct {
 	Targets []Target   `json:"targets,omitempty"`
 	DueAt   *time.Time `json:"dueAt,omitempty"`
 
+	// Autonomy fixes HOW SELF-RELIANT the run works — when it stops to ask instead of deciding for
+	// itself (model.AutonomyLevel). Empty RESOLVES to Autonomous, so an existing run keeps today's
+	// never-ask behavior.
+	Autonomy model.AutonomyLevel `json:"autonomy,omitempty"`
+
 	Tuning Tuning `json:"tuning"`
 
 	// PromptSnapshot is the ONE composed prompt (constitution included); PromptInputHash
@@ -74,15 +79,16 @@ type Run struct {
 // RunInput is the create/update request shape (the ONE parse target of the runs handler and the
 // run MCP tools).
 type RunInput struct {
-	Kind     model.RunKind `json:"kind,omitempty"`
-	Title    string        `json:"title"`
-	Task     string        `json:"task,omitempty"`
-	AxiomIDs []string      `json:"axiomIds,omitempty"`
-	Schedule *ScheduleSpec `json:"schedule,omitempty"`
-	Active   *bool         `json:"active,omitempty"`
-	Targets  []Target      `json:"targets,omitempty"`
-	DueAt    *time.Time    `json:"dueAt,omitempty"`
-	Tuning   *Tuning       `json:"tuning,omitempty"`
+	Kind     model.RunKind       `json:"kind,omitempty"`
+	Title    string              `json:"title"`
+	Task     string              `json:"task,omitempty"`
+	AxiomIDs []string            `json:"axiomIds,omitempty"`
+	Schedule *ScheduleSpec       `json:"schedule,omitempty"`
+	Active   *bool               `json:"active,omitempty"`
+	Targets  []Target            `json:"targets,omitempty"`
+	DueAt    *time.Time          `json:"dueAt,omitempty"`
+	Autonomy model.AutonomyLevel `json:"autonomy,omitempty"`
+	Tuning   *Tuning             `json:"tuning,omitempty"`
 }
 
 // AttachmentRef is metadata for one media file attached to a run. The bytes live in the passive

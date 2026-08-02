@@ -59,6 +59,131 @@ func heldOnFailedTip(rc *RepoCtx, tip *runs.Delivery) error {
 	}}
 }
 
+// heldOnOpenQuestion holds an order whose repository carries another order's unanswered question. It
+// is the SAME deliberate wait as a failed tip, reusing the honest-blockade surfacing (K-5): the
+// order sits blocked with a named reason and stays in the open ToDo list until the question is
+// answered — no new work is branched past a decision the user has not made.
+func heldOnOpenQuestion(rc *RepoCtx, q *runs.Question) error {
+	now := rc.Deps.Now().UTC()
+	reason := fmt.Sprintf(
+		"held before branching: %s has an open question from run %q awaiting the user's answer — %q. "+
+			"No new order is branched past an unanswered question. Answer it in the Blocked tab, then this order continues.",
+		rc.Repo, nonEmpty(q.RunTitle, q.RunID), firstLine(q.Question))
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: reason, Class: "held-on-open-question", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
+// raiseQuestion is the halt at the top of the stack when THIS run asks a question. It preserves the
+// work already finished (commit loose + publish, K-1), records the question on the Blocked surface
+// (which delivers it to the user), persists the continuation so the answer resumes this exact spot,
+// and returns the honest block. It deliberately mints NO delivery id: the repo is held by the open
+// question, not by a "Lieferung gescheitert" mark, so exactly one hold stands, never two.
+func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question, recommendation, report string) error {
+	// Keep what the agent already finished before it stopped to ask.
+	if dirty, derr := wb.HasUncommitted(ctx); derr == nil && dirty {
+		if _, cerr := wb.CommitAll(ctx, "mercury-run: "+rc.Run.Title+" (work in progress — awaiting an answer)"); cerr != nil {
+			rc.logf("could not commit work in progress before asking (it stays in the working tree): %s", firstLine(cerr.Error()))
+		}
+	}
+	_ = wb.Publish(ctx)
+
+	q := runs.Question{
+		RunID:          rc.Run.ID,
+		RunTitle:       rc.Run.Title,
+		Kind:           rc.Run.Kind,
+		ExecutionID:    rc.Doc.ID,
+		Repo:           rc.Repo,
+		QKind:          runs.QuestionDecision,
+		Autonomy:       rc.Run.Autonomy.Resolve(),
+		Question:       question,
+		Recommendation: recommendation,
+		Progress:       clip(report),
+		AskedBy:        model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+	}
+	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
+		// A question that could not be recorded must NOT vanish into a silent guess: fail the stage
+		// with the named reason so the repo blocks and the operator sees why.
+		return fmt.Errorf("could not record the run's question (the run does not guess past it): %w", err)
+	}
+	// Resume continues the SAME agent conversation at implement (session.Resume), so persist the
+	// continuation point; the block moves the execution to "blocked" and the repo to RepoBlocked.
+	rc.Sink.Continuation(model.ContinuationView{Repo: rc.Repo, Stage: model.StageImplement})
+	rc.logf("asked the user a question and stopped — the repository is blocked until it is answered: %s", firstLine(question))
+	now := rc.Deps.Now().UTC()
+	reason := fmt.Sprintf("waiting for your answer: %s", firstLine(question))
+	if recommendation != "" {
+		reason += " (recommendation: " + firstLine(recommendation) + ")"
+	}
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: reason, Class: "awaiting-answer", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
+// raiseWrapperQuestion is THE FREED HANDLE (point 5): the self delivery refused because the root
+// wrapper scripts drifted, so the run asks the user to renew them and blocks. It carries the exact
+// difference to the installed scripts so the user sees precisely what would change, and it mints no
+// delivery id (the repo is held by the open question, not by a failed delivery).
+//
+// SAFETY: this raises a QUESTION and blocks — it grants NOTHING. The chain never writes the wrapper
+// scripts (they are its own sudo allowlist). The user renews them with their own sudo via the named
+// one-line script, and on resume the guard re-measures the ACTUAL installed scripts by content: the
+// install proceeds only when they genuinely match, never because a question was approved. So an
+// approval a run could somehow forge still installs nothing — only a real root renewal does.
+func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
+	// A prior answer that did not actually renew the scripts is stale — consume it so the surface
+	// shows the ONE current question, not a settled-but-unfixed one.
+	rc.consumeWrapperQuestion(ctx)
+	q := runs.Question{
+		RunID: rc.Run.ID, RunTitle: rc.Run.Title, Kind: rc.Run.Kind,
+		ExecutionID: rc.Doc.ID, Repo: rc.Repo,
+		QKind: runs.QuestionWrapperRenewal, Autonomy: rc.Run.Autonomy.Resolve(),
+		Question: "Renew the root wrapper scripts under /usr/local/sbin so they match this delivery? " +
+			"They no longer match the repository, so the daemon cannot be installed until they are renewed.",
+		Recommendation: "These scripts run as root and are the runner's own permission allowlist — the chain " +
+			"never writes them. Run the one-line script named in the difference below with sudo, then approve. " +
+			"The run re-checks that the installed scripts actually match before it installs anything; your " +
+			"approval alone never writes them.",
+		Detail:  drift,
+		AskedBy: model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+	}
+	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
+		return fmt.Errorf("%w (the wrapper-renewal question could not be recorded: %v)", ErrWrappersStale, err)
+	}
+	rc.logf("root wrappers drifted — asked the user to renew them (explicit approval required); nothing was installed")
+	now := rc.Deps.Now().UTC()
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin — run the " +
+			"named one-line script with sudo, then approve; the run re-verifies the scripts match before it installs",
+		Class: "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
+// consumeWrapperQuestion marks this execution's answered wrapper-renewal question consumed, so it
+// leaves the Blocked surface once the renewal has actually taken effect (best-effort).
+func (rc *RepoCtx) consumeWrapperQuestion(ctx context.Context) {
+	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
+	if err == nil && q != nil && q.QKind == runs.QuestionWrapperRenewal {
+		_ = rc.Deps.Questions().Resolve(ctx, q.ID)
+	}
+}
+
+// answerContinuation frames the user's answer as the next turn of the run's own agent conversation.
+// The agent already holds the full context (the conversation is resumed), so this is only the answer
+// plus the reminder that the same ask policy still applies — a further genuine fork may ask again.
+func answerContinuation(q runs.Question) string {
+	var b strings.Builder
+	b.WriteString("The user has answered the question you raised.\n\n")
+	b.WriteString("Your question was:\n")
+	b.WriteString(q.Question)
+	b.WriteString("\n\nThe user's answer:\n")
+	b.WriteString(q.Answer)
+	b.WriteString("\n\nContinue the task from where you stopped, applying this answer. Do not start over. " +
+		"If you reach another genuine decision you may ask again with the same question block; otherwise " +
+		"finish and commit your work.")
+	return b.String()
+}
+
 // ── preflight ────────────────────────────────────────────────────────────────────────────
 //
 // Effect: none (observation; the B-4 admission gate already ran BEFORE the document existed —
@@ -129,6 +254,14 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		return heldOnFailedTip(rc, tip)
 	}
 
+	// An open question is a tip whose state is not settled — it holds the repository exactly like a
+	// failed delivery. BEFORE this order branches, a still-open question raised by ANOTHER order holds
+	// it: no new work is stacked past a decision the user has not made yet. The order's own question
+	// (same execution id) never holds it — that is the resume path, which feeds the answer below.
+	if q, qerr := deps.Questions().OpenForRepo(ctx, rc.Repo, rc.Doc.ID); qerr == nil && q != nil {
+		return heldOnOpenQuestion(rc, q)
+	}
+
 	// One branch per TASK, named after the run, in every repository it targets. The name records
 	// the owner, so what lies on the branch can never again be mistaken for somebody else's work.
 	taskBranch := runs.TaskBranch(rc.Target.Create, rc.Run.Title, rc.Run.ID)
@@ -190,7 +323,17 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 
 	// The examined stand of THIS repository (read per repo, never folded into the shared snapshot):
 	// without it every prompt falls back to "never examined ⇒ examine everything".
-	prompt := AssemblePrompt(rc.Run.PromptSnapshot, rc.Finding, deps.AxiomScope(ctx, rc.Repo, rc.Run), manifest)
+	prompt := AssemblePrompt(rc.Run.PromptSnapshot, rc.Run.Autonomy, rc.Finding, deps.AxiomScope(ctx, rc.Repo, rc.Run), manifest)
+	// A resume that carries the user's answer to this run's own question continues the SAME agent
+	// conversation with that answer as its next turn — not the whole prompt again — so the run picks
+	// up exactly where it stopped. The question is marked consumed once the agent has taken it.
+	if resumingImplement {
+		if q, aerr := deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo); aerr == nil && q != nil && q.QKind == runs.QuestionDecision {
+			prompt = answerContinuation(*q)
+			rc.answeredQuestionID = q.ID
+			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))
+		}
+	}
 	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
 	if err != nil {
 		return fmt.Errorf("start agent: %w", err)
@@ -251,6 +394,25 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		_ = wb.Publish(rc.parent)
 		rc.failLog = out.TranscriptTail
 		return fmt.Errorf("agent reported an error: %s", firstLine(out.ResultText))
+	}
+
+	// The answer this resume carried has now been taken by the agent — mark it consumed so a later
+	// resume does not feed it a second time.
+	if rc.answeredQuestionID != "" {
+		if err := deps.Questions().Resolve(ctx, rc.answeredQuestionID); err != nil {
+			rc.logf("could not mark the answered question consumed (a later resume may re-ask): %s", firstLine(err.Error()))
+		}
+		rc.answeredQuestionID = ""
+	}
+
+	// A RÜCKFRAGE IS A BLOCKER. When the run — at a level that may ask — ends its message with the
+	// question block, it stops here: the work it already finished is committed and published (nothing
+	// is lost, K-1), the question is recorded on the Blocked surface and delivered to the user, and
+	// the repository blocks on an open question until the answer resumes THIS run. It does NOT guess
+	// and it does NOT shrink the task. An autonomous run may not ask, so its block (were it to write
+	// one anyway) is ignored and the run proceeds.
+	if q, rec, asks := parseAgentQuestion(out.ResultText); asks && rc.Run.Autonomy.MayAsk() {
+		return rc.raiseQuestion(ctx, wb, q, rec, out.ResultText)
 	}
 
 	// The agent usually commits its own work; whatever is loose is committed now — judging by
@@ -439,6 +601,15 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 			rc.logf("already delivered and running: %s", firstLine(err.Error()))
 			return nil
 		}
+		// THE FREED HANDLE: the self delivery refused because the root wrapper scripts drifted. The
+		// chain never writes those scripts — they are the runner's own sudo allowlist, and writing them
+		// would be a self-escalation. Instead the stage asks the user to renew them (with the exact
+		// difference) and blocks until they do; the guard that raised this refusal re-measures the
+		// actual scripts on resume, so nothing installs until they genuinely match — the approval alone
+		// never writes them and never bypasses the content check.
+		if errors.Is(err, ErrWrappersStale) {
+			return rc.raiseWrapperQuestion(ctx, out.WrapperDrift)
+		}
 		// Both halves are named even when the stage fails: a UI half that could not be built in
 		// (unconfigured/failed) still leaves the program installed — the stage fails BENANNT, but the
 		// program's own result is not swallowed by the interface's failure.
@@ -448,6 +619,10 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 		}
 		return err // named failure, exactly one attempt — e.g. "delivery not yet set up" (K-4)
 	}
+	// The self delivery succeeded: if a wrapper-renewal question led here, the user renewed the
+	// scripts and the guard just confirmed the match — the question has done its job and leaves the
+	// Blocked surface.
+	rc.consumeWrapperQuestion(ctx)
 	rc.deliveredCommit = rc.head
 	rc.logf("program: installed and running on port %d — delivered state %s@%s", out.Port, rc.branchName(), short(rc.head))
 	if out.Detail != "" {

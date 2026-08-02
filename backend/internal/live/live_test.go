@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-// TestTopicsClosedSet pins the EXACTLY EIGHT topics (REQ-034): the set is closed, distinct,
+// TestTopicsClosedSet pins the EXACTLY NINE topics (REQ-034): the set is closed, distinct,
 // and matches the frontend vocabulary verbatim.
 func TestTopicsClosedSet(t *testing.T) {
-	want := []Topic{"axioms", "runs", "active", "progress", "deliveries", "notices", "slots", "restart"}
+	want := []Topic{"axioms", "runs", "active", "progress", "deliveries", "notices", "slots", "restart", "questions"}
 	got := Topics()
-	if len(got) != 8 {
-		t.Fatalf("Topics() has %d entries, want exactly 8", len(got))
+	if len(got) != 9 {
+		t.Fatalf("Topics() has %d entries, want exactly 9", len(got))
 	}
 	seen := map[Topic]bool{}
 	for i, tp := range got {

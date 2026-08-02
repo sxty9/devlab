@@ -39,6 +39,7 @@ import {
 } from './logic';
 import type { StartTarget } from '../exec/StartDialog';
 import type {
+  AutonomyLevel,
   Repo,
   Run,
   RunAttachment,
@@ -48,6 +49,14 @@ import type {
   RunSchedule,
   RunTuning,
 } from '@/types';
+
+// The three autonomy levels, ordered from "asks the most" to "asks never". The names carry their
+// meaning (Intuitiv by Design), so the picker needs no help text beside it.
+const AUTONOMY_LEVELS: { value: AutonomyLevel; label: string }[] = [
+  { value: 'collaborative', label: 'Collaborative' },
+  { value: 'balanced', label: 'Balanced' },
+  { value: 'autonomous', label: 'Autonomous' },
+];
 
 const labelClass = 'mb-1.5 text-caption font-semibold uppercase tracking-wide text-text-tertiary';
 const inputClass =
@@ -83,6 +92,9 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
 
   const [title, setTitle] = useState(base?.title ?? '');
   const [tuning, setTuning] = useState<RunTuning>(base?.tuning ?? {});
+  // How self-reliant the run works. A new run defaults to 'balanced' — it asks only at a genuine
+  // architecture or design fork (the Klärungspflicht), never at routine choices.
+  const [autonomy, setAutonomy] = useState<AutonomyLevel>(base?.autonomy ?? 'balanced');
   const [busy, setBusy] = useState(false);
 
   // auto
@@ -160,7 +172,7 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
     }
     setBusy(true);
     const body: RunInput = isTodo
-      ? { kind, title: title.trim(), task: task.trim(), targets: toRunTargets(rows), dueAt: dueIso, tuning }
+      ? { kind, title: title.trim(), task: task.trim(), targets: toRunTargets(rows), dueAt: dueIso, autonomy, tuning }
       : {
           kind,
           title: title.trim(),
@@ -170,6 +182,7 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
               ? { kind: 'weekly', timeOfDay: schedule.timeOfDay, weekdays: [...(schedule.weekdays ?? [])].sort((a, b) => a - b) }
               : { kind: 'daily', timeOfDay: schedule.timeOfDay },
           axiomIds,
+          autonomy,
           tuning,
         };
     try {
@@ -380,6 +393,16 @@ export function TaskForm({ kind, base, repos = [], coverage, onCancel, onSaved, 
           </div>
         </>
       )}
+
+      <div>
+        <div className={labelClass}>Autonomy</div>
+        <Segmented<AutonomyLevel>
+          className="w-fit"
+          value={autonomy}
+          options={AUTONOMY_LEVELS.map((a) => ({ value: a.value, label: a.label }))}
+          onChange={setAutonomy}
+        />
+      </div>
 
       <RunTuningFields value={tuning} onChange={setTuning} />
 

@@ -321,6 +321,9 @@ func (d *ChainDeps) Deliver() executor.DeliverOps { return chainDeliver{d: d} }
 // Deploy is the delivery-to-host machinery (S11).
 func (d *ChainDeps) Deploy() executor.DeployOps { return chainDeploy{d: d} }
 
+// Questions is the blocking-question slice (the Blocked surface).
+func (d *ChainDeps) Questions() executor.QuestionOps { return chainQuestions{d: d} }
+
 // Preflight observes one repo for one run — the same derivation the admission gate uses.
 func (d *ChainDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	return preflight.Derive(ctx, d, repo, run)
@@ -789,6 +792,52 @@ func (c chainDeliver) EnsureProtection(ctx context.Context, repo string) error {
 	return nil
 }
 
+// ── the question shim ────────────────────────────────────────────────────────────────────
+
+type chainQuestions struct{ d *ChainDeps }
+
+// OpenForRepo resolves the repo's full name (the pool stores questions under the target as the run
+// named it, but a full name may reach it too) and reports the open question holding it, if any.
+func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return nil, nil
+	}
+	return c.d.s.runQuestions.OpenForRepo(repo, exceptExecutionID)
+}
+
+func (c chainQuestions) AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return nil, nil
+	}
+	return c.d.s.runQuestions.AnsweredForExec(executionID, repo)
+}
+
+// Raise records the question and ticks the Blocked surface. Outward delivery to the user rides the
+// question pool's on-new hook (StartQuestionDelivery), which records a disturbance notice — the SAME
+// path the sister order built for disturbances, never a second one.
+func (c chainQuestions) Raise(ctx context.Context, q runs.Question) (runs.Question, error) {
+	if c.d.s.runQuestions == nil {
+		return runs.Question{}, errors.New("the question pool is not available")
+	}
+	saved, err := c.d.s.runQuestions.Raise(q)
+	if err != nil {
+		return runs.Question{}, err
+	}
+	c.d.s.publish(live.TopicQuestions)
+	return saved, nil
+}
+
+func (c chainQuestions) Resolve(ctx context.Context, id string) error {
+	if c.d.s.runQuestions == nil {
+		return nil
+	}
+	if err := c.d.s.runQuestions.Resolve(id); err != nil {
+		return err
+	}
+	c.d.s.publish(live.TopicQuestions)
+	return nil
+}
+
 // ── the deploy shim ──────────────────────────────────────────────────────────────────────
 
 type chainDeploy struct{ d *ChainDeps }
@@ -840,7 +889,13 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 		// A drift is a NAMED failure that installs nothing (no half state, K-4); it names each stale
 		// wrapper and the one line a human runs to make them current, then resumes the execution.
 		if err := deploy.GuardWrappersCurrent(wt); err != nil {
-			return executor.DeployOutcome{Self: true}, err
+			// The refusal is real — nothing is installed. Instead of failing silently every night, the
+			// deliver-dev stage turns it into a wrapper-renewal question the user must approve. We name
+			// the refusal with the motor's sentinel and carry the exact difference; the guard above STILL
+			// gates the install, so a resume proceeds only once the scripts genuinely match again — the
+			// approval never writes them and never bypasses this content check.
+			return executor.DeployOutcome{Self: true, WrapperDrift: err.Error()},
+				fmt.Errorf("%w: %s", executor.ErrWrappersStale, err.Error())
 		}
 		if err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact); err != nil {
 			return executor.DeployOutcome{Self: true}, err

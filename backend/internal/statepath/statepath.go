@@ -67,6 +67,10 @@ func (p *Paths) PRs() string { return filepath.Join(p.Mercury(), "runs-prs.json"
 // NoticesFile is the notice pool: <root>/mercury/runs-notices.json.
 func (p *Paths) NoticesFile() string { return filepath.Join(p.Mercury(), "runs-notices.json") }
 
+// QuestionsFile is the blocking-question pool: <root>/mercury/runs-questions.json. It holds every
+// open question a run raised (the Blocked surface) plus its answer once given.
+func (p *Paths) QuestionsFile() string { return filepath.Join(p.Mercury(), "runs-questions.json") }
+
 // Settings is the service-settings pool (slot capacity, default time budget, automerge
 // window): <root>/mercury/settings.json.
 func (p *Paths) Settings() string { return filepath.Join(p.Mercury(), "settings.json") }

@@ -106,6 +106,47 @@ const (
 	KindTodo RunKind = "todo"
 )
 
+// AutonomyLevel is HOW SELF-RELIANT an execution works — chosen when a run is defined. It fixes WHEN
+// the run stops and asks the user instead of deciding for itself. The three levels are one ordered
+// axis (from "asks the most" to "asks never"); the names carry their meaning, so no help text stands
+// beside the picker (Intuitiv by Design). An empty value RESOLVES to Autonomous — today's behavior —
+// so a run that names no level keeps working exactly as before.
+type AutonomyLevel string
+
+const (
+	// AutonomyCollaborative stops before EVERY nontrivial decision: the run raises the choice as a
+	// question and blocks its repository until the user answers.
+	AutonomyCollaborative AutonomyLevel = "collaborative"
+	// AutonomyBalanced stops only at a genuine architecture or design fork it cannot settle from the
+	// task, the code, or the constitution (the Klärungspflicht core); routine choices it makes itself.
+	AutonomyBalanced AutonomyLevel = "balanced"
+	// AutonomyAutonomous never stops to ask: it decides everything itself and never blocks on a
+	// question. This is the resolved default of an unset level.
+	AutonomyAutonomous AutonomyLevel = "autonomous"
+)
+
+// Resolve maps an empty level onto the default (Autonomous) and leaves a named level unchanged, so
+// the resolution lives in ONE place.
+func (a AutonomyLevel) Resolve() AutonomyLevel {
+	if a == "" {
+		return AutonomyAutonomous
+	}
+	return a
+}
+
+// MayAsk reports whether a run at this level is permitted to stop and ask at all — false only for the
+// autonomous level, which decides everything itself.
+func (a AutonomyLevel) MayAsk() bool { return a.Resolve() != AutonomyAutonomous }
+
+// Valid reports whether a is empty (⇒ default) or one of the three named levels.
+func (a AutonomyLevel) Valid() bool {
+	switch a {
+	case "", AutonomyCollaborative, AutonomyBalanced, AutonomyAutonomous:
+		return true
+	}
+	return false
+}
+
 // ── Authorship (REQ-041): a label, never a barrier ───────────────────────────────────────
 
 // Actor names who acted: a person, the autonomous system, or the system on a person's behalf.

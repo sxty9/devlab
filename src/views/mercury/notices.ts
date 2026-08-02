@@ -49,6 +49,8 @@ const KINDS: Record<string, { label: string; tone: NoticeTone }> = {
   // The automatic axiom→run assignment.
   assigned: { label: 'Axioms assigned', tone: 'note' },
   failed: { label: 'Assignment failed', tone: 'alarm' },
+  // A run stopped and asked the user a question — it waits, blocked, until it is answered.
+  question: { label: 'Question', tone: 'alarm' },
 };
 
 /** Turns any kind into a readable label: "some-new-kind" → "Some new kind". */

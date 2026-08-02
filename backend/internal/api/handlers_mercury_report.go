@@ -37,6 +37,10 @@ func (s *Server) StartReporter(ctx context.Context) {
 	// "speak up about itself" side of the service; it installs the pool's on-new hook and needs no
 	// context of its own (each delivery carries its own deadline).
 	s.StartNoticeDelivery()
+	// A raised question reaches the user the SAME way a disturbance does — by recording a disturbance
+	// notice, which the notice hook above then delivers. Installed AFTER StartNoticeDelivery so the
+	// notice it records finds the delivery hook already armed.
+	s.StartQuestionDelivery()
 
 	user := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_USER"))
 	if user == "" {

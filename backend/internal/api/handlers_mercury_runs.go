@@ -251,6 +251,9 @@ func validateRunInput(b *runs.RunInput, cat runs.Catalog, activeNow bool) (int, 
 			return code, msg
 		}
 	}
+	if !b.Autonomy.Valid() {
+		return http.StatusBadRequest, "autonomy must be collaborative, balanced, or autonomous"
+	}
 	if b.Kind == "" {
 		b.Kind = model.KindAuto
 	}
@@ -305,6 +308,7 @@ func applyInput(run *runs.Run, b runs.RunInput) {
 	}
 	run.Targets = b.Targets
 	run.DueAt = b.DueAt
+	run.Autonomy = b.Autonomy
 	if b.Tuning != nil {
 		run.Tuning = *b.Tuning
 	}

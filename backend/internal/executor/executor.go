@@ -153,13 +153,42 @@ type DeployOutcome struct {
 	// UIDetail carries the reason when another service blocks the shared dashboard build.
 	UI       string
 	UIDetail string
+	// WrapperDrift carries the exact difference between the repository's root wrapper scripts and the
+	// installed ones, set ONLY when the self delivery refused because they drifted (ErrWrappersStale).
+	// The stage turns it into the wrapper-renewal question the user must explicitly approve.
+	WrapperDrift string
 }
+
+// ErrWrappersStale is the named refusal of a self delivery whose installed root wrapper scripts under
+// /usr/local/sbin no longer match the repository. The chain NEVER writes those scripts (they are the
+// runner's own sudo allowlist — writing them would be a self-escalation); the deliver-dev stage
+// turns this refusal into a wrapper-renewal question, and it installs only once the scripts actually
+// match again (a content check it re-measures, never the approval flag).
+var ErrWrappersStale = errors.New("delivery incomplete: installed root wrappers are stale")
 
 // DeployOps is the deploy slice (S11): detection and the one dev delivery (build as user,
 // install-only as root, honest running gate — all inside the deploy package).
 type DeployOps interface {
 	Detect(ctx context.Context, repo string) (Detection, error)
 	DeliverDev(ctx context.Context, repo string) (DeployOutcome, error)
+}
+
+// QuestionOps is the blocking-question slice (the Blocked surface). It reuses the SAME halt as a
+// failed delivery tip: an OPEN question holds a repository — the implement stage consults
+// OpenForRepo BEFORE it branches, so no new order is cut past an unanswered question. An ANSWERED
+// question feeds its answer back into the SAME agent conversation, so the run continues where it
+// stopped instead of starting over.
+type QuestionOps interface {
+	// OpenForRepo returns an unanswered question holding this repository, raised by an execution
+	// OTHER than exceptExecutionID (so a run is never held by its own question), or nil.
+	OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error)
+	// AnsweredForExec returns this execution's own answered, not-yet-consumed question for the repo,
+	// whose answer the resumed agent session is fed — nil when none waits.
+	AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error)
+	// Raise records a new open question (the Blocked surface + the disturbance delivery).
+	Raise(ctx context.Context, q runs.Question) (runs.Question, error)
+	// Resolve marks an answered question consumed, so a later resume does not re-inject the answer.
+	Resolve(ctx context.Context, id string) error
 }
 
 // AgentSession names the agent conversation of ONE repository inside ONE execution. Key is the
@@ -182,6 +211,7 @@ type Deps interface {
 	GitHub() GitHubOps
 	Deliver() DeliverOps
 	Deploy() DeployOps
+	Questions() QuestionOps
 	Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error)
 	// AxiomScope names the stand THIS repository was last examined against, per axiom of the run —
 	// the section that makes an execution incremental instead of re-reading whole repositories
@@ -309,6 +339,9 @@ type RepoCtx struct {
 	detectErr       error
 	report          string
 	usage           *usageTotal
+	// answeredQuestionID names this repo's own answered question whose answer was fed to the resumed
+	// agent session; it is marked consumed once the agent has taken it.
+	answeredQuestionID string
 
 	logBuf  []string
 	failLog string // F11: transcript tail shown as the failed stage's log

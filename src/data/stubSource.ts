@@ -96,8 +96,12 @@ export const stubSource: DataSource = {
   async mercuryRunNotices() {
     return { notices: [] };
   },
+  async mercuryRunQuestions() {
+    return { questions: [] };
+  },
   mercuryDismissRunNotice: offline,
   mercuryClearRunNotices: offline,
+  mercuryAnswerRunQuestion: offline,
   mercuryCreateRun: offline,
   mercuryUpdateRun: offline,
   mercuryDeleteRun: offline,

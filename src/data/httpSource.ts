@@ -267,6 +267,12 @@ export const httpSource: DataSource = {
   async mercuryClearRunNotices() {
     await json<void>(await post('/api/mercury/runs/notices/clear', {}));
   },
+  async mercuryRunQuestions() {
+    return json(await request('/api/mercury/runs/questions'));
+  },
+  async mercuryAnswerRunQuestion(id, answer, approve) {
+    return json(await post('/api/mercury/runs/questions/answer', { id, answer, approve }));
+  },
   async mercuryCreateRun(body) {
     return json(await post('/api/mercury/runs', body));
   },

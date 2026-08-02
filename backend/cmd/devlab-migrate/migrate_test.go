@@ -525,7 +525,7 @@ func TestOpenTaskCarriesTheComposedPromptTheAgentReceives(t *testing.T) {
 	if !strings.Contains(withWording.PromptSnapshot, "Keep it small.") {
 		t.Errorf("recomposing with the constitution must fold in the wording:\n%s", withWording.PromptSnapshot)
 	}
-	full := executor.AssemblePrompt(todo.PromptSnapshot, preflight.Finding{State: model.TaskNotImplemented}, "", "")
+	full := executor.AssemblePrompt(todo.PromptSnapshot, model.AutonomyAutonomous, preflight.Finding{State: model.TaskNotImplemented}, "", "")
 	if !strings.Contains(full, "Switch the imports and prove the check passes.") {
 		t.Errorf("the assembled execution prompt names no task:\n%s", full)
 	}
