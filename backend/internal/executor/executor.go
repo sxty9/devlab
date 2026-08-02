@@ -553,7 +553,9 @@ func runRepo(ctx context.Context, rc *RepoCtx) (model.RepoPipeline, error) {
 					sv.Log = joinNonEmpty(rc.takeLog(), "already in the desired state: "+firstLine(err.Error()))
 				} else {
 					sv.State = model.StepFailed
-					sv.Reason = firstLine(err.Error())
+					// Keep the CAUSE, not the head: tool/wrapper failures print the reason LAST, after
+					// their own green log lines — firstLine would surface the success and drop the failure.
+					sv.Reason = failReason(err.Error())
 					sv.Log = rc.takeFailLogOr()
 					failedStage = spec.Name
 				}
@@ -671,6 +673,32 @@ func firstLine(s string) string {
 	const max = 400
 	if len(s) > max {
 		return s[:max] + "…"
+	}
+	return s
+}
+
+// failReason condenses a step-failure message for the one-line StageView.Reason. Unlike firstLine it
+// keeps the CAUSE, not the head: a tool's failure is printed LAST (a wrapper runs its steps, logs each
+// green one, then dies on the one that broke), so the first line is often a SUCCESS log ("install-only
+// deploy … done") while the real reason sits at the end. firstLine surrendered exactly that end —
+// stripping everything after the first newline and, when still too long, keeping the front — so an
+// operator read a truncated success and never the failure. failReason keeps the last non-empty line and,
+// when it must still shorten, keeps the TAIL (leading …), because error causes are at the end of output.
+func failReason(s string) string {
+	s = strings.TrimRight(s, "\r\n \t")
+	if s == "" {
+		return ""
+	}
+	// A single line has its cause where it is; keep it verbatim (firstLine's head-truncation is right
+	// there). Multi-line output is where the cause hides at the end, so surface the last non-empty line.
+	if i := strings.LastIndexByte(s, '\n'); i >= 0 {
+		if last := strings.TrimSpace(s[i+1:]); last != "" {
+			s = "… " + last
+		}
+	}
+	const max = 600
+	if len(s) > max {
+		return "…" + s[len(s)-max:]
 	}
 	return s
 }

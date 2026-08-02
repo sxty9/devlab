@@ -62,8 +62,25 @@ SERVE_T="$(newest "$HOLISTIC_WWW")"
 printf 'dashboard build output : %s  (%s)\n' "$(stamp "$BUILD_T")" "$DIST_DIR"
 printf 'serve root (browser)   : %s  (%s)\n' "$(stamp "$SERVE_T")" "$HOLISTIC_WWW"
 
-if [ "$SERVE_T" -ge "$BUILD_T" ]; then
-  echo "OK — the serve root is at least as fresh as the build output: the browser fetches the new bundle."
-  exit 0
+if [ "$SERVE_T" -lt "$BUILD_T" ]; then
+  die "NOT ARRIVED — the serve root is OLDER than the build output: the dashboard was rebuilt but never delivered, so the browser still serves the old bundle. Re-run the ui-bearing delivery through the chain." 1
 fi
-die "NOT ARRIVED — the serve root is OLDER than the build output: the dashboard was rebuilt but never delivered, so the browser still serves the old bundle. Re-run the ui-bearing delivery through the chain." 1
+
+# A fresh bundle the webserver cannot READ is the same outage from the other side — measured 2026-08-01:
+# the serve root was present and current, yet the webserver (a different account) could not read it and
+# answered 404 over a present page. Freshness alone would report OK. So the reachability of the browser
+# is proven the same way the delivery now proves it: as root, drop to the unprivileged `nobody` (if it
+# can read the start page, any webserver account can); otherwise measure the other-read bit directly.
+INDEX="$HOLISTIC_WWW/index.html"
+[ -f "$INDEX" ] || die "the serve root '$HOLISTIC_WWW' has no index.html — the browser has no start page to fetch (delivery incomplete)" 1
+if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null 2>&1 && getent passwd nobody >/dev/null 2>&1; then
+  runuser -u nobody -- test -r "$INDEX" \
+    || die "NOT READABLE — the start page '$INDEX' is not readable by an unprivileged reader ('nobody'), so the webserver answers 404 over a present page. The serve root's permissions do not match its public role — re-run the delivery, which now sets them by role." 1
+else
+  MODE="$(stat -c %a "$INDEX" 2>/dev/null || echo 0)"
+  [ "$(( 8#${MODE:-0} & 4 ))" = 4 ] \
+    || die "NOT READABLE — the start page '$INDEX' lacks other-read (mode $MODE), so the webserver could not read it and answers 404. Re-run the delivery, which now sets serve-root permissions by role." 1
+fi
+
+echo "OK — the serve root is at least as fresh as the build output AND readable by the webserver's role: the browser fetches the new bundle."
+exit 0
