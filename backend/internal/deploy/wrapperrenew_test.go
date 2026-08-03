@@ -12,6 +12,7 @@ package deploy
 // the standard branch is never what the approval (and thus the install) is pinned to.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -233,6 +234,112 @@ func TestMainWrapperDriftReadsStandardBranch(t *testing.T) {
 	}
 	if string(got.WantContent) != string(merged) {
 		t.Fatalf("WantContent must be the merged content byte-for-byte")
+	}
+}
+
+// WorkingWrapperDrift offers THIS run's own working-branch content — the second renewal source, for
+// when the run itself changed a root script that is not yet merged. It reports the drift against the
+// installed copy and pins the offered checksum to the working-tree copy (not the standard branch).
+func TestWorkingWrapperDriftReadsWorkingBranch(t *testing.T) {
+	wt := t.TempDir()
+
+	// The run changed devlab-exec on its working branch (only the working tree matters here — no commit
+	// or standard branch is needed, which is exactly the case MainWrapperDrift cannot serve).
+	working := []byte("#!/usr/bin/env bash\n# THIS RUN's devlab-exec\n")
+	writeRepoFile(t, wt, "deploy/devlab-exec", working)
+
+	sbin := filepath.Join(t.TempDir(), "sbin")
+	if err := os.MkdirAll(sbin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sbin, "devlab-exec"), []byte("stale installed\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	restore := wrapperInstallDir
+	wrapperInstallDir = sbin
+	t.Cleanup(func() { wrapperInstallDir = restore })
+
+	drifts, err := WorkingWrapperDrift(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *WrapperDrift
+	for i := range drifts {
+		if drifts[i].Name == "devlab-exec" {
+			got = &drifts[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("devlab-exec working-branch drift not reported, got %+v", drifts)
+	}
+	if got.WantSHA != sha256of(working) || string(got.WantContent) != string(working) {
+		t.Fatalf("the offered content must be THIS run's working-tree content; got sha %s want %s", got.WantSHA, sha256of(working))
+	}
+	// The drift carries a SHORT change summary (task point 4) — a human reads it, not the full content.
+	if !strings.Contains(got.Summary, "lines") {
+		t.Fatalf("the drift must summarize the change for the question, got %q", got.Summary)
+	}
+
+	// When the installed copy already matches the working branch, there is no drift to renew.
+	if err := os.WriteFile(filepath.Join(sbin, "devlab-exec"), working, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	drifts, err = WorkingWrapperDrift(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range drifts {
+		if d.Name == "devlab-exec" {
+			t.Fatalf("no drift expected once the installed copy matches the working branch, got %+v", d)
+		}
+	}
+}
+
+// fakeRenewer records whether the root write step was reached at all — a refusal before the write
+// (source no longer matches the approval) must never call it.
+type fakeRenewer struct{ calls []string }
+
+func (f *fakeRenewer) Renew(_ context.Context, name, _, _ string) error {
+	f.calls = append(f.calls, name)
+	return nil
+}
+
+// A working-source approval with a matching checksum reaches the root write step and stages the run's
+// own content; but if the run's branch CHANGES after the approval, the re-read no longer hashes to the
+// approved checksum and RenewApprovedWrapper refuses BEFORE the write — nothing is installed (task
+// point 3, the working-source half of "the branch changed after approval installs nothing").
+func TestRenewApprovedWrapperBindsWorkingSourceToTheApprovedChecksum(t *testing.T) {
+	wt := t.TempDir()
+	grantDir := filepath.Join(t.TempDir(), "grants")
+
+	approved := []byte("#!/usr/bin/env bash\n# approved run content\n")
+	writeRepoFile(t, wt, "deploy/devlab-install", approved)
+	approvedSHA := sha256of(approved)
+
+	// Matching content → the write step is reached and the grant is staged.
+	r := &fakeRenewer{}
+	if err := RenewApprovedWrapper(context.Background(), r, WorkingWrapperContent(wt), grantDir,
+		"devlab-install", approvedSHA, "qst_w1", "operator", "2026-08-04T00:00:00Z"); err != nil {
+		t.Fatalf("a matching working-source approval should reach the write step, got %v", err)
+	}
+	if len(r.calls) != 1 || r.calls[0] != "devlab-install" {
+		t.Fatalf("the root write step should have been called once, got %+v", r.calls)
+	}
+	if _, err := os.Stat(filepath.Join(grantDir, "qst_w1.devlab-install.content")); err != nil {
+		t.Fatalf("the approved content should have been staged for the root tool: %v", err)
+	}
+
+	// The run's branch changes AFTER the approval (a later commit rewrote the script). The re-read now
+	// differs from the approved checksum, so the renewal refuses and never reaches the write step.
+	writeRepoFile(t, wt, "deploy/devlab-install", []byte("#!/usr/bin/env bash\n# changed after approval\n"))
+	r2 := &fakeRenewer{}
+	err := RenewApprovedWrapper(context.Background(), r2, WorkingWrapperContent(wt), grantDir,
+		"devlab-install", approvedSHA, "qst_w2", "operator", "2026-08-04T00:00:00Z")
+	if err == nil || !strings.Contains(err.Error(), "not the approved") {
+		t.Fatalf("a source that changed after the approval must be refused, got %v", err)
+	}
+	if len(r2.calls) != 0 {
+		t.Fatalf("nothing must reach the root write step when the source no longer matches, got %+v", r2.calls)
 	}
 }
 

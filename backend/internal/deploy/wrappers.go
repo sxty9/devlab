@@ -57,11 +57,17 @@ type WrapperDrift struct {
 	Installed string // <sbin>/<name> — what runs today
 	Reason    string // why it drifted ("not installed" | "installed copy differs …")
 
-	// WantSHA and WantContent are set ONLY by MainWrapperDrift: the sha256 (hex) and bytes of the
-	// STANDARD-BRANCH copy of the wrapper — the merged content that a renewal would install. They stay
-	// empty for the working-tree drift probe (CheckWrapperDrift), which only reports a mismatch.
+	// WantSHA and WantContent are set ONLY by the renewal drift probes (MainWrapperDrift /
+	// WorkingWrapperDrift): the sha256 (hex) and bytes of the copy — merged or working-branch — that a
+	// renewal would install. They stay empty for the working-tree drift probe (CheckWrapperDrift), which
+	// only reports a mismatch.
 	WantSHA     string
 	WantContent []byte
+
+	// Summary is a SHORT, human-readable description of what the renewal changes in this file (e.g.
+	// "+12/-3 lines vs the installed script") — the difference summary a human reads to decide without
+	// opening the branch, never the full content. Set by the renewal drift probes.
+	Summary string
 }
 
 // ErrWrappersStale is the named refusal of a self delivery whose installed root wrappers no longer

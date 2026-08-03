@@ -1224,6 +1224,9 @@ func (f fixtureDeploy) DeliverDev(_ context.Context, repo string) (executor.Depl
 func (f fixtureDeploy) MainWrapperDrift(_ context.Context, _ string) ([]runs.WrapperGrant, error) {
 	return nil, nil
 }
+func (f fixtureDeploy) WorkingWrapperDrift(_ context.Context, _ string) ([]runs.WrapperGrant, error) {
+	return nil, nil
+}
 func (f fixtureDeploy) RenewApprovedWrappers(_ context.Context, _ string, _ runs.Question) error {
 	return nil
 }

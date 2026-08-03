@@ -174,37 +174,59 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 }
 
 // raiseWrapperQuestion is THE FREED HANDLE (point 5): the self delivery refused because the root
-// wrapper scripts drifted from the standard branch, so the run asks the user to approve renewing them
-// and blocks. It offers EXACTLY the merged (standard-branch) content, pinned per file to its checksum,
-// and mints no delivery id (the repo is held by the open question, not by a failed delivery).
+// wrapper scripts under /usr/local/sbin are not what the delivered code expects, so the run asks the
+// user to approve renewing them and blocks. It offers EXACTLY the content pinned per file to its
+// checksum, and mints no delivery id (the repo is held by the open question, not by a failed delivery).
 //
-// SAFETY (the delta from the prior order, which built the ask but REFUSED the write): approval now
-// DOES install — but only merged content a run cannot author, and only under an approval a run cannot
-// forge, and the root tool re-verifies both itself. The write is applied on resume by
-// applyApprovedWrapperRenewal → DeployOps.RenewApprovedWrappers → `sudo devlab-install
-// --renew-wrapper` (see backend/internal/deploy/wrapperrenew.go). A forged approval installs nothing:
-// the content must still hash to the standard-branch checksum, and the grant the root tool reads sits
-// in a daemon-owned, run-unwritable place. The `drift` argument is the guard's original refusal text,
-// kept only for the log line; the question's Detail is rebuilt from the standard-branch grant set.
+// TWO SOURCES, ONE QUESTION. The offered content comes from one of two places, tried in order:
+//
+//	MERGED  — the installed scripts drifted from the STANDARD BRANCH (a merged wrapper change never
+//	          reached sbin). The content is merged history a run cannot author; the human confirms it.
+//	WORKING — THIS run itself changed a root script that is not yet merged, and the installed scripts
+//	          match the standard branch, so there is nothing MERGED to offer. Here the source is the
+//	          run's OWN working branch. Without this second source the chain used to halt for good: it
+//	          waited on a merge it itself blocked (measured 03.08.2026, exec_20260803-184101-599031860).
+//
+// Both build the SAME question kind, take the SAME single-use approval, and install through the SAME
+// root write path (applyApprovedWrapperRenewal → DeployOps.RenewApprovedWrappers → `sudo devlab-install
+// --renew-wrapper`); only the source of the bytes and the wording differ. There is no second approval
+// path and no second question kind (task point 2).
+//
+// SAFETY. Approval DOES install, but a forged approval installs nothing: the content must still hash to
+// the approved checksum, and the grant the root tool reads sits in a daemon-owned, run-unwritable
+// place. For the WORKING source the run authored the bytes, so the human — not a merge — is the gate;
+// that is admissible because the same four bindings hold (sha, single-use, run-unwritable approval,
+// re-read-after-approval). They are spelled out on deploy.WorkingWrapperContent. The `drift` argument
+// is the guard's original refusal text, kept only for the log line.
 func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
-	// The renewal offers EXACTLY the standard-branch (merged) content — never the working tree. So the
-	// question is built from the difference between the installed wrappers and the standard branch, and
-	// it pins each file to the merged content's checksum (the approval is for one content, task 1/2).
+	// Prefer the MERGED source: the installed scripts drifted from the standard branch, so the renewal
+	// offers merged content a run cannot author. Each file is pinned to the merged content's checksum.
 	grants, derr := rc.Deps.Deploy().MainWrapperDrift(ctx, rc.Repo)
 	if derr != nil {
 		return fmt.Errorf("%w (could not read the standard-branch wrapper scripts: %v)", ErrWrappersStale, derr)
 	}
+	source := runs.WrapperSourceMerged
+	if len(grants) == 0 {
+		// Nothing MERGED to renew: the installed scripts already match the standard branch, so the
+		// refusal is because THIS run changed a root script that has not merged yet. Offer the run's OWN
+		// working-branch content instead — the human approves this specific content and the delivery
+		// continues, rather than halting for good on a merge the chain itself blocks (task point 1).
+		working, werr := rc.Deps.Deploy().WorkingWrapperDrift(ctx, rc.Repo)
+		if werr != nil {
+			return fmt.Errorf("%w (could not read this run's working-branch wrapper scripts: %v)", ErrWrappersStale, werr)
+		}
+		grants, source = working, runs.WrapperSourceWorking
+	}
 	now := rc.Deps.Now().UTC()
 	if len(grants) == 0 {
-		// The installed wrappers already match the standard branch — there is nothing MERGED to renew.
-		// The delivery is blocked because THIS run changed a wrapper script and that change is not yet
-		// on the standard branch; only merged content is ever installed, so it waits until it merges.
-		// We ask no question the user cannot satisfy.
+		// Neither the standard branch nor the working branch differs from the installed scripts, yet the
+		// delivery refused on stale wrappers — the drift resolved itself between the guard and this
+		// measurement. Nothing to approve; block honestly and let the next attempt re-measure.
 		rc.consumeWrapperQuestion(ctx)
-		rc.logf("this run changed a root wrapper script, but the change is not yet on the standard branch — only merged content is installed; the delivery waits until it merges")
+		rc.logf("the self delivery refused on stale root wrappers, but neither the standard branch nor this run's working branch now differs from the installed scripts — re-measuring on the next attempt")
 		return &faultclass.BlockedError{Backoff: model.Backoff{
-			Reason: "this run changed a root wrapper script under /usr/local/sbin, but that change is not yet on the standard branch — only merged wrapper content is installed, so the delivery waits until it merges",
-			Class:  "awaiting-wrapper-merge", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+			Reason: "the self delivery refused on stale root wrapper scripts, but the drift is no longer measurable — re-checking on the next attempt",
+			Class:  "awaiting-wrapper-recheck", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
 		}}
 	}
 	// A prior answer that did not actually renew the scripts is stale — consume it so the surface
@@ -214,34 +236,76 @@ func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error
 		RunID: rc.Run.ID, RunTitle: rc.Run.Title, Kind: rc.Run.Kind,
 		ExecutionID: rc.Doc.ID, Repo: rc.Repo,
 		QKind: runs.QuestionWrapperRenewal, Autonomy: rc.Run.Autonomy.Resolve(),
-		Question: "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
-			"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed.",
-		Recommendation: "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
-			"version listed below — nothing from this run's working tree, and only the named files with the " +
-			"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing.",
-		Detail:   renderWrapperGrants(grants),
-		Wrappers: grants,
-		AskedBy:  model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+		Question:       wrapperQuestionText(source),
+		Recommendation: wrapperRecommendation(source),
+		Detail:         renderWrapperGrants(grants, source),
+		Wrappers:       grants,
+		WrapperSource:  source,
+		AskedBy:        model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
 	}
 	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
 		return fmt.Errorf("%w (the wrapper-renewal question could not be recorded: %v)", ErrWrappersStale, err)
 	}
-	rc.logf("root wrappers differ from the standard branch — asked the user to approve renewing them to the merged version; nothing was installed (guard: %s)", firstLine(drift))
+	rc.logf("root wrappers differ from %s — asked the user to approve renewing them; nothing was installed (guard: %s)", wrapperSourceLabel(source), firstLine(drift))
 	return &faultclass.BlockedError{Backoff: model.Backoff{
-		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin to their standard-branch version — approve on the Blocked surface; the merged content is then installed and verified",
+		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin — approve on the Blocked surface; the approved content is then installed and verified",
 		Class:  "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
 	}}
 }
 
-// renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
-// would be renewed and the checksum of the standard-branch content it would be renewed to.
-func renderWrapperGrants(grants []runs.WrapperGrant) string {
-	var b strings.Builder
-	b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
-	for _, g := range grants {
-		fmt.Fprintf(&b, "  - %s → sha256 %s\n", g.Name, g.SHA)
+// wrapperSourceLabel names the renewal source in a log line and question text.
+func wrapperSourceLabel(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "this run's own working branch (the run changed a root script)"
 	}
-	b.WriteString("Only these files, with these exact checksums, are installed; the approval is single-use.")
+	return "the standard branch (the installed scripts drifted from the merged code)"
+}
+
+// wrapperQuestionText is the wording the user reads. It names WHY the scripts must be renewed — a merge
+// that never reached sbin, or a change this very run made — so a human can decide without opening the
+// branch (task point 4).
+func wrapperQuestionText(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "Renew the root wrapper scripts under /usr/local/sbin to THIS run's version? " +
+			"This run itself changed one of the root scripts, and the change is not yet merged, so the daemon " +
+			"cannot be installed until you approve installing the run's own version of the changed scripts."
+	}
+	return "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
+		"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed."
+}
+
+// wrapperRecommendation is the run's own proposed answer, stating what approval installs and why the
+// approval stays safe (single-use, content-pinned) for the source at hand.
+func wrapperRecommendation(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "These scripts run as root, so this decision is always yours — it is never answered automatically, " +
+			"not even at the autonomous level. Approving installs EXACTLY this run's version of the named files with " +
+			"the named checksums below — nothing else. The approval is single-use: if this run's branch changes " +
+			"afterwards, it installs nothing."
+	}
+	return "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
+		"version listed below — nothing from this run's working tree, and only the named files with the " +
+		"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing."
+}
+
+// renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
+// would be renewed and the checksum of the content it would be renewed to, naming the source so it is
+// unambiguous whether the standard branch or this run's own change is being installed (task point 4).
+func renderWrapperGrants(grants []runs.WrapperGrant, source string) string {
+	var b strings.Builder
+	if source == runs.WrapperSourceWorking {
+		b.WriteString("These root wrapper scripts will be renewed to THIS run's own (not-yet-merged) version:\n")
+	} else {
+		b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
+	}
+	for _, g := range grants {
+		if g.Summary != "" {
+			fmt.Fprintf(&b, "  - %s — %s (sha256 %s)\n", g.Name, g.Summary, g.SHA)
+		} else {
+			fmt.Fprintf(&b, "  - %s → sha256 %s\n", g.Name, g.SHA)
+		}
+	}
+	b.WriteString("These scripts run as root. Only these files, with these exact checksums, are installed; the approval is single-use.")
 	return b.String()
 }
 

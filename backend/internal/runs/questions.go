@@ -35,6 +35,21 @@ const (
 	QuestionWrapperRenewal = "wrapper-renewal"
 )
 
+// Wrapper renewal SOURCES — where the approved content is re-read from at install time. Both flow
+// through the SAME question kind, the SAME approval and the SAME root write path; only the source of
+// the offered bytes differs, so a run that changes a root script asks the very question a drifted
+// install already did, never a second kind of question (task point 2).
+const (
+	// WrapperSourceMerged renews from the standard branch — the installed scripts drifted from the
+	// merged content. This is the original, and the default when the field is empty.
+	WrapperSourceMerged = "merged"
+	// WrapperSourceWorking renews from THIS run's own working branch — the run itself changed a root
+	// script that is not yet merged. The offered content is the run's, pinned to its sha256; the human
+	// is the gate instead of the merge, and the four bindings (sha, single-use, run-unwritable
+	// approval, re-read-after-approval) keep the root boundary exactly where it was.
+	WrapperSourceWorking = "working"
+)
+
 // Question is one open (or answered) question of one run at one repository.
 type Question struct {
 	ID          string        `json:"id"`
@@ -77,6 +92,13 @@ type Question struct {
 	// renewal is refused (the approval is single-use and content-pinned, never a blanket permission).
 	Wrappers []WrapperGrant `json:"wrappers,omitempty"`
 
+	// WrapperSource names WHERE the approved wrapper content is re-read from at install time — the
+	// standard branch (WrapperSourceMerged) or this run's own working branch (WrapperSourceWorking).
+	// It is set only on a wrapper-renewal question; an empty value means WrapperSourceMerged (the
+	// original behaviour). The write half re-reads the bytes from exactly this source and re-checks
+	// their sha256, so a change to the source after the approval installs nothing.
+	WrapperSource string `json:"wrapperSource,omitempty"`
+
 	// Resolved marks a question whose answer the resumed run has already consumed, so a later resume
 	// does not feed the same answer to the agent twice.
 	Resolved   bool       `json:"resolved,omitempty"`
@@ -88,7 +110,11 @@ type Question struct {
 // install time and must still hash to SHA, so a stale approval installs nothing.
 type WrapperGrant struct {
 	Name string `json:"name"` // one of the four renewable wrappers (the authoritative list lives in the root tool)
-	SHA  string `json:"sha"`  // sha256 (hex) of the standard-branch content the user approved
+	SHA  string `json:"sha"`  // sha256 (hex) of the content the user approved (merged or working-branch)
+	// Summary is a SHORT, human-readable description of what the renewal changes in this file (e.g.
+	// "+12/-3 lines vs the installed script"). It is display-only — the approval is bound solely by
+	// Name and SHA — and lets a human decide without opening the branch.
+	Summary string `json:"summary,omitempty"`
 }
 
 // Open reports whether the question still waits for an answer.

@@ -289,6 +289,9 @@ type fakeDeploy struct {
 	// mainGrants is what MainWrapperDrift returns — the standard-branch (file, checksum) set the
 	// renewal question offers. Empty means the installed wrappers already match the standard branch.
 	mainGrants []runs.WrapperGrant
+	// workingGrants is what WorkingWrapperDrift returns — the run's OWN working-branch (file, checksum)
+	// set, offered when the run itself changed a root script that is not yet merged.
+	workingGrants []runs.WrapperGrant
 	// renewErr, when set, makes RenewApprovedWrappers fail; renewed records the questions it applied.
 	renewErr error
 	renewed  []runs.Question
@@ -307,6 +310,11 @@ func (d *fakeDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.mainGrants, nil
+}
+func (d *fakeDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.workingGrants, nil
 }
 func (d *fakeDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
 	d.mu.Lock()

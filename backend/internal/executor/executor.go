@@ -193,6 +193,12 @@ type DeployOps interface {
 	// wrappers already match the standard branch, so there is nothing MERGED to renew (a self delivery
 	// still blocked while this is empty is blocked by the run's OWN not-yet-merged wrapper change).
 	MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error)
+	// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own
+	// working branch — the content the run itself changed but has not yet merged. Each carries the
+	// sha256 of the working-branch content, the exact (file, checksum) set a wrapper-renewal question
+	// offers when the change is the run's OWN (empty means the run changed no root wrapper). This is the
+	// second source that turns the run-changed-a-root-script dead end into an answerable approval.
+	WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error)
 	// RenewApprovedWrappers is the WRITE half: it installs the user-approved wrappers from the standard
 	// branch through the root tool. The approved question carries the (file, checksum) set, who
 	// approved and when; the daemon re-reads the merged content, refuses if it no longer hashes to the

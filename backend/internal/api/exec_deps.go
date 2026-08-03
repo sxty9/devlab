@@ -1198,15 +1198,40 @@ func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.
 	}
 	grants := make([]runs.WrapperGrant, 0, len(drifts))
 	for _, d := range drifts {
-		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA})
+		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA, Summary: d.Summary})
+	}
+	return grants, nil
+}
+
+// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own working
+// branch — the content the run itself changed but has not yet merged. It is the second renewal source
+// (beside MainWrapperDrift): when the installed scripts already match the standard branch, this is what
+// lets a run that changed a root script ask for approval instead of halting for good. Only the self
+// repo owns these root wrappers, so a foreign repo has none.
+func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+	if repoShort(repo) != selfRepo() {
+		return nil, nil
+	}
+	_, wt, err := c.d.bench(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	drifts, err := deploy.WorkingWrapperDrift(wt)
+	if err != nil {
+		return nil, err
+	}
+	grants := make([]runs.WrapperGrant, 0, len(drifts))
+	for _, d := range drifts {
+		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA, Summary: d.Summary})
 	}
 	return grants, nil
 }
 
 // RenewApprovedWrappers is the daemon side of the WRITE half: for each wrapper the user approved, it
-// re-reads the merged content from the standard branch, stages a run-unwritable grant, and calls the
-// root tool (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved
-// checksum (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
+// re-reads the content from the SAME source the approval was built from (the standard branch or this
+// run's working branch, per q.WrapperSource), stages a run-unwritable grant, and calls the root tool
+// (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved checksum
+// (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
 func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
 	if repoShort(repo) != selfRepo() {
 		return fmt.Errorf("refusing wrapper renewal for non-self repository %q", repo)
@@ -1217,6 +1242,14 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	}
 	grantDir := c.d.s.paths.WrapperGrants()
 	renewer := deploy.SudoWrapperRenewer{}
+	// Bind the re-read to the SAME source the approval named. An empty source is the original merged
+	// case (standard branch); WrapperSourceWorking re-reads this run's own working branch. Either way
+	// the daemon re-reads the bytes and RenewApprovedWrapper refuses any that no longer hash to the
+	// approved checksum, so a source that changed after the approval installs nothing.
+	src := deploy.MergedWrapperContent(wt)
+	if q.WrapperSource == runs.WrapperSourceWorking {
+		src = deploy.WorkingWrapperContent(wt)
+	}
 	by := q.AnsweredBy.User
 	if by == "" {
 		by = q.AnsweredBy.OnBehalfOf
@@ -1229,7 +1262,7 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 		if deploy.InstalledWrapperMatches(g.Name, g.SHA) {
 			continue // already renewed to this exact content — do not spend the single-use approval again
 		}
-		if err := deploy.RenewMergedWrapper(ctx, renewer, wt, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
+		if err := deploy.RenewApprovedWrapper(ctx, renewer, src, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
 			return err
 		}
 	}
