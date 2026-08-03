@@ -50,8 +50,10 @@ test('open-delivery facts fold per execution: blocked wins, the soonest deadline
     dlv({ id: 'x1', repo: 'o/four', stage: 'open', mergeBy: '2026-08-01T00:00:00Z', createdAt: '2026-07-01T00:00:00Z' }),
   ]);
 
-  assert.deepEqual(facts.get('exec_a'), { blocked: false, mergeBy: '2026-08-08T00:00:00Z' });
-  assert.deepEqual(facts.get('exec_b'), { blocked: true, reason: 'rate limit' });
+  // Every open pull request is a live automatic step, so `awaitingMerge` is set alongside its
+  // deadline — and even a blocked-yet-open delivery carries it (its PR still exists).
+  assert.deepEqual(facts.get('exec_a'), { blocked: false, awaitingMerge: true, mergeBy: '2026-08-08T00:00:00Z' });
+  assert.deepEqual(facts.get('exec_b'), { blocked: true, reason: 'rate limit', awaitingMerge: true });
   assert.equal(facts.get('exec_c'), undefined, 'a merged delivery holds no live wait');
   assert.equal(facts.size, 2, 'only the two executions with an OPEN attributed delivery are folded');
 });

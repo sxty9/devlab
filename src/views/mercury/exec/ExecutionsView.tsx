@@ -171,6 +171,7 @@ export function ExecutionsView() {
   const elsewhere = [
     outside.inFlight.length > 0 ? `${outside.inFlight.length} unfinished in Active` : '',
     outside.awaitingDelivery.length > 0 ? `${outside.awaitingDelivery.length} with an open delivery` : '',
+    outside.failed.length > 0 ? `${outside.failed.length} failed in Blocked` : '',
   ]
     .filter(Boolean)
     .join(' · ');
@@ -186,7 +187,7 @@ export function ExecutionsView() {
         <div className="dl-scroll flex-1 overflow-y-auto p-1.5">
           {history.length === 0 ? (
             <p className="px-2.5 py-3 text-caption text-text-tertiary">
-              {elsewhere ? 'Nothing finished yet — an execution enters the history once it ended and every delivery of it is settled.' : 'No executions yet.'}
+              {elsewhere ? 'Nothing finished yet — an execution enters the history once its whole chain ran through to production, with no intervention needed.' : 'No executions yet.'}
             </p>
           ) : (
             <div className="flex flex-col gap-0.5">

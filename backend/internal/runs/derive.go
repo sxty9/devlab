@@ -5,15 +5,34 @@ package runs
 
 import "devlab/backend/internal/model"
 
-// ExecutionCompleted reports whether an execution is history-ready: it ended AND every delivery
-// that arose from it is SETTLED (B-8 + WHAT-1). A delivery is settled when it is closed, rolled
-// back, or merged AND its production step has succeeded (or is proven not applicable). A merged
-// delivery whose work is not yet running in production keeps its execution — and thus its ToDo —
-// out of the history: production is the last step of the chain, and "done" means proven live there,
-// not merely merged.
+// ExecutionCompleted reports whether an execution is history-ready. HISTORISED IS STRICT (WHAT-4):
+// the whole chain ran through — up to AND including the production delivery — with no intervention
+// and no approval needed. Anything short of that is not a history entry but a CURRENT state, and
+// belongs in the tab that holds that state.
+//
+// The old rule asked only "did it end, and does an unsettled delivery hang on it". That let an
+// execution which blocked or failed on an EARLY stage count as history: it produced no delivery, so
+// nothing hung on it, so it slipped in — even though its chain never ran through (the vacuous-truth
+// hole). The positive proof the chain DID run through is MergedAt: SettleExecution stamps it only
+// once EVERY delivery of the execution is settled through production (B-8 + WHAT-1), and the startup
+// reconciliation stamps it on a synthetic check-off once the work verifiably arrived in the default
+// branch. A blocked or failed execution never earns that stamp.
+//
+// So an execution historises iff it ended AND either it is a frozen archive record (Legacy — a
+// closed past, display-only, with no live tab to move to), or it carries the MergedAt stamp AND the
+// ledger agrees every delivery of it is settled (belt-and-suspenders: the stamp and the ledger are
+// written together, so they never disagree, but the surface must never show an un-settled delivery
+// as history). The client mirror (views/mercury/tasks/select.ts executionCompleted) asks exactly
+// this, so the two never drift.
 func ExecutionCompleted(res Result, deliveries []Delivery) bool {
 	if res.EndedAt == nil {
 		return false
+	}
+	if res.Legacy {
+		return true // a frozen archive record is a closed past — history by construction.
+	}
+	if res.MergedAt == nil {
+		return false // no production-settled stamp ⇒ the chain did not run through: a current state.
 	}
 	for _, d := range deliveries {
 		if d.ExecutionID == res.ID && !d.Settled() {

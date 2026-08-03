@@ -345,8 +345,11 @@ test('the history admits an execution only once every delivery is settled (REQ-0
     });
   const all = [
     shipped('unmerged'),
-    shipped('merged'),
+    // The chain ran through: the server stamped MergedAt once its delivery settled through production.
+    shipped('merged', { mergedAt: '2026-07-26T12:00:00Z' }),
     result({ id: 'running', runId: 'r' }), // no end stamp → not history
+    // Ended but never shipped — no MergedAt stamp. Under the STRICT rule this is a current (failed)
+    // state, not history: the chain did not run through even though nothing hangs on it.
     result({ id: 'nodelivery', runId: 'r', endedAt: '2026-07-26T09:00:00Z', repos: [pipeline({ repo: 'a', stages: [stage({ stage: 'y', state: 'failed' })], done: true })] }),
   ];
   // Openness comes from the LEDGER, where the server states it — the client never reconstructs it
@@ -354,11 +357,12 @@ test('the history admits an execution only once every delivery is settled (REQ-0
   // membership rule exists.
   const ledger: Delivery[] = [
     { id: 'dlv_1', repo: 'o/a', branch: 'b1', fromCommit: 'c0', toCommit: 'c1', createdAt: '2026-07-26T11:30:00Z', stage: 'open', executionId: 'unmerged' },
-    { id: 'dlv_2', repo: 'o/a', branch: 'b2', fromCommit: 'c1', toCommit: 'c2', createdAt: '2026-07-26T11:30:00Z', stage: 'merged', executionId: 'merged' },
+    { id: 'dlv_2', repo: 'o/a', branch: 'b2', fromCommit: 'c1', toCommit: 'c2', createdAt: '2026-07-26T11:30:00Z', stage: 'merged', prodStage: 'live', executionId: 'merged' },
   ];
   const open = openDeliveryExecutionIds(ledger);
   const history = sortExecutions(all.filter((res) => executionCompleted(res, open)));
-  assert.deepEqual(history.map((r) => r.id), ['merged', 'nodelivery']);
+  // Only the execution whose whole chain ran through (MergedAt stamped, nothing held open) historizes.
+  assert.deepEqual(history.map((r) => r.id), ['merged']);
   assert.ok(open.has('unmerged'));
 });
 

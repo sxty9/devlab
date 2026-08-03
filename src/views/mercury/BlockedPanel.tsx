@@ -16,7 +16,7 @@ import { Button } from '@/ui/Button';
 import { cn } from '@/lib/cn';
 import { fmtDateTime } from '@/lib/format';
 import type { RunQuestion } from '@/types';
-import { BlockedTasks } from './BlockedTasks';
+import { TaskSurface } from './tasks/Surface';
 
 const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
 
@@ -102,26 +102,33 @@ export function BlockedPanel() {
         </span>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        {/* A failed layer is a blocker too (WHAT-4): the stuck todos stand here alongside the
-            questions. This section hides itself when nothing is stuck. */}
-        <BlockedTasks />
-        {questions === null ? (
-          <p className="px-2.5 py-3 text-caption text-text-tertiary">Loading…</p>
-        ) : open.length === 0 ? (
-          <p className="px-2.5 py-3 text-caption text-text-tertiary">
-            No question is waiting. When a run stops to ask a decision, it waits here until you answer.
-          </p>
-        ) : (
-          <>
-            <h3 className="mb-2 text-caption font-medium uppercase tracking-wide text-text-tertiary">Questions</h3>
-            <ul className="flex flex-col gap-3">
-              {open.map((q) => (
-                <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} />
-              ))}
-            </ul>
-          </>
-        )}
+      {/* The Rückfragen — questions that wait for a DECISION of the user. They stand ABOVE the task
+          list: a question is a different thing from a failed layer and does not replace it. The card
+          hides itself when nothing waits. A wrapper-renewal is presented as an explicit approval. */}
+      {questions === null ? (
+        <p className="shrink-0 px-3 py-3 text-caption text-text-tertiary">Loading…</p>
+      ) : open.length > 0 ? (
+        <section className="max-h-[45%] shrink-0 overflow-y-auto border-b border-separator px-3 py-3">
+          <h3 className="mb-2 text-caption font-medium uppercase tracking-wide text-text-tertiary">Questions</h3>
+          <ul className="flex flex-col gap-3">
+            {open.map((q) => (
+              <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} />
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {/* The failed / stuck TODOS — the SAME TaskSurface every neighbour lifecycle tab uses (Todos,
+          Pending), narrowed to the 'blocked' bucket, with the same rows and the same handles: open
+          the task, run it again. A failed layer is a blocker too (WHAT-4), so it stands here — but as
+          a work list like its neighbours, not as a compact read-only log beside them. */}
+      <div className="min-h-0 flex-1">
+        <TaskSurface
+          kind="todo"
+          newLabel="New todo"
+          buckets={['blocked']}
+          emptyText="Nothing is stuck. A run that failed, left a target uncovered, or stopped at a broken delivery tip waits here until it is run again or rolled back."
+        />
       </div>
     </div>
   );

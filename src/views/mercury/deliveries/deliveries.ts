@@ -127,6 +127,12 @@ export interface OpenDeliveryFacts {
   blocked: boolean;
   reason?: string;
   mergeBy?: string;
+  /** There is a healthy OPEN delivery — a pull request still working its way to merge, i.e. a live
+   *  automatic step. Set whenever a delivery is open, WITH or WITHOUT a stamped `mergeBy` deadline:
+   *  a freshly opened pull request is a genuine wait even before the maintenance stamps its window.
+   *  It lets the open-list derivation tell "waiting on an open PR" apart from "in the awaiting set
+   *  for a reason that is NOT a live step" (a failed tip), so the latter is never dressed as a wait. */
+  awaitingMerge?: boolean;
   /** The delivery is merged and awaiting its PRODUCTION step (WHAT-1): the work reached the default
    *  branch, but it is not with the user until it runs in production. */
   prodPending?: boolean;
@@ -158,6 +164,9 @@ export function openDeliveryFactsByExecution(list: readonly Delivery[]): Map<str
       cur.blocked = true;
       cur.reason ??= d.blockedReason;
     }
+    // A healthy open pull request is a live automatic step, deadline stamped or not — so the open
+    // list can wait on it instead of mistaking a deadline-less open PR for "nothing is happening".
+    if (isOpenDelivery(d)) cur.awaitingMerge = true;
     // Merged and awaiting production (WHAT-1): the work reached the default branch but is not running
     // in production yet. A failed production send is retrying — the task stays open and reports it,
     // but this is NOT a dev-delivery failure, so it never reads as blocked (the stack is untouched).
