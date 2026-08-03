@@ -40,6 +40,12 @@ const maintainMaxBackoff = time.Hour
 // block that was only ever a prune whose branch had already vanished — a goal reached, not a fault.
 const prunePrefix = "pruning the delivery branch failed: "
 
+// readFailPrefix opens the fault reason recorded when READING a tracked pull request fails. It is a
+// named constant because the maintenance loop matches against it to recognise a block that was only
+// ever a read GitHub answered 404/410 — a vanished pull request, which is a reached goal, not a
+// fault waiting on a person (blockIsReadGone).
+const readFailPrefix = "reading the pull request failed: "
+
 // The K-5 classification seams. They default to the ONE classification point (faultclass);
 // they exist as variables solely so this package's tests stay deterministic while faultclass
 // is filled in the same wave — production wiring never overrides them.
@@ -994,6 +1000,14 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 	for _, p := range tracked {
 		repos[p.Repo] = true
 		if p.Blocked {
+			// A block that was only ever a READ GitHub answered 404/410 is stale: the pull request is
+			// gone, which is a reached goal, not a fault waiting on a person. Untrack it here so a
+			// pre-existing block of this cause dissolves on the next maintenance run — no restart and no
+			// human release needed. Any other block still waits for an explicit resume.
+			if blockIsReadGone(p.BlockedReason) {
+				untrackVanished(ledger, prs, res, n, pub, p, now)
+				continue
+			}
 			// F4: an honestly blocked record waits for an explicit resume — and gates its repo.
 			queueBlocked[p.Repo] = true
 			continue
@@ -1030,7 +1044,17 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 				notify(n, runs.NoticeGitHubQuota, "", maintainQuotaText(budget.Reset))
 				break
 			}
-			recordFault(prs, n, p, "reading the pull request failed: "+err.Error(), err, now)
+			// A pull request GitHub no longer knows on a READ (404, or 410 gone) is a reached goal, not
+			// an obstacle: there is nothing left to follow. Untrack it exactly as a closed pull request —
+			// the read-side twin of isSatisfiedDelete on the write side — rather than blocking on a human
+			// to wave away something already gone. Missing rights (401/403) are NOT this: they fall
+			// through to recordFault below and stay blocked, because "gone" and "forbidden" are told apart
+			// by the status number, never by the error text.
+			if isReadGone(err) {
+				untrackVanished(ledger, prs, res, n, pub, p, now)
+				continue
+			}
+			recordFault(prs, n, p, readFailPrefix+err.Error(), err, now)
 			queueBlocked[p.Repo] = true
 			if firstErr == nil {
 				firstErr = err
@@ -1288,6 +1312,45 @@ func isSatisfiedDelete(err error) bool {
 		return false
 	}
 	return se.Status == 404 || (se.Status == 422 && strings.Contains(se.Msg, "Reference does not exist"))
+}
+
+// isReadGone reports the read-side reached goal: GitHub answers a pull-request READ with 404 (not
+// found) or 410 (gone). Both mean the pull request is no longer there — nothing left to follow — so
+// on a READ this is a goal reached, never a fault. It is the read-side twin of isSatisfiedDelete on
+// the write side (where 404 on a delete means the branch is already gone). The distinction hangs on
+// the STATUS NUMBER, never on the message text, so a missing right (401/403) can never be mistaken
+// for a vanished pull request or the reverse.
+func isReadGone(err error) bool {
+	var se *github.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Status == 404 || se.Status == 410
+}
+
+// untrackVanished removes a pull request GitHub no longer knows from the tracked set and pulls the
+// ledger along, exactly as a closed pull request is handled: the ledger entry is mirrored closed —
+// so NextPRBase stops counting it open and the stack tip never points at a vanished branch — the
+// pool entry is dropped, the execution settles per B-8, the delivery surface republishes, and a
+// visible self-check notice records the untracking so nothing disappears silently. A block recorded
+// for this same cause dissolves the moment this runs: the record it stilled is gone.
+func untrackVanished(ledger *runs.DeliveryStore, prs *runs.PRStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, p runs.PendingPR, now time.Time) {
+	reason := fmt.Sprintf("pull request #%d no longer exists on GitHub and was untracked", p.Number)
+	mirrorClosed(ledger, p, PRState{}, reason, now)
+	_ = prs.Remove(p.Repo, p.Number)
+	settleExecutionOf(ledger, res, p)
+	publishDeliveries(pub)
+	notify(n, runs.NoticeDeliverySelfCheck, p.Repo, reason)
+}
+
+// blockIsReadGone reports whether an already-recorded block was only ever a READ GitHub answered
+// 404/410 — a vanished pull request, which is a reached goal, not a durable fault. Such a block is
+// no longer a block: the maintenance loop untracks the record instead of keeping it stilled for a
+// person. It reads the stored reason the same way ReviveStaleBlocks does (the reason is the only
+// thing a persisted block keeps) and hangs the decision on the status number, never the message text
+// — so a stored 401/403 (a genuine missing right) stays a block.
+func blockIsReadGone(reason string) bool {
+	return strings.HasPrefix(reason, readFailPrefix) && isReadGone(errorFromReason(reason))
 }
 
 // isRateLimited reports GitHub's explicit "too many requests" (429): the request window is spent.
