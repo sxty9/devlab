@@ -32,16 +32,20 @@ import (
 // grants privilege, so unlike the wrapper scripts' own env seams it needs no sudoers guard.
 var wrapperInstallDir = envOr("DEVLAB_SBIN_DIR", "/usr/local/sbin")
 
-// selfWrappers are the root-owned wrappers the devlab (self) repository ships from deploy/ into
-// wrapperInstallDir. It MIRRORS the WRAPPERS array in the `service` CLI (and the pins in
-// deploy/devlab.sudoers / deploy/devlab-runs.sudoers); a wrapper added there must be added here, or
-// the drift probe would go blind to it. deploy/devlab-deploy-recv is deliberately absent — it is the
-// prod-receive path, not armed in this phase and not installed to sbin by `service`.
+// selfWrappers are the root-owned wrappers (and the shared setup library) the devlab (self) repository
+// ships from deploy/ into wrapperInstallDir. It MIRRORS the WRAPPERS array in the `service` CLI (and the
+// pins in deploy/devlab.sudoers / deploy/devlab-runs.sudoers); a wrapper added there must be added here,
+// or the drift probe would go blind to it. devlab-setup-lib.sh is a SOURCED fragment, not an executable
+// wrapper, but it is installed beside them and BOTH devlab-install and devlab-exec source it, so a stale
+// copy would silently change what a setup produces — the drift probe keeps it current like the rest.
+// deploy/devlab-deploy-recv is deliberately absent — it lives on the PRODUCTION host, not in this host's
+// sbin, and reaches production by hand (it is not installed to sbin by `service`).
 var selfWrappers = []string{
 	"devlab-exec",
 	"devlab-install",
 	"devlab-mkworkspace",
 	"devlab-restart-when-free",
+	"devlab-setup-lib.sh",
 }
 
 // WrapperDrift names one root wrapper whose installed copy no longer matches the repository's

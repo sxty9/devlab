@@ -215,6 +215,20 @@ func (LivePorts) PortFor(ctx context.Context, service string, desired int) (int,
 	return port, true, nil
 }
 
+// ProdSetupPort resolves the port the production unit will bind on a FIRST-TIME setup: the service's
+// declared port when it has one (the coordinated, cross-machine value every host agrees on), else a
+// free port proposed from the atlas band. It is baked into the delivered unit and route at build time;
+// the receiver installs those bytes unchanged (it generates nothing), and the honest running gate on
+// the target catches a genuine port collision as a failed delivery rather than a silent one.
+func ProdSetupPort(ctx context.Context, d Detection) (int, error) {
+	desired := 0
+	if d.Decl != nil {
+		desired = d.Decl.Port
+	}
+	port, _, err := LivePorts{}.PortFor(ctx, d.ID, desired)
+	return port, err
+}
+
 // ─── the honest running gate (F10) ───────────────────────────────────────────
 
 // Gate proves a service is up: unit active AND port held. The probes are seams so the gate is

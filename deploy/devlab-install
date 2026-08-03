@@ -110,23 +110,18 @@ UNIT_DIR="/etc/systemd/system"
 # in root-owned runtime configuration and never as a literal in this template.
 OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
 
-# Reserved names, and the RULE they follow. Reserved is an identity that belongs to the operating
-# system, to a third-party package, or to the landscape as a whole — one that can appear on this host
-# without anybody's decision and that this wrapper must therefore never create, borrow or shadow.
-# `root` is the sharpest case, because the unit template carries `User=<repo>`.
+# Reserved names, the first-time SETUP templates (unit/route), the service account and the identity
+# checks now live in ONE sourced library, deploy/devlab-setup-lib.sh — so this wrapper (which GENERATES
+# the setup on the dev host) and devlab-deploy-recv (which INSTALLS the SAME product on the production
+# host) share a single source and can never drift on what a valid setup is. The list is
+# SETUP_RESERVED_REPOS; the templates are setup_unit_text / setup_route_text; the account is
+# setup_ensure_account. See the sourcing block below (after the renew half, which needs none of it).
 #
-# A name the ORGANISATION can legitimately give a service of its own is NOT on this list, even where
-# a like-named OS account exists: a landscape may run a service called `mail`, and blocking the name
-# here made it permanently undeliverable. What decides there are the checks that ask about the actual
-# identity rather than the spelling — the origin check (is this OUR repository?), the unit check (is the
-# unit ours?) and, at first-time setup only, the account check (are we about to squat an account?).
-# Those three see every already-existing account and unit; this list carries what a lookup cannot see
-# today, namely software the host may acquire tomorrow.
-RESERVED_REPOS="root daemon bin sys nobody nogroup www-data adm
-halt shutdown reboot init systemd udev dbus messagebus polkitd syslog rsyslog
-sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
-caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod
-docker containerd kubelet etcd snapd holistic"
+# The RULE the list follows is unchanged: reserved is an identity that belongs to the operating system,
+# to a third-party package, or to the landscape as a whole. A name the ORGANISATION can legitimately
+# give a service of its own is NOT on the list even where a like-named OS account exists — what decides
+# there are the identity checks (origin: is this OUR repository? unit: is the unit ours? account: are we
+# about to squat an account?), not the spelling.
 
 log() { logger -t devlab-install -- "$*" 2>/dev/null || true; echo "devlab-install: $*"; }
 die() { printf 'devlab-install: error: %s\n' "$1" >&2; exit "${2:-2}"; }
@@ -266,6 +261,16 @@ if [ "$RENEW" = 1 ]; then
   exit 0
 fi
 
+# The shared first-time SETUP product + rules (unit/route templates, the reserved-name list, the
+# service account, the identity checks) — sourced here, AFTER the renew half, which touches none of it,
+# so renewing a wrapper never depends on this library being present. It sits beside this wrapper (the
+# same sbin dir in production, the same deploy/ dir in the test tree); DEVLAB_SETUP_LIB is the direct-
+# invocation test seam. A missing library is a config-state failure, never a silent skip.
+SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
+[ -r "$SETUP_LIB" ] || die "shared setup library not found: $SETUP_LIB (deploy/devlab-setup-lib.sh must be installed beside this wrapper)" 5
+# shellcheck source=/dev/null
+. "$SETUP_LIB"
+
 # ── validation cascade (every step BEFORE any effect) ────────────────────────────────────────────
 [ "${#POSITIONAL[@]}" -eq 3 ] || die "usage: devlab-install <repo> <artifact-dir> <env> [--port <n>] [--handover] [--check]" 2
 
@@ -315,7 +320,7 @@ FIRST_TIME=0
 MANIFEST=""
 
 # 5a) reserved identities: no repository may be named after an OS, package or landscape component.
-for r in $RESERVED_REPOS; do
+for r in $SETUP_RESERVED_REPOS; do
   if [ "$REPO" = "$r" ]; then
     die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one" 2
   fi
@@ -452,9 +457,10 @@ BIN="$real/${REPO}d"    # go build ./cmd/... writes cmd/<repo>d into the artifac
 # UNIT_FILE / FIRST_TIME / MANIFEST were decided in the validation cascade (step 5) — systemd was
 # asked, the account was judged and the manifest was resolved before any effect could happen.
 if [ "$FIRST_TIME" = 1 ]; then
-  # First-time setup from root-owned INLINE templates (this root-owned script is their source):
-  # unit + route + rights with VALIDATED values only. The port is the atlas proposal handed in
-  # by the service (--port); repo content is never executed, only validated files are copied.
+  # First-time setup from the root-owned SHARED templates (setup_unit_text / setup_route_text in
+  # devlab-setup-lib.sh — the ONE source the production receiver installs from too): unit + route +
+  # rights with VALIDATED values only. The port is the atlas proposal handed in by the service
+  # (--port); repo content is never executed, only validated files are copied.
   [ "$PORT" != 0 ] || die "first-time setup of '$REPO' needs --port <n> (a free port from the atlas proposal)" 5
   log "first-time setup of '$REPO' (unit + route + rights from inline templates, port $PORT)"
 
@@ -471,28 +477,8 @@ if [ "$FIRST_TIME" = 1 ]; then
     fi
     echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $REPO"
   else
-    getent passwd "$REPO" >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$REPO" "$REPO"
-    install -d -o "$REPO" -g "$REPO" -m 0755 "/var/lib/$REPO"
-    cat > "$UNIT_FILE" <<UNIT
-[Unit]
-Description=${REPO} — a holistic service (generated by devlab-install)
-After=network.target
-
-[Service]
-User=${REPO}
-Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret
-ExecStart=/opt/${REPO}/bin/${REPO}d --listen 127.0.0.1:${PORT}
-Restart=on-failure
-RestartSec=2
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/${REPO}
-ProtectHome=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+    setup_ensure_account "$REPO"
+    setup_unit_text "$REPO" "$PORT" > "$UNIT_FILE"
     if [ -d "$CADDY_CONF" ]; then
       # This directory is SHARED: the edge serves every other service of the host out of it, so an
       # unparseable file of ours does not break "our" route — it breaks the whole edge at the next
@@ -500,12 +486,7 @@ UNIT
       # it does not hold, and the reload's failure is NAMED instead of swallowed: the caller must not
       # read "installed" over a service that has no route.
       ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
-      cat > "$ROUTE_FILE" <<ROUTE
-# Generated by devlab-install. Routes the service API to the daemon.
-handle /api/services/${REPO}/* {
-	reverse_proxy 127.0.0.1:${PORT}
-}
-ROUTE
+      setup_route_text "$REPO" "$PORT" > "$ROUTE_FILE"
       # unwind_first_time removes what THIS first-time branch has created so far — the route and the
       # generated unit, both of which did not exist before this run (FIRST_TIME=1 was decided by
       # systemd). Without it a failed route step would leave a unit behind, the next attempt would read

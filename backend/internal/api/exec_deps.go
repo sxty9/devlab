@@ -92,6 +92,10 @@ type ChainDeps struct {
 	// remote target. nil means the production function.
 	prodBuild func(ctx context.Context, ex workspace.Executor, wt string) (string, error)
 	prodSend  func(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error
+	// prodEmit lays the first-time SETUP product (unit/route/rights) into the artifact before the send,
+	// AS THE RUNNER through the pinned wrapper. Like prodBuild, a hermetic test substitutes it (no
+	// wrapper, no runner). nil means the production function.
+	prodEmit func(ctx context.Context, ex workspace.Executor, wt, repo string, det deploy.Detection) error
 }
 
 // runnerExec builds the Executor that acts AS the runner account. It is the ONE place the runner's
@@ -116,6 +120,23 @@ func (d *ChainDeps) sendProd(ctx context.Context, cfg deploy.ProdConfig, repo, a
 		return d.prodSend(ctx, cfg, repo, artifact)
 	}
 	return deploy.SendProd(ctx, cfg, repo, artifact)
+}
+
+// emitProdSetup lays the first-time SETUP product into the artifact (before the send), honouring the
+// test seam. The production path resolves the port the delivered unit will bind (declared, else an
+// atlas proposal) and runs the emit AS THE RUNNER through the pinned wrapper.
+func (d *ChainDeps) emitProdSetup(ctx context.Context, ex workspace.Executor, wt, repo string, det deploy.Detection) error {
+	if d.prodEmit != nil {
+		return d.prodEmit(ctx, ex, wt, repo, det)
+	}
+	port, err := deploy.ProdSetupPort(ctx, det)
+	if err != nil {
+		return fmt.Errorf("resolve the production port for %s: %w", repo, err)
+	}
+	if out, err := ex.EmitSetup(ctx, wt, repo, port); err != nil {
+		return fmt.Errorf("emit the setup product for %s: %w\n%s", repo, err, out)
+	}
+	return nil
 }
 
 // repoBench is one repo's prepared working tree, held for the execution's lifetime.
@@ -1121,6 +1142,12 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	artifact, err := c.d.buildProd(ctx, ex, wt)
 	if err != nil {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: build the production artifact of %s: %w", repo, err)
+	}
+	// The first-time SETUP product (unit/route/rights) is laid INTO the artifact so the receiver can
+	// set the service up on a bare host without any manual per-service step. It travels beside the
+	// program; the send below ships it, the receiver installs it only when the unit is still missing.
+	if err := c.d.emitProdSetup(ctx, ex, wt, repoShort(repo), det); err != nil {
+		return deliver.ProdOutcome{Detail: err.Error()}, fmt.Errorf("deploy: prepare production setup of %s: %w", repo, err)
 	}
 	// The send expects the SHORT repo id (its name grammar rejects a slash); the ledger carries the
 	// full "owner/repo", so it is reduced here — the same value-form seam that the workbench needs.

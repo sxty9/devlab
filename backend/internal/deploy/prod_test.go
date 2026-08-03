@@ -37,9 +37,13 @@ func TestProdBothCallsUseConfiguredKey(t *testing.T) {
 			t.Errorf("%s call does not point at the durable known-hosts file: %s", c.name, c.args)
 		}
 	}
-	// A local-directory fixture target (no key) must NOT inject an ssh transport.
-	if got := strings.Join(rsyncArgs(ProdConfig{}, "src/", "dest/"), " "); strings.Contains(got, "-e") {
-		t.Errorf("the fixture path (no key) must not set an ssh transport: %s", got)
+	// A local-directory fixture target (no key) must NOT inject an ssh transport. Check for the exact
+	// "-e" ARGUMENT (a standalone element), not a substring — "--exclude=…" legitimately contains "-e".
+	fixture := rsyncArgs(ProdConfig{}, "src/", "dest/")
+	for i, a := range fixture {
+		if a == "-e" {
+			t.Errorf("the fixture path (no key) must not set an ssh transport: %v", fixture[i:])
+		}
 	}
 }
 
@@ -127,6 +131,45 @@ func TestSendProdAgainstFixtureTarget(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(staging, "svc-a", "svc-ad"))
 	if err != nil || string(got) != "prebuilt-bytes" {
 		t.Fatalf("artifact not staged under <target>/<repo>/: %v %q", err, got)
+	}
+}
+
+// Only FINISHED bytes travel: the production send ships the program and the setup/ product, but NOT a
+// service's dashboard ui/ SOURCE — production never builds it, so it would be dead weight on the target.
+// The exclusion is anchored to the artifact root, so only a TOP-LEVEL ui/ is dropped.
+func TestSendProdExcludesUISource(t *testing.T) {
+	art := t.TempDir()
+	if err := os.WriteFile(filepath.Join(art, "svc-ad"), []byte("prebuilt-bytes"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(art, "setup"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(art, "setup", "svc-a.service"), []byte("[Service]\nUser=svc-a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(art, "ui", "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(art, "ui", "src", "App.tsx"), []byte("export const x = 1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staging := t.TempDir()
+	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: staging}, "svc-a", art); err != nil {
+		t.Fatal(err)
+	}
+
+	// The program and the setup product arrived…
+	if _, err := os.Stat(filepath.Join(staging, "svc-a", "svc-ad")); err != nil {
+		t.Fatalf("the program must reach production: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(staging, "svc-a", "setup", "svc-a.service")); err != nil {
+		t.Fatalf("the setup product must reach production: %v", err)
+	}
+	// …but the ui SOURCE did not.
+	if _, err := os.Stat(filepath.Join(staging, "svc-a", "ui")); !os.IsNotExist(err) {
+		t.Fatalf("the ui/ source must NOT reach production (err=%v)", err)
 	}
 }
 

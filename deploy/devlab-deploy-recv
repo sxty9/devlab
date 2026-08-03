@@ -17,13 +17,24 @@
 #      the staging root and allows ONLY writes (-wo). This is how the prebuilt bytes arrive; it is
 #      impossible to write outside <STAGING_ROOT> or to read anything back.
 #   2. install <repo>  -> copy the staged prebuilt artifact into prod paths + restart the prod unit.
+#      When the unit does NOT yet exist, this is a FIRST-TIME setup: the unit/route/rights that TRAVELLED
+#      IN THE ARTIFACT (staged under <repo>/setup/, produced by the one devlab-install template) are
+#      installed, the service account is created, systemd is reloaded, the unit enabled and started.
+#      The receiver ERZEUGT nichts — it INSTALLS what was delivered, guarded by the SAME name/namespace/
+#      identity rules devlab-install applies (shared via devlab-setup-lib.sh).
 # So even a COMPROMISED dev key can only push files into staging and (re)install a KNOWN repo — never
 # run an arbitrary command as this host's ssh user, never escape the staging/prod paths.
 #
-# Exit codes: 0 ok · 2 bad/blocked request · 3 no staged artifact / no mapping · 5 rrsync missing ·
-#             10 staged input missing.
+# A --check dry-run (direct invocation, no ssh) runs the FIRST-TIME-vs-UPDATE decision and the setup
+# validations WITHOUT root and WITHOUT effect, so the install logic is provable off the production host.
+#
+# Exit codes: 0 ok · 2 bad/blocked request or setup validation · 3 no staged artifact / no mapping ·
+#             4 external tool failed (caddy) · 5 rrsync missing / foreign unit / missing setup library ·
+#             10 staged input missing · 11 unit did not come up after start.
 #
 # Install (on the VPS): sudo install -o root -g root -m 0755 devlab-deploy-recv /usr/local/sbin/devlab-deploy-recv
+#   and, beside it, the shared library:
+#   sudo install -o root -g root -m 0644 devlab-setup-lib.sh /usr/local/sbin/devlab-setup-lib.sh
 set -euo pipefail
 
 # The ONE state-root derivation shared by every DevLab wrapper (devlab-install, devlab-exec,
@@ -40,53 +51,78 @@ STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
 STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
 WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 
+# The system paths a first-time setup writes into, and the tools it asks. Instance-neutral defaults of
+# this template; the env overrides are the direct-invocation test seam (sshd strips the client's env).
+UNIT_DIR="${DEVLAB_UNIT_DIR:-/etc/systemd/system}"
+CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
+CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
+PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
+# systemd is the authority on which units exist — asked through this binary so the question is
+# answerable in a dry run (the seam is stripped by sshd in production).
+SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
+
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
+
+# --check dry-run: FIRST arg is the flag; direct invocation only (the forced command never sets it).
+CHECK=0
+if [ "${1:-}" = "--check" ]; then CHECK=1; shift; fi
+
+# run — execute for real, or record the decision as a PLAN line in --check mode (mirrors devlab-install).
+run() {
+  if [ "$CHECK" = 1 ]; then echo "PLAN: $*"; return 0; fi
+  "$@"
+}
 
 # The honest running gate (F10), executed HERE on the production host — the SAME proof the dev
 # delivery uses (deploy.VerifyRunning), just run on the target: "installed and started" is reported
 # only once the unit is genuinely ACTIVE. A restart is not a start; a unit that installs but does not
 # come up is a FAILED production delivery, and this receiver exits non-zero so the sending side sees
 # it (WHAT-2). It polls for up to ~15s, matching the dev gate's window. Exit code 11 = did not come up.
+# In --check it never runs (nothing was started) — the plan names it instead.
 prove_running() {
   local unit="$1" deadline=$((SECONDS + 15))
+  if [ "$CHECK" = 1 ]; then echo "PLAN: prove '$unit' is active (F10), else fail the delivery"; return 0; fi
   while :; do
-    if systemctl is-active --quiet "$unit"; then log "prod gate: unit '$unit' is active"; return 0; fi
-    (( SECONDS >= deadline )) && die "prod gate: unit '$unit' is NOT active after restart — delivery failed" 11
+    if "$SYSTEMCTL" is-active --quiet "$unit"; then log "prod gate: unit '$unit' is active"; return 0; fi
+    (( SECONDS >= deadline )) && die "prod gate: unit '$unit' is NOT active after start — delivery failed" 11
     sleep 1
   done
 }
 
 mkdir -p "$STAGING_ROOT"
 
-# The client command: forced-command path uses $SSH_ORIGINAL_COMMAND; a direct/local run uses argv.
-CMD="${SSH_ORIGINAL_COMMAND:-$*}"
-
 # ── operation 1: rsync receive (the prebuilt upload) ──────────────────────────────────────────────
 # Match only an rsync SERVER receive; hand it to rrsync locked to the staging root. rrsync (shipped
 # with rsync) rejects absolute paths, '..', and any non-receive mode, so the client can write ONLY
-# under <STAGING_ROOT>/<its-chosen-subdir>.
-case "$CMD" in
-  rsync\ --server\ *)
-    rrsync=""
-    for c in rrsync /usr/bin/rrsync /usr/share/rsync/scripts/rrsync /usr/lib/rsync/rrsync; do
-      p="$(command -v "$c" 2>/dev/null || true)"; [[ -n "$p" ]] && { rrsync="$p"; break; }
-    done
-    [[ -n "$rrsync" ]] || die "rrsync not found; cannot confine rsync receive" 5
-    exec "$rrsync" -wo "$STAGING_ROOT"
-    ;;
-esac
+# under <STAGING_ROOT>/<its-chosen-subdir>. Skipped in --check (no ssh command in a dry run).
+if [ "$CHECK" = 0 ]; then
+  CMD="${SSH_ORIGINAL_COMMAND:-$*}"
+  case "$CMD" in
+    rsync\ --server\ *)
+      rrsync=""
+      for c in rrsync /usr/bin/rrsync /usr/share/rsync/scripts/rrsync /usr/lib/rsync/rrsync; do
+        p="$(command -v "$c" 2>/dev/null || true)"; [[ -n "$p" ]] && { rrsync="$p"; break; }
+      done
+      [[ -n "$rrsync" ]] || die "rrsync not found; cannot confine rsync receive" 5
+      exec "$rrsync" -wo "$STAGING_ROOT"
+      ;;
+  esac
 
-# ── operation 2: install trigger — "[devlab-deploy-recv] <repo>" ─────────────────────────────────
-# Disable globbing before word-splitting the (untrusted) command so a '*' cannot expand to filenames.
-set -f
-# Deliberate, glob-disabled word-split of the (untrusted) client command into program + repo.
-# shellcheck disable=SC2086
-set -- $CMD
-set +f
-case "${1:-}" in devlab-deploy-recv|*/devlab-deploy-recv) shift ;; esac
+  # ── operation 2: install trigger — "[devlab-deploy-recv] <repo>" ───────────────────────────────
+  # Disable globbing before word-splitting the (untrusted) command so a '*' cannot expand to filenames.
+  set -f
+  # shellcheck disable=SC2086
+  set -- $CMD
+  set +f
+  case "${1:-}" in devlab-deploy-recv|*/devlab-deploy-recv) shift ;; esac
+  [[ $# -le 1 ]] || die "unexpected extra arguments" 2
+fi
 REPO="${1:-}"
-[[ $# -le 1 ]] || die "unexpected extra arguments" 2
+
+# The repo name must be path-safe under staging (charset + no traversal). The STRICTER service-name
+# grammar (setup_valid_repo_name) is applied only where it decides an identity — first-time setup below.
 { [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$REPO" != *..* ]]; } || die "invalid repo name '${REPO:-<none>}'" 2
 
 # Resolve the staged artifact and require it stays under the staging root (defeat symlink escapes).
@@ -95,7 +131,17 @@ real="$(realpath -e -- "$SRC" 2>/dev/null)" || die "no staged artifact for '$REP
 rootreal="$(realpath -e -- "$STAGING_ROOT")"
 case "$real/" in "$rootreal"/*) : ;; *) die "staged path escapes staging root" 2 ;; esac
 
-log "install-only prod deploy of '$REPO' from $real"
+log "install-only prod deploy of '$REPO' from $real${CHECK:+ (dry-run)}"
+
+# The shared first-time SETUP product + rules — the SAME library devlab-install sources on the dev host,
+# so the receiver INSTALLS exactly what that one template produced and applies the identical name,
+# reserved-identity, foreign-unit and User= checks. Sourced HERE (an rsync receive above never needs
+# it) — beside this wrapper (same sbin dir in production, same deploy/ dir in the test tree);
+# DEVLAB_SETUP_LIB is the direct-invocation test seam. A missing library is a config-state failure.
+SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
+[ -r "$SETUP_LIB" ] || die "shared setup library not found: $SETUP_LIB (devlab-setup-lib.sh must be installed beside this receiver)" 5
+# shellcheck source=/dev/null
+. "$SETUP_LIB"
 
 # Install the prebuilt artifact into concrete prod paths + unit. NO build, and no per-repo
 # scripts (B-44): every uniform service takes the ONE generic branch below; only the self repo
@@ -105,22 +151,114 @@ case "$REPO" in
     BIN="$real/devlabd"; WEB="$real/web"
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
-    install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
-    mkdir -p "$WWW_DIR"
-    rsync -a --delete "$WEB"/ "$WWW_DIR"/
-    systemctl restart devlabd
+    run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
+    run mkdir -p "$WWW_DIR"
+    run rsync -a --delete "$WEB"/ "$WWW_DIR"/
+    run "$SYSTEMCTL" restart devlabd
     prove_running devlabd
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
-    # to /opt/<repo>/bin/<repo>d and restart <repo>.service — the standard layout every service shares.
-    # <repo> is already charset+traversal validated above, so the derived paths are bounded.
+    # to /opt/<repo>/bin/<repo>d. <repo> is already charset+traversal validated above, so the derived
+    # paths are bounded.
     gbin="$real/${REPO}d"
     [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
-    install -d -o root -g root -m 0755 "/opt/$REPO/bin"
-    install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
-    systemctl restart "$REPO"
-    prove_running "$REPO"
+
+    # FIRST-TIME vs UPDATE is decided by systemd, not by a path: `systemctl show -p FragmentPath` sees a
+    # vendor unit under /lib or /usr/lib that a test on $UNIT_DIR would miss. Our own unit (or one we
+    # already installed) → UPDATE. No unit at all → FIRST-TIME. A FOREIGN unit → refuse: we neither
+    # shadow nor overwrite a unit that is not ours (the same refusal devlab-install makes).
+    UNIT_FILE="$UNIT_DIR/${REPO}.service"
+    frag="$(setup_fragment_path "$REPO" "$SYSTEMCTL")" || die "could not ask systemd about ${REPO}.service" 4
+    case "$frag" in
+      "$UNIT_FILE") FIRST_TIME=0 ;;
+      "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
+      *) die "unit ${REPO}.service already exists outside this receiver's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
+    esac
+
+    if [ "$FIRST_TIME" = 1 ]; then
+      # ── FIRST-TIME SETUP — install the DELIVERED unit/route/rights (the receiver erzeugt nichts) ──
+      log "Erstinstallation of '$REPO' — no unit on this host; installing the delivered setup product"
+      SETUP="$real/setup"
+      DELIV_UNIT="$SETUP/${REPO}.service"
+      [ -d "$SETUP" ] || die "first-time setup of '$REPO' needs a delivered setup/ in the artifact, but none was shipped — the build did not attach the unit (a change without its delivery is a failure)" 10
+      [ -f "$DELIV_UNIT" ] || die "first-time setup of '$REPO' has no delivered unit at $DELIV_UNIT" 10
+
+      # The delivered unit is NOT trusted blindly (the same three gates devlab-install applies):
+      #  1) the NAME must pass the service grammar + reserved-identity list (shared rule);
+      #  2) the unit must run as its OWN account — exactly `User=<repo>`, never root, never something else;
+      #  3) systemd must not already know a FOREIGN unit under this name (checked above — frag was empty).
+      setup_valid_repo_name "$REPO" || die "refusing first-time setup of '$REPO' (name/namespace)" 2
+      setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
+        || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
+
+      DELIV_ROUTE="$SETUP/${REPO}.caddy"
+      DELIV_RIGHTS="$SETUP/${REPO}.json"
+
+      if [ "$CHECK" = 1 ]; then
+        echo "PLAN: Erstinstallation of '$REPO' (no unit on this host)"
+        echo "PLAN: create nologin system account '$REPO' (home /var/lib/$REPO) if missing"
+        echo "PLAN: install binary $gbin -> /opt/$REPO/bin/${REPO}d"
+        echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
+        [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy (caddy validate + reload; unwind on failure)" \
+                              || echo "PLAN: no delivered route in the artifact — none installed"
+        [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/$REPO.json + groupadd its hp_* groups" \
+                               || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
+        echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $REPO && $SYSTEMCTL start $REPO"
+        prove_running "$REPO"
+        echo "PLAN: prod deploy of '$REPO' done (first-time setup)"
+        exit 0
+      fi
+
+      setup_ensure_account "$REPO"
+      install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+      install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+      install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
+
+      # The route dir is SHARED by every service of the host: an unparseable file of ours breaks the
+      # whole edge at the next reload, so the ASSEMBLED config is validated first and OUR file is taken
+      # back out (with the freshly written unit) when it does not hold — the same guard devlab-install
+      # uses. A delivered route is optional; its failure is NAMED, never swallowed.
+      if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
+        ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
+        install -o root -g root -m 0644 "$DELIV_ROUTE" "$ROUTE_FILE"
+        unwind_first_time() { rm -f "$ROUTE_FILE" "$UNIT_FILE"; }
+        if command -v "$CADDY_BIN" >/dev/null 2>&1 && [ -f "$CADDY_MAIN" ]; then
+          if ! validate_out="$("$CADDY_BIN" validate --config "$CADDY_MAIN" 2>&1)"; then
+            unwind_first_time
+            die "the edge configuration does not validate with the delivered route — route and unit removed, edge untouched: $(printf '%s' "$validate_out" | tail -n 3)" 4
+          fi
+        else
+          unwind_first_time
+          die "cannot validate the shared edge configuration ($CADDY_BIN / $CADDY_MAIN) — refusing to write into a config directory serving every other service" 5
+        fi
+        "$SYSTEMCTL" reload caddy || { unwind_first_time; die "caddy reload failed — route and unit removed so the edge keeps its last good configuration" 4; }
+      elif [ -f "$DELIV_ROUTE" ]; then
+        log "no route dir at $CADDY_CONF — delivered route NOT installed"
+      fi
+
+      # Rights manifest: a validated FILE COPY of the delivered manifest (never executed).
+      if [ -f "$DELIV_RIGHTS" ]; then
+        install -d -m 0755 "$PERMS_DIR"
+        install -m 0644 "$DELIV_RIGHTS" "$PERMS_DIR/$REPO.json"
+        grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$DELIV_RIGHTS" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
+          while read -r g; do groupadd -f "$g"; done
+      else
+        log "no delivered rights for '$REPO' — installed without declared rights"
+      fi
+
+      "$SYSTEMCTL" daemon-reload
+      "$SYSTEMCTL" enable "$REPO" >/dev/null 2>&1 || true
+      "$SYSTEMCTL" start "$REPO"
+      prove_running "$REPO"
+    else
+      # ── UPDATE — the unit already exists: replace the program and restart (today's behaviour) ──
+      log "Aktualisierung of '$REPO' — unit already present; replacing the program and restarting"
+      run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+      run install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+      run "$SYSTEMCTL" restart "$REPO"
+      prove_running "$REPO"
+    fi
     ;;
 esac
 

@@ -87,15 +87,29 @@ type ProdConfig struct {
 	Trigger func(ctx context.Context, repo string) error
 }
 
+// ProdSendExcludes names — at the ONE place, in code, never a silent rsync flag buried elsewhere —
+// the artifact subtrees the production send does NOT ship, because production never installs them.
+// `ui` is a service's dashboard SOURCE (TypeScript): the dashboard is BUILT on the dev host and served
+// from there, never on the production host ("THIS HOST NEVER BUILDS — prod runs only prebuilt bytes"),
+// so shipping the source would leave unused, unbuilt code on the target (measured: prizm 28 KB of
+// source beside its 8.9 MB program). The production send carries only what production installs — the
+// program and the `setup/` first-time product. Add an exclusion here, with its reason, never elsewhere.
+var ProdSendExcludes = []string{"ui"}
+
 // rsyncArgs assembles the full rsync argument list. When a key is armed it hands rsync its transport
 // via `-e "ssh …"` carrying the SAME options as the trigger — so both calls authenticate with the
 // one configured key. A local-directory target ignores `-e`, which keeps the fixture path unchanged.
+// The ProdSendExcludes are anchored to the artifact root (a leading '/'), so only a TOP-LEVEL ui/ is
+// dropped — never a ui/ that a service legitimately nests inside its own program tree.
 func rsyncArgs(cfg ProdConfig, src, dest string) []string {
 	args := cfg.RsyncArgs
 	if args == nil {
 		args = []string{"-az", "--delete"}
 	}
 	full := append([]string{}, args...)
+	for _, ex := range ProdSendExcludes {
+		full = append(full, "--exclude=/"+ex)
+	}
 	if cfg.Identity.armed() {
 		full = append(full, "-e", "ssh "+strings.Join(cfg.Identity.sshOpts(), " "))
 	}
