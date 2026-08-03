@@ -6,6 +6,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 
 	"devlab/backend/internal/model"
@@ -107,6 +108,29 @@ func AssemblePrompt(snapshot string, autonomy model.AutonomyLevel, f preflight.F
 		b.WriteString(strings.TrimRight(attManifest, "\n"))
 		b.WriteString("\n")
 	}
+	return b.String()
+}
+
+// catchUpSection tells a resumed order that its branch was moved onto the current stack tip and
+// WHICH deliveries landed in between — so it weighs its own work against them (REQ point 3: "Der
+// Auftrag muss es wissen"). A clean rebase means the lines did not collide, NOT that the work is
+// still needed; the section says so, because that is the trap this axiom guards against.
+func catchUpSection(u *preflight.Understack) string {
+	var b strings.Builder
+	b.WriteString("## Your branch was caught up onto the current stack tip\n\n")
+	fmt.Fprintf(&b, "Before you continue, this order's branch was rebased from %s onto the current tip %s (%s). ",
+		short(u.ForkCommit), u.TipBranch, short(u.TipCommit))
+	if len(u.Intervening) == 0 {
+		fmt.Fprintf(&b, "%d change(s) landed in between.\n", u.Behind)
+	} else {
+		fmt.Fprintf(&b, "%d delivery/deliveries landed in between:\n", len(u.Intervening))
+		for _, d := range u.Intervening {
+			fmt.Fprintf(&b, "- %s (%s)\n", d.Title, d.Branch)
+		}
+	}
+	b.WriteString("\nCheck your own work against these changes: is it still needed, does it now duplicate one of " +
+		"them, or has one of them overturned an assumption it rests on? A clean rebase means only that the lines " +
+		"did not collide — not that the work is still correct.\n")
 	return b.String()
 }
 

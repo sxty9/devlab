@@ -74,6 +74,22 @@ type WorkbenchOps interface {
 	// MergeBaseDefault returns the merge base of the workbench and the default branch — the
 	// span start of undelivered work on the rest path.
 	MergeBaseDefault(ctx context.Context) (string, error)
+	// CatchUpOnto rebases the task branch onto the current stack tip (tipBranch) so a branch cut from
+	// an older layer sits on the newest. A conflict aborts FULLY and leaves the branch exactly as it
+	// was, reporting the conflicting files; a clean run moves it. It replays the branch's own commits
+	// onto the tip — never a reset that drops committed work.
+	CatchUpOnto(ctx context.Context, tipBranch string) (CatchUpInfo, error)
+}
+
+// CatchUpInfo mirrors the workbench's catch-up report across the seam: whether the branch was
+// rebased onto the tip, whether it conflicted (the branch is then exactly as before), the
+// conflicting files, and the branch head before/after.
+type CatchUpInfo struct {
+	Rebased       bool
+	Conflicted    bool
+	ConflictFiles []string
+	OldHead       string
+	NewHead       string
 }
 
 // AgentStream is a running agent invocation: its stream-json stdout plus its completion.
@@ -226,6 +242,13 @@ type Deps interface {
 	Deploy() DeployOps
 	Questions() QuestionOps
 	Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error)
+	// StackPosition measures where THIS run's task branch sits on the delivery stack relative to the
+	// current tip (deliver.NextPRBase): the tip it should stand on, the fork commit they share, how
+	// many delivered layers landed since, and those layers (title + branch each). nil when the branch
+	// carries no undelivered work or the position cannot be measured — a branch with nothing on it is
+	// never behind. The preflight stage records it for the protocol and the implement stage acts on it
+	// (rebasing the branch onto the tip before more work is built on it).
+	StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error)
 	// AxiomScope names the stand THIS repository was last examined against, per axiom of the run —
 	// the section that makes an execution incremental instead of re-reading whole repositories
 	// every night. "" when there is nothing to say (a ToDo carries no axioms). It is a per-REPO

@@ -74,6 +74,59 @@ func heldOnOpenQuestion(rc *RepoCtx, q *runs.Question) error {
 	}}
 }
 
+// catchUpBranch rebases this order's branch onto the current stack tip when it rests on an older
+// layer (the understack measured by preflight). It is the ONE place all four ways a branch goes
+// stale are handled, so the fix does not hang off "resume" alone. Rules:
+//   - nothing behind (or nothing measured) ⇒ no-op (a fresh branch is cut from the tip already);
+//   - a RECORDED open delivery ⇒ left as it stands (that is a re-delivery of a fixed span, not
+//     weiterbauen — rebasing it would rewrite an already-opened PR's branch);
+//   - a clean catch-up ⇒ the branch is moved and the fact is marked for the agent prompt (no alarm);
+//   - a CONFLICT ⇒ the branch is left EXACTLY as it was (the workbench aborted fully) and the order
+//     is held with a named reason listing the files, reusing the honest-blockade surfacing (K-5).
+func (rc *RepoCtx) catchUpBranch(ctx context.Context, wb WorkbenchOps, tipBranch string) error {
+	u := rc.Finding.Understack
+	if u == nil || u.Behind == 0 {
+		return nil // already on the tip, or nothing to measure — nothing happens
+	}
+	if rc.Finding.OpenDelivery != nil {
+		return nil // a recorded open delivery is re-shipped as its fixed span, not rebuilt on the tip
+	}
+	info, err := wb.CatchUpOnto(ctx, tipBranch)
+	if err != nil {
+		return fmt.Errorf("catch the branch up onto the current tip: %w", err)
+	}
+	if info.Conflicted {
+		return rc.heldOnCatchUpConflict(u, info)
+	}
+	if info.Rebased {
+		u.CaughtUp = true
+		rc.logf("caught up: rebased %s from %s onto %s@%s — %d delivery/deliveries landed since",
+			rc.branchName(), short(info.OldHead), u.TipBranch, short(info.NewHead), len(u.Intervening))
+	}
+	return nil
+}
+
+// heldOnCatchUpConflict holds an order whose branch could not be rebased onto the current tip
+// without conflict. The workbench already aborted the rebase FULLY (the branch is byte-for-byte as
+// before), so this is a clean, resumable wait — not a failed delivery and not a corrupted branch.
+// It reuses the honest-blockade surfacing (K-5): a named reason on the Blocked surface listing the
+// conflicting files, exactly like a failed tip or an open question holds a repository.
+func (rc *RepoCtx) heldOnCatchUpConflict(u *preflight.Understack, info CatchUpInfo) error {
+	now := rc.Deps.Now().UTC()
+	files := "the branch's files"
+	if len(info.ConflictFiles) > 0 {
+		files = strings.Join(info.ConflictFiles, ", ")
+	}
+	reason := fmt.Sprintf(
+		"catch-up blocked: this order's branch sits %d commit(s) behind the current tip %s and could not be "+
+			"rebased onto it without conflict — the branch was left exactly as it was (@%s), nothing half-applied. "+
+			"Conflicting files: %s. Resolve the conflict against the current tip, then resume this order.",
+		u.Behind, u.TipBranch, short(info.OldHead), files)
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: reason, Class: "catch-up-conflict", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
 // raiseQuestion is the halt at the top of the stack when THIS run asks a question. It preserves the
 // work already finished (commit loose + publish, K-1), records the question on the Blocked surface
 // (which delivers it to the user), persists the continuation so the answer resumes this exact spot,
@@ -267,6 +320,27 @@ func preflightRun(ctx context.Context, rc *RepoCtx) error {
 	if f.OpenPR != nil {
 		rc.link = f.OpenPR.URL
 	}
+
+	// The understack: how this task's branch sits against the CURRENT stack tip (REQ point 1). It is
+	// MEASURED, not vermutet — the fork commit, the distance behind the tip, and the deliveries that
+	// landed in between all stand in the preflight protocol, so a branch resting on an older layer is
+	// visible before the implement stage catches it up. An unreachable measurement is named and never
+	// a guess; a behind branch is the NORMAL case of a growing stack, so it raises no alarm here.
+	if u, uerr := rc.Deps.StackPosition(ctx, rc.Repo, rc.Run); uerr != nil {
+		rc.logf("understack not measured (the branch is caught up when it is next worked on): %s", firstLine(uerr.Error()))
+	} else if u != nil {
+		rc.Finding.Understack = u
+		switch {
+		case u.Behind > 0:
+			rc.logf("understack: this task's branch forks at %s and sits %d commit(s) behind the current tip %s@%s — it is caught up before more work is built on it",
+				short(u.ForkCommit), u.Behind, u.TipBranch, short(u.TipCommit))
+			for _, d := range u.Intervening {
+				rc.logf("  landed since: %s (%s)", d.Title, d.Branch)
+			}
+		default:
+			rc.logf("understack: this task's branch already sits on the current tip %s@%s — nothing to catch up", u.TipBranch, short(u.TipCommit))
+		}
+	}
 	return nil
 }
 
@@ -345,17 +419,28 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	if err := wb.CleanUntracked(ctx); err != nil {
 		return fmt.Errorf("clean untracked leftovers: %w", err)
 	}
-	head, err := wb.Head(ctx)
-	if err != nil {
-		return fmt.Errorf("read workbench head: %w", err)
-	}
-	// The delivery base is the head AFTER the fold, so the span holds exactly the agent's own
-	// commits — the range a counter-booking later reverses.
-	rc.deliveryBase, rc.head = head, head
 	// Measure the branch actually worked on so every log line names the truth, not a constant.
 	if b := wb.CurrentBranch(ctx); b != "" {
 		rc.branch = b
 	}
+
+	// A RESTING BRANCH IS CAUGHT UP ONTO THE STACK TIP BEFORE MORE WORK IS BUILT ON IT. A branch cut
+	// from an older layer would otherwise measure its delivery against a state that no longer exists;
+	// so it is rebased onto the current tip here, before the agent runs — the ONE place all four ways
+	// a branch goes stale (paused, deferred, a failed delivery re-run days later, an implemented ToDo
+	// left lying) pass through. A clean catch-up is the normal case of a growing stack (no alarm, no
+	// failed tip); only a conflict halts the order, and then the branch is left EXACTLY as it was.
+	if err := rc.catchUpBranch(ctx, wb, stackBase); err != nil {
+		return err
+	}
+
+	head, err := wb.Head(ctx)
+	if err != nil {
+		return fmt.Errorf("read workbench head: %w", err)
+	}
+	// The delivery base is the head AFTER the fold and any catch-up, so the span holds exactly the
+	// agent's own commits — the range a counter-booking later reverses.
+	rc.deliveryBase, rc.head = head, head
 
 	// Rest path (K-3/REQ-020.3): already implemented ⇒ create nothing new; only establish the
 	// span of the existing, undelivered work so the remaining stages can walk it. EXCEPTION:
@@ -390,6 +475,13 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 			rc.answeredQuestionID = q.ID
 			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))
 		}
+	}
+	// THE AGENT MUST KNOW it stands on a moved base: when the branch was just caught up onto the tip,
+	// the prompt names from where to where and which deliveries landed in between, with the express
+	// task of weighing its own work against them (REQ point 3). Appended to whichever prompt is used,
+	// so a resume with an answered question carries it too.
+	if u := rc.Finding.Understack; u != nil && u.CaughtUp {
+		prompt += "\n" + catchUpSection(u)
 	}
 	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
 	if err != nil {

@@ -40,6 +40,11 @@ type fakeBench struct {
 	writes     map[string]string
 	branchAt   map[string]string
 	pushed     []string
+
+	// catch-up: the report CatchUpOnto returns and a record of the tips it was asked to catch up onto.
+	catchUp      CatchUpInfo
+	catchUpErr   error
+	catchUpCalls []string
 }
 
 func newFakeBench() *fakeBench {
@@ -117,6 +122,19 @@ func (b *fakeBench) PushBranch(ctx context.Context, name string) error {
 	return nil
 }
 func (b *fakeBench) MergeBaseDefault(ctx context.Context) (string, error) { return b.mergeBase, nil }
+func (b *fakeBench) CatchUpOnto(ctx context.Context, tipBranch string) (CatchUpInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.catchUpCalls = append(b.catchUpCalls, tipBranch)
+	if b.catchUpErr != nil {
+		return CatchUpInfo{}, b.catchUpErr
+	}
+	// A rebased catch-up moves the branch head (so the delivery span is measured from the new state).
+	if b.catchUp.Rebased && b.catchUp.NewHead != "" {
+		b.head = b.catchUp.NewHead
+	}
+	return b.catchUp, nil
+}
 
 // ── fake agent stream ────────────────────────────────────────────────────────────────────
 
@@ -418,16 +436,18 @@ type pauseCall struct {
 }
 
 type fakeDeps struct {
-	mu        sync.Mutex
-	benches   map[string]*fakeBench
-	gh        *fakeGH
-	deliver   *fakeDeliver
-	deploy    *fakeDeploy
-	questions *fakeQuestions
-	agentFn   func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
-	attsFn    func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
-	findings  map[string]preflight.Finding
-	findErr   error
+	mu         sync.Mutex
+	benches    map[string]*fakeBench
+	gh         *fakeGH
+	deliver    *fakeDeliver
+	deploy     *fakeDeploy
+	questions  *fakeQuestions
+	agentFn    func(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess AgentSession) (AgentStream, error)
+	attsFn     func(ctx context.Context, repo string, atts []runs.AttachmentRef) (string, func() error, error)
+	findings   map[string]preflight.Finding
+	findErr    error
+	understack map[string]*preflight.Understack
+	understErr error
 
 	agentCalls   []agentCall
 	restartBy    []model.Actor
@@ -499,6 +519,15 @@ func (d *fakeDeps) Preflight(ctx context.Context, repo string, run runs.Run) (pr
 		return preflight.Finding{State: model.TaskUnknown}, d.findErr
 	}
 	return d.findings[repo], nil
+}
+func (d *fakeDeps) StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error) {
+	if d.understErr != nil {
+		return nil, d.understErr
+	}
+	if d.understack == nil {
+		return nil, nil
+	}
+	return d.understack[repo], nil
 }
 func (d *fakeDeps) AxiomScope(ctx context.Context, repo string, run runs.Run) string {
 	d.mu.Lock()

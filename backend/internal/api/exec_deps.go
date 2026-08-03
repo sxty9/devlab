@@ -369,6 +369,100 @@ func (d *ChainDeps) Preflight(ctx context.Context, repo string, run runs.Run) (p
 	return preflight.Derive(ctx, d, repo, run)
 }
 
+// StackPosition measures where this run's task branch sits relative to the current stack tip
+// (deliver.NextPRBase): the tip's commit, the fork commit they share, how far behind the branch is,
+// and the deliveries that landed in between (title + branch). It reads the local checkout and the
+// ledger, never mutating anything — the rebase itself is the implement stage's act. nil (no error)
+// when the runner has no checkout, the branch carries no work, or the tip cannot be resolved: a
+// branch with nothing on it is never behind, so there is simply nothing to record.
+func (d *ChainDeps) StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error) {
+	create := false
+	for _, t := range run.Targets {
+		if sameRepo(t.Repo, repo) {
+			create = t.Create
+			break
+		}
+	}
+	taskBranch := runs.TaskBranch(create, run.Title, run.ID)
+
+	b, ok, err := d.observeBench(ctx, repo)
+	if err != nil || !ok {
+		return nil, err // no checkout → nothing to measure (err nil when the repo is simply absent)
+	}
+	bb, err := b.On(taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tipBranch, err := d.Deliver().NextPRBase(ctx, repo, taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tip, fork, behind, exists, err := bb.StackPosition(ctx, tipBranch)
+	if err != nil || !exists {
+		return nil, err
+	}
+	u := &preflight.Understack{TipBranch: tipBranch, TipCommit: tip, ForkCommit: fork, Behind: behind}
+	if behind > 0 {
+		u.Intervening = d.interveningDeliveries(ctx, bb, repo, taskBranch, tip, fork)
+	}
+	return u, nil
+}
+
+// interveningDeliveries names the deliveries that landed between a branch's fork point and the
+// current tip: every ledger delivery of the repo (other than the task's own branch) whose merged
+// commit is reachable from the tip but NOT from the fork. Read-only reachability probes over the
+// checkout; the title is joined through the delivery's execution. Deduped by branch, best-effort —
+// a delivery whose reachability cannot be decided is simply left out, never guessed in.
+func (d *ChainDeps) interveningDeliveries(ctx context.Context, b *workbench.Bench, repo, taskBranch, tip, fork string) []preflight.DeliverySpan {
+	if d.s.deliveries == nil {
+		return nil
+	}
+	all, err := d.s.deliveries.All()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []preflight.DeliverySpan
+	for _, del := range all {
+		if !sameRepo(del.Repo, repo) || del.Branch == "" || del.Branch == taskBranch || del.ToCommit == "" || seen[del.Branch] {
+			continue
+		}
+		inTip, err := b.Reaches(ctx, del.ToCommit, tip)
+		if err != nil || !inTip {
+			continue
+		}
+		afterFork, err := b.Reaches(ctx, del.ToCommit, fork)
+		if err != nil || afterFork {
+			continue // reachable from the fork ⇒ already present when the branch forked, not "in between"
+		}
+		seen[del.Branch] = true
+		out = append(out, preflight.DeliverySpan{Title: d.deliveryTitle(del), Branch: del.Branch})
+	}
+	return out
+}
+
+// deliveryTitle resolves the human title of a delivery through its execution — the archived result
+// carries it directly, else the run behind the execution does. It falls back to the delivery's
+// branch (which encodes the task's description) so the section is never nameless.
+func (d *ChainDeps) deliveryTitle(del runs.Delivery) string {
+	if d.s.results != nil && del.ExecutionID != "" {
+		if res, ok, err := d.s.results.Get(del.ExecutionID); err == nil && ok && res.RunTitle != "" {
+			return res.RunTitle
+		}
+	}
+	if d.s.runs != nil {
+		if runID := d.runIDOf(del.ExecutionID); runID != "" {
+			if r, ok, err := d.s.runs.Get(runID); err == nil && ok && r.Title != "" {
+				return r.Title
+			}
+		}
+	}
+	if del.Branch != "" {
+		return del.Branch
+	}
+	return "a delivery"
+}
+
 // RequestRestart is the B-3 seam into sched (handover restart after a self-repo install).
 func (d *ChainDeps) RequestRestart(by model.Actor) error {
 	if d.hooks.RequestRestart == nil {
@@ -658,6 +752,21 @@ func (o benchOps) MergeBaseDefault(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return b.MergeBaseDefault(ctx)
+}
+
+func (o benchOps) CatchUpOnto(ctx context.Context, tipBranch string) (executor.CatchUpInfo, error) {
+	b, _, err := o.d.bench(ctx, o.repo)
+	if err != nil {
+		return executor.CatchUpInfo{}, err
+	}
+	rep, err := b.CatchUpOnto(ctx, tipBranch)
+	return executor.CatchUpInfo{
+		Rebased:       rep.Rebased,
+		Conflicted:    rep.Conflicted,
+		ConflictFiles: rep.ConflictFiles,
+		OldHead:       rep.OldHead,
+		NewHead:       rep.NewHead,
+	}, err
 }
 
 // runnerIdentity resolves the commit identity of the runner's linked account (best-effort — the

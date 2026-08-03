@@ -528,6 +528,60 @@ func (d *fixtureDeps) Preflight(ctx context.Context, repo string, run runs.Run) 
 	return preflight.Derive(ctx, d, repo, run)
 }
 
+// StackPosition measures the task branch against the current tip over the SHIPPED bench and the
+// real ledger — the same join production runs (NextPRBase + bench.StackPosition + the intervening
+// deliveries), so an integration test exercises the actual catch-up measurement, not a fixture claim.
+func (d *fixtureDeps) StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error) {
+	create := false
+	for _, t := range run.Targets {
+		if t.Repo == repo {
+			create = t.Create
+			break
+		}
+	}
+	taskBranch := runs.TaskBranch(create, run.Title, run.ID)
+	gr, err := d.world.get(repo)
+	if err != nil {
+		return nil, err
+	}
+	d.refreshRefs(ctx, gr)
+	bb, err := gr.bench.On(taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tipBranch, err := (fixtureDeliver{d: d}).NextPRBase(ctx, repo, taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tip, fork, behind, exists, err := bb.StackPosition(ctx, tipBranch)
+	if err != nil || !exists {
+		return nil, err
+	}
+	u := &preflight.Understack{TipBranch: tipBranch, TipCommit: tip, ForkCommit: fork, Behind: behind}
+	if behind > 0 {
+		all, _ := d.e.deliveries.All()
+		seen := map[string]bool{}
+		for _, del := range all {
+			if del.Repo != repo || del.Branch == "" || del.Branch == taskBranch || del.ToCommit == "" || seen[del.Branch] {
+				continue
+			}
+			if in, rerr := bb.Reaches(ctx, del.ToCommit, tip); rerr != nil || !in {
+				continue
+			}
+			if after, rerr := bb.Reaches(ctx, del.ToCommit, fork); rerr != nil || after {
+				continue
+			}
+			seen[del.Branch] = true
+			title := del.Branch
+			if r, ok, gerr := d.e.runStore.Get(d.e.runIDOf(del.ExecutionID)); gerr == nil && ok && r.Title != "" {
+				title = r.Title
+			}
+			u.Intervening = append(u.Intervening, preflight.DeliverySpan{Title: title, Branch: del.Branch})
+		}
+	}
+	return u, nil
+}
+
 // AxiomScope / RecordAxiomScope run on the SHIPPED join (api.ChainDeps over the real pools and the
 // real constitution store): the examined stand is not an I/O edge, so a fixture that answered it
 // itself would prove nothing about the code that has to carry it into the prompt.
@@ -679,6 +733,16 @@ func (o benchOps) PushBranch(ctx context.Context, name string) error {
 func (o benchOps) MergeBaseDefault(ctx context.Context) (string, error) {
 	return o.b.MergeBaseDefault(ctx)
 }
+func (o benchOps) CatchUpOnto(ctx context.Context, tipBranch string) (executor.CatchUpInfo, error) {
+	rep, err := o.b.CatchUpOnto(ctx, tipBranch)
+	return executor.CatchUpInfo{
+		Rebased:       rep.Rebased,
+		Conflicted:    rep.Conflicted,
+		ConflictFiles: rep.ConflictFiles,
+		OldHead:       rep.OldHead,
+		NewHead:       rep.NewHead,
+	}, err
+}
 
 // brokenBench answers every operation with the reason the repository could not be opened — the
 // motor then FAILS the stage honestly instead of skipping it (K-4).
@@ -701,6 +765,9 @@ func (x brokenBench) WriteFile(context.Context, string, []byte) error  { return 
 func (x brokenBench) BranchAt(context.Context, string, string) error   { return x.err }
 func (x brokenBench) PushBranch(context.Context, string) error         { return x.err }
 func (x brokenBench) MergeBaseDefault(context.Context) (string, error) { return "", x.err }
+func (x brokenBench) CatchUpOnto(context.Context, string) (executor.CatchUpInfo, error) {
+	return executor.CatchUpInfo{}, x.err
+}
 
 // ── the fixture agent ────────────────────────────────────────────────────────────────────────
 

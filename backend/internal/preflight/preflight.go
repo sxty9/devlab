@@ -39,7 +39,36 @@ type Finding struct {
 	ObservedAt   time.Time       `json:"observedAt"`
 	OpenPR       *model.PRRef    `json:"openPr,omitempty"`
 	OpenDelivery *runs.Delivery  `json:"openDelivery,omitempty"`
-	Err          string          `json:"err,omitempty"`
+	// Understack, when set, names how this task's branch sits on the delivery stack relative to the
+	// CURRENT tip — recorded by the preflight stage for a branch that carries undelivered work. A
+	// branch cut from an older layer is caught up onto the tip before more work is built on it, so a
+	// resting branch never measures its delivery against a state that no longer exists.
+	Understack *Understack `json:"understack,omitempty"`
+	Err        string      `json:"err,omitempty"`
+}
+
+// Understack is the task branch's standing on the delivery stack, measured against the CURRENT tip
+// (deliver.NextPRBase — the layer a fresh branch would be cut from today). A branch cut from an
+// OLDER layer sits behind the tip: Behind names how many delivered layers landed since it forked,
+// ForkCommit the point the branch and the tip still share, TipCommit/TipBranch the layer it should
+// stand on, and Intervening those layers (title + branch each) so an order resuming on the branch
+// can weigh its own work against what arrived meanwhile. Behind==0 means the branch already sits on
+// the tip and nothing is caught up. CaughtUp is set by the implement stage once it has actually
+// rebased the branch onto the tip — a fact the agent prompt then names.
+type Understack struct {
+	TipBranch   string         `json:"tipBranch"`
+	TipCommit   string         `json:"tipCommit"`
+	ForkCommit  string         `json:"forkCommit"`
+	Behind      int            `json:"behind"`
+	Intervening []DeliverySpan `json:"intervening,omitempty"`
+	CaughtUp    bool           `json:"caughtUp,omitempty"`
+}
+
+// DeliverySpan names one delivery that landed between a branch's fork point and the current tip:
+// the task it delivered (its title) and the branch it delivered on.
+type DeliverySpan struct {
+	Title  string `json:"title"`
+	Branch string `json:"branch"`
 }
 
 // Derive observes one repo for one run: not-implemented | implemented-undelivered | delivered |
