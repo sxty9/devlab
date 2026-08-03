@@ -610,12 +610,31 @@ func (e Executor) CreateBranch(ctx context.Context, wt, name, from string) error
 	return err
 }
 
-// Checkout switches the working tree to an existing branch.
+// Checkout switches the working tree to an existing LOCAL branch. `git switch -- <name>` refuses
+// anything that is not a local branch, on purpose: it is the tool for moving onto a branch you go on
+// to commit to. A remote-tracking ref (origin/<default>) or a raw commit is NOT a local branch, so it
+// belongs to CheckoutDetached, not here.
 func (e Executor) Checkout(ctx context.Context, wt, name string) error {
 	if !branchRe.MatchString(name) || strings.HasPrefix(name, "-") {
 		return fmt.Errorf("invalid branch name %q", name)
 	}
 	_, err := runGit(e.gitIn(ctx, wt, "", "switch", "--", name))
+	return err
+}
+
+// CheckoutDetached moves the working tree onto ref in DETACHED HEAD state — no local branch is
+// created and none is required. It is the tool for building from a state named by a REMOTE-TRACKING
+// ref (origin/<default>, the merged state) or a raw commit: `git switch --detach <ref>`. Checkout is
+// the wrong tool for that value: `git switch -- origin/main` fails with "a branch is expected, got
+// remote branch origin/main" (git itself hints "try again with the --detach option"), because it only
+// accepts a local branch. Detached is exactly the intent for the production build — pin the tree to
+// precisely what merged, nameless and unmovable, and build from that — so it gets its own primitive
+// instead of being assembled at the call site.
+func (e Executor) CheckoutDetached(ctx context.Context, wt, ref string) error {
+	if !branchRe.MatchString(ref) || strings.HasPrefix(ref, "-") {
+		return fmt.Errorf("invalid ref %q", ref)
+	}
+	_, err := runGit(e.gitIn(ctx, wt, "", "switch", "--detach", ref))
 	return err
 }
 

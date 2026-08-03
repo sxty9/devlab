@@ -76,6 +76,46 @@ type ChainDeps struct {
 	mu      sync.Mutex
 	benches map[string]*repoBench
 	full    map[string]string
+
+	// The three seams below default to production and are overridden ONLY by the end-to-end
+	// production test, which drives the whole path against a REAL local repository. In production
+	// they are zero/false, so the behaviour is exactly the inline code they replaced.
+	//
+	// execBypass runs the runner's git ops directly (PerUser=false) instead of through the pinned
+	// sudo wrapper — a hermetic test has no wrapper, but it does have a real git and a real checkout,
+	// so the fetch and the DETACHED checkout of the merged state run for real.
+	execBypass bool
+	// prodBuild / prodSend are the build-and-ship half of the production step. Everything BEFORE
+	// them — resolve the merged default branch, fetch it, check it out detached, detect the service —
+	// runs against the real repository. The build (root-only, via the wrapper) and the send to the
+	// foreign host are what a test substitutes, because a hermetic test has neither the wrapper nor a
+	// remote target. nil means the production function.
+	prodBuild func(ctx context.Context, ex workspace.Executor, wt string) (string, error)
+	prodSend  func(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error
+}
+
+// runnerExec builds the Executor that acts AS the runner account. It is the ONE place the runner's
+// executor is constructed, so the per-user mode — production: run AS the workspace owner through the
+// pinned devlab-exec wrapper — lives in a single spot instead of five identical literals. execBypass
+// (set only by the end-to-end production test) drops to direct execution.
+func (d *ChainDeps) runnerExec() workspace.Executor {
+	return workspace.Executor{User: d.user, PerUser: !d.execBypass}
+}
+
+// buildProd runs the production artifact build, honouring the test seam.
+func (d *ChainDeps) buildProd(ctx context.Context, ex workspace.Executor, wt string) (string, error) {
+	if d.prodBuild != nil {
+		return d.prodBuild(ctx, ex, wt)
+	}
+	return deploy.Build(ctx, ex, wt)
+}
+
+// sendProd ships the prebuilt artifact to the production host, honouring the test seam.
+func (d *ChainDeps) sendProd(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error {
+	if d.prodSend != nil {
+		return d.prodSend(ctx, cfg, repo, artifact)
+	}
+	return deploy.SendProd(ctx, cfg, repo, artifact)
 }
 
 // repoBench is one repo's prepared working tree, held for the execution's lifetime.
@@ -211,7 +251,7 @@ func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.Resol
 	if err != nil {
 		return nil, err
 	}
-	ex := workspace.Executor{User: d.user, PerUser: true}
+	ex := d.runnerExec()
 	// Name the branch the working tree is ACTUALLY on — each run works on its own order branch, so a
 	// preamble that always said "mercury-dev" told the agent a falsehood about where its commits land.
 	// The workbench constant is only the fallback when the measurement yields nothing (bare/detached).
@@ -304,7 +344,7 @@ func (d *ChainDeps) StageAttachments(ctx context.Context, repo string, atts []ru
 		}
 		files = append(files, workspace.AttachmentFile{Filename: a.Filename, Data: data, Note: a.MIME})
 	}
-	ex := workspace.Executor{User: d.user, PerUser: true}
+	ex := d.runnerExec()
 	manifest, _, cleanup, serr := ex.StageAttachments(ctx, wt, files)
 	if serr != nil {
 		return "", noop, serr
@@ -477,7 +517,7 @@ func (d *ChainDeps) observeBench(ctx context.Context, repo string) (*workbench.B
 	if err != nil {
 		return nil, false, err
 	}
-	ex := workspace.Executor{User: d.user, PerUser: true}
+	ex := d.runnerExec()
 	b, err := workbench.New(&ex, wt)
 	if err != nil {
 		return nil, false, err
@@ -875,7 +915,7 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	if err != nil {
 		return executor.DeployOutcome{}, err
 	}
-	ex := workspace.Executor{User: c.d.user, PerUser: true}
+	ex := c.d.runnerExec()
 	artifact, err := deploy.Build(ctx, ex, wt)
 	if err != nil {
 		return executor.DeployOutcome{}, err
@@ -934,11 +974,15 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	if err != nil || def == "" {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: resolve default branch of %s: %v", repo, err)
 	}
-	ex := workspace.Executor{User: c.d.user, PerUser: true}
+	ex := c.d.runnerExec()
 	if err := ex.Fetch(ctx, wt, c.d.token); err != nil {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: fetch %s: %w", repo, err)
 	}
-	if err := ex.Checkout(ctx, wt, "origin/"+def); err != nil {
+	// The merged state is named by a REMOTE-TRACKING ref (origin/<default>), not a local branch, and
+	// the intent is a DETACHED build from exactly what merged — so it is checked out with the detached
+	// primitive. Plain Checkout (git switch -- origin/main) is the wrong tool here: it accepts only a
+	// local branch and refuses the remote-tracking ref outright.
+	if err := ex.CheckoutDetached(ctx, wt, "origin/"+def); err != nil {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: check out the merged state (origin/%s) of %s: %w", def, repo, err)
 	}
 	_ = bench // the checkout above pins the worktree to the merged tip for the build below
@@ -965,11 +1009,13 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 		return deliver.ProdOutcome{Detail: cfgErr.Error()}, cfgErr
 	}
 
-	artifact, err := deploy.Build(ctx, ex, wt)
+	artifact, err := c.d.buildProd(ctx, ex, wt)
 	if err != nil {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: build the production artifact of %s: %w", repo, err)
 	}
-	if err := deploy.SendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
+	// The send expects the SHORT repo id (its name grammar rejects a slash); the ledger carries the
+	// full "owner/repo", so it is reduced here — the same value-form seam that the workbench needs.
+	if err := c.d.sendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
 		return deliver.ProdOutcome{Detail: err.Error()}, err
 	}
 	// The receiver installed the prebuilt artifact AND proved the service running on the target, so a
