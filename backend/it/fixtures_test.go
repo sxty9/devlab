@@ -981,6 +981,71 @@ func (g fixtureGH) DeleteBranch(_ context.Context, repo, branch string) error {
 	return gitQuiet("", "--git-dir="+gr.origin, "update-ref", "-d", "refs/heads/"+branch)
 }
 
+// RetargetPullRequest re-homes an open pull request onto a new base branch (umhaengen vor loeschen).
+func (g fixtureGH) RetargetPullRequest(_ context.Context, repo string, number int, base string) error {
+	if err := g.d.fault("RetargetPullRequest"); err != nil {
+		return err
+	}
+	gh := g.d.world.gh
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	pr, ok := gh.prs[g.key(repo, number)]
+	if !ok {
+		return &github.StatusError{Status: 404, Msg: "pull request not found"}
+	}
+	pr.base = base
+	return nil
+}
+
+// CreateBranch creates the ref in the ORIGIN at sha — the restore half of the stacked-PR heal. An
+// already-present ref answers 422 "Reference already exists" (Satisfied at the caller).
+func (g fixtureGH) CreateBranch(_ context.Context, repo, branch, sha string) error {
+	if err := g.d.fault("CreateBranch"); err != nil {
+		return err
+	}
+	gr, err := g.d.world.get(repo)
+	if err != nil {
+		return err
+	}
+	if gr.originHead("refs/heads/"+branch) != "" {
+		return &github.StatusError{Status: 422, Msg: "Reference already exists"}
+	}
+	return gitQuiet("", "--git-dir="+gr.origin, "update-ref", "refs/heads/"+branch, sha)
+}
+
+// ReopenPullRequest reopens a closed-without-merge pull request (state=open).
+func (g fixtureGH) ReopenPullRequest(_ context.Context, repo string, number int) error {
+	if err := g.d.fault("ReopenPullRequest"); err != nil {
+		return err
+	}
+	gh := g.d.world.gh
+	gh.mu.Lock()
+	defer gh.mu.Unlock()
+	pr, ok := gh.prs[g.key(repo, number)]
+	if !ok {
+		return &github.StatusError{Status: 404, Msg: "pull request not found"}
+	}
+	pr.state, pr.merged = "open", false
+	return nil
+}
+
+// BranchTip resolves a branch's tip in the ORIGIN; an absent branch answers 404 — the tell the heal
+// reads to know a base branch was deleted under a pull request.
+func (g fixtureGH) BranchTip(_ context.Context, repo, branch string) (string, error) {
+	if err := g.d.fault("BranchTip"); err != nil {
+		return "", err
+	}
+	gr, err := g.d.world.get(repo)
+	if err != nil {
+		return "", err
+	}
+	sha := gr.originHead("refs/heads/" + branch)
+	if sha == "" {
+		return "", &github.StatusError{Status: 404, Msg: "branch " + branch + " not found"}
+	}
+	return sha, nil
+}
+
 func (g fixtureGH) CreateRepo(_ context.Context, name string, _ bool) (string, error) {
 	if err := g.d.fault("CreateRepo"); err != nil {
 		return "", err

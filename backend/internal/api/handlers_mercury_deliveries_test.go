@@ -63,6 +63,14 @@ func (f *fakeDeliverOps) ClosePullRequest(_ context.Context, _ string, number in
 	return nil
 }
 func (f *fakeDeliverOps) DeleteBranch(context.Context, string, string) error { return nil }
+func (f *fakeDeliverOps) RetargetPullRequest(context.Context, string, int, string) error {
+	return nil
+}
+func (f *fakeDeliverOps) CreateBranch(context.Context, string, string, string) error { return nil }
+func (f *fakeDeliverOps) ReopenPullRequest(context.Context, string, int) error       { return nil }
+func (f *fakeDeliverOps) BranchTip(context.Context, string, string) (string, error) {
+	return "", nil
+}
 func (f *fakeDeliverOps) CreateRepo(_ context.Context, name string, _ bool) (string, error) {
 	return "org/" + name, nil
 }

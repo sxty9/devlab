@@ -60,6 +60,50 @@ func DeleteBranch(ctx context.Context, token, fullName, branch string) error {
 	return typed(res, derr)
 }
 
+// CreateBranch creates a branch ref at sha. It is the RESTORE half of the stacked-PR heal: a pull
+// request whose base branch was deleted under it cannot be reopened until that base branch exists
+// again, so the chain recreates it before reopening. A branch that already exists surfaces as
+// *StatusError{Status: 422} "Reference already exists" — Satisfied at the caller (isBranchExists).
+func CreateBranch(ctx context.Context, token, fullName, branch, sha string) error {
+	owner, name, err := splitFullName(fullName)
+	if err != nil {
+		return err
+	}
+	res, cerr := doPost(ctx, token, fmt.Sprintf("%s/repos/%s/%s/git/refs", apiBase, owner, name),
+		map[string]any{"ref": "refs/heads/" + branch, "sha": sha}, nil)
+	return typed(res, cerr)
+}
+
+// ReopenPullRequest reopens a pull request GitHub (or a person) closed without merging (PATCH
+// state=open). GitHub refuses the reopen when the pull request's base branch is gone, so the caller
+// recreates the base branch first (CreateBranch). Typed errors so faultclass can classify.
+func ReopenPullRequest(ctx context.Context, token, fullName string, number int) error {
+	owner, name, err := splitFullName(fullName)
+	if err != nil {
+		return err
+	}
+	res, perr := doMethod(ctx, http.MethodPatch, token,
+		fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number),
+		map[string]any{"state": "open"}, nil)
+	return typed(res, perr)
+}
+
+// RetargetPullRequest re-homes an open pull request onto a new base branch (PATCH base). It is the
+// "umhaengen vor loeschen" primitive: before a merged delivery's branch is pruned, every open pull
+// request stacked on it is moved onto the default branch, because GitHub does NOT reliably re-home a
+// stacked pull request when its base branch is deleted — it CLOSES the successor (measured 2026-08-04).
+// Typed errors so faultclass can classify.
+func RetargetPullRequest(ctx context.Context, token, fullName string, number int, base string) error {
+	owner, name, err := splitFullName(fullName)
+	if err != nil {
+		return err
+	}
+	res, perr := doMethod(ctx, http.MethodPatch, token,
+		fmt.Sprintf("%s/repos/%s/%s/pulls/%d", apiBase, owner, name, number),
+		map[string]any{"base": base}, nil)
+	return typed(res, perr)
+}
+
 // PullState is the maintenance view of one pull request: whether it is open, merged (and
 // when), where its head sits, AND which branch it merges INTO (BaseRef). The list endpoints do
 // not report `merged`, so the delivery maintenance reads this single-PR projection. BaseRef is the

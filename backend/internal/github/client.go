@@ -374,8 +374,10 @@ func BranchTip(ctx context.Context, token, fullName, branch string) (string, err
 			SHA string `json:"sha"`
 		} `json:"commit"`
 	}
-	if _, err := do(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/branches/"+branch, &r); err != nil {
-		return "", err
+	// typed() attaches the HTTP status: a vanished branch answers 404, and the stacked-PR heal reads
+	// exactly that status to tell a base branch DELETED under a pull request from one that is still there.
+	if res, err := do(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/branches/"+branch, &r); err != nil {
+		return "", typed(res, err)
 	}
 	return r.Commit.SHA, nil
 }

@@ -75,6 +75,22 @@ func (g liveGitHub) DeleteBranch(ctx context.Context, repo, branch string) error
 	return github.DeleteBranch(ctx, g.token, repo, branch)
 }
 
+func (g liveGitHub) RetargetPullRequest(ctx context.Context, repo string, number int, base string) error {
+	return github.RetargetPullRequest(ctx, g.token, repo, number, base)
+}
+
+func (g liveGitHub) CreateBranch(ctx context.Context, repo, branch, sha string) error {
+	return github.CreateBranch(ctx, g.token, repo, branch, sha)
+}
+
+func (g liveGitHub) ReopenPullRequest(ctx context.Context, repo string, number int) error {
+	return github.ReopenPullRequest(ctx, g.token, repo, number)
+}
+
+func (g liveGitHub) BranchTip(ctx context.Context, repo, branch string) (string, error) {
+	return github.BranchTip(ctx, g.token, repo, branch)
+}
+
 // CreateRepo creates the repository in the instance's holistic namespace (owner + topic from
 // the runtime configuration — never a literal) and reports the resulting full name. An
 // already-existing repo is returned as-is (Satisfied, REQ-033.6). The `private` flag is
