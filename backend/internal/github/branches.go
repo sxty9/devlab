@@ -61,8 +61,11 @@ func DeleteBranch(ctx context.Context, token, fullName, branch string) error {
 }
 
 // PullState is the maintenance view of one pull request: whether it is open, merged (and
-// when), and where its head sits. The list endpoints do not report `merged`, so the delivery
-// maintenance reads this single-PR projection.
+// when), where its head sits, AND which branch it merges INTO (BaseRef). The list endpoints do
+// not report `merged`, so the delivery maintenance reads this single-PR projection. BaseRef is the
+// guard that a delivery reached the DEFAULT branch: a pull request merged into any other branch —
+// a stale stacked base — never reaches main, so its content did not ship however the ledger might
+// otherwise read.
 type PullState struct {
 	Number   int
 	State    string // "open" | "closed"
@@ -70,6 +73,7 @@ type PullState struct {
 	MergedAt *time.Time
 	HeadRef  string
 	HeadSHA  string
+	BaseRef  string // the branch this pull request merges INTO
 }
 
 // pullWire is the wire subset PullState is decoded from.
@@ -82,12 +86,15 @@ type pullWire struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }
 
 func (p pullWire) toState() PullState {
 	return PullState{
 		Number: p.Number, State: p.State, Merged: p.Merged, MergedAt: p.MergedAt,
-		HeadRef: p.Head.Ref, HeadSHA: p.Head.SHA,
+		HeadRef: p.Head.Ref, HeadSHA: p.Head.SHA, BaseRef: p.Base.Ref,
 	}
 }
 

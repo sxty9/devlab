@@ -78,7 +78,7 @@ func (f *fakeGH) CreatePullRequest(_ context.Context, repo, head, base, title, b
 	n := 100 + len(f.createdPRs)
 	ref := model.PRRef{Number: n, URL: "https://github.example/" + repo + "/pull/" + fmt.Sprint(n), HeadBranch: head}
 	f.openByHead[repo+"|"+head] = &ref
-	f.prState[key(repo, n)] = PRState{Number: n, State: "open", HeadRef: head, HeadSHA: "sha-" + head}
+	f.prState[key(repo, n)] = PRState{Number: n, State: "open", HeadRef: head, HeadSHA: "sha-" + head, BaseRef: base}
 	return ref, nil
 }
 
@@ -147,6 +147,15 @@ func (f *fakeGH) DeleteBranch(_ context.Context, repo, branch string) error {
 		return f.deleteErr
 	}
 	f.deleted = append(f.deleted, repo+"|"+branch)
+	// Model GitHub: deleting a branch re-targets every OPEN pull request based on it. Real GitHub
+	// re-targets onto the deleted branch's own base; for a linear delivery stack that resolves to the
+	// default branch, which is what the maintenance relies on to merge the next pull request correctly.
+	for k, st := range f.prState {
+		if strings.HasPrefix(k, repo+"|") && st.State == "open" && st.BaseRef == branch {
+			st.BaseRef = f.defaultBranch
+			f.prState[k] = st
+		}
+	}
 	return nil
 }
 
@@ -930,6 +939,164 @@ func TestMaintainDetectsHumanMerge(t *testing.T) {
 	}
 	if len(gh.deleted) != 1 {
 		t.Errorf("the delivery branch must be pruned, deleted = %v", gh.deleted)
+	}
+}
+
+// TestMaintainMergedIntoNonDefaultIsNotDelivered is the NACHWEIS for point 5: a pull request GitHub
+// reports as MERGED, but into a branch that is NOT the default branch, did NOT reach main. Its content
+// sits on a stale stacked base. The ledger must NEVER read that as delivered — the 2026-08-04 gap,
+// where four deliveries stood on "merged" with a production stamp while main carried none of their
+// work. The delivery is marked FAILED (it becomes the repo's tip so the stack halts), the finding is
+// delivered, and nothing is pruned (the delivery branch is the only remaining copy of the work).
+func TestMaintainMergedIntoNonDefaultIsNotDelivered(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH() // defaultBranch = "main"
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(24*time.Hour))) // NOT overdue — merged by hand, onto the wrong base
+	mergedAt := t0.Add(2 * time.Hour)
+	// Merged — but into a sibling delivery branch that was never pruned, not into the default branch.
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "closed", Merged: true, MergedAt: &mergedAt, HeadRef: d.Branch, HeadSHA: "c1", BaseRef: "fix/stale-predecessor"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	got, _, _ := ledger.ByID("dlv_1")
+	if got.MergedAt != nil {
+		t.Errorf("a pull request merged into a non-default branch must NOT be recorded as merged: %+v", got.MergedAt)
+	}
+	if !got.Failed() {
+		t.Errorf("the delivery must be marked FAILED (its work never reached main), got %+v", got)
+	}
+	if !strings.Contains(got.FailedReason, "non-default branch") {
+		t.Errorf("the failure reason must name the misdelivery, got %q", got.FailedReason)
+	}
+	// It becomes the repo's tip — the stack halts on it until the work is re-delivered onto main.
+	if tip, _ := FailedTip(ledger, "o/x"); tip == nil || tip.ID != "dlv_1" {
+		t.Errorf("the misdelivered delivery must become the failed tip, got %+v", tip)
+	}
+	// The finding is delivered outward (a disturbance by the default rule).
+	notes, _ := n.List()
+	var found bool
+	for _, note := range notes {
+		if note.Kind == runs.NoticeMisdelivered {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a misdelivery must raise the %q notice, got %+v", runs.NoticeMisdelivered, notes)
+	}
+	// Nothing is pruned: the delivery branch is the only remaining copy of work that never reached main.
+	if len(gh.deleted) != 0 {
+		t.Errorf("a misdelivered branch must NOT be pruned, deleted = %v", gh.deleted)
+	}
+	// GitHub reports it merged; there is nothing left to poll, so tracking drops it.
+	if left, _ := prs.List(); len(left) != 0 {
+		t.Errorf("the misdelivered pull request must be dropped from tracking, left %+v", left)
+	}
+}
+
+// TestMaintainHoldsMergeUntilBaseIsDefault is the NACHWEIS for point 4's PREVENT half: the chain
+// refuses to merge an open pull request whose base is still a sibling delivery branch, not the
+// default branch. Merging it there would land the work on a stale base and never reach main. The
+// repo is held and the finding reported; the merge waits until the predecessor prunes and GitHub
+// re-targets this pull request onto the default branch.
+func TestMaintainHoldsMergeUntilBaseIsDefault(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH() // defaultBranch = "main"
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/two-bbb222", PRNumber: 6, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour))) // overdue — a healthy pass WOULD merge it
+	gh.prState["o/x|6"] = PRState{Number: 6, State: "open", HeadRef: d.Branch, HeadSHA: "c2", BaseRef: "fix/one-aaa111"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Errorf("a pull request based on a non-default branch must NOT be merged, calls = %v", gh.mergeCalls)
+	}
+	if len(gh.deleted) != 0 {
+		t.Errorf("nothing is pruned while the merge is held, deleted = %v", gh.deleted)
+	}
+	got, _, _ := ledger.ByID("dlv_1")
+	if got.MergedAt != nil || got.Failed() {
+		t.Errorf("a HELD pull request is neither delivered nor failed — it simply waits, got %+v", got)
+	}
+	if left, _ := prs.List(); len(left) != 1 {
+		t.Errorf("the held pull request stays tracked, left %+v", left)
+	}
+	notes, _ := n.List()
+	var found bool
+	for _, note := range notes {
+		if note.Kind == runs.NoticeMisdelivered {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("holding a misdelivery-in-waiting must raise the %q notice, got %+v", runs.NoticeMisdelivered, notes)
+	}
+}
+
+// TestMaintainStackedMergesOnePerPassThenRetargets is the NACHWEIS for point 4's ORDER: stacked pull
+// requests are merged ONE per pass, the base branch is deleted right after, and only the DELETION
+// re-targets the next pull request onto the default branch so the following pass merges it correctly.
+// Two stacked deliveries: #5 (base main) below #6 (base = #5's branch). Pass 1 merges ONLY #5 and
+// prunes its branch, which re-targets #6 onto main; #6 stays open and untouched. Pass 2 merges #6,
+// now correctly based on main. No misdelivery is ever recorded — each merge lands on the default branch.
+func TestMaintainStackedMergesOnePerPassThenRetargets(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH() // defaultBranch = "main"
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d1 := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	d2 := runs.Delivery{ID: "dlv_2", Repo: "o/x", Branch: "fix/two-bbb222", PRNumber: 6, CreatedAt: t0.Add(time.Minute), ExecutionID: "exec_2"}
+	_ = ledger.Put(d1)
+	_ = ledger.Put(d2)
+	_ = prs.Add(trackedPR(d1, time.Now().Add(-time.Hour)))
+	_ = prs.Add(trackedPR(d2, time.Now().Add(-time.Hour)))
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d1.Branch, HeadSHA: "c1", BaseRef: "main"}
+	gh.prState["o/x|6"] = PRState{Number: 6, State: "open", HeadRef: d2.Branch, HeadSHA: "c2", BaseRef: d1.Branch}
+
+	// Pass 1: only the older #5 merges; its branch is pruned; #6 is re-targeted onto main and left open.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != "o/x|5|merge" {
+		t.Fatalf("pass 1 must merge ONLY the older #5, calls = %v", gh.mergeCalls)
+	}
+	if len(gh.deleted) != 1 || gh.deleted[0] != "o/x|fix/one-aaa111" {
+		t.Fatalf("pass 1 must prune #5's branch right after the merge, deleted = %v", gh.deleted)
+	}
+	if gh.prState["o/x|6"].BaseRef != "main" {
+		t.Fatalf("pruning #5's branch must re-target #6 onto main, base = %q", gh.prState["o/x|6"].BaseRef)
+	}
+	if m1, _, _ := ledger.ByID("dlv_1"); m1.MergedAt == nil {
+		t.Errorf("#5 must be recorded merged, got %+v", m1)
+	}
+	if m2, _, _ := ledger.ByID("dlv_2"); m2.MergedAt != nil || m2.Failed() {
+		t.Errorf("#6 must still be open after pass 1, got %+v", m2)
+	}
+
+	// Pass 2: #6, now based on main, merges and prunes.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if len(gh.mergeCalls) != 2 || gh.mergeCalls[1] != "o/x|6|merge" {
+		t.Fatalf("pass 2 must merge #6, calls = %v", gh.mergeCalls)
+	}
+	if m2, _, _ := ledger.ByID("dlv_2"); m2.MergedAt == nil {
+		t.Errorf("#6 must be recorded merged after pass 2, got %+v", m2)
+	}
+	// No misdelivery anywhere: every merge landed on the default branch.
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeMisdelivered {
+			t.Errorf("a correctly stacked merge must raise NO misdelivery notice, got %+v", note)
+		}
 	}
 }
 

@@ -89,6 +89,12 @@ const (
 	// A run stopped and asked the user a question (the Blocked surface). It is a disturbance: the run
 	// waits, and its repository is blocked, until the user answers.
 	NoticeQuestion = "question"
+	// A pull request merged into a branch that is NOT the default branch: its content landed on a
+	// stale stacked base and never reached main. The delivery is NOT delivered — the ledger must never
+	// read it as merged — so the chain marks the delivery FAILED and reports the finding here. It is a
+	// disturbance by the default rule (IsDisturbance); it names the standing gap between "the pull
+	// request is merged" and "the content is in the standard branch".
+	NoticeMisdelivered = "misdelivered"
 )
 
 // Message is the notice's display text: Text when set, else Reason. Repo, when present, is a
