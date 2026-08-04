@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -236,6 +237,91 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	// The wrapper question was consumed once the renewal took effect.
 	if len(deps.questions.resolve) == 0 {
 		t.Fatalf("the wrapper question should be resolved after a successful renewal")
+	}
+}
+
+// A GRANTED APPROVAL OUTLIVES THE EXECUTION THAT ASKED (task test a): the approval belongs to the
+// ORDER, so a LATER execution — a restart mints a fresh execution id — redeems it without asking the
+// human again. This is the trap the fix closes: the write half used to look the approval up by the
+// execution id, so a new execution never read the old approval and re-asked forever.
+func TestWrapperApprovalRedeemedByLaterExecution(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "root wrapper(s) devlab-install differ from the stack tip"
+	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+
+	// exec_test raises the approval question and blocks.
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), newFakeSink()); err == nil {
+		t.Fatalf("expected the first execution to block on the wrapper drift")
+	}
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("expected exactly one wrapper question, got %d", len(deps.questions.raised))
+	}
+	// The user approves — but the execution that asked (exec_test) has since ENDED.
+	deps.questions.approve(deps.questions.raised[0].ID, "Approved renewing devlab-install.")
+
+	// A RESTART: a brand-new execution id, same order, same repo. The approval must still redeem.
+	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
+	req.Doc.ID = "exec_restart"
+	sink2 := newFakeSink()
+	if err := Execute(context.Background(), deps, req, sink2); err != nil {
+		t.Fatalf("the restarted execution should redeem the approval and deliver, got %v", err)
+	}
+	if len(deps.deploy.renewed) != 1 {
+		t.Fatalf("the later execution should have redeemed the order's approval, got %+v", deps.deploy.renewed)
+	}
+	// The human was NOT asked again — no second wrapper question was raised.
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("a redeemed approval must not re-ask; raised=%d", len(deps.questions.raised))
+	}
+	if dd, ok := sink2.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepExecuted {
+		t.Fatalf("deliver-dev should succeed on the restart, got %+v", dd)
+	}
+}
+
+// A GRANTED APPROVAL WHOSE CONTENT CHANGED IS NOT REDEEMED (task test b): the checksum binding is the
+// protection. When the source content moved after the approval, the write half installs nothing and a
+// FRESH question is raised for the new content — the stale approval never carries over silently.
+func TestWrapperApprovalNotRedeemedWhenContentChanged(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "root wrapper(s) devlab-install differ from the stack tip"
+	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), newFakeSink()); err == nil {
+		t.Fatalf("expected the first execution to block on the wrapper drift")
+	}
+	firstQID := deps.questions.raised[0].ID
+	deps.questions.approve(firstQID, "Approved renewing devlab-install.")
+
+	// The source content moved after the approval: the write half refuses (checksum mismatch), and the
+	// stack tip now offers a DIFFERENT checksum for the same file.
+	deps.deploy.renewErr = fmt.Errorf("renew devlab-install: stack-tip content is now different, not the approved sha — refusing")
+	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("c", 64)}}
+
+	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
+	req.Doc.ID = "exec_restart"
+	sink2 := newFakeSink()
+	if err := Execute(context.Background(), deps, req, sink2); err == nil {
+		t.Fatalf("a changed-content approval must not deliver; it re-asks")
+	}
+	// Nothing was installed under the stale approval.
+	if len(deps.deploy.renewed) != 0 {
+		t.Fatalf("no renewal may run when the content no longer matches the approval, got %+v", deps.deploy.renewed)
+	}
+	// A FRESH question was raised for the new content, and the stale (answered) one was withdrawn.
+	if len(deps.questions.raised) != 2 {
+		t.Fatalf("a changed-content refusal should raise a fresh question, raised=%d", len(deps.questions.raised))
+	}
+	fresh := deps.questions.raised[1]
+	if len(fresh.Wrappers) != 1 || fresh.Wrappers[0].SHA != strings.Repeat("c", 64) {
+		t.Fatalf("the fresh question should pin the NEW content checksum, got %+v", fresh.Wrappers)
+	}
+	if q, ok := deps.questions.byID(firstQID); !ok || !q.Resolved {
+		t.Fatalf("the stale approval should be withdrawn (resolved), got %+v", q)
+	}
+	if rp, _ := sink2.done("org/devlab"); rp.Block == nil || rp.Block.Class != "awaiting-wrapper-approval" {
+		t.Fatalf("the changed-content case should block awaiting a fresh approval, got %+v", rp.Block)
 	}
 }
 

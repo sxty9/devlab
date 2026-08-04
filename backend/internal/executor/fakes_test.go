@@ -358,28 +358,50 @@ type fakeQuestions struct {
 	resolve []string
 }
 
-func (q *fakeQuestions) OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+func (q *fakeQuestions) OpenForRepo(ctx context.Context, repo, exceptRunID string) (*runs.Question, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for i := range q.items {
 		it := q.items[i]
-		if it.Open() && it.Repo == repo && it.ExecutionID != exceptExecutionID {
+		if it.Open() && it.Repo == repo && it.RunID != exceptRunID {
 			return &it, nil
 		}
 	}
 	return nil, nil
 }
 
-func (q *fakeQuestions) AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error) {
+func (q *fakeQuestions) AnsweredForRun(ctx context.Context, runID, repo string) (*runs.Question, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	var found *runs.Question
 	for i := range q.items {
 		it := q.items[i]
-		if it.Answered() && it.ExecutionID == executionID && it.Repo == repo {
-			return &it, nil
+		if it.Answered() && it.RunID == runID && it.Repo == repo {
+			hit := it
+			found = &hit
 		}
 	}
-	return nil, nil
+	return found, nil
+}
+
+func (q *fakeQuestions) WithdrawForRun(ctx context.Context, runID, repo, qKind string) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := 0
+	for i := range q.items {
+		if q.items[i].Resolved || q.items[i].RunID != runID || q.items[i].Repo != repo {
+			continue
+		}
+		if qKind != "" && q.items[i].QKind != qKind {
+			continue
+		}
+		now := time.Now().UTC()
+		q.items[i].Resolved = true
+		q.items[i].ResolvedAt = &now
+		q.resolve = append(q.resolve, q.items[i].ID)
+		n++
+	}
+	return n, nil
 }
 
 func (q *fakeQuestions) Raise(ctx context.Context, in runs.Question) (runs.Question, error) {
@@ -429,6 +451,18 @@ func (q *fakeQuestions) answerApproved(id, answer string, approved bool) {
 			q.items[i].AnsweredAt = &now
 		}
 	}
+}
+
+// byID returns the stored question by id (test helper for asserting its lifecycle flags).
+func (q *fakeQuestions) byID(id string) (runs.Question, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for i := range q.items {
+		if q.items[i].ID == id {
+			return q.items[i], true
+		}
+	}
+	return runs.Question{}, false
 }
 
 // ── fake Deps ────────────────────────────────────────────────────────────────────────────

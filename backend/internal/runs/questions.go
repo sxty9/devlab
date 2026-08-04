@@ -119,8 +119,10 @@ type WrapperGrant struct {
 	Summary string `json:"summary,omitempty"`
 }
 
-// Open reports whether the question still waits for an answer.
-func (q Question) Open() bool { return q.AnsweredAt == nil }
+// Open reports whether the question still waits for an answer — it carries no answer AND has not
+// been withdrawn. A withdrawn question (Resolved with no answer, superseded by a fresh one) no
+// longer holds its repository, so the surface and the branch-halt both stop counting it.
+func (q Question) Open() bool { return q.AnsweredAt == nil && !q.Resolved }
 
 // Answered reports whether the question carries the user's answer but the run has not yet consumed
 // it — the state that feeds the resumed agent session.
@@ -214,11 +216,13 @@ func (s *QuestionStore) Get(id string) (Question, bool, error) {
 	return Question{}, false, nil
 }
 
-// OpenForRepo returns the oldest still-open question that holds this repository, raised by an
-// execution OTHER than exceptExecutionID — the halt the implement stage runs before it branches
-// (the question mirror of a failed delivery tip). exceptExecutionID excludes a run's OWN question so
-// a run is never held by the very question it raised. nil when nothing holds the repo.
-func (s *QuestionStore) OpenForRepo(repo, exceptExecutionID string) (*Question, error) {
+// OpenForRepo returns the oldest still-open question that holds this repository, raised by an ORDER
+// OTHER than exceptRunID — the halt the implement stage runs before it branches (the question mirror
+// of a failed delivery tip). The exclusion is by RUN, not by execution: a question belongs to its
+// ORDER, so a later execution of the same order (after a restart) is never held by a question one of
+// the order's earlier executions raised — it resumes and reads the answer instead of deadlocking
+// behind it. nil when nothing holds the repo.
+func (s *QuestionStore) OpenForRepo(repo, exceptRunID string) (*Question, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, err := s.load()
@@ -227,29 +231,70 @@ func (s *QuestionStore) OpenForRepo(repo, exceptExecutionID string) (*Question, 
 	}
 	for i := range cur {
 		q := cur[i]
-		if q.Open() && sameRepoID(q.Repo, repo) && q.ExecutionID != exceptExecutionID {
+		if q.Open() && sameRepoID(q.Repo, repo) && q.RunID != exceptRunID {
 			return &q, nil
 		}
 	}
 	return nil, nil
 }
 
-// AnsweredForExec returns this execution's own answered, not-yet-consumed question for the repo —
-// the answer the resumed agent session is fed. nil when none waits.
-func (s *QuestionStore) AnsweredForExec(executionID, repo string) (*Question, error) {
+// AnsweredForRun returns the ORDER's own answered, not-yet-consumed question for the repo — the
+// answer a resuming execution redeems. The answer belongs to the order and its subject, not to the
+// single execution that first asked: a later execution (after a restart that minted a NEW execution
+// id) looks the answer up by run id and redeems it, as long as its bindings still hold. For a
+// wrapper-renewal approval those bindings are re-checked at install time (the source content must
+// still hash to the approved checksum), so a stale approval installs nothing. The newest matching
+// answer wins. nil when none waits.
+func (s *QuestionStore) AnsweredForRun(runID, repo string) (*Question, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, err := s.load()
 	if err != nil {
 		return nil, err
 	}
+	var found *Question
 	for i := range cur {
-		q := cur[i]
-		if q.Answered() && q.ExecutionID == executionID && sameRepoID(q.Repo, repo) {
-			return &q, nil
+		if cur[i].Answered() && cur[i].RunID == runID && sameRepoID(cur[i].Repo, repo) {
+			q := cur[i]
+			found = &q
 		}
 	}
-	return nil, nil
+	return found, nil
+}
+
+// WithdrawForRun marks every not-yet-consumed question this ORDER raised for the repo as resolved —
+// OPEN or ANSWERED, optionally narrowed to one kind (qKind == "" means any kind). Raising a fresh
+// question calls it first, so an order never accumulates two live questions for the same repository:
+// a question left open by a since-ended execution, or an answered one whose action did not take, is
+// retired here rather than lingering as a second, un-redeemable blocker. Returns how many it
+// withdrew (0 → nothing written).
+func (s *QuestionStore) WithdrawForRun(runID, repo, qKind string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	n := 0
+	for i := range cur {
+		if cur[i].Resolved || cur[i].RunID != runID || !sameRepoID(cur[i].Repo, repo) {
+			continue
+		}
+		if qKind != "" && cur[i].QKind != qKind {
+			continue
+		}
+		cur[i].Resolved = true
+		cur[i].ResolvedAt = &now
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if err := s.save(cur); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // Raise records a new open question and fires the on-new hook once (outside the lock). The store

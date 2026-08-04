@@ -20,9 +20,11 @@ import { TaskSurface } from './tasks/Surface';
 
 const errMsg = (e: unknown): string => String((e as Error)?.message ?? e);
 
-/** A question still waits while it carries no answer. */
+/** A question still waits while it carries no answer AND has not been withdrawn — a withdrawn
+ *  question (resolved without an answer, superseded by a fresh one from a restart) is no longer a
+ *  blocker and drops off the surface. */
 function isOpen(q: RunQuestion): boolean {
-  return !q.answeredAt;
+  return !q.answeredAt && !q.resolved;
 }
 
 /** "waiting 2h 5m" — the human duration since a question was raised, so the user sees how long it
