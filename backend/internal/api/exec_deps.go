@@ -92,6 +92,10 @@ type ChainDeps struct {
 	// remote target. nil means the production function.
 	prodBuild func(ctx context.Context, ex workspace.Executor, wt string) (string, error)
 	prodSend  func(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error
+	// prodEmit lays the first-time SETUP product (unit/route/rights) into the artifact before the send,
+	// AS THE RUNNER through the pinned wrapper. Like prodBuild, a hermetic test substitutes it (no
+	// wrapper, no runner). nil means the production function.
+	prodEmit func(ctx context.Context, ex workspace.Executor, wt, repo string, det deploy.Detection) error
 }
 
 // runnerExec builds the Executor that acts AS the runner account. It is the ONE place the runner's
@@ -116,6 +120,23 @@ func (d *ChainDeps) sendProd(ctx context.Context, cfg deploy.ProdConfig, repo, a
 		return d.prodSend(ctx, cfg, repo, artifact)
 	}
 	return deploy.SendProd(ctx, cfg, repo, artifact)
+}
+
+// emitProdSetup lays the first-time SETUP product into the artifact (before the send), honouring the
+// test seam. The production path resolves the port the delivered unit will bind (declared, else an
+// atlas proposal) and runs the emit AS THE RUNNER through the pinned wrapper.
+func (d *ChainDeps) emitProdSetup(ctx context.Context, ex workspace.Executor, wt, repo string, det deploy.Detection) error {
+	if d.prodEmit != nil {
+		return d.prodEmit(ctx, ex, wt, repo, det)
+	}
+	port, err := deploy.ProdSetupPort(ctx, det)
+	if err != nil {
+		return fmt.Errorf("resolve the production port for %s: %w", repo, err)
+	}
+	if out, err := ex.EmitSetup(ctx, wt, repo, port); err != nil {
+		return fmt.Errorf("emit the setup product for %s: %w\n%s", repo, err, out)
+	}
+	return nil
 }
 
 // repoBench is one repo's prepared working tree, held for the execution's lifetime.
@@ -367,6 +388,100 @@ func (d *ChainDeps) Questions() executor.QuestionOps { return chainQuestions{d: 
 // Preflight observes one repo for one run — the same derivation the admission gate uses.
 func (d *ChainDeps) Preflight(ctx context.Context, repo string, run runs.Run) (preflight.Finding, error) {
 	return preflight.Derive(ctx, d, repo, run)
+}
+
+// StackPosition measures where this run's task branch sits relative to the current stack tip
+// (deliver.NextPRBase): the tip's commit, the fork commit they share, how far behind the branch is,
+// and the deliveries that landed in between (title + branch). It reads the local checkout and the
+// ledger, never mutating anything — the rebase itself is the implement stage's act. nil (no error)
+// when the runner has no checkout, the branch carries no work, or the tip cannot be resolved: a
+// branch with nothing on it is never behind, so there is simply nothing to record.
+func (d *ChainDeps) StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error) {
+	create := false
+	for _, t := range run.Targets {
+		if sameRepo(t.Repo, repo) {
+			create = t.Create
+			break
+		}
+	}
+	taskBranch := runs.TaskBranch(create, run.Title, run.ID)
+
+	b, ok, err := d.observeBench(ctx, repo)
+	if err != nil || !ok {
+		return nil, err // no checkout → nothing to measure (err nil when the repo is simply absent)
+	}
+	bb, err := b.On(taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tipBranch, err := d.Deliver().NextPRBase(ctx, repo, taskBranch)
+	if err != nil {
+		return nil, err
+	}
+	tip, fork, behind, exists, err := bb.StackPosition(ctx, tipBranch)
+	if err != nil || !exists {
+		return nil, err
+	}
+	u := &preflight.Understack{TipBranch: tipBranch, TipCommit: tip, ForkCommit: fork, Behind: behind}
+	if behind > 0 {
+		u.Intervening = d.interveningDeliveries(ctx, bb, repo, taskBranch, tip, fork)
+	}
+	return u, nil
+}
+
+// interveningDeliveries names the deliveries that landed between a branch's fork point and the
+// current tip: every ledger delivery of the repo (other than the task's own branch) whose merged
+// commit is reachable from the tip but NOT from the fork. Read-only reachability probes over the
+// checkout; the title is joined through the delivery's execution. Deduped by branch, best-effort —
+// a delivery whose reachability cannot be decided is simply left out, never guessed in.
+func (d *ChainDeps) interveningDeliveries(ctx context.Context, b *workbench.Bench, repo, taskBranch, tip, fork string) []preflight.DeliverySpan {
+	if d.s.deliveries == nil {
+		return nil
+	}
+	all, err := d.s.deliveries.All()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []preflight.DeliverySpan
+	for _, del := range all {
+		if !sameRepo(del.Repo, repo) || del.Branch == "" || del.Branch == taskBranch || del.ToCommit == "" || seen[del.Branch] {
+			continue
+		}
+		inTip, err := b.Reaches(ctx, del.ToCommit, tip)
+		if err != nil || !inTip {
+			continue
+		}
+		afterFork, err := b.Reaches(ctx, del.ToCommit, fork)
+		if err != nil || afterFork {
+			continue // reachable from the fork ⇒ already present when the branch forked, not "in between"
+		}
+		seen[del.Branch] = true
+		out = append(out, preflight.DeliverySpan{Title: d.deliveryTitle(del), Branch: del.Branch})
+	}
+	return out
+}
+
+// deliveryTitle resolves the human title of a delivery through its execution — the archived result
+// carries it directly, else the run behind the execution does. It falls back to the delivery's
+// branch (which encodes the task's description) so the section is never nameless.
+func (d *ChainDeps) deliveryTitle(del runs.Delivery) string {
+	if d.s.results != nil && del.ExecutionID != "" {
+		if res, ok, err := d.s.results.Get(del.ExecutionID); err == nil && ok && res.RunTitle != "" {
+			return res.RunTitle
+		}
+	}
+	if d.s.runs != nil {
+		if runID := d.runIDOf(del.ExecutionID); runID != "" {
+			if r, ok, err := d.s.runs.Get(runID); err == nil && ok && r.Title != "" {
+				return r.Title
+			}
+		}
+	}
+	if del.Branch != "" {
+		return del.Branch
+	}
+	return "a delivery"
 }
 
 // RequestRestart is the B-3 seam into sched (handover restart after a self-repo install).
@@ -658,6 +773,21 @@ func (o benchOps) MergeBaseDefault(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return b.MergeBaseDefault(ctx)
+}
+
+func (o benchOps) CatchUpOnto(ctx context.Context, tipBranch string) (executor.CatchUpInfo, error) {
+	b, _, err := o.d.bench(ctx, o.repo)
+	if err != nil {
+		return executor.CatchUpInfo{}, err
+	}
+	rep, err := b.CatchUpOnto(ctx, tipBranch)
+	return executor.CatchUpInfo{
+		Rebased:       rep.Rebased,
+		Conflicted:    rep.Conflicted,
+		ConflictFiles: rep.ConflictFiles,
+		OldHead:       rep.OldHead,
+		NewHead:       rep.NewHead,
+	}, err
 }
 
 // runnerIdentity resolves the commit identity of the runner's linked account (best-effort — the
@@ -1013,6 +1143,12 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	if err != nil {
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: build the production artifact of %s: %w", repo, err)
 	}
+	// The first-time SETUP product (unit/route/rights) is laid INTO the artifact so the receiver can
+	// set the service up on a bare host without any manual per-service step. It travels beside the
+	// program; the send below ships it, the receiver installs it only when the unit is still missing.
+	if err := c.d.emitProdSetup(ctx, ex, wt, repoShort(repo), det); err != nil {
+		return deliver.ProdOutcome{Detail: err.Error()}, fmt.Errorf("deploy: prepare production setup of %s: %w", repo, err)
+	}
 	// The send expects the SHORT repo id (its name grammar rejects a slash); the ledger carries the
 	// full "owner/repo", so it is reduced here — the same value-form seam that the workbench needs.
 	if err := c.d.sendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
@@ -1062,15 +1198,40 @@ func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.
 	}
 	grants := make([]runs.WrapperGrant, 0, len(drifts))
 	for _, d := range drifts {
-		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA})
+		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA, Summary: d.Summary})
+	}
+	return grants, nil
+}
+
+// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own working
+// branch — the content the run itself changed but has not yet merged. It is the second renewal source
+// (beside MainWrapperDrift): when the installed scripts already match the standard branch, this is what
+// lets a run that changed a root script ask for approval instead of halting for good. Only the self
+// repo owns these root wrappers, so a foreign repo has none.
+func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+	if repoShort(repo) != selfRepo() {
+		return nil, nil
+	}
+	_, wt, err := c.d.bench(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	drifts, err := deploy.WorkingWrapperDrift(wt)
+	if err != nil {
+		return nil, err
+	}
+	grants := make([]runs.WrapperGrant, 0, len(drifts))
+	for _, d := range drifts {
+		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA, Summary: d.Summary})
 	}
 	return grants, nil
 }
 
 // RenewApprovedWrappers is the daemon side of the WRITE half: for each wrapper the user approved, it
-// re-reads the merged content from the standard branch, stages a run-unwritable grant, and calls the
-// root tool (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved
-// checksum (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
+// re-reads the content from the SAME source the approval was built from (the standard branch or this
+// run's working branch, per q.WrapperSource), stages a run-unwritable grant, and calls the root tool
+// (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved checksum
+// (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
 func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
 	if repoShort(repo) != selfRepo() {
 		return fmt.Errorf("refusing wrapper renewal for non-self repository %q", repo)
@@ -1081,6 +1242,14 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	}
 	grantDir := c.d.s.paths.WrapperGrants()
 	renewer := deploy.SudoWrapperRenewer{}
+	// Bind the re-read to the SAME source the approval named. An empty source is the original merged
+	// case (standard branch); WrapperSourceWorking re-reads this run's own working branch. Either way
+	// the daemon re-reads the bytes and RenewApprovedWrapper refuses any that no longer hash to the
+	// approved checksum, so a source that changed after the approval installs nothing.
+	src := deploy.MergedWrapperContent(wt)
+	if q.WrapperSource == runs.WrapperSourceWorking {
+		src = deploy.WorkingWrapperContent(wt)
+	}
 	by := q.AnsweredBy.User
 	if by == "" {
 		by = q.AnsweredBy.OnBehalfOf
@@ -1093,7 +1262,7 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 		if deploy.InstalledWrapperMatches(g.Name, g.SHA) {
 			continue // already renewed to this exact content — do not spend the single-use approval again
 		}
-		if err := deploy.RenewMergedWrapper(ctx, renewer, wt, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
+		if err := deploy.RenewApprovedWrapper(ctx, renewer, src, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
 			return err
 		}
 	}

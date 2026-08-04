@@ -74,6 +74,59 @@ func heldOnOpenQuestion(rc *RepoCtx, q *runs.Question) error {
 	}}
 }
 
+// catchUpBranch rebases this order's branch onto the current stack tip when it rests on an older
+// layer (the understack measured by preflight). It is the ONE place all four ways a branch goes
+// stale are handled, so the fix does not hang off "resume" alone. Rules:
+//   - nothing behind (or nothing measured) ⇒ no-op (a fresh branch is cut from the tip already);
+//   - a RECORDED open delivery ⇒ left as it stands (that is a re-delivery of a fixed span, not
+//     weiterbauen — rebasing it would rewrite an already-opened PR's branch);
+//   - a clean catch-up ⇒ the branch is moved and the fact is marked for the agent prompt (no alarm);
+//   - a CONFLICT ⇒ the branch is left EXACTLY as it was (the workbench aborted fully) and the order
+//     is held with a named reason listing the files, reusing the honest-blockade surfacing (K-5).
+func (rc *RepoCtx) catchUpBranch(ctx context.Context, wb WorkbenchOps, tipBranch string) error {
+	u := rc.Finding.Understack
+	if u == nil || u.Behind == 0 {
+		return nil // already on the tip, or nothing to measure — nothing happens
+	}
+	if rc.Finding.OpenDelivery != nil {
+		return nil // a recorded open delivery is re-shipped as its fixed span, not rebuilt on the tip
+	}
+	info, err := wb.CatchUpOnto(ctx, tipBranch)
+	if err != nil {
+		return fmt.Errorf("catch the branch up onto the current tip: %w", err)
+	}
+	if info.Conflicted {
+		return rc.heldOnCatchUpConflict(u, info)
+	}
+	if info.Rebased {
+		u.CaughtUp = true
+		rc.logf("caught up: rebased %s from %s onto %s@%s — %d delivery/deliveries landed since",
+			rc.branchName(), short(info.OldHead), u.TipBranch, short(info.NewHead), len(u.Intervening))
+	}
+	return nil
+}
+
+// heldOnCatchUpConflict holds an order whose branch could not be rebased onto the current tip
+// without conflict. The workbench already aborted the rebase FULLY (the branch is byte-for-byte as
+// before), so this is a clean, resumable wait — not a failed delivery and not a corrupted branch.
+// It reuses the honest-blockade surfacing (K-5): a named reason on the Blocked surface listing the
+// conflicting files, exactly like a failed tip or an open question holds a repository.
+func (rc *RepoCtx) heldOnCatchUpConflict(u *preflight.Understack, info CatchUpInfo) error {
+	now := rc.Deps.Now().UTC()
+	files := "the branch's files"
+	if len(info.ConflictFiles) > 0 {
+		files = strings.Join(info.ConflictFiles, ", ")
+	}
+	reason := fmt.Sprintf(
+		"catch-up blocked: this order's branch sits %d commit(s) behind the current tip %s and could not be "+
+			"rebased onto it without conflict — the branch was left exactly as it was (@%s), nothing half-applied. "+
+			"Conflicting files: %s. Resolve the conflict against the current tip, then resume this order.",
+		u.Behind, u.TipBranch, short(info.OldHead), files)
+	return &faultclass.BlockedError{Backoff: model.Backoff{
+		Reason: reason, Class: "catch-up-conflict", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+	}}
+}
+
 // raiseQuestion is the halt at the top of the stack when THIS run asks a question. It preserves the
 // work already finished (commit loose + publish, K-1), records the question on the Blocked surface
 // (which delivers it to the user), persists the continuation so the answer resumes this exact spot,
@@ -121,37 +174,59 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 }
 
 // raiseWrapperQuestion is THE FREED HANDLE (point 5): the self delivery refused because the root
-// wrapper scripts drifted from the standard branch, so the run asks the user to approve renewing them
-// and blocks. It offers EXACTLY the merged (standard-branch) content, pinned per file to its checksum,
-// and mints no delivery id (the repo is held by the open question, not by a failed delivery).
+// wrapper scripts under /usr/local/sbin are not what the delivered code expects, so the run asks the
+// user to approve renewing them and blocks. It offers EXACTLY the content pinned per file to its
+// checksum, and mints no delivery id (the repo is held by the open question, not by a failed delivery).
 //
-// SAFETY (the delta from the prior order, which built the ask but REFUSED the write): approval now
-// DOES install — but only merged content a run cannot author, and only under an approval a run cannot
-// forge, and the root tool re-verifies both itself. The write is applied on resume by
-// applyApprovedWrapperRenewal → DeployOps.RenewApprovedWrappers → `sudo devlab-install
-// --renew-wrapper` (see backend/internal/deploy/wrapperrenew.go). A forged approval installs nothing:
-// the content must still hash to the standard-branch checksum, and the grant the root tool reads sits
-// in a daemon-owned, run-unwritable place. The `drift` argument is the guard's original refusal text,
-// kept only for the log line; the question's Detail is rebuilt from the standard-branch grant set.
+// TWO SOURCES, ONE QUESTION. The offered content comes from one of two places, tried in order:
+//
+//	MERGED  — the installed scripts drifted from the STANDARD BRANCH (a merged wrapper change never
+//	          reached sbin). The content is merged history a run cannot author; the human confirms it.
+//	WORKING — THIS run itself changed a root script that is not yet merged, and the installed scripts
+//	          match the standard branch, so there is nothing MERGED to offer. Here the source is the
+//	          run's OWN working branch. Without this second source the chain used to halt for good: it
+//	          waited on a merge it itself blocked (measured 03.08.2026, exec_20260803-184101-599031860).
+//
+// Both build the SAME question kind, take the SAME single-use approval, and install through the SAME
+// root write path (applyApprovedWrapperRenewal → DeployOps.RenewApprovedWrappers → `sudo devlab-install
+// --renew-wrapper`); only the source of the bytes and the wording differ. There is no second approval
+// path and no second question kind (task point 2).
+//
+// SAFETY. Approval DOES install, but a forged approval installs nothing: the content must still hash to
+// the approved checksum, and the grant the root tool reads sits in a daemon-owned, run-unwritable
+// place. For the WORKING source the run authored the bytes, so the human — not a merge — is the gate;
+// that is admissible because the same four bindings hold (sha, single-use, run-unwritable approval,
+// re-read-after-approval). They are spelled out on deploy.WorkingWrapperContent. The `drift` argument
+// is the guard's original refusal text, kept only for the log line.
 func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
-	// The renewal offers EXACTLY the standard-branch (merged) content — never the working tree. So the
-	// question is built from the difference between the installed wrappers and the standard branch, and
-	// it pins each file to the merged content's checksum (the approval is for one content, task 1/2).
+	// Prefer the MERGED source: the installed scripts drifted from the standard branch, so the renewal
+	// offers merged content a run cannot author. Each file is pinned to the merged content's checksum.
 	grants, derr := rc.Deps.Deploy().MainWrapperDrift(ctx, rc.Repo)
 	if derr != nil {
 		return fmt.Errorf("%w (could not read the standard-branch wrapper scripts: %v)", ErrWrappersStale, derr)
 	}
+	source := runs.WrapperSourceMerged
+	if len(grants) == 0 {
+		// Nothing MERGED to renew: the installed scripts already match the standard branch, so the
+		// refusal is because THIS run changed a root script that has not merged yet. Offer the run's OWN
+		// working-branch content instead — the human approves this specific content and the delivery
+		// continues, rather than halting for good on a merge the chain itself blocks (task point 1).
+		working, werr := rc.Deps.Deploy().WorkingWrapperDrift(ctx, rc.Repo)
+		if werr != nil {
+			return fmt.Errorf("%w (could not read this run's working-branch wrapper scripts: %v)", ErrWrappersStale, werr)
+		}
+		grants, source = working, runs.WrapperSourceWorking
+	}
 	now := rc.Deps.Now().UTC()
 	if len(grants) == 0 {
-		// The installed wrappers already match the standard branch — there is nothing MERGED to renew.
-		// The delivery is blocked because THIS run changed a wrapper script and that change is not yet
-		// on the standard branch; only merged content is ever installed, so it waits until it merges.
-		// We ask no question the user cannot satisfy.
+		// Neither the standard branch nor the working branch differs from the installed scripts, yet the
+		// delivery refused on stale wrappers — the drift resolved itself between the guard and this
+		// measurement. Nothing to approve; block honestly and let the next attempt re-measure.
 		rc.consumeWrapperQuestion(ctx)
-		rc.logf("this run changed a root wrapper script, but the change is not yet on the standard branch — only merged content is installed; the delivery waits until it merges")
+		rc.logf("the self delivery refused on stale root wrappers, but neither the standard branch nor this run's working branch now differs from the installed scripts — re-measuring on the next attempt")
 		return &faultclass.BlockedError{Backoff: model.Backoff{
-			Reason: "this run changed a root wrapper script under /usr/local/sbin, but that change is not yet on the standard branch — only merged wrapper content is installed, so the delivery waits until it merges",
-			Class:  "awaiting-wrapper-merge", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
+			Reason: "the self delivery refused on stale root wrapper scripts, but the drift is no longer measurable — re-checking on the next attempt",
+			Class:  "awaiting-wrapper-recheck", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
 		}}
 	}
 	// A prior answer that did not actually renew the scripts is stale — consume it so the surface
@@ -161,34 +236,76 @@ func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error
 		RunID: rc.Run.ID, RunTitle: rc.Run.Title, Kind: rc.Run.Kind,
 		ExecutionID: rc.Doc.ID, Repo: rc.Repo,
 		QKind: runs.QuestionWrapperRenewal, Autonomy: rc.Run.Autonomy.Resolve(),
-		Question: "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
-			"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed.",
-		Recommendation: "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
-			"version listed below — nothing from this run's working tree, and only the named files with the " +
-			"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing.",
-		Detail:   renderWrapperGrants(grants),
-		Wrappers: grants,
-		AskedBy:  model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
+		Question:       wrapperQuestionText(source),
+		Recommendation: wrapperRecommendation(source),
+		Detail:         renderWrapperGrants(grants, source),
+		Wrappers:       grants,
+		WrapperSource:  source,
+		AskedBy:        model.Actor{Autonomous: true, OnBehalfOf: rc.Doc.Requested.Created.User},
 	}
 	if _, err := rc.Deps.Questions().Raise(ctx, q); err != nil {
 		return fmt.Errorf("%w (the wrapper-renewal question could not be recorded: %v)", ErrWrappersStale, err)
 	}
-	rc.logf("root wrappers differ from the standard branch — asked the user to approve renewing them to the merged version; nothing was installed (guard: %s)", firstLine(drift))
+	rc.logf("root wrappers differ from %s — asked the user to approve renewing them; nothing was installed (guard: %s)", wrapperSourceLabel(source), firstLine(drift))
 	return &faultclass.BlockedError{Backoff: model.Backoff{
-		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin to their standard-branch version — approve on the Blocked surface; the merged content is then installed and verified",
+		Reason: "waiting for your approval to renew the root wrapper scripts under /usr/local/sbin — approve on the Blocked surface; the approved content is then installed and verified",
 		Class:  "awaiting-wrapper-approval", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
 	}}
 }
 
-// renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
-// would be renewed and the checksum of the standard-branch content it would be renewed to.
-func renderWrapperGrants(grants []runs.WrapperGrant) string {
-	var b strings.Builder
-	b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
-	for _, g := range grants {
-		fmt.Fprintf(&b, "  - %s → sha256 %s\n", g.Name, g.SHA)
+// wrapperSourceLabel names the renewal source in a log line and question text.
+func wrapperSourceLabel(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "this run's own working branch (the run changed a root script)"
 	}
-	b.WriteString("Only these files, with these exact checksums, are installed; the approval is single-use.")
+	return "the standard branch (the installed scripts drifted from the merged code)"
+}
+
+// wrapperQuestionText is the wording the user reads. It names WHY the scripts must be renewed — a merge
+// that never reached sbin, or a change this very run made — so a human can decide without opening the
+// branch (task point 4).
+func wrapperQuestionText(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "Renew the root wrapper scripts under /usr/local/sbin to THIS run's version? " +
+			"This run itself changed one of the root scripts, and the change is not yet merged, so the daemon " +
+			"cannot be installed until you approve installing the run's own version of the changed scripts."
+	}
+	return "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
+		"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed."
+}
+
+// wrapperRecommendation is the run's own proposed answer, stating what approval installs and why the
+// approval stays safe (single-use, content-pinned) for the source at hand.
+func wrapperRecommendation(source string) string {
+	if source == runs.WrapperSourceWorking {
+		return "These scripts run as root, so this decision is always yours — it is never answered automatically, " +
+			"not even at the autonomous level. Approving installs EXACTLY this run's version of the named files with " +
+			"the named checksums below — nothing else. The approval is single-use: if this run's branch changes " +
+			"afterwards, it installs nothing."
+	}
+	return "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
+		"version listed below — nothing from this run's working tree, and only the named files with the " +
+		"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing."
+}
+
+// renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
+// would be renewed and the checksum of the content it would be renewed to, naming the source so it is
+// unambiguous whether the standard branch or this run's own change is being installed (task point 4).
+func renderWrapperGrants(grants []runs.WrapperGrant, source string) string {
+	var b strings.Builder
+	if source == runs.WrapperSourceWorking {
+		b.WriteString("These root wrapper scripts will be renewed to THIS run's own (not-yet-merged) version:\n")
+	} else {
+		b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
+	}
+	for _, g := range grants {
+		if g.Summary != "" {
+			fmt.Fprintf(&b, "  - %s — %s (sha256 %s)\n", g.Name, g.Summary, g.SHA)
+		} else {
+			fmt.Fprintf(&b, "  - %s → sha256 %s\n", g.Name, g.SHA)
+		}
+	}
+	b.WriteString("These scripts run as root. Only these files, with these exact checksums, are installed; the approval is single-use.")
 	return b.String()
 }
 
@@ -266,6 +383,27 @@ func preflightRun(ctx context.Context, rc *RepoCtx) error {
 	}
 	if f.OpenPR != nil {
 		rc.link = f.OpenPR.URL
+	}
+
+	// The understack: how this task's branch sits against the CURRENT stack tip (REQ point 1). It is
+	// MEASURED, not vermutet — the fork commit, the distance behind the tip, and the deliveries that
+	// landed in between all stand in the preflight protocol, so a branch resting on an older layer is
+	// visible before the implement stage catches it up. An unreachable measurement is named and never
+	// a guess; a behind branch is the NORMAL case of a growing stack, so it raises no alarm here.
+	if u, uerr := rc.Deps.StackPosition(ctx, rc.Repo, rc.Run); uerr != nil {
+		rc.logf("understack not measured (the branch is caught up when it is next worked on): %s", firstLine(uerr.Error()))
+	} else if u != nil {
+		rc.Finding.Understack = u
+		switch {
+		case u.Behind > 0:
+			rc.logf("understack: this task's branch forks at %s and sits %d commit(s) behind the current tip %s@%s — it is caught up before more work is built on it",
+				short(u.ForkCommit), u.Behind, u.TipBranch, short(u.TipCommit))
+			for _, d := range u.Intervening {
+				rc.logf("  landed since: %s (%s)", d.Title, d.Branch)
+			}
+		default:
+			rc.logf("understack: this task's branch already sits on the current tip %s@%s — nothing to catch up", u.TipBranch, short(u.TipCommit))
+		}
 	}
 	return nil
 }
@@ -345,17 +483,28 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	if err := wb.CleanUntracked(ctx); err != nil {
 		return fmt.Errorf("clean untracked leftovers: %w", err)
 	}
-	head, err := wb.Head(ctx)
-	if err != nil {
-		return fmt.Errorf("read workbench head: %w", err)
-	}
-	// The delivery base is the head AFTER the fold, so the span holds exactly the agent's own
-	// commits — the range a counter-booking later reverses.
-	rc.deliveryBase, rc.head = head, head
 	// Measure the branch actually worked on so every log line names the truth, not a constant.
 	if b := wb.CurrentBranch(ctx); b != "" {
 		rc.branch = b
 	}
+
+	// A RESTING BRANCH IS CAUGHT UP ONTO THE STACK TIP BEFORE MORE WORK IS BUILT ON IT. A branch cut
+	// from an older layer would otherwise measure its delivery against a state that no longer exists;
+	// so it is rebased onto the current tip here, before the agent runs — the ONE place all four ways
+	// a branch goes stale (paused, deferred, a failed delivery re-run days later, an implemented ToDo
+	// left lying) pass through. A clean catch-up is the normal case of a growing stack (no alarm, no
+	// failed tip); only a conflict halts the order, and then the branch is left EXACTLY as it was.
+	if err := rc.catchUpBranch(ctx, wb, stackBase); err != nil {
+		return err
+	}
+
+	head, err := wb.Head(ctx)
+	if err != nil {
+		return fmt.Errorf("read workbench head: %w", err)
+	}
+	// The delivery base is the head AFTER the fold and any catch-up, so the span holds exactly the
+	// agent's own commits — the range a counter-booking later reverses.
+	rc.deliveryBase, rc.head = head, head
 
 	// Rest path (K-3/REQ-020.3): already implemented ⇒ create nothing new; only establish the
 	// span of the existing, undelivered work so the remaining stages can walk it. EXCEPTION:
@@ -390,6 +539,13 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 			rc.answeredQuestionID = q.ID
 			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))
 		}
+	}
+	// THE AGENT MUST KNOW it stands on a moved base: when the branch was just caught up onto the tip,
+	// the prompt names from where to where and which deliveries landed in between, with the express
+	// task of weighing its own work against them (REQ point 3). Appended to whichever prompt is used,
+	// so a resume with an answered question carries it too.
+	if u := rc.Finding.Understack; u != nil && u.CaughtUp {
+		prompt += "\n" + catchUpSection(u)
 	}
 	stream, err := deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
 	if err != nil {

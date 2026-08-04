@@ -164,6 +164,35 @@ case "$verb" in
     [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui)"
     ;;
 
+  emit-setup)
+    # Lay the service's first-time SETUP product (systemd unit + edge route + rights) BESIDE the built
+    # program, under <wt>/.mercury-artifact/setup/, so the production receiver INSTALLS it rather than
+    # generating anything of its own ("Ein Erzeuger, ein Installierer"). The templates come from the ONE
+    # shared library the dev installer also uses (devlab-setup-lib.sh) — no second unit template exists.
+    # Runs AS THIS USER (like artifact-build) so the emitted files are the workspace owner's, never root.
+    wt="${1:-}"; repo="${2:-}"; port="${3:-}"
+    require_under_root "$wt"
+    [ -d "$wt" ] || die "no such workspace: $wt"
+    { [ -n "$repo" ] && [ -n "$port" ]; } || die "emit-setup needs <wt> <repo> <port>"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || die "invalid port: $port"
+    SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
+    [ -r "$SETUP_LIB" ] || die "shared setup library not found: $SETUP_LIB"
+    # shellcheck source=/dev/null
+    . "$SETUP_LIB"
+    setup_valid_repo_name "$repo" || die "refusing to emit setup for '$repo'"
+    art="$wt/.mercury-artifact"
+    [ -d "$art" ] || die "no artifact at $art — build before emitting setup"
+    dst="$art/setup"
+    rm -rf -- "$dst"; mkdir -p -- "$dst"
+    setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
+    setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
+    # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
+    if [ -f "$wt/permissions/${repo}.json" ]; then
+      cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
+    fi
+    echo "devlab-exec: emitted setup product for '$repo' (port $port) into $dst"
+    ;;
+
   *)
     die "unknown verb: ${verb:-<none>}"
     ;;

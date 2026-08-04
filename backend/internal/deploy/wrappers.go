@@ -32,16 +32,20 @@ import (
 // grants privilege, so unlike the wrapper scripts' own env seams it needs no sudoers guard.
 var wrapperInstallDir = envOr("DEVLAB_SBIN_DIR", "/usr/local/sbin")
 
-// selfWrappers are the root-owned wrappers the devlab (self) repository ships from deploy/ into
-// wrapperInstallDir. It MIRRORS the WRAPPERS array in the `service` CLI (and the pins in
-// deploy/devlab.sudoers / deploy/devlab-runs.sudoers); a wrapper added there must be added here, or
-// the drift probe would go blind to it. deploy/devlab-deploy-recv is deliberately absent — it is the
-// prod-receive path, not armed in this phase and not installed to sbin by `service`.
+// selfWrappers are the root-owned wrappers (and the shared setup library) the devlab (self) repository
+// ships from deploy/ into wrapperInstallDir. It MIRRORS the WRAPPERS array in the `service` CLI (and the
+// pins in deploy/devlab.sudoers / deploy/devlab-runs.sudoers); a wrapper added there must be added here,
+// or the drift probe would go blind to it. devlab-setup-lib.sh is a SOURCED fragment, not an executable
+// wrapper, but it is installed beside them and BOTH devlab-install and devlab-exec source it, so a stale
+// copy would silently change what a setup produces — the drift probe keeps it current like the rest.
+// deploy/devlab-deploy-recv is deliberately absent — it lives on the PRODUCTION host, not in this host's
+// sbin, and reaches production by hand (it is not installed to sbin by `service`).
 var selfWrappers = []string{
 	"devlab-exec",
 	"devlab-install",
 	"devlab-mkworkspace",
 	"devlab-restart-when-free",
+	"devlab-setup-lib.sh",
 }
 
 // WrapperDrift names one root wrapper whose installed copy no longer matches the repository's
@@ -53,11 +57,17 @@ type WrapperDrift struct {
 	Installed string // <sbin>/<name> — what runs today
 	Reason    string // why it drifted ("not installed" | "installed copy differs …")
 
-	// WantSHA and WantContent are set ONLY by MainWrapperDrift: the sha256 (hex) and bytes of the
-	// STANDARD-BRANCH copy of the wrapper — the merged content that a renewal would install. They stay
-	// empty for the working-tree drift probe (CheckWrapperDrift), which only reports a mismatch.
+	// WantSHA and WantContent are set ONLY by the renewal drift probes (MainWrapperDrift /
+	// WorkingWrapperDrift): the sha256 (hex) and bytes of the copy — merged or working-branch — that a
+	// renewal would install. They stay empty for the working-tree drift probe (CheckWrapperDrift), which
+	// only reports a mismatch.
 	WantSHA     string
 	WantContent []byte
+
+	// Summary is a SHORT, human-readable description of what the renewal changes in this file (e.g.
+	// "+12/-3 lines vs the installed script") — the difference summary a human reads to decide without
+	// opening the branch, never the full content. Set by the renewal drift probes.
+	Summary string
 }
 
 // ErrWrappersStale is the named refusal of a self delivery whose installed root wrappers no longer

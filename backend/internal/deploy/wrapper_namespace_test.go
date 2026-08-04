@@ -314,23 +314,24 @@ func TestWrappersShareOneWorkspaceDerivation(t *testing.T) {
 	}
 }
 
-// reservedRepoNames reads the wrapper's own reservation list, so this test file holds no second copy
-// of that knowledge (a list that drifted would be worse than none).
+// reservedRepoNames reads the shared library's reservation list, so this test file holds no second copy
+// of that knowledge (a list that drifted would be worse than none). The list moved out of devlab-install
+// into deploy/devlab-setup-lib.sh, the ONE source both the dev installer and the prod receiver share.
 func reservedRepoNames(t *testing.T) map[string]bool {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "devlab-install"))
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	const marker = `RESERVED_REPOS="`
+	const marker = `SETUP_RESERVED_REPOS="`
 	i := strings.Index(string(b), marker)
 	if i < 0 {
-		t.Fatal("deploy/devlab-install carries no RESERVED_REPOS list")
+		t.Fatal("deploy/devlab-setup-lib.sh carries no SETUP_RESERVED_REPOS list")
 	}
 	rest := string(b)[i+len(marker):]
 	j := strings.Index(rest, `"`)
 	if j < 0 {
-		t.Fatal("the RESERVED_REPOS list is unterminated")
+		t.Fatal("the SETUP_RESERVED_REPOS list is unterminated")
 	}
 	set := map[string]bool{}
 	for _, f := range strings.Fields(rest[:j]) {

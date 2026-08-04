@@ -662,6 +662,21 @@ func (e Executor) ArtifactBuild(ctx context.Context, wt string) (string, error) 
 	return strings.TrimRight(string(out), "\n"), err
 }
 
+// EmitSetup lays the service's first-time SETUP product (systemd unit + edge route + rights) into the
+// already-built artifact (<wt>/.mercury-artifact/setup/), AS THE WORKSPACE OWNER through the pinned
+// devlab-exec wrapper. It runs after ArtifactBuild so the production receiver installs the delivered
+// unit rather than generating one — the unit/route come from the ONE shared template devlab-install
+// uses, so no second template exists. Returns the combined output for error context.
+func (e Executor) EmitSetup(ctx context.Context, wt, repo string, port int) (string, error) {
+	if !e.PerUser {
+		return "", fmt.Errorf("EmitSetup requires per-user execution")
+	}
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "-u", e.User, execWrapper, "emit-setup", wt, repo, strconv.Itoa(port))
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	return strings.TrimRight(string(out), "\n"), err
+}
+
 // RevParse resolves ref to a full commit SHA. Used by the autonomous runner to capture the tip AFTER it
 // bases a run on main + pending PRs, so it can later tell whether the AGENT contributed anything new.
 func (e Executor) RevParse(ctx context.Context, wt, ref string) (string, error) {

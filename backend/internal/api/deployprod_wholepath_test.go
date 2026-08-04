@@ -136,6 +136,11 @@ func TestMaintainProd_WholePathAgainstRealRepo(t *testing.T) {
 			}
 			return art, nil
 		},
+		// The setup emission runs root-only through the pinned wrapper (absent here) and resolves a port
+		// via atlas — both substituted with a placeholder, like the build, so the path reaches the send.
+		prodEmit: func(_ context.Context, _ workspace.Executor, _, _ string, _ deploy.Detection) error {
+			return nil
+		},
 		// The send to the foreign host and its receiver stay placeholders (WHAT-2): record the values
 		// and stop here — this is the "immediately before the send" boundary.
 		prodSend: func(_ context.Context, _ deploy.ProdConfig, repo, artifact string) error {
