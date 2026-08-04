@@ -51,6 +51,7 @@ type Server struct {
 	runNotices   *runs.NoticeStore
 	runQuestions *runs.QuestionStore
 	deliveries   *runs.DeliveryStore
+	prodState    *runs.ProdStateStore
 	attachments  *runs.AttachmentStore
 	axiomChecks  *runs.AxiomChecks
 	settings     *runs.SettingsStore
@@ -105,6 +106,7 @@ func New(v *auth.Verifier, paths *statepath.Paths) *Server {
 		runNotices:   runs.NewNoticeStore(paths),
 		runQuestions: runs.NewQuestionStore(paths),
 		deliveries:   runs.NewDeliveryStore(paths),
+		prodState:    runs.NewProdStateStore(paths),
 		attachments:  runs.NewAttachmentStore(paths),
 		axiomChecks:  runs.NewAxiomChecks(paths),
 		axiomAuthors: axiomauthors.NewStore(paths),

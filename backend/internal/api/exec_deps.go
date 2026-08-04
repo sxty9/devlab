@@ -1141,6 +1141,9 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 		return deliver.ProdOutcome{}, fmt.Errorf("deploy: check out the merged state (origin/%s) of %s: %w", def, repo, err)
 	}
 	_ = bench // the checkout above pins the worktree to the merged tip for the build below
+	// The exact standard-branch commit this send builds from and ships — read from the tree that was
+	// just checked out, so the production-state record names precisely what production will carry.
+	shipped, _ := ex.RevParse(ctx, wt, "HEAD")
 
 	// A repository that is no service proves production inapplicable — a not-applicable outcome, never
 	// a failure. A structure violation is a failure (there is a service shape but it does not reduce).
@@ -1150,7 +1153,7 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	}
 	switch det.Kind {
 	case deploy.KindLibrary, deploy.KindExcluded, deploy.KindTemplate:
-		return deliver.ProdOutcome{NotApplicable: true, Evidence: det.Evidence,
+		return deliver.ProdOutcome{NotApplicable: true, Evidence: det.Evidence, Commit: shipped,
 			Detail: "not a service — nothing to run in production"}, nil
 	case deploy.KindNonconforming:
 		return deliver.ProdOutcome{Detail: det.Evidence},
@@ -1180,9 +1183,27 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 		return deliver.ProdOutcome{Detail: err.Error()}, err
 	}
 	// The receiver installed the prebuilt artifact AND proved the service running on the target, so a
-	// clean send is the honest running proof (F10), executed on the second machine.
-	return deliver.ProdOutcome{Running: true,
+	// clean send is the honest running proof (F10), executed on the second machine. Commit names the
+	// standard-branch state now running in production, for the production-state record.
+	return deliver.ProdOutcome{Running: true, Commit: shipped,
 		Detail: "shipped to production and proven running on the target"}, nil
+}
+
+// DefaultBranchTip resolves the current commit at the tip of a repository's standard (default)
+// branch — the state production must carry — with ONE GitHub read and no worktree. It is the measure
+// the production reconciliation compares production's recorded commit against. A missing token or an
+// unresolved default branch yields "" (no error) so the reconciliation leaves the repository for the
+// next pass rather than guessing at the standard branch.
+func (c chainDeploy) DefaultBranchTip(ctx context.Context, repo string) (string, error) {
+	full, err := c.d.fullName(ctx, repo)
+	if err != nil {
+		return "", err
+	}
+	def, err := github.DefaultBranch(ctx, c.d.token, full)
+	if err != nil || def == "" {
+		return "", err
+	}
+	return github.BranchTip(ctx, c.d.token, full, def)
 }
 
 // prodConfigFromEnv assembles the production send from server-side configuration only (E §7.4): the

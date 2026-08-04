@@ -635,7 +635,7 @@ func (s *Server) MaintainProdDeliveries(ctx context.Context) error {
 	if s.broker != nil {
 		pub = s.broker
 	}
-	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.results, s.runNotices, pub)
+	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, pub)
 }
 
 // protectionEnforcementArmed reports whether the operator has armed protection WRITES.

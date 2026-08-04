@@ -61,6 +61,11 @@ func (p *Paths) Execution(id string) string { return filepath.Join(p.Executions(
 // Deliveries is the delivery ledger: <root>/mercury/runs-deliveries.json.
 func (p *Paths) Deliveries() string { return filepath.Join(p.Mercury(), "runs-deliveries.json") }
 
+// ProdState is the per-repository record of the standard-branch commit production is known to
+// carry: <root>/mercury/runs-prodstate.json. It lets the production reconciliation tell whether the
+// standard branch has advanced past what production runs.
+func (p *Paths) ProdState() string { return filepath.Join(p.Mercury(), "runs-prodstate.json") }
+
 // PRs is the PR maintenance pool: <root>/mercury/runs-prs.json.
 func (p *Paths) PRs() string { return filepath.Join(p.Mercury(), "runs-prs.json") }
 
