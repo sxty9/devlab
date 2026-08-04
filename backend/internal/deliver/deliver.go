@@ -93,7 +93,10 @@ func (b RateBudget) Exhausted(now time.Time, floor int) bool {
 }
 
 // PRState is the maintenance view of one pull request: whether it is open, merged (and when),
-// and where its head sits.
+// where its head sits, AND which branch it merges INTO (BaseRef). BaseRef is what lets the chain
+// tell a delivery that reached the default branch from one whose pull request merged into a stale
+// stacked base and never reached main — the field mirrors github.PullState, so the two are one
+// conversion apart (github.go).
 type PRState struct {
 	Number   int
 	State    string // "open" | "closed"
@@ -101,6 +104,7 @@ type PRState struct {
 	MergedAt *time.Time
 	HeadRef  string
 	HeadSHA  string
+	BaseRef  string // the branch this pull request merges INTO
 }
 
 // Protection is the observed branch-protection state.
@@ -996,6 +1000,24 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 	queueBlocked := map[string]bool{}
 	repos := map[string]bool{}
 
+	// defaultBranchOf resolves a repo's default branch AT MOST ONCE per pass and remembers the answer
+	// (including "could not read it" as an empty string that is not re-asked). It is the one fact the
+	// base guard needs: the branch a delivery MUST merge into to reach main. An unreadable default is
+	// reported as unknown (ok=false), and an unknown default never fabricates a misdelivery — the guard
+	// only ever fires on a base it can PROVE is not the default branch.
+	defaultBranchCache := map[string]string{}
+	defaultBranchOf := func(repo string) (string, bool) {
+		if b, seen := defaultBranchCache[repo]; seen {
+			return b, b != ""
+		}
+		b, err := gh.DefaultBranch(ctx, repo)
+		if err != nil {
+			b = ""
+		}
+		defaultBranchCache[repo] = b
+		return b, b != ""
+	}
+
 	var firstErr error
 	for _, p := range tracked {
 		repos[p.Repo] = true
@@ -1064,6 +1086,17 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 
 		switch {
 		case st.Merged:
+			// A pull request GitHub reports as MERGED is only DELIVERED if it merged into the DEFAULT
+			// branch. Merged into anything else — a sibling delivery branch that was never pruned, a
+			// stale stacked base — its content sits off to the side and never reached main. The ledger
+			// must NOT read that as delivered (the 2026-08-04 gap: four deliveries stood on merged with a
+			// production stamp while main carried nothing of their work). Recognise it from the base,
+			// mark the delivery FAILED so it becomes the tip and the stack halts until the work is
+			// re-delivered properly, and deliver the finding.
+			if base, ok := defaultBranchOf(p.Repo); ok && st.BaseRef != "" && st.BaseRef != base {
+				recordMisdelivery(ledger, prs, res, n, pub, p, st, base, now)
+				continue
+			}
 			mergedAt := now
 			if st.MergedAt != nil {
 				mergedAt = st.MergedAt.UTC()
@@ -1085,6 +1118,20 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 			due := !now.Before(p.MergeBy)
 			if !due || queueBlocked[p.Repo] {
 				queueBlocked[p.Repo] = true
+				continue
+			}
+			// Never merge a delivery whose base is not the default branch. Stacked pull requests merge
+			// ONE per pass and each base is pruned right after (finalizeMerged) — that prune is what makes
+			// GitHub re-target the next pull request onto the default branch. So the oldest open pull
+			// request, the only one this pass would merge, has its base at the default branch by the time
+			// its turn comes. A base still pointing at a sibling delivery branch means that predecessor
+			// has not merged+pruned yet: merging now would land the work on a stale base and never reach
+			// main. Hold the repo instead and report it; the predecessor merges first, its prune re-targets
+			// this one, and the next pass merges it correctly. This is the WRITE-side twin of the
+			// merged-into-non-default detection above — the misdelivery is prevented, not only recognised.
+			if base, ok := defaultBranchOf(p.Repo); ok && st.BaseRef != "" && st.BaseRef != base {
+				queueBlocked[p.Repo] = true
+				notify(n, runs.NoticeMisdelivered, p.Repo, misdeliverPreReason(p.Number, st.BaseRef, base))
 				continue
 			}
 			// One merge per repo per tick: a successful merge just moved the default branch, a
@@ -1171,6 +1218,45 @@ func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger
 	settleExecutionOf(ledger, res, p)
 	publishDeliveries(pub)
 	return nil
+}
+
+// misdeliverPrefix opens the reason recorded (and the notice raised) for a pull request merged into
+// a branch that is NOT the default branch. It is a named prefix so the meaning stays in one place,
+// mirroring prunePrefix/readFailPrefix.
+const misdeliverPrefix = "merged into a non-default branch: "
+
+// misdeliverReason is the durable ledger reason for a delivery whose pull request already merged
+// into the wrong branch: its content never reached the standard branch, so the delivery is NOT
+// delivered.
+func misdeliverReason(number int, base, defaultBranch string) string {
+	return fmt.Sprintf("%spull request #%d merged into %q, not the default branch %q — its content never reached the standard branch, so the delivery is NOT delivered",
+		misdeliverPrefix, number, base, defaultBranch)
+}
+
+// misdeliverPreReason is the notice raised when the chain REFUSES to merge a pull request whose base
+// is not yet the default branch — the misdelivery prevented before it happens.
+func misdeliverPreReason(number int, base, defaultBranch string) string {
+	return fmt.Sprintf("%sheld pull request #%d: its base is %q, not the default branch %q — its predecessor has not merged and pruned yet; merging now would never reach the standard branch",
+		misdeliverPrefix, number, base, defaultBranch)
+}
+
+// recordMisdelivery is the ledger side of "a pull request merged into a non-default branch does NOT
+// count as delivered". The delivery is marked FAILED (its work did not reach main; the failed record
+// becomes the repo's tip, halting the stack until the work is re-delivered onto the default branch),
+// the finding is delivered as a disturbance, and the pull request is dropped from tracking — GitHub
+// reports it merged, so there is nothing left to poll. Nothing is pruned: the delivery branch is the
+// only remaining copy of work that never reached main.
+func recordMisdelivery(ledger *runs.DeliveryStore, prs *runs.PRStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, p runs.PendingPR, st PRState, defaultBranch string, now time.Time) {
+	reason := misdeliverReason(p.Number, st.BaseRef, defaultBranch)
+	if d, ok := deliveryFor(ledger, p); ok {
+		_ = RecordFailedDelivery(ledger, FailedDeliveryIn{
+			DeliveryID: d.ID, ExecutionID: d.ExecutionID, Repo: d.Repo, Branch: d.Branch,
+			FromCommit: d.FromCommit, ToCommit: d.ToCommit, Reason: reason,
+		})
+	}
+	notify(n, runs.NoticeMisdelivered, p.Repo, reason)
+	_ = prs.Remove(p.Repo, p.Number)
+	publishDeliveries(pub)
 }
 
 // deliveryFor resolves the ledger entry of a tracked PR — by DeliveryID first, by repo+number
