@@ -119,13 +119,13 @@ func TestRenewIsSingleUse(t *testing.T) {
 	}
 }
 
-// (d) A path/name outside the four known wrappers is refused.
+// (d) A path/name outside the renewable list is refused.
 func TestRenewRefusesUnknownName(t *testing.T) {
 	f := newRenewFixture(t)
 	content := []byte("malicious\n")
 	c, g := f.writeGrant(t, "qst_d1", "evil-tool", content, sha256of(content), "operator")
 	res := f.renew(t, "evil-tool", c, g)
-	if res.exit == 0 || !strings.Contains(res.out, "not one of the four") {
+	if res.exit == 0 || !strings.Contains(res.out, "not a renewable root wrapper") {
 		t.Fatalf("expected refusal of an unknown wrapper name, got exit %d\n%s", res.exit, res.out)
 	}
 	// And a real wrapper name whose content is fine still cannot be installed from a run-writable
@@ -141,6 +141,35 @@ func TestRenewRefusesUnknownName(t *testing.T) {
 	res2 := f.renew(t, "devlab-exec", wc, g)
 	if res2.exit == 0 || !strings.Contains(res2.out, "workspaces") {
 		t.Fatalf("expected refusal of a run-writable source, got exit %d\n%s", res2.exit, res2.out)
+	}
+}
+
+// Defect #1 closed, measured end-to-end: the sourced setup library is now a RENEWABLE name, and the
+// root tool installs it READ-ONLY (0644), not executable. Before this change the daemon could guard
+// devlab-setup-lib.sh and offer it for approval, but this tool refused the very name the human
+// approved. Here an approval for it installs it, at mode 0644.
+func TestRenewInstallsSetupLibraryReadOnly(t *testing.T) {
+	f := newRenewFixture(t)
+	content := []byte("# shellcheck shell=bash\n# merged devlab-setup-lib.sh\n")
+	sha := sha256of(content)
+	c, g := f.writeGrant(t, "qst_lib1", "devlab-setup-lib.sh", content, sha, "operator")
+
+	if res := f.renew(t, "devlab-setup-lib.sh", c, g); res.exit != 0 {
+		t.Fatalf("renewing the setup library must succeed (defect #1), got exit %d\n%s", res.exit, res.out)
+	}
+	dest := filepath.Join(f.sbinDir, "devlab-setup-lib.sh")
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != string(content) {
+		t.Fatalf("the approved library content was not installed: err=%v", err)
+	}
+	// The library is SOURCED, never executed: it must land 0644, not 0755. The tool ran unprivileged
+	// here (own_root is a no-op off root), so the explicit chmod is what the mode reflects.
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Fatalf("the sourced setup library must be installed read-only (0644), got %o", perm)
 	}
 }
 

@@ -30,7 +30,20 @@ CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 CADDY_ROUTE="$CADDY_CONF/${SERVICE_ID}.caddy"
 PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
 PERMS_FILE="$PERMS_DIR/${SERVICE_ID}.json"
-WRAPPERS=(devlab-exec devlab-mkworkspace devlab-install devlab-restart-when-free)
+# name:mode — the ONE list of pinned root artifacts under /usr/local/sbin, each with the mode it is
+# installed with: the executable wrappers (0755) and the SOURCED setup library devlab-setup-lib.sh
+# (0644, world-readable so the unprivileged runner can source it during a build). Installing AND
+# uninstalling both walk this single list, and the mode is taken FROM it — no second, hand-maintained
+# path for the library. It names exactly the drift-tracked set (selfWrappers in
+# backend/internal/deploy/wrappers.go) and the renewal tool's RENEWABLE list; a Go test holds all three
+# together (TestRenewableWrapperListsAgree).
+WRAPPERS=(
+  devlab-exec:0755
+  devlab-mkworkspace:0755
+  devlab-install:0755
+  devlab-restart-when-free:0755
+  devlab-setup-lib.sh:0644
+)
 SUDOERS=(devlab devlab-runs)
 
 log()  { printf '[%s] %s\n' "$SERVICE_ID" "$*"; }
@@ -103,15 +116,16 @@ install_artifacts() {
 
 install_wrappers() {
   log "installing the pinned wrappers + sudoers..."
-  local w
-  for w in "${WRAPPERS[@]}"; do
-    install -o root -g root -m 0755 "$REPO_ROOT/deploy/$w" "/usr/local/sbin/$w"
+  # One list, one install path: each entry is name:mode, so the sourced setup library (0644) and the
+  # executable wrappers (0755) install through the SAME loop with the mode taken from the list. The
+  # library rides `service setup` beside the wrappers so a renewed devlab-install never finds it missing
+  # (they install together).
+  local entry name mode
+  for entry in "${WRAPPERS[@]}"; do
+    name="${entry%%:*}"; mode="${entry##*:}"
+    install -o root -g root -m "$mode" "$REPO_ROOT/deploy/$name" "/usr/local/sbin/$name"
   done
-  # The shared setup library both devlab-install and devlab-exec SOURCE (unit/route templates + the
-  # first-time-setup rules). A sourced fragment, not an executable, so 0644 — world-readable so the
-  # unprivileged runner can source it during the build. It rides `service setup` beside the wrappers
-  # so a renewed devlab-install never finds it missing (they install together).
-  install -o root -g root -m 0644 "$REPO_ROOT/deploy/devlab-setup-lib.sh" "/usr/local/sbin/devlab-setup-lib.sh"
+  local w
   for w in "${SUDOERS[@]}"; do
     install -o root -g root -m 0440 "$REPO_ROOT/deploy/${w}.sudoers" "/etc/sudoers.d/$w"
     visudo -cf "/etc/sudoers.d/$w" >/dev/null || die "sudoers validation failed for $w — NOT trusting it" 4
@@ -222,8 +236,10 @@ cmd_status() {
   printf '  %-14s %s\n' "unit:"   "$([ -f "$UNIT_FILE" ] && echo "$UNIT_FILE" || echo missing)"
   printf '  %-14s %s\n' "route:"  "$([ -f "$CADDY_ROUTE" ] && echo "$CADDY_ROUTE" || echo missing)"
   printf '  %-14s %s\n' "rights:" "$([ -f "$PERMS_FILE" ] && echo "$PERMS_FILE" || echo missing)"
-  local w missing=""
-  for w in "${WRAPPERS[@]}"; do [ -x "/usr/local/sbin/$w" ] || missing="$missing $w"; done
+  local entry name missing=""
+  # Existence, not executability: the setup library is installed 0644, so an -x test would report a
+  # correctly installed library as missing.
+  for entry in "${WRAPPERS[@]}"; do name="${entry%%:*}"; [ -e "/usr/local/sbin/$name" ] || missing="$missing $name"; done
   if [ -n "$missing" ]; then
     printf '  %-14s missing:%s\n' "wrappers:" "$missing"
   else
@@ -246,9 +262,10 @@ cmd_uninstall() {
   systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
   rm -f "$UNIT_FILE"; systemctl daemon-reload
   rm -f "$CADDY_ROUTE" "$PERMS_FILE" "$DAEMON_BIN"
-  local w
-  for w in "${WRAPPERS[@]}"; do rm -f "/usr/local/sbin/$w"; done
-  rm -f "/usr/local/sbin/devlab-setup-lib.sh"
+  # One list, one removal path: the same name:mode entries drive the uninstall, so the setup library is
+  # removed with the wrappers and never left behind by a forgotten second line.
+  local entry w
+  for entry in "${WRAPPERS[@]}"; do rm -f "/usr/local/sbin/${entry%%:*}"; done
   for w in "${SUDOERS[@]}"; do rm -f "/etc/sudoers.d/$w"; done
   systemctl reload caddy 2>/dev/null || true
 

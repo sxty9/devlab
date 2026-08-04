@@ -151,8 +151,17 @@ run() {
 # named wrapper with a named checksum:
 #     sudo -n /usr/local/sbin/devlab-install --renew-wrapper <name> <content-file> <grant-file>
 # This is the ONE path that writes /usr/local/sbin. It re-derives EVERY check itself and trusts
-# nothing the caller says (E §7.4). The four names below are the authoritative list — never the call.
-RENEWABLE="devlab-exec devlab-install devlab-mkworkspace devlab-restart-when-free"
+# nothing the caller says (E §7.4). The list below is the authoritative one — never the call — and it
+# covers EXACTLY the set the drift probe guards (selfWrappers in backend/internal/deploy/wrappers.go)
+# and `service` installs: the executable wrappers (0755) AND the sourced setup library
+# devlab-setup-lib.sh (0644), which both devlab-install and devlab-exec source. A stale library drifts
+# a first-time setup as surely as a stale wrapper, so what the daemon can offer for approval and what
+# this tool will renew must be the SAME set — otherwise a human approves renewing devlab-setup-lib.sh
+# and this tool refuses it, an approval that can do nothing. Each entry carries its own INSTALL MODE
+# (name:mode), because the library is installed read-only, not executable. A Go test holds this list
+# against the other three (TestRenewableWrapperListsAgree) — it is no longer a comment that keeps them
+# in step.
+RENEWABLE="devlab-exec:0755 devlab-install:0755 devlab-mkworkspace:0755 devlab-restart-when-free:0755 devlab-setup-lib.sh:0644"
 # Destination of the wrappers. Pinned; the env seam is stripped by sudo's env_reset in production
 # exactly like every other seam in this wrapper, so it only ever moves the target in a direct-
 # invocation test — it grants no privilege.
@@ -172,11 +181,18 @@ renew_wrapper() {
     || die "usage: devlab-install --renew-wrapper <name> <content-file> <grant-file>" 2
   local name="${POSITIONAL[0]}" contentf="${POSITIONAL[1]}" grantf="${POSITIONAL[2]}"
 
-  # 1) THE NAME IS ONE OF THE FOUR — the list lives here, not in the call (task point 4). No path,
-  #    no pattern, no extension beyond the list.
-  local ok=0 w
-  for w in $RENEWABLE; do [ "$name" = "$w" ] && ok=1; done
-  [ "$ok" = 1 ] || die "refusing '$name': not one of the four renewable root wrappers ($RENEWABLE)" 2
+  # 1) THE NAME IS ON THE RENEWABLE LIST — the list lives here, not in the call (task point 4). No
+  #    path, no pattern, no extension beyond the list. The INSTALL MODE comes from the list too (0755
+  #    for the executable wrappers, 0644 for the sourced setup library), so a renewal never turns the
+  #    read-only library into an executable, nor a wrapper into a non-executable. The refusal names the
+  #    renewable set; it does not count it.
+  local ok=0 mode="" entry ename names=""
+  for entry in $RENEWABLE; do
+    ename="${entry%%:*}"
+    names="${names:+$names }$ename"
+    if [ "$name" = "$ename" ]; then ok=1; mode="${entry##*:}"; fi
+  done
+  [ "$ok" = 1 ] || die "refusing '$name': not a renewable root wrapper (renewable: $names)" 2
 
   # 2) THE SOURCE MUST BE RUN-UNWRITABLE (task point 1: no file a run produced is ever a source). The
   #    grant + content must resolve under the daemon-owned state root and NOT under the run-writable
@@ -232,7 +248,7 @@ renew_wrapper() {
   fi
 
   if [ "$CHECK" = 1 ]; then
-    echo "PLAN: renew $name -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha) from $creal"
+    echo "PLAN: renew $name (mode $mode) -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha) from $creal"
     return 0
   fi
 
@@ -244,7 +260,7 @@ renew_wrapper() {
   local tmp
   tmp="$(mktemp "$SBIN_DIR/.${name}.XXXXXX")" || die "cannot stage a temp file in $SBIN_DIR" 4
   cp -- "$creal" "$tmp" || { rm -f -- "$tmp"; die "cannot write staged wrapper" 4; }
-  chmod 0755 "$tmp"; own_root "$tmp"
+  chmod "$mode" "$tmp"; own_root "$tmp"
   mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; die "cannot move the new $name into place" 4; }
 
   # 8) APPEND THE TAMPER-EVIDENT RECORD: who approved what, what was installed, what was there before,
