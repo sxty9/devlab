@@ -287,7 +287,7 @@ export function rollbackConfirmation(d: Delivery): Consequence {
   const failed = isFailedDelivery(d);
   if (failed) {
     return {
-      effect: `Dismantles the failed tip in ${d.repo}: ${commitRange(d)} is counter-booked off the dev branch. This work never shipped, so there is no pull request to close.`,
+      effect: `Clears the failed tip in ${d.repo} (${commitRange(d)}): its work is counter-booked off the dev branch, or simply dissolved off the stack when it never reached the dev branch. This work never shipped, so there is no pull request to close.`,
       result: 'The last sound layer becomes the tip again; the failed delivery reads as rolled back and no longer holds new orders.',
       undo: 'Nothing is rewritten — running the order again delivers it anew.',
     };

@@ -638,6 +638,98 @@ func TestRollbackConflictRaisesTodo(t *testing.T) {
 	}
 }
 
+// TestRollbackUnlandedDissolves (REQ-025.4): a delivery that NEVER landed — deliver-dev failed, no
+// PR, nothing on the dev branch, so the reverse conflicts — is DISSOLVED off the stack. "0 later
+// open deliveries" is not a conflict: no manual-work todo is raised, the record settles as rolled
+// back, and the failed tip is gone.
+func TestRollbackUnlandedDissolves(t *testing.T) {
+	gh := newFakeGH()
+	ledger := tempLedger(t)
+	rs := tempRuns(t)
+	// A sound merged layer beneath, then A's failed layer whose work never reached the dev branch.
+	mergedAt := t0
+	_ = ledger.Put(runs.Delivery{ID: "dlv_base", Repo: "o/x", Branch: "fix/base-000", FromCommit: "c0", ToCommit: "base0", PRNumber: 4, CreatedAt: t0, MergedAt: &mergedAt})
+	if err := RecordFailedDelivery(ledger, FailedDeliveryIn{
+		DeliveryID: "dlv_a", ExecutionID: "exec_a", Repo: "o/x",
+		Branch: "fix/a-aaa111", FromCommit: "base0", ToCommit: "workA", Reason: "deliver-dev stage failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A manual counter-booking todo was left behind by an EARLIER (buggy) rollback of this same
+	// delivery — the exact residue of run_qixaesuafucrxhnq/run_7ifbgcepeeh2f7vu. Dissolving must
+	// retire it (self-healing), not leave it describing work the chain now does itself.
+	staleTodo := buildRollbackTodo(runs.Delivery{ID: "dlv_a", Repo: "o/x", Branch: "fix/a-aaa111"}, nil, nil, model.Actor{User: "tester"}, t0)
+	if err := rs.Put(staleTodo); err != nil {
+		t.Fatal(err)
+	}
+	// The reverse of work that never landed on dev conflicts — the git side reports it.
+	gh.cb = CounterBookResult{Conflicted: true, ConflictFiles: []string{"main.go"}, DefaultBranch: "main"}
+
+	out, err := Rollback(context.Background(), gh, ledger, rs, "dlv_a", model.Actor{User: "tester"})
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if out.ConflictTodoID != "" {
+		t.Fatalf("an unlanded delivery must NOT raise a manual-work todo, got %q", out.ConflictTodoID)
+	}
+	if todos, _ := rs.List(); len(todos) != 0 {
+		t.Errorf("the obsolete counter-booking todo must be retired and none raised, got %d", len(todos))
+	}
+	if !strings.Contains(out.Detail, "retired 1 obsolete counter-booking todo") || !strings.Contains(out.Detail, staleTodo.ID) {
+		t.Errorf("the outcome must name the retired todo, got %q", out.Detail)
+	}
+	if strings.Contains(out.Detail, "0 later") || strings.Contains(strings.ToLower(out.Detail), "conflict") {
+		t.Errorf("the outcome must not read as a conflict, got %q", out.Detail)
+	}
+	if !strings.Contains(strings.ToLower(out.Detail), "never landed") {
+		t.Errorf("the outcome must name the dissolution, got %q", out.Detail)
+	}
+	d, _, _ := ledger.ByID("dlv_a")
+	if d.Failed() || d.ClosedAt == nil || d.FailedAt != nil {
+		t.Fatalf("the dissolved delivery must be settled (closed) and no longer failed, got %+v", d)
+	}
+	if !strings.Contains(d.ClosedReason, "rolled back by tester") {
+		t.Errorf("the record must carry the rollback reason, got %q", d.ClosedReason)
+	}
+	// The tip is sound again: the merged layer beneath holds no follower.
+	if tip, _ := FailedTip(ledger, "o/x"); tip != nil {
+		t.Errorf("after the dissolution the tip must be sound, got %+v", tip)
+	}
+	// Nothing was booked, so nothing is re-delivered and no PR is touched (there was none).
+	if len(gh.closeCalls) != 0 {
+		t.Errorf("a delivery that never landed has no PR to close, got %v", gh.closeCalls)
+	}
+	if len(gh.redelivered) != 0 {
+		t.Errorf("dissolution changes nothing on dev, so no re-delivery, got %v", gh.redelivered)
+	}
+}
+
+// TestRollbackConflictDetailNamesLaterWork: when a real conflict remains (later open work builds on
+// the delivery), the outcome names the concrete colliding deliveries — never a bare "0".
+func TestRollbackConflictDetailNamesLaterWork(t *testing.T) {
+	gh := newFakeGH()
+	ledger := tempLedger(t)
+	rs := tempRuns(t)
+	_ = ledger.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0})
+	_ = ledger.Put(runs.Delivery{ID: "dlv_2", Repo: "o/x", Branch: "fix/two-bbb222", FromCommit: "c1", ToCommit: "c2", PRNumber: 6, CreatedAt: t0.Add(time.Minute)})
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open"}
+	gh.cb = CounterBookResult{Conflicted: true, ConflictFiles: []string{"main.go"}}
+
+	out, err := Rollback(context.Background(), gh, ledger, rs, "dlv_1", model.Actor{User: "tester"})
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	if out.ConflictTodoID == "" {
+		t.Fatalf("later open work must raise a conflict todo, got %+v", out)
+	}
+	if !strings.Contains(out.Detail, "dlv_2") {
+		t.Errorf("the outcome must name the colliding later delivery, got %q", out.Detail)
+	}
+	if strings.Contains(out.Detail, "0 later") {
+		t.Errorf("the outcome must never read as a bare 0, got %q", out.Detail)
+	}
+}
+
 // TestRollbackOpenClosesPR: the open direction — the PR is closed WITH the justification, the
 // delivery is closed with the rollback reason, no reversal PR, and dev is re-delivered.
 func TestRollbackOpenClosesPR(t *testing.T) {

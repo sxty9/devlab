@@ -443,9 +443,21 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 	now := time.Now().UTC()
 
 	if cb.Conflicted {
-		// Make no guess (REQ-025.4): later work built on this delivery and the reverse does not
-		// apply cleanly. Raise a concrete ToDo that counter-books by hand; nothing is discarded.
+		// "0 later open deliveries" is NEVER a conflict (REQ-025.4). A counter-booking is in genuine
+		// contradiction only when later OPEN work builds on this delivery, so that reversing it blind
+		// could destroy that work. laterOpenDeliveries measures exactly that set — nothing more.
 		later := laterOpenDeliveries(all, d)
+		if len(later) == 0 && !merged {
+			// The delivery NEVER landed: it is not merged, and its content is not cleanly on the dev
+			// branch — which is the very reason the reverse did not apply. Nothing was booked, so
+			// there is nothing to counter-book and nothing a guess could destroy. The delivery is
+			// dissolved off the stack (the failed tip leaves, the last sound layer becomes the tip
+			// again) instead of raising manual work for changes that were never there.
+			return dissolveUnlanded(ctx, gh, ledger, rs, d, by, now, &out)
+		}
+		// A real contradiction remains — the last resort. Either later open work builds on this
+		// delivery, or a merged delivery's reverse collides with the current default-branch state.
+		// The ToDo names WHAT collides with WHAT, never a bare "0".
 		todo := buildRollbackTodo(d, later, cb.ConflictFiles, by, now)
 		if rs == nil {
 			return out, errors.New("deliver: rollback conflicts but no run store to raise the todo in")
@@ -454,7 +466,7 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 			return out, err
 		}
 		out.ConflictTodoID = todo.ID
-		out.Detail = fmt.Sprintf("counter-booking conflicts with %d later open delivery/ies — raised todo %s instead of guessing", len(later), todo.ID)
+		out.Detail = rollbackConflictDetail(later, todo.ID)
 		return out, nil
 	}
 
@@ -475,6 +487,7 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 			}
 		}
 		out.Detail = "nothing to counter-book — the delivery's effect is already absent"
+		noteRetired(&out, retireObsoleteRollbackTodos(rs, d.ID))
 		redeliver(ctx, gs, d.Repo, &out)
 		return out, nil
 	}
@@ -545,6 +558,7 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 			}
 		}
 	}
+	noteRetired(&out, retireObsoleteRollbackTodos(rs, d.ID))
 	redeliver(ctx, gs, d.Repo, &out)
 	return out, nil
 }
@@ -560,6 +574,94 @@ func redeliver(ctx context.Context, gs GitSide, repo string, out *RollbackOutcom
 		}
 		out.Detail += "dev re-delivery pending: " + err.Error()
 	}
+}
+
+// dissolveUnlanded resolves a delivery that NEVER landed (REQ-025.4): not merged, and its content
+// is not cleanly on the dev branch — so the reverse found nothing to apply and no later open work
+// a guess could destroy. Nothing was booked, so nothing is counter-booked: any dangling pull
+// request is closed, the record is settled (closed, no longer failed), and the failed tip leaves
+// the stack so the last sound layer becomes the tip again. No manual-work ToDo, and no re-delivery
+// — the dev state was never carrying this work, so it is unchanged.
+func dissolveUnlanded(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs *runs.Store, d runs.Delivery, by model.Actor, now time.Time, out *RollbackOutcome) (RollbackOutcome, error) {
+	if d.PRNumber != 0 {
+		if err := gh.ClosePullRequest(ctx, d.Repo, d.PRNumber, rollbackCloseReason(d, by)); err != nil {
+			return *out, fmt.Errorf("close PR: %w", err)
+		}
+		out.ClosedPR = &model.PRRef{Number: d.PRNumber, URL: d.PRURL, HeadBranch: d.Branch}
+	}
+	d.ClosedAt = &now
+	d.ClosedReason = rolledBackReasonPrefix + actorName(by) + " — delivery never landed; dissolved off the stack, nothing to counter-book"
+	// A failed mark is subsumed by the close: the delivery is now settled (rolled back), not failed.
+	d.FailedAt, d.FailedReason = nil, ""
+	if err := ledger.Put(d); err != nil {
+		return *out, err
+	}
+	if out.ClosedPR != nil {
+		out.Detail = "delivery never landed — dissolved off the stack and its open pull request closed; nothing was booked to counter-book and the tip is free again"
+	} else {
+		out.Detail = "delivery never landed — dissolved off the stack; nothing was booked to counter-book and the tip is free again"
+	}
+	noteRetired(out, retireObsoleteRollbackTodos(rs, d.ID))
+	return *out, nil
+}
+
+// retireObsoleteRollbackTodos withdraws any manual counter-booking ToDo previously raised for this
+// delivery. Once a rollback RESOLVES the delivery itself — dissolved or counter-booked — such a
+// ToDo describes work the chain has now done, so it is obsolete and removed (self-healing). The
+// match is the deterministic title buildRollbackTodo mints, so a ToDo left behind by an OLDER
+// rollback is caught too. Best-effort and rs-optional: a nil store or a delete race never fails the
+// rollback.
+func retireObsoleteRollbackTodos(rs *runs.Store, deliveryID string) []string {
+	if rs == nil {
+		return nil
+	}
+	all, err := rs.List()
+	if err != nil {
+		return nil
+	}
+	want := rollbackTodoTitle(deliveryID)
+	var retired []string
+	for _, r := range all {
+		if r.Kind == model.KindTodo && r.Title == want {
+			if err := rs.Delete(r.ID); err == nil {
+				retired = append(retired, r.ID)
+			}
+		}
+	}
+	return retired
+}
+
+// rollbackTodoTitle is the ONE deterministic title a manual counter-booking ToDo carries, so both
+// raising it and retiring it agree on the same string.
+func rollbackTodoTitle(deliveryID string) string {
+	return "Counter-book delivery " + deliveryID + " by hand"
+}
+
+// noteRetired appends the obsolete-ToDo cleanup to the outcome so the surface states what became of
+// the manual-work ToDo, never leaving it silently deleted.
+func noteRetired(out *RollbackOutcome, retired []string) {
+	if len(retired) == 0 {
+		return
+	}
+	if out.Detail != "" {
+		out.Detail += "; "
+	}
+	out.Detail += fmt.Sprintf("retired %d obsolete counter-booking todo(s) (%s)", len(retired), strings.Join(retired, ", "))
+}
+
+// rollbackConflictDetail names WHAT a conflicting counter-booking collides with — the concrete
+// later open deliveries, or the current default-branch state when a merged delivery's reverse does
+// not apply — never a bare count of "0".
+func rollbackConflictDetail(later []runs.Delivery, todoID string) string {
+	if len(later) == 0 {
+		return "counter-booking collides with the current default-branch state and cannot be reversed blind — raised todo " + todoID + " instead of guessing"
+	}
+	ids := make([]string, len(later))
+	for i, l := range later {
+		ids[i] = l.ID
+	}
+	return fmt.Sprintf("counter-booking conflicts with %d later open delivery/ies (%s) — raised todo %s instead of guessing",
+		len(later), strings.Join(ids, ", "), todoID)
 }
 
 // laterOpenDeliveries lists the OPEN deliveries of d's repo created after d — the "later work"
@@ -585,7 +687,7 @@ func buildRollbackTodo(d runs.Delivery, later []runs.Delivery, conflictFiles []s
 		fmt.Fprintf(&b, "- delivery %s (branch %s, commits %s..%s)\n", l.ID, l.Branch, shortSHA(l.FromCommit), shortSHA(l.ToCommit))
 	}
 	if len(later) == 0 {
-		b.WriteString("- (no later open delivery recorded; the conflict came from the working state)\n")
+		b.WriteString("- (no later open delivery builds on this one; the reverse collides with the current default-branch state)\n")
 	}
 	if len(conflictFiles) > 0 {
 		b.WriteString("\nConflicting files:\n")
@@ -598,7 +700,7 @@ func buildRollbackTodo(d runs.Delivery, later []runs.Delivery, conflictFiles []s
 	return runs.Run{
 		ID:      runs.NewID(),
 		Kind:    model.KindTodo,
-		Title:   "Counter-book delivery " + d.ID + " by hand",
+		Title:   rollbackTodoTitle(d.ID),
 		Task:    b.String(),
 		Targets: []runs.Target{{Repo: repoShortName(d.Repo)}},
 		DueAt:   &now,
