@@ -33,7 +33,13 @@ func rubricOf(kind string) string {
 		runs.NoticeDeliverySelfCheck, runs.NoticeStructureViolation,
 		// A held maintenance is work that did not reach the user for the whole day — the daily
 		// report is exactly where that belongs.
-		runs.NoticeDeliveryHeld:
+		runs.NoticeDeliveryHeld,
+		// Production not reaching the user is a delivery alarm too: a merged delivery still stuck
+		// before production, and the standard branch silently drifting ahead of what production runs.
+		runs.NoticeProdUndelivered, runs.NoticeProdDrift,
+		// A pull request merged onto a stale base never reached the standard branch — the same
+		// class of "the work did not land where the ledger claims" finding.
+		runs.NoticeMisdelivered:
 		return RubricDeliveryAlarms
 	case runs.NoticeAdminOverride:
 		return RubricOverrides

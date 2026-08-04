@@ -39,9 +39,11 @@ func prodNameServer(t *testing.T) (*Server, string) {
 	t.Setenv("DEVLAB_MERCURY_RUNS_RESULTS", filepath.Join(dir, "results"))
 	t.Setenv("DEVLAB_MERCURY_EXECUTIONS", filepath.Join(dir, "executions"))
 	t.Setenv("DEVLAB_MERCURY_RUNS_NOTICES", filepath.Join(dir, "notices.json"))
+	t.Setenv("DEVLAB_MERCURY_RUNS_PRODSTATE", filepath.Join(dir, "prodstate.json"))
 	s := &Server{
 		workspaces: workspace.NewManager(nil),
 		deliveries: runs.NewDeliveryStore(nil),
+		prodState:  runs.NewProdStateStore(nil),
 		results:    runs.NewResultStore(nil),
 		runNotices: runs.NewNoticeStore(nil),
 	}
@@ -111,7 +113,7 @@ func TestMaintainProd_LedgerFullNameReachesSend(t *testing.T) {
 	}
 
 	deps := &ChainDeps{s: s, user: user, benches: map[string]*repoBench{}, full: map[string]string{}}
-	err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.results, s.runNotices, nil)
+	err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, nil)
 	if err == nil {
 		t.Fatal("the send cannot complete against a fixture (no real remote/target) — it must surface a failure")
 	}

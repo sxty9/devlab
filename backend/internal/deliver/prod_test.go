@@ -12,12 +12,14 @@ import (
 )
 
 // fakeProd is the fixture ProdDeployer: it records the repos it was asked to deliver and answers a
-// scripted outcome/error per repo.
+// scripted outcome/error per repo. tips answers DefaultBranchTip per repo (empty = "cannot measure",
+// the safe default that keeps the reconciliation from acting in tests that do not exercise it).
 type fakeProd struct {
 	mu    sync.Mutex
 	calls []string
 	out   map[string]ProdOutcome
 	err   map[string]error
+	tips  map[string]string
 }
 
 func (f *fakeProd) DeployProd(_ context.Context, repo string) (ProdOutcome, error) {
@@ -25,6 +27,12 @@ func (f *fakeProd) DeployProd(_ context.Context, repo string) (ProdOutcome, erro
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, repo)
 	return f.out[repo], f.err[repo]
+}
+
+func (f *fakeProd) DefaultBranchTip(_ context.Context, repo string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tips[repo], nil
 }
 
 // mergedDelivery is one merged delivery of an execution — the state a delivery reaches AFTER its PR
@@ -65,7 +73,7 @@ func completed(t *testing.T, ledger *runs.DeliveryStore, res *runs.ResultStore, 
 // TestMaintainProd_HistorizesOnlyAfterProd is WHAT-7(a): a task is done — and historizes — only
 // once its production delivery has succeeded, never on the merge alone.
 func TestMaintainProd_HistorizesOnlyAfterProd(t *testing.T) {
-	ledger, res, n := tempLedger(t), tempResults(t), tempNotices(t)
+	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 	mergedDelivery(t, ledger, "dlv_1", "o/x", "exec_1")
 	endedExecution(t, res, "exec_1")
 
@@ -75,7 +83,7 @@ func TestMaintainProd_HistorizesOnlyAfterProd(t *testing.T) {
 	}
 
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {Running: true}}}
-	if err := MaintainProd(context.Background(), prod, ledger, res, n, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
@@ -99,12 +107,12 @@ func TestMaintainProd_HistorizesOnlyAfterProd(t *testing.T) {
 // delivery does NOT historize, reports itself, retries by itself, and — crucially — leaves the
 // merged layer valid so the stack built on top of it does not collapse (WHAT-3).
 func TestMaintainProd_FailureDoesNotHistorizeAndKeepsStackValid(t *testing.T) {
-	ledger, res, n := tempLedger(t), tempResults(t), tempNotices(t)
+	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 	mergedDelivery(t, ledger, "dlv_1", "o/x", "exec_1")
 	endedExecution(t, res, "exec_1")
 
 	prod := &fakeProd{err: map[string]error{"o/x": errors.New("receiver unreachable")}}
-	if err := MaintainProd(context.Background(), prod, ledger, res, n, nil); err == nil {
+	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil); err == nil {
 		t.Fatal("a failed production send must surface its error")
 	}
 
@@ -151,7 +159,7 @@ func TestMaintainProd_FailureDoesNotHistorizeAndKeepsStackValid(t *testing.T) {
 	_ = ledger.Put(d2)
 	prod.err = nil
 	prod.out = map[string]ProdOutcome{"o/x": {Running: true}}
-	if err := MaintainProd(context.Background(), prod, ledger, res, n, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil); err != nil {
 		t.Fatalf("MaintainProd retry: %v", err)
 	}
 	if !completed(t, ledger, res, "exec_1") {
@@ -163,12 +171,12 @@ func TestMaintainProd_FailureDoesNotHistorizeAndKeepsStackValid(t *testing.T) {
 // so its merged delivery settles at once — not-applicable follows from a PROVEN property, never a
 // missing configuration.
 func TestMaintainProd_NotAService(t *testing.T) {
-	ledger, res, n := tempLedger(t), tempResults(t), tempNotices(t)
+	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 	mergedDelivery(t, ledger, "dlv_1", "o/lib", "exec_1")
 	endedExecution(t, res, "exec_1")
 
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/lib": {NotApplicable: true, Evidence: "no cmd/ daemon and no service manifest"}}}
-	if err := MaintainProd(context.Background(), prod, ledger, res, n, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 	d, _, _ := ledger.ByID("dlv_1")
@@ -186,10 +194,10 @@ func TestMaintainProd_NotAService(t *testing.T) {
 // TestMaintainProd_SkipsUnmerged pins that the production pass touches ONLY merged deliveries — an
 // open delivery (PR still waiting) is never shipped to production.
 func TestMaintainProd_SkipsUnmerged(t *testing.T) {
-	ledger, res, n := tempLedger(t), tempResults(t), tempNotices(t)
+	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 	_ = ledger.Put(runs.Delivery{ID: "dlv_open", Repo: "o/x", Branch: "fix/o-1", CreatedAt: t0, ExecutionID: "exec_1"})
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {Running: true}}}
-	if err := MaintainProd(context.Background(), prod, ledger, res, n, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 	if len(prod.calls) != 0 {

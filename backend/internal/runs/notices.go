@@ -76,6 +76,13 @@ const (
 	// here (a disturbance the user sees) while the send is retried by itself. It never blocks the
 	// stack: the merged layer stays valid, only the task waits for its production step.
 	NoticeProdUndelivered = "prod-undelivered"
+	// The standard branch advanced past the state production carries WITHOUT a delivery to account
+	// for it — a change reached the standard branch on another path (a hand-merged pull request),
+	// and nothing re-sent it to production, so production silently runs an older state while the
+	// ledger still reads "delivered". This is the finding "Kein stummes Ausbleiben" forbids being
+	// silent: it is named here and the reconciliation brings production up to the standard branch
+	// over the existing production path. A disturbance the user sees.
+	NoticeProdDrift = "prod-drift"
 	// The standstill of the delivery maintenance: its writing half is not armed, so nothing is
 	// merged, pruned or stamped. A STATE the operator ends, and the reason nothing moves.
 	NoticeDeliveryHeld = "delivery-held"

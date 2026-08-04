@@ -358,6 +358,28 @@ func DefaultBranch(ctx context.Context, token, fullName string) (string, error) 
 	return r.DefaultBranch, nil
 }
 
+// BranchTip resolves the commit SHA at the tip of a repository's branch — one GET, no worktree. The
+// production reconciliation uses it to MEASURE the standard branch against the commit production
+// carries, so a stale production host is found rather than assumed.
+func BranchTip(ctx context.Context, token, fullName, branch string) (string, error) {
+	owner, name, ok := strings.Cut(fullName, "/")
+	if !ok || owner == "" || name == "" {
+		return "", fmt.Errorf("github: bad repo %q", fullName)
+	}
+	if branch == "" {
+		return "", fmt.Errorf("github: empty branch for %q", fullName)
+	}
+	var r struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	if _, err := do(ctx, token, apiBase+"/repos/"+owner+"/"+name+"/branches/"+branch, &r); err != nil {
+		return "", err
+	}
+	return r.Commit.SHA, nil
+}
+
 // CreatePullRequest opens a PR from head → base on fullName (same-repo branches). GitHub 422s when
 // a PR for head already exists or the branches are identical; the caller can fall back to lookup.
 func CreatePullRequest(ctx context.Context, token, fullName, head, base, title, body string) (PullRequest, error) {

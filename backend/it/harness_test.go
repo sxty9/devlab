@@ -45,6 +45,7 @@ type env struct {
 	results    *runs.ResultStore
 	notices    *runs.NoticeStore
 	deliveries *runs.DeliveryStore
+	prodState  *runs.ProdStateStore
 	settings   *runs.SettingsStore
 	usage      *telemetry.UsageLedger
 	// prs is the auto-merge window pool. api.New opens its own handle over the SAME pool file (it
@@ -166,11 +167,14 @@ func (e *env) maintain(ctx context.Context) error {
 	// merges, ships every merged delivery to production and proves it running there. The fixture
 	// deployer models a healthy production host — a delivery that merged runs there and answers — so
 	// the loop reaches "done" exactly as it will in production, and the execution historizes only then.
-	return deliver.MaintainProd(ctx, e.prod, e.deliveries, e.results, e.notices, e.broker)
+	return deliver.MaintainProd(ctx, e.prod, e.deliveries, e.prodState, e.results, e.notices, e.broker)
 }
 
 // fixtureProd is the harness ProdDeployer: it models a healthy production host by proving every
-// merged delivery running. A test that wants a production FAILURE flips fail to true.
+// merged delivery running. A test that wants a production FAILURE flips fail to true. It reports the
+// standard branch as UNRESOLVED (""), so the drift reconciliation — which measures the standard
+// branch against what production carries — makes no move here: these tests drive the booked-delivery
+// path, not the reconciliation, and an empty tip is the "cannot measure, leave it be" answer.
 type fixtureProd struct{ fail bool }
 
 func (p fixtureProd) DeployProd(_ context.Context, repo string) (deliver.ProdOutcome, error) {
@@ -179,6 +183,8 @@ func (p fixtureProd) DeployProd(_ context.Context, repo string) (deliver.ProdOut
 	}
 	return deliver.ProdOutcome{Running: true, Detail: "fixture: proven running in production"}, nil
 }
+
+func (p fixtureProd) DefaultBranchTip(_ context.Context, _ string) (string, error) { return "", nil }
 
 // newEnvAt composes the system over an EXISTING state root (a fresh one on the first call).
 func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
@@ -247,6 +253,7 @@ func newEnvAt(t *testing.T, cfg sched.Config, root string) *env {
 	e.results = runs.NewResultStore(paths)
 	e.notices = runs.NewNoticeStore(paths)
 	e.deliveries = runs.NewDeliveryStore(paths)
+	e.prodState = runs.NewProdStateStore(paths)
 	e.settings = runs.NewSettingsStore(paths, runs.Settings{MaxConcurrency: 2, DefaultTimeBudget: 3 * time.Hour})
 	e.usage = telemetry.OpenUsage(paths)
 	e.prs = runs.NewPRStore(paths)
