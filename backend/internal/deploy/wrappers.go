@@ -33,11 +33,16 @@ import (
 var wrapperInstallDir = envOr("DEVLAB_SBIN_DIR", "/usr/local/sbin")
 
 // selfWrappers are the root-owned wrappers (and the shared setup library) the devlab (self) repository
-// ships from deploy/ into wrapperInstallDir. It MIRRORS the WRAPPERS array in the `service` CLI (and the
-// pins in deploy/devlab.sudoers / deploy/devlab-runs.sudoers); a wrapper added there must be added here,
-// or the drift probe would go blind to it. devlab-setup-lib.sh is a SOURCED fragment, not an executable
-// wrapper, but it is installed beside them and BOTH devlab-install and devlab-exec source it, so a stale
-// copy would silently change what a setup produces — the drift probe keeps it current like the rest.
+// ships from deploy/ into wrapperInstallDir. This is the CANONICAL set: three places must name exactly
+// it — the WRAPPERS array in the `service` CLI, the RENEWABLE list the root renewal tool
+// (deploy/devlab-install) will act on, and this slice — and TestRenewableWrapperListsAgree fails if any
+// of the three diverges (a comment used to be the only thing holding them together; that is not an
+// assurance). The pins in deploy/devlab.sudoers / deploy/devlab-runs.sudoers are the SUBSET invoked via
+// sudo (devlab-exec, devlab-mkworkspace, devlab-install); the same test proves every pinned wrapper is
+// a member of this set, so a sudo grant can never name a wrapper the drift probe does not track.
+// devlab-setup-lib.sh is a SOURCED fragment, not an executable wrapper, but it is installed beside them
+// and BOTH devlab-install and devlab-exec source it, so a stale copy would silently change what a setup
+// produces — the drift probe (and now the renewal tool) keeps it current like the rest.
 // deploy/devlab-deploy-recv is deliberately absent — it lives on the PRODUCTION host, not in this host's
 // sbin, and reaches production by hand (it is not installed to sbin by `service`).
 var selfWrappers = []string{
