@@ -979,18 +979,29 @@ type chainQuestions struct{ d *ChainDeps }
 
 // OpenForRepo resolves the repo's full name (the pool stores questions under the target as the run
 // named it, but a full name may reach it too) and reports the open question holding it, if any.
-func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptRunID string) (*runs.Question, error) {
 	if c.d.s.runQuestions == nil {
 		return nil, nil
 	}
-	return c.d.s.runQuestions.OpenForRepo(repo, exceptExecutionID)
+	return c.d.s.runQuestions.OpenForRepo(repo, exceptRunID)
 }
 
-func (c chainQuestions) AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error) {
+func (c chainQuestions) AnsweredForRun(ctx context.Context, runID, repo string) (*runs.Question, error) {
 	if c.d.s.runQuestions == nil {
 		return nil, nil
 	}
-	return c.d.s.runQuestions.AnsweredForExec(executionID, repo)
+	return c.d.s.runQuestions.AnsweredForRun(runID, repo)
+}
+
+func (c chainQuestions) WithdrawForRun(ctx context.Context, runID, repo, qKind string) (int, error) {
+	if c.d.s.runQuestions == nil {
+		return 0, nil
+	}
+	n, err := c.d.s.runQuestions.WithdrawForRun(runID, repo, qKind)
+	if err == nil && n > 0 {
+		c.d.s.publish(live.TopicQuestions)
+	}
+	return n, err
 }
 
 // Raise records the question and ticks the Blocked surface. Outward delivery to the user rides the

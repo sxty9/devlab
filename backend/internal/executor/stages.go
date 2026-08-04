@@ -141,6 +141,10 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 	}
 	_ = wb.Publish(ctx)
 
+	// Retire any decision question a since-ended execution of THIS order left for this repo, so the
+	// fresh one below is the ONE current question and no stale, un-redeemable blocker lingers.
+	_, _ = rc.Deps.Questions().WithdrawForRun(ctx, rc.Run.ID, rc.Repo, runs.QuestionDecision)
+
 	q := runs.Question{
 		RunID:          rc.Run.ID,
 		RunTitle:       rc.Run.Title,
@@ -309,14 +313,18 @@ func renderWrapperGrants(grants []runs.WrapperGrant, source string) string {
 	return b.String()
 }
 
-// applyApprovedWrapperRenewal is the WRITE half's trigger on resume: if this execution's own
+// applyApprovedWrapperRenewal is the WRITE half's trigger on resume: if the ORDER's own
 // wrapper-renewal question was answered AND approved, install the approved wrappers (from the stack tip
 // or this run's delivering branch, per the question's source) through the root tool BEFORE the delivery
-// re-checks the guard. It is idempotent — a renewal already applied (or partly applied) is skipped per
-// file in the deploy layer — and a failure never marks the approval consumed, so the delivery simply
-// re-checks and may ask again.
+// re-checks the guard. The lookup keys by RUN, not execution: an approval belongs to the order, so a
+// LATER execution (after a restart minted a fresh execution and a fresh question) still redeems the
+// earlier approval — the very gap that let an approved renewal go unread once its execution had ended.
+// It is idempotent — a renewal already applied (or partly applied) is skipped per file in the deploy
+// layer — and a failure never marks the approval consumed, so the delivery simply re-checks and may ask
+// again. The content-pin is the safety: the approval installs only bytes that still hash to the approved
+// checksum, so a source that changed after the approval installs nothing and the delivery re-asks.
 func (rc *RepoCtx) applyApprovedWrapperRenewal(ctx context.Context) {
-	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
+	q, err := rc.Deps.Questions().AnsweredForRun(ctx, rc.Run.ID, rc.Repo)
 	if err != nil || q == nil || q.QKind != runs.QuestionWrapperRenewal || !q.Approved || len(q.Wrappers) == 0 {
 		return
 	}
@@ -334,13 +342,13 @@ func (rc *RepoCtx) applyApprovedWrapperRenewal(ctx context.Context) {
 	}
 }
 
-// consumeWrapperQuestion marks this execution's answered wrapper-renewal question consumed, so it
-// leaves the Blocked surface once the renewal has actually taken effect (best-effort).
+// consumeWrapperQuestion retires the ORDER's own wrapper-renewal question(s) for this repo — open OR
+// answered — so exactly one current question stands on the Blocked surface. It keys by RUN, not
+// execution, so a question a since-ended execution left behind is retired too (never a lingering
+// second blocker); raising a fresh wrapper question calls it first, and a successful delivery calls
+// it to clear the answered approval once the renewal has taken effect (best-effort).
 func (rc *RepoCtx) consumeWrapperQuestion(ctx context.Context) {
-	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
-	if err == nil && q != nil && q.QKind == runs.QuestionWrapperRenewal {
-		_ = rc.Deps.Questions().Resolve(ctx, q.ID)
-	}
+	_, _ = rc.Deps.Questions().WithdrawForRun(ctx, rc.Run.ID, rc.Repo, runs.QuestionWrapperRenewal)
 }
 
 // answerContinuation frames the user's answer as the next turn of the run's own agent conversation.
@@ -452,9 +460,11 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 
 	// An open question is a tip whose state is not settled — it holds the repository exactly like a
 	// failed delivery. BEFORE this order branches, a still-open question raised by ANOTHER order holds
-	// it: no new work is stacked past a decision the user has not made yet. The order's own question
-	// (same execution id) never holds it — that is the resume path, which feeds the answer below.
-	if q, qerr := deps.Questions().OpenForRepo(ctx, rc.Repo, rc.Doc.ID); qerr == nil && q != nil {
+	// it: no new work is stacked past a decision the user has not made yet. The order's OWN question
+	// never holds it — the exclusion is by RUN, not execution, so even a later execution (after a
+	// restart) is not deadlocked behind a question one of the order's earlier executions raised; it
+	// resumes, redeems the answer, or re-asks below.
+	if q, qerr := deps.Questions().OpenForRepo(ctx, rc.Repo, rc.Run.ID); qerr == nil && q != nil {
 		return heldOnOpenQuestion(rc, q)
 	}
 
@@ -535,7 +545,7 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// conversation with that answer as its next turn — not the whole prompt again — so the run picks
 	// up exactly where it stopped. The question is marked consumed once the agent has taken it.
 	if resumingImplement {
-		if q, aerr := deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo); aerr == nil && q != nil && q.QKind == runs.QuestionDecision {
+		if q, aerr := deps.Questions().AnsweredForRun(ctx, rc.Run.ID, rc.Repo); aerr == nil && q != nil && q.QKind == runs.QuestionDecision {
 			prompt = answerContinuation(*q)
 			rc.answeredQuestionID = q.ID
 			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))

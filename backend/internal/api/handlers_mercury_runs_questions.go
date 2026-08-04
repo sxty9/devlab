@@ -97,17 +97,31 @@ func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 	s.publish(live.TopicQuestions)
 	s.publish(live.TopicNotices)
 
-	// Resume the run that raised the question. A missing scheduler (dev) or a run that is no longer
-	// blocked live is not an error for the answer — the answer is recorded either way, and the resume
-	// picks it up when the run is next admitted.
+	// Drive the run that raised the question forward with the answer. Two cases, because an answer
+	// belongs to the ORDER, not to the one execution that asked:
+	//   - the raising execution is still live (paused/blocked/interrupted) → RESUME it in place;
+	//   - its execution has ENDED (the run has no live execution — the very trap this fixes: the
+	//     approval could be given but never redeemed) → START a fresh execution, which redeems the
+	//     answer by run id (AnsweredForRun) exactly as a manual restart would.
+	// A missing scheduler (dev) leaves the answer recorded for the run's next admission; it is never
+	// an error for the answer itself.
 	resumed := false
 	if s.scheduler != nil && q.RunID != "" {
 		switch rerr := s.scheduler.Resume(q.RunID, actorFrom(r)); {
 		case rerr == nil:
 			resumed = true
-		case errors.Is(rerr, sched.ErrNotActive), errors.Is(rerr, sched.ErrNotPaused),
-			errors.Is(rerr, sched.ErrNotRunning), errors.Is(rerr, sched.ErrUnknownRun):
-			// The answer stands; the run simply has no live blocked execution to resume right now.
+		case errors.Is(rerr, sched.ErrNotActive):
+			// No live execution to resume — start a fresh one so the recorded answer is redeemed
+			// instead of lingering unread. The restart runs the SAME order: an already-implemented
+			// target takes the rest path (no new agent work), and the wrapper renewal installs under
+			// the approval just answered.
+			if _, serr := s.scheduler.Submit(r.Context(), sched.StartRequest{RunID: q.RunID, By: actorFrom(r)}); serr != nil {
+				log.Printf("devlabd: restart run %s to redeem its answer: %v", q.RunID, serr)
+			} else {
+				resumed = true
+			}
+		case errors.Is(rerr, sched.ErrNotPaused), errors.Is(rerr, sched.ErrNotRunning), errors.Is(rerr, sched.ErrUnknownRun):
+			// The answer stands; the run simply has no resumable execution right now.
 		default:
 			log.Printf("devlabd: resume run %s after answer: %v", q.RunID, rerr)
 		}

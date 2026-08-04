@@ -1128,28 +1128,49 @@ func (f fixtureDeliver) RecordFailedDelivery(_ context.Context, in executor.Deli
 // fixtureQuestions is the motor's QuestionOps over the fixture's in-memory Blocked surface.
 type fixtureQuestions struct{ d *fixtureDeps }
 
-func (f fixtureQuestions) OpenForRepo(_ context.Context, repo, exceptExecutionID string) (*runs.Question, error) {
+func (f fixtureQuestions) OpenForRepo(_ context.Context, repo, exceptRunID string) (*runs.Question, error) {
 	f.d.mu.Lock()
 	defer f.d.mu.Unlock()
 	for i := range f.d.questions {
 		q := f.d.questions[i]
-		if q.Open() && q.Repo == repo && q.ExecutionID != exceptExecutionID {
+		if q.Open() && q.Repo == repo && q.RunID != exceptRunID {
 			return &q, nil
 		}
 	}
 	return nil, nil
 }
 
-func (f fixtureQuestions) AnsweredForExec(_ context.Context, executionID, repo string) (*runs.Question, error) {
+func (f fixtureQuestions) AnsweredForRun(_ context.Context, runID, repo string) (*runs.Question, error) {
 	f.d.mu.Lock()
 	defer f.d.mu.Unlock()
+	var found *runs.Question
 	for i := range f.d.questions {
 		q := f.d.questions[i]
-		if q.Answered() && q.ExecutionID == executionID && q.Repo == repo {
-			return &q, nil
+		if q.Answered() && q.RunID == runID && q.Repo == repo {
+			hit := q
+			found = &hit
 		}
 	}
-	return nil, nil
+	return found, nil
+}
+
+func (f fixtureQuestions) WithdrawForRun(_ context.Context, runID, repo, qKind string) (int, error) {
+	f.d.mu.Lock()
+	defer f.d.mu.Unlock()
+	n := 0
+	for i := range f.d.questions {
+		if f.d.questions[i].Resolved || f.d.questions[i].RunID != runID || f.d.questions[i].Repo != repo {
+			continue
+		}
+		if qKind != "" && f.d.questions[i].QKind != qKind {
+			continue
+		}
+		now := time.Now().UTC()
+		f.d.questions[i].Resolved = true
+		f.d.questions[i].ResolvedAt = &now
+		n++
+	}
+	return n, nil
 }
 
 func (f fixtureQuestions) Raise(_ context.Context, q runs.Question) (runs.Question, error) {

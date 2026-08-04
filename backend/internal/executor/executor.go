@@ -213,19 +213,24 @@ type DeployOps interface {
 // QuestionOps is the blocking-question slice (the Blocked surface). It reuses the SAME halt as a
 // failed delivery tip: an OPEN question holds a repository — the implement stage consults
 // OpenForRepo BEFORE it branches, so no new order is cut past an unanswered question. An ANSWERED
-// question feeds its answer back into the SAME agent conversation, so the run continues where it
-// stopped instead of starting over.
+// question feeds its answer back into the run, so the run continues where it stopped instead of
+// starting over. Every lookup keys by the ORDER (run id), not the single execution that asked: an
+// answer belongs to the order and its subject, so a later execution (after a restart) redeems it.
 type QuestionOps interface {
-	// OpenForRepo returns an unanswered question holding this repository, raised by an execution
-	// OTHER than exceptExecutionID (so a run is never held by its own question), or nil.
-	OpenForRepo(ctx context.Context, repo, exceptExecutionID string) (*runs.Question, error)
-	// AnsweredForExec returns this execution's own answered, not-yet-consumed question for the repo,
-	// whose answer the resumed agent session is fed — nil when none waits.
-	AnsweredForExec(ctx context.Context, executionID, repo string) (*runs.Question, error)
+	// OpenForRepo returns an unanswered question holding this repository, raised by a run OTHER than
+	// exceptRunID (so a run is never held by a question one of its own executions raised), or nil.
+	OpenForRepo(ctx context.Context, repo, exceptRunID string) (*runs.Question, error)
+	// AnsweredForRun returns the ORDER's own answered, not-yet-consumed question for the repo, whose
+	// answer a resuming execution redeems — nil when none waits.
+	AnsweredForRun(ctx context.Context, runID, repo string) (*runs.Question, error)
 	// Raise records a new open question (the Blocked surface + the disturbance delivery).
 	Raise(ctx context.Context, q runs.Question) (runs.Question, error)
 	// Resolve marks an answered question consumed, so a later resume does not re-inject the answer.
 	Resolve(ctx context.Context, id string) error
+	// WithdrawForRun retires the order's own not-yet-consumed questions for the repo (open or
+	// answered, narrowed to qKind when non-empty), so raising a fresh one never leaves a second,
+	// un-redeemable blocker behind. Returns how many it withdrew.
+	WithdrawForRun(ctx context.Context, runID, repo, qKind string) (int, error)
 }
 
 // AgentSession names the agent conversation of ONE repository inside ONE execution. Key is the
