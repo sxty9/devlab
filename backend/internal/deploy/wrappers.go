@@ -1,12 +1,10 @@
 package deploy
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -62,10 +60,10 @@ type WrapperDrift struct {
 	Installed string // <sbin>/<name> — what runs today
 	Reason    string // why it drifted ("not installed" | "installed copy differs …")
 
-	// WantSHA and WantContent are set ONLY by the renewal drift probes (MainWrapperDrift /
-	// WorkingWrapperDrift): the sha256 (hex) and bytes of the copy — merged or working-branch — that a
-	// renewal would install. They stay empty for the working-tree drift probe (CheckWrapperDrift), which
-	// only reports a mismatch.
+	// WantSHA and WantContent are the sha256 (hex) and bytes of the copy — stack-tip or
+	// delivering-branch — that a renewal would install. Every drift the probes (StackTipWrapperDrift /
+	// DeliveringBranchWrapperDrift, which the gate reuses) return now through driftAgainstInstalled
+	// carries them.
 	WantSHA     string
 	WantContent []byte
 
@@ -107,48 +105,27 @@ func (e *WrapperDriftError) Error() string {
 // Is lets callers match the sentinel through the concrete error (errors.Is).
 func (e *WrapperDriftError) Is(target error) bool { return target == ErrWrappersStale }
 
-// CheckWrapperDrift compares each root wrapper the self repo ships (deploy/<name>) against the
-// installed copy (<sbin>/<name>) by content. It is a READ-ONLY, unprivileged probe — the wrappers
-// are world-readable and the repo files are the runner's own; nothing here writes a privileged path.
-// A wrapper the repository does not carry is skipped (it is not this repo's to keep current). The
-// result is sorted by name so the report is stable.
-func CheckWrapperDrift(wt string) ([]WrapperDrift, error) {
-	var drifts []WrapperDrift
-	for _, name := range selfWrappers {
-		repoPath := filepath.Join(wt, "deploy", name)
-		want, err := os.ReadFile(repoPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue // the repository does not ship this wrapper — nothing to keep current
-			}
-			return nil, fmt.Errorf("read repository wrapper %s: %w", repoPath, err)
-		}
-		installedPath := filepath.Join(wrapperInstallDir, name)
-		got, err := os.ReadFile(installedPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				drifts = append(drifts, WrapperDrift{Name: name, RepoPath: repoPath, Installed: installedPath,
-					Reason: "not installed"})
-				continue
-			}
-			return nil, fmt.Errorf("read installed wrapper %s: %w", installedPath, err)
-		}
-		if sha256.Sum256(want) != sha256.Sum256(got) {
-			drifts = append(drifts, WrapperDrift{Name: name, RepoPath: repoPath, Installed: installedPath,
-				Reason: "installed copy differs from the repository"})
-		}
-	}
-	sort.Slice(drifts, func(i, j int) bool { return drifts[i].Name < drifts[j].Name })
-	return drifts, nil
+// CheckWrapperDrift compares each root wrapper the self repo ships against the installed copy
+// (<sbin>/<name>) by content, reading the intended content from the branch BEING DELIVERED
+// (deliverBranch) — NOT the shared working tree, which on a resume sits on the standard branch and so
+// would hide a run's own change (the false negative measured 2026-08-04). It is a READ-ONLY,
+// unprivileged probe. A wrapper the delivering branch does not carry is skipped. Each drift carries the
+// delivering-branch content and its sha256 (via DeliveringBranchWrapperDrift), so the same result also
+// feeds the working-source renewal question; the gate itself needs only the names. The result is
+// sorted by name so the report is stable.
+func CheckWrapperDrift(wt, deliverBranch string) ([]WrapperDrift, error) {
+	return DeliveringBranchWrapperDrift(wt, deliverBranch)
 }
 
-// GuardWrappersCurrent is the self-delivery gate: if any shipped root wrapper drifted from the
-// repository, it returns a WrapperDriftError (named, with the one-line fix) so the deliver-dev stage
-// fails honestly instead of installing a new binary over stale root scripts. wt is the checkout, so
-// the fix points at that checkout's own `service` CLI — the existing install/repair path (reuse
-// before build), run in one line by the human with sudo.
-func GuardWrappersCurrent(wt string) error {
-	drifts, err := CheckWrapperDrift(wt)
+// GuardWrappersCurrent is the self-delivery gate: if any shipped root wrapper drifted from the branch
+// BEING DELIVERED, it returns a WrapperDriftError (named, with the one-line fix) so the deliver-dev
+// stage fails honestly instead of installing a new binary over stale root scripts. It measures the
+// delivering branch (deliverBranch), so a run that changed a root script on its own branch is seen even
+// when the shared working tree sits on the standard branch. wt is the checkout, so the fix points at
+// that checkout's own `service` CLI — the existing install/repair path (reuse before build), run in one
+// line by the human with sudo.
+func GuardWrappersCurrent(wt, deliverBranch string) error {
+	drifts, err := CheckWrapperDrift(wt, deliverBranch)
 	if err != nil {
 		return err
 	}

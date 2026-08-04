@@ -52,7 +52,7 @@ func identical() map[string]string {
 // TestGuardWrappersCurrentPassesWhenInstalledMatches: no drift ⇒ no refusal, delivery may proceed.
 func TestGuardWrappersCurrentPassesWhenInstalledMatches(t *testing.T) {
 	wt := stageWrappers(t, identical(), identical())
-	if err := GuardWrappersCurrent(wt); err != nil {
+	if err := GuardWrappersCurrent(wt, ""); err != nil {
 		t.Fatalf("matching wrappers must not refuse the delivery, got: %v", err)
 	}
 }
@@ -67,7 +67,7 @@ func TestGuardWrappersCurrentRefusesStaleRootScript(t *testing.T) {
 
 	wt := stageWrappers(t, repo, sbin)
 
-	err := GuardWrappersCurrent(wt)
+	err := GuardWrappersCurrent(wt, "")
 	if err == nil {
 		t.Fatal("a stale installed root wrapper must fail the delivery, got nil")
 	}
@@ -99,7 +99,7 @@ func TestGuardWrappersCurrentRefusesMissingInstall(t *testing.T) {
 
 	wt := stageWrappers(t, repo, sbin)
 
-	err := GuardWrappersCurrent(wt)
+	err := GuardWrappersCurrent(wt, "")
 	if !errors.Is(err, ErrWrappersStale) {
 		t.Fatalf("a not-installed wrapper must fail the delivery, got: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCheckWrapperDriftReportsAllStale(t *testing.T) {
 
 	wt := stageWrappers(t, repo, sbin)
 
-	drifts, err := CheckWrapperDrift(wt)
+	drifts, err := CheckWrapperDrift(wt, "")
 	if err != nil {
 		t.Fatal(err)
 	}

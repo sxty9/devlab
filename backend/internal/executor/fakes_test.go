@@ -286,10 +286,10 @@ type fakeDeploy struct {
 	// wrapperDrift, when set, makes DeliverDev refuse with ErrWrappersStale carrying this drift — the
 	// self-delivery guard's refusal the deliver-dev stage turns into a wrapper-renewal question.
 	wrapperDrift string
-	// mainGrants is what MainWrapperDrift returns — the standard-branch (file, checksum) set the
-	// renewal question offers. Empty means the installed wrappers already match the standard branch.
+	// mainGrants is what StackTipWrapperDrift returns — the stack-tip (file, checksum) set the renewal
+	// question offers. Empty means the installed wrappers already match the stack tip.
 	mainGrants []runs.WrapperGrant
-	// workingGrants is what WorkingWrapperDrift returns — the run's OWN working-branch (file, checksum)
+	// workingGrants is what WorkingWrapperDrift returns — the run's OWN delivering-branch (file, checksum)
 	// set, offered when the run itself changed a root script that is not yet merged.
 	workingGrants []runs.WrapperGrant
 	// renewErr, when set, makes RenewApprovedWrappers fail; renewed records the questions it applied.
@@ -306,7 +306,7 @@ func (d *fakeDeploy) Detect(ctx context.Context, repo string) (Detection, error)
 	}
 	return d.det, nil
 }
-func (d *fakeDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+func (d *fakeDeploy) StackTipWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.mainGrants, nil

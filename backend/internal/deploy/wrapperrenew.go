@@ -8,11 +8,13 @@ package deploy
 //
 // The boundary is held by three facts, none of which a run can bend:
 //
-//  1. ONLY MERGED CONTENT IS A SOURCE. A renewal installs the wrapper exactly as it stands on the
-//     repository's STANDARD BRANCH — content that traversed the full chain and was merged through a
-//     protected pull request. MainWrapperDrift reads it from committed history (origin/<default>),
-//     never from a branch, a working tree, or a file a run produced. A run cannot put bytes on the
-//     standard branch by itself (it is protected), so it cannot choose what a renewal installs.
+//  1. THE SOURCE IS COMMITTED HISTORY THE RUN CANNOT AUTHOR ALONE — one of two committed stands.
+//     For a drifted-installed-script renewal it is the STACK TIP (deliver.NextPRBase): another open
+//     delivery's branch, else the standard branch — content that either merged through a protected
+//     pull request or is a delivered-and-open change. StackTipWrapperDrift reads it from committed
+//     history (origin/<tip>, falling back to the local ref), never from the shared working tree. The
+//     second stand, admissible only under the human-gate spelled out below, is the DELIVERING BRANCH
+//     itself, used when the run's own not-yet-merged change is what drifted.
 //
 //  2. THE APPROVAL IS SINGLE-USE AND CONTENT-PINNED, AND A RUN CANNOT FORGE IT. The user approves a
 //     named file with a named checksum. That approval lives in the daemon-owned question pool under
@@ -56,23 +58,31 @@ type WrapperContentAt struct {
 	read  func(name string) (content []byte, ok bool)
 }
 
-// MergedWrapperContent reads each wrapper from the repository's STANDARD BRANCH — the merged content,
-// from committed history via origin/<default> (falling back to the local default branch). This is the
-// source for a drifted-installed-script renewal: content that traversed the full chain and merged
-// through a protected pull request, which a run cannot author by itself.
-func MergedWrapperContent(wt string) WrapperContentAt {
-	def := git.DefaultBranch(wt)
+// StackTipContent reads each wrapper from the STACK TIP — the base the next pull request stacks onto
+// (deliver.NextPRBase): another open delivery's branch when the repository has one open, else the
+// standard branch. It reads committed history via origin/<tip> (falling back to the local ref), never
+// the working tree. This is the reference for a drifted-installed-script renewal, and it is the stack
+// tip rather than main alone BECAUSE an open delivery that already changed a wrapper is part of the
+// stack: measuring against main would report drift against a stand the installed scripts have already
+// moved past, and offer to roll them BACK to the older content (the false positive measured
+// 2026-08-04). Content on the stack tip either merged through a protected pull request or is itself a
+// delivered-and-open change; a run cannot author the tip by itself.
+func StackTipContent(wt, tipBranch string) WrapperContentAt {
+	ref := firstRef(wt, "origin/"+tipBranch, tipBranch)
 	return WrapperContentAt{
-		label: "the standard branch",
-		read:  func(name string) ([]byte, bool) { return mergedWrapperContent(wt, def, name) },
+		label: "the stack tip",
+		read:  func(name string) ([]byte, bool) { return refWrapper(wt, ref, name) },
 	}
 }
 
-// WorkingWrapperContent reads each wrapper from THIS run's own working branch (the working tree the
-// run committed its change onto). This is the source when the run ITSELF changed a root wrapper: the
-// content is not yet merged, so it is offered from the run's branch instead of the standard branch.
+// DeliveringBranchContent reads each wrapper from the branch BEING DELIVERED — this run's own task
+// branch tip, the tree that is actually shipped. It reads the committed branch ref (local first, since
+// the run just committed onto it; origin/<branch> as the fallback for a freshly-opened checkout that
+// only fetched it), and falls back to the working tree only when no branch ref resolves. This is what
+// makes the gate measure the delivering branch instead of the shared working tree (which sits on the
+// standard branch on a resume), so a run that changed a root script is SEEN (task point 1).
 //
-// SAFETY — why a run-authored source is admissible here (task point 3): unlike the merged source, a
+// SAFETY — why a run-authored source is admissible here (task point 3): unlike the stack-tip source, a
 // run CAN choose these bytes, so the human — never a merge — is the gate. That gate holds because the
 // approval is bound to EXACTLY this content by its sha256 (RenewApprovedWrapper re-reads and refuses
 // any other bytes), it is SINGLE-USE and lives in a daemon-owned place a run cannot write (the
@@ -80,30 +90,44 @@ func MergedWrapperContent(wt string) WrapperContentAt {
 // single-use itself before it writes, and a branch that changes AFTER the approval no longer hashes to
 // the approved sha, so it installs nothing. Those four facts are why the human may approve one specific
 // content the run wrote without opening a hole a run could widen on its own.
-func WorkingWrapperContent(wt string) WrapperContentAt {
+func DeliveringBranchContent(wt, branch string) WrapperContentAt {
+	ref := firstRef(wt, branch, "origin/"+branch)
 	return WrapperContentAt{
-		label: "this run's working branch",
-		read:  func(name string) ([]byte, bool) { return workingWrapperContent(wt, name) },
+		label: "this run's own branch",
+		read: func(name string) ([]byte, bool) {
+			if ref != "" {
+				return refWrapper(wt, ref, name)
+			}
+			// No delivering-branch ref resolved — read the working tree, which in the normal path IS this
+			// branch's checkout. This is the last resort, not the primary source; the branch ref above is
+			// what makes the gate correct when the shared tree sits on the standard branch.
+			b, err := os.ReadFile(filepath.Join(wt, "deploy", name))
+			if err != nil {
+				return nil, false
+			}
+			return b, true
+		},
 	}
 }
 
-// MainWrapperDrift compares each renewable root wrapper's INSTALLED copy (<sbin>/<name>,
-// world-readable) against the copy on the repository's STANDARD BRANCH (the merged content). Every
-// reported drift carries the merged content and its sha256, so the caller can offer EXACTLY that
-// content for the user's approval. A read-only, unprivileged probe throughout.
-func MainWrapperDrift(wt string) ([]WrapperDrift, error) {
-	return driftAgainstInstalled(MergedWrapperContent(wt))
+// StackTipWrapperDrift compares each renewable root wrapper's INSTALLED copy (<sbin>/<name>,
+// world-readable) against the copy on the STACK TIP (deliver.NextPRBase — never main alone). Every
+// reported drift carries the tip content and its sha256, so the caller can offer EXACTLY that content
+// for the user's approval. A read-only, unprivileged probe throughout. (This is the same probe that
+// used to measure against the standard branch under the name MainWrapperDrift; its reference point
+// moved to the stack tip so an open delivery's wrapper change is not mistaken for drift.)
+func StackTipWrapperDrift(wt, tipBranch string) ([]WrapperDrift, error) {
+	return driftAgainstInstalled(StackTipContent(wt, tipBranch))
 }
 
-// WorkingWrapperDrift is the SIBLING probe for the case the chain lacked: the run itself changed a
-// root wrapper, so the source of the renewal is THIS run's working branch, not the standard branch.
-// It reports each installed wrapper that differs from the run's working-tree deploy/<name> and pins
-// the offered content to the working-tree copy's sha256 — the exact (file, checksum) set the same
-// wrapper-renewal question offers for approval. When the installed scripts already match the standard
-// branch (so MainWrapperDrift is empty) but the run changed one, THIS is what turns a dead-end halt
-// into an answerable approval question (task point 1).
-func WorkingWrapperDrift(wt string) ([]WrapperDrift, error) {
-	return driftAgainstInstalled(WorkingWrapperContent(wt))
+// DeliveringBranchWrapperDrift compares each renewable root wrapper's INSTALLED copy against the
+// branch BEING DELIVERED (this run's own task branch). It is the ONE probe both the self-delivery gate
+// (GuardWrappersCurrent) and the working-source renewal question use: the gate halts on any drift, and
+// the question offers the delivering-branch content pinned to its sha256 when the run itself changed a
+// root script that has not merged yet (task point 1). Reading the branch ref rather than the shared
+// working tree is what lets it SEE a run's change even when the tree sits on the standard branch.
+func DeliveringBranchWrapperDrift(wt, branch string) ([]WrapperDrift, error) {
+	return driftAgainstInstalled(DeliveringBranchContent(wt, branch))
 }
 
 // driftAgainstInstalled scans every renewable wrapper, comparing the source's intended content against
@@ -139,29 +163,26 @@ func driftAgainstInstalled(src WrapperContentAt) ([]WrapperDrift, error) {
 	return drifts, nil
 }
 
-// mergedWrapperContent reads deploy/<name> from the standard branch, byte-for-byte. It tries the
-// remote-tracking default branch first (the true merged stand), then the local default branch, so a
-// checkout that has the branch but not the remote ref still resolves. The bytes equal the committed
-// blob, so their sha256 equals that of a file installed verbatim from it.
-func mergedWrapperContent(wt, def, name string) ([]byte, bool) {
-	rel := "deploy/" + name
-	for _, ref := range []string{"origin/" + def, def} {
-		if b, ok := git.FileAtRefBytes(wt, ref, rel); ok {
-			return b, true
+// firstRef returns the first of the given git refs that resolves to a commit in wt, or "" when none
+// does. It picks ONE stand up front so every wrapper of a source is read from the same ref (never a
+// mix of a branch and the working tree), which is what keeps the offered checksums self-consistent.
+func firstRef(wt string, refs ...string) string {
+	for _, ref := range refs {
+		if ref != "" && ref != "origin/" && git.RefExists(wt, ref) {
+			return ref
 		}
 	}
-	return nil, false
+	return ""
 }
 
-// workingWrapperContent reads deploy/<name> from the run's WORKING TREE — the branch the run committed
-// its change onto, checked out at delivery time. These are the very bytes the drift probe compared
-// against the installed copy, so the sha256 offered for approval equals what a renewal would install.
-func workingWrapperContent(wt, name string) ([]byte, bool) {
-	b, err := os.ReadFile(filepath.Join(wt, "deploy", name))
-	if err != nil {
+// refWrapper reads deploy/<name> from a committed git ref, byte-for-byte. The bytes equal the
+// committed blob, so their sha256 equals that of a file installed verbatim from it. An empty ref (no
+// stand resolved) carries no wrapper.
+func refWrapper(wt, ref, name string) ([]byte, bool) {
+	if ref == "" {
 		return nil, false
 	}
-	return b, true
+	return git.FileAtRefBytes(wt, ref, "deploy/"+name)
 }
 
 func sha256hex(b []byte) string {
@@ -230,15 +251,15 @@ type WrapperRenewer interface {
 }
 
 // RenewApprovedWrapper is the daemon side of ONE approved renewal. It re-reads the wrapper from the
-// SAME source the approval was built from (src — merged standard branch or the run's working branch),
-// refuses if that content no longer matches the sha the user approved (the approval is for exactly one
-// content), stages the content and a run-unwritable grant under grantDir, and calls the root tool.
-// grantDir MUST be a daemon-owned, run-unwritable directory (the caller passes
-// <state>/mercury/wrapper-grants); the bytes a run could reach are never a source of what root writes.
+// SAME source the approval was built from (src — the stack tip or the delivering branch), refuses if
+// that content no longer matches the sha the user approved (the approval is for exactly one content),
+// stages the content and a run-unwritable grant under grantDir, and calls the root tool. grantDir MUST
+// be a daemon-owned, run-unwritable directory (the caller passes <state>/mercury/wrapper-grants); the
+// bytes a run could reach are never a source of what root writes.
 //
 // The re-read against src is what makes "a branch that changed after the approval installs nothing"
-// hold for BOTH sources: whether the approved content came from the standard branch or the run's own
-// working branch, a later change to that source no longer hashes to approvedSHA and is refused here —
+// hold for BOTH sources: whether the approved content came from the stack tip or the run's own
+// delivering branch, a later change to that source no longer hashes to approvedSHA and is refused here —
 // so a run can never swap the approved bytes for others after the human said yes (task point 3).
 func RenewApprovedWrapper(ctx context.Context, r WrapperRenewer, src WrapperContentAt, grantDir, name, approvedSHA, approvalID, approvedBy, approvedAt string) error {
 	want, ok := src.read(name)

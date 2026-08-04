@@ -7,9 +7,10 @@ package deploy
 //   (d) a name outside the four is refused,
 //   (e) after an install, who approved and what was there before is readable, and the previous
 //       content is kept for a rollback.
-// (b) — only merged content is a source — is proven at the Go level (TestMainWrapperDriftReadsStandardBranch):
-// the offered checksum is the STANDARD BRANCH's, never the working tree's, so content that is not on
-// the standard branch is never what the approval (and thus the install) is pinned to.
+// (b) — the source is committed history, never an unpinned working tree — is proven at the Go level
+// (TestStackTipWrapperDriftReadsCommittedTip): the offered checksum is the STACK TIP's committed
+// content, never the working tree's, so content that is not on the tip is never what the approval (and
+// thus the install) is pinned to.
 
 import (
 	"context"
@@ -215,21 +216,21 @@ func TestRenewIsAuditableAndReversible(t *testing.T) {
 	}
 }
 
-// (b) Only merged content is a source: MainWrapperDrift offers the STANDARD-BRANCH checksum, never
-// the working tree's. A wrapper changed only in the working tree (not committed to the default
-// branch) is never what the renewal is pinned to.
-func TestMainWrapperDriftReadsStandardBranch(t *testing.T) {
+// (b) The source is committed history, never an unpinned working tree: StackTipWrapperDrift offers the
+// STACK TIP's committed checksum. A wrapper changed only in the working tree (not committed to the tip)
+// is never what the renewal is pinned to.
+func TestStackTipWrapperDriftReadsCommittedTip(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
 	wt := t.TempDir()
 	gitInit(t, wt)
 
-	merged := []byte("#!/usr/bin/env bash\n# MERGED devlab-exec\n")
-	writeRepoFile(t, wt, "deploy/devlab-exec", merged)
-	gitCommitAll(t, wt, "add merged wrapper")
+	tip := []byte("#!/usr/bin/env bash\n# STACK-TIP devlab-exec\n")
+	writeRepoFile(t, wt, "deploy/devlab-exec", tip)
+	gitCommitAll(t, wt, "add tip wrapper")
 
-	// The working tree now diverges from the committed (merged) content — this is what a run could do.
+	// The working tree now diverges from the committed (tip) content — this is what a run could do.
 	writeRepoFile(t, wt, "deploy/devlab-exec", []byte("#!/usr/bin/env bash\n# WORKING-TREE tampering\n"))
 
 	// The installed copy differs from both, so a drift exists.
@@ -245,35 +246,32 @@ func TestMainWrapperDriftReadsStandardBranch(t *testing.T) {
 	wrapperInstallDir = sbin
 	t.Cleanup(func() { wrapperInstallDir = restore })
 
-	drifts, err := MainWrapperDrift(wt)
+	// The stack tip here is the default branch (no other open delivery); read its committed content.
+	drifts, err := StackTipWrapperDrift(wt, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got *WrapperDrift
-	for i := range drifts {
-		if drifts[i].Name == "devlab-exec" {
-			got = &drifts[i]
-		}
-	}
+	got := driftNamed(drifts, "devlab-exec")
 	if got == nil {
 		t.Fatalf("devlab-exec drift not reported, got %+v", drifts)
 	}
-	if got.WantSHA != sha256of(merged) {
-		t.Fatalf("the offered content must be the MERGED (standard-branch) content, not the working tree's; got %s want %s", got.WantSHA, sha256of(merged))
+	if got.WantSHA != sha256of(tip) {
+		t.Fatalf("the offered content must be the committed STACK-TIP content, not the working tree's; got %s want %s", got.WantSHA, sha256of(tip))
 	}
-	if string(got.WantContent) != string(merged) {
-		t.Fatalf("WantContent must be the merged content byte-for-byte")
+	if string(got.WantContent) != string(tip) {
+		t.Fatalf("WantContent must be the committed tip content byte-for-byte")
 	}
 }
 
-// WorkingWrapperDrift offers THIS run's own working-branch content — the second renewal source, for
-// when the run itself changed a root script that is not yet merged. It reports the drift against the
-// installed copy and pins the offered checksum to the working-tree copy (not the standard branch).
-func TestWorkingWrapperDriftReadsWorkingBranch(t *testing.T) {
+// DeliveringBranchWrapperDrift offers THIS run's own delivering-branch content — the second renewal
+// source, for when the run itself changed a root script that is not yet merged. It reports the drift
+// against the installed copy and pins the offered checksum to the delivering branch. With no branch ref
+// resolvable (a bare working tree), it falls back to the working tree — the run's checkout.
+func TestDeliveringBranchWrapperDriftReadsTheRunsBranch(t *testing.T) {
 	wt := t.TempDir()
 
-	// The run changed devlab-exec on its working branch (only the working tree matters here — no commit
-	// or standard branch is needed, which is exactly the case MainWrapperDrift cannot serve).
+	// The run changed devlab-exec on its branch (a bare working tree here, so the source falls back to
+	// the working tree — exactly the case the stack tip cannot serve).
 	working := []byte("#!/usr/bin/env bash\n# THIS RUN's devlab-exec\n")
 	writeRepoFile(t, wt, "deploy/devlab-exec", working)
 
@@ -288,40 +286,43 @@ func TestWorkingWrapperDriftReadsWorkingBranch(t *testing.T) {
 	wrapperInstallDir = sbin
 	t.Cleanup(func() { wrapperInstallDir = restore })
 
-	drifts, err := WorkingWrapperDrift(wt)
+	drifts, err := DeliveringBranchWrapperDrift(wt, "fix/change-a-root-script")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got *WrapperDrift
-	for i := range drifts {
-		if drifts[i].Name == "devlab-exec" {
-			got = &drifts[i]
-		}
-	}
+	got := driftNamed(drifts, "devlab-exec")
 	if got == nil {
-		t.Fatalf("devlab-exec working-branch drift not reported, got %+v", drifts)
+		t.Fatalf("devlab-exec delivering-branch drift not reported, got %+v", drifts)
 	}
 	if got.WantSHA != sha256of(working) || string(got.WantContent) != string(working) {
-		t.Fatalf("the offered content must be THIS run's working-tree content; got sha %s want %s", got.WantSHA, sha256of(working))
+		t.Fatalf("the offered content must be THIS run's content; got sha %s want %s", got.WantSHA, sha256of(working))
 	}
 	// The drift carries a SHORT change summary (task point 4) — a human reads it, not the full content.
 	if !strings.Contains(got.Summary, "lines") {
 		t.Fatalf("the drift must summarize the change for the question, got %q", got.Summary)
 	}
 
-	// When the installed copy already matches the working branch, there is no drift to renew.
+	// When the installed copy already matches the delivering branch, there is no drift to renew.
 	if err := os.WriteFile(filepath.Join(sbin, "devlab-exec"), working, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	drifts, err = WorkingWrapperDrift(wt)
+	drifts, err = DeliveringBranchWrapperDrift(wt, "fix/change-a-root-script")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range drifts {
-		if d.Name == "devlab-exec" {
-			t.Fatalf("no drift expected once the installed copy matches the working branch, got %+v", d)
+	if d := driftNamed(drifts, "devlab-exec"); d != nil {
+		t.Fatalf("no drift expected once the installed copy matches the delivering branch, got %+v", d)
+	}
+}
+
+// driftNamed returns the drift for one wrapper name, or nil.
+func driftNamed(drifts []WrapperDrift, name string) *WrapperDrift {
+	for i := range drifts {
+		if drifts[i].Name == name {
+			return &drifts[i]
 		}
 	}
+	return nil
 }
 
 // fakeRenewer records whether the root write step was reached at all — a refusal before the write
@@ -347,7 +348,7 @@ func TestRenewApprovedWrapperBindsWorkingSourceToTheApprovedChecksum(t *testing.
 
 	// Matching content → the write step is reached and the grant is staged.
 	r := &fakeRenewer{}
-	if err := RenewApprovedWrapper(context.Background(), r, WorkingWrapperContent(wt), grantDir,
+	if err := RenewApprovedWrapper(context.Background(), r, DeliveringBranchContent(wt, "fix/x"), grantDir,
 		"devlab-install", approvedSHA, "qst_w1", "operator", "2026-08-04T00:00:00Z"); err != nil {
 		t.Fatalf("a matching working-source approval should reach the write step, got %v", err)
 	}
@@ -362,7 +363,7 @@ func TestRenewApprovedWrapperBindsWorkingSourceToTheApprovedChecksum(t *testing.
 	// differs from the approved checksum, so the renewal refuses and never reaches the write step.
 	writeRepoFile(t, wt, "deploy/devlab-install", []byte("#!/usr/bin/env bash\n# changed after approval\n"))
 	r2 := &fakeRenewer{}
-	err := RenewApprovedWrapper(context.Background(), r2, WorkingWrapperContent(wt), grantDir,
+	err := RenewApprovedWrapper(context.Background(), r2, DeliveringBranchContent(wt, "fix/x"), grantDir,
 		"devlab-install", approvedSHA, "qst_w2", "operator", "2026-08-04T00:00:00Z")
 	if err == nil || !strings.Contains(err.Error(), "not the approved") {
 		t.Fatalf("a source that changed after the approval must be refused, got %v", err)

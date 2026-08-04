@@ -49,6 +49,18 @@ func FileAtRefBytes(repo, ref, rel string) ([]byte, bool) {
 	return b, true
 }
 
+// RefExists reports whether a git ref (a local branch like "fix/x", a remote-tracking ref like
+// "origin/main", or any committish) resolves to a commit in the repo. The wrapper drift probes use it
+// to CHOOSE one stand to read every wrapper from — the delivering branch or the stack tip — so a
+// missing ref falls back to the next candidate instead of silently reading nothing. It never mutates.
+func RefExists(repo, ref string) bool {
+	if ref == "" {
+		return false
+	}
+	_, err := run(repo, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
+	return err == nil
+}
+
 // Lang maps a path to a Monaco language id (mirrors frontend src/lib/lang.ts).
 func Lang(path string) string {
 	name := path
