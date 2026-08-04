@@ -187,9 +187,9 @@ func TestAnswerResumesSameRun(t *testing.T) {
 func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
-	drift := "root wrapper(s) devlab-install differ from the standard branch"
+	drift := "root wrapper(s) devlab-install differ from the stack tip"
 	deps.deploy.wrapperDrift = drift
-	// The renewal offers EXACTLY the standard-branch content — one file, one checksum.
+	// The renewal offers EXACTLY the stack-tip content — one file, one checksum.
 	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
 	sink := newFakeSink()
 
@@ -204,9 +204,9 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	if len(deps.questions.raised) != 1 || deps.questions.raised[0].QKind != runs.QuestionWrapperRenewal {
 		t.Fatalf("expected a wrapper-renewal question, got %+v", deps.questions.raised)
 	}
-	// The question pins the standard-branch (file, checksum) set the approval covers.
+	// The question pins the stack-tip (file, checksum) set the approval covers.
 	if got := deps.questions.raised[0].Wrappers; len(got) != 1 || got[0].Name != "devlab-install" {
-		t.Fatalf("the question must carry the standard-branch grant set, got %+v", got)
+		t.Fatalf("the question must carry the stack-tip grant set, got %+v", got)
 	}
 	if !strings.Contains(deps.questions.raised[0].Detail, "devlab-install") {
 		t.Fatalf("the question must show the exact difference, got %q", deps.questions.raised[0].Detail)
@@ -218,7 +218,7 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	}
 
 	// The user APPROVES (the single-use green light). The write half now installs the approved
-	// standard-branch content through the root tool — the drift is gone on the same resume.
+	// stack-tip content through the root tool — the drift is gone on the same resume.
 	deps.questions.approve(deps.questions.raised[0].ID, "Approved renewing devlab-install.")
 
 	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
@@ -247,9 +247,9 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 func TestRunChangedRootScriptRaisesWorkingSourceQuestionAndRenews(t *testing.T) {
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
-	deps.deploy.wrapperDrift = "installed devlab-install differs from this run's working tree"
-	deps.deploy.mainGrants = nil // nothing on the standard branch differs from what is installed …
-	// … but THIS run changed devlab-install on its own working branch.
+	deps.deploy.wrapperDrift = "installed devlab-install differs from this run's delivering branch"
+	deps.deploy.mainGrants = nil // nothing on the stack tip differs from what is installed …
+	// … but THIS run changed devlab-install on its own delivering branch.
 	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("b", 64),
 		Summary: "+7/-2 lines vs the installed script"}}
 	sink := newFakeSink()

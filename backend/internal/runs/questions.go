@@ -40,10 +40,12 @@ const (
 // the offered bytes differs, so a run that changes a root script asks the very question a drifted
 // install already did, never a second kind of question (task point 2).
 const (
-	// WrapperSourceMerged renews from the standard branch — the installed scripts drifted from the
-	// merged content. This is the original, and the default when the field is empty.
-	WrapperSourceMerged = "merged"
-	// WrapperSourceWorking renews from THIS run's own working branch — the run itself changed a root
+	// WrapperSourceStackTip renews from the STACK TIP (deliver.NextPRBase) — another open delivery's
+	// branch when one is open, else the standard branch. The installed scripts drifted from that stand
+	// (a wrapper change that reached the stack but not yet /usr/local/sbin). This is the default when the
+	// field is empty, and it also covers the retired "merged" value persisted by an in-flight question.
+	WrapperSourceStackTip = "stacktip"
+	// WrapperSourceWorking renews from THIS run's own delivering branch — the run itself changed a root
 	// script that is not yet merged. The offered content is the run's, pinned to its sha256; the human
 	// is the gate instead of the merge, and the four bindings (sha, single-use, run-unwritable
 	// approval, re-read-after-approval) keep the root boundary exactly where it was.
@@ -86,17 +88,17 @@ type Question struct {
 
 	// Wrappers pins EXACTLY WHICH root wrapper scripts (by name) and WHICH content (by sha256) the
 	// user's approval covers — one entry per file. It is set only on a wrapper-renewal question and is
-	// derived from the STANDARD BRANCH (merged content), never from the run's working tree. The
-	// approval frees the renewal of these named files with these exact checksums and nothing else: if
-	// the merged content changes after the approval, the recorded sha no longer matches and the
-	// renewal is refused (the approval is single-use and content-pinned, never a blanket permission).
+	// derived from committed history (the stack tip or the delivering branch, per WrapperSource), never
+	// from an unpinned working tree. The approval frees the renewal of these named files with these
+	// exact checksums and nothing else: if the source content changes after the approval, the recorded
+	// sha no longer matches and the renewal is refused (single-use and content-pinned, never blanket).
 	Wrappers []WrapperGrant `json:"wrappers,omitempty"`
 
-	// WrapperSource names WHERE the approved wrapper content is re-read from at install time — the
-	// standard branch (WrapperSourceMerged) or this run's own working branch (WrapperSourceWorking).
-	// It is set only on a wrapper-renewal question; an empty value means WrapperSourceMerged (the
-	// original behaviour). The write half re-reads the bytes from exactly this source and re-checks
-	// their sha256, so a change to the source after the approval installs nothing.
+	// WrapperSource names WHERE the approved wrapper content is re-read from at install time — the stack
+	// tip (WrapperSourceStackTip) or this run's own delivering branch (WrapperSourceWorking). It is set
+	// only on a wrapper-renewal question; an empty value (or the retired "merged") means the stack tip.
+	// The write half re-reads the bytes from exactly this source and re-checks their sha256, so a change
+	// to the source after the approval installs nothing.
 	WrapperSource string `json:"wrapperSource,omitempty"`
 
 	// Resolved marks a question whose answer the resumed run has already consumed, so a later resume

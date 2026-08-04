@@ -196,34 +196,34 @@ func (rc *RepoCtx) raiseQuestion(ctx context.Context, wb WorkbenchOps, question,
 // the approved checksum, and the grant the root tool reads sits in a daemon-owned, run-unwritable
 // place. For the WORKING source the run authored the bytes, so the human — not a merge — is the gate;
 // that is admissible because the same four bindings hold (sha, single-use, run-unwritable approval,
-// re-read-after-approval). They are spelled out on deploy.WorkingWrapperContent. The `drift` argument
+// re-read-after-approval). They are spelled out on deploy.DeliveringBranchContent. The `drift` argument
 // is the guard's original refusal text, kept only for the log line.
 func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error {
-	// Prefer the MERGED source: the installed scripts drifted from the standard branch, so the renewal
-	// offers merged content a run cannot author. Each file is pinned to the merged content's checksum.
-	grants, derr := rc.Deps.Deploy().MainWrapperDrift(ctx, rc.Repo)
+	// Prefer the STACK-TIP source: the installed scripts drifted from the stack tip (deliver.NextPRBase),
+	// so the renewal offers tip content a run cannot author. Each file is pinned to the tip's checksum.
+	grants, derr := rc.Deps.Deploy().StackTipWrapperDrift(ctx, rc.Repo)
 	if derr != nil {
-		return fmt.Errorf("%w (could not read the standard-branch wrapper scripts: %v)", ErrWrappersStale, derr)
+		return fmt.Errorf("%w (could not read the stack-tip wrapper scripts: %v)", ErrWrappersStale, derr)
 	}
-	source := runs.WrapperSourceMerged
+	source := runs.WrapperSourceStackTip
 	if len(grants) == 0 {
-		// Nothing MERGED to renew: the installed scripts already match the standard branch, so the
-		// refusal is because THIS run changed a root script that has not merged yet. Offer the run's OWN
-		// working-branch content instead — the human approves this specific content and the delivery
+		// Nothing on the stack tip to renew: the installed scripts already match the tip, so the refusal
+		// is because THIS run changed a root script that has not merged yet. Offer the run's OWN
+		// delivering-branch content instead — the human approves this specific content and the delivery
 		// continues, rather than halting for good on a merge the chain itself blocks (task point 1).
 		working, werr := rc.Deps.Deploy().WorkingWrapperDrift(ctx, rc.Repo)
 		if werr != nil {
-			return fmt.Errorf("%w (could not read this run's working-branch wrapper scripts: %v)", ErrWrappersStale, werr)
+			return fmt.Errorf("%w (could not read this run's delivering-branch wrapper scripts: %v)", ErrWrappersStale, werr)
 		}
 		grants, source = working, runs.WrapperSourceWorking
 	}
 	now := rc.Deps.Now().UTC()
 	if len(grants) == 0 {
-		// Neither the standard branch nor the working branch differs from the installed scripts, yet the
+		// Neither the stack tip nor the delivering branch differs from the installed scripts, yet the
 		// delivery refused on stale wrappers — the drift resolved itself between the guard and this
 		// measurement. Nothing to approve; block honestly and let the next attempt re-measure.
 		rc.consumeWrapperQuestion(ctx)
-		rc.logf("the self delivery refused on stale root wrappers, but neither the standard branch nor this run's working branch now differs from the installed scripts — re-measuring on the next attempt")
+		rc.logf("the self delivery refused on stale root wrappers, but neither the stack tip nor this run's delivering branch now differs from the installed scripts — re-measuring on the next attempt")
 		return &faultclass.BlockedError{Backoff: model.Backoff{
 			Reason: "the self delivery refused on stale root wrapper scripts, but the drift is no longer measurable — re-checking on the next attempt",
 			Class:  "awaiting-wrapper-recheck", Attempts: 1, FirstAt: now, LastAt: now, NextAt: now,
@@ -256,22 +256,22 @@ func (rc *RepoCtx) raiseWrapperQuestion(ctx context.Context, drift string) error
 // wrapperSourceLabel names the renewal source in a log line and question text.
 func wrapperSourceLabel(source string) string {
 	if source == runs.WrapperSourceWorking {
-		return "this run's own working branch (the run changed a root script)"
+		return "this run's own delivering branch (the run changed a root script)"
 	}
-	return "the standard branch (the installed scripts drifted from the merged code)"
+	return "the stack tip (the installed scripts drifted from the stacked delivery base)"
 }
 
-// wrapperQuestionText is the wording the user reads. It names WHY the scripts must be renewed — a merge
-// that never reached sbin, or a change this very run made — so a human can decide without opening the
-// branch (task point 4).
+// wrapperQuestionText is the wording the user reads. It names WHY the scripts must be renewed — a
+// stacked wrapper change that never reached sbin, or a change this very run made — so a human can
+// decide without opening the branch (task point 4).
 func wrapperQuestionText(source string) string {
 	if source == runs.WrapperSourceWorking {
 		return "Renew the root wrapper scripts under /usr/local/sbin to THIS run's version? " +
 			"This run itself changed one of the root scripts, and the change is not yet merged, so the daemon " +
 			"cannot be installed until you approve installing the run's own version of the changed scripts."
 	}
-	return "Renew the root wrapper scripts under /usr/local/sbin to their standard-branch version? " +
-		"The installed scripts no longer match the merged code, so the daemon cannot be installed until they are renewed."
+	return "Renew the root wrapper scripts under /usr/local/sbin to their stack-tip version? " +
+		"The installed scripts no longer match the stacked delivery base, so the daemon cannot be installed until they are renewed."
 }
 
 // wrapperRecommendation is the run's own proposed answer, stating what approval installs and why the
@@ -283,9 +283,9 @@ func wrapperRecommendation(source string) string {
 			"the named checksums below — nothing else. The approval is single-use: if this run's branch changes " +
 			"afterwards, it installs nothing."
 	}
-	return "These scripts run as root. Approving installs EXACTLY the merged (standard-branch) " +
-		"version listed below — nothing from this run's working tree, and only the named files with the " +
-		"named checksums. The approval is single-use: if the merged content changes afterwards, it installs nothing."
+	return "These scripts run as root. Approving installs EXACTLY the stack-tip version listed below — " +
+		"nothing from this run's working tree, and only the named files with the named checksums. " +
+		"The approval is single-use: if the stack-tip content changes afterwards, it installs nothing."
 }
 
 // renderWrapperGrants shows the user the exact difference the approval covers: each root wrapper that
@@ -296,7 +296,7 @@ func renderWrapperGrants(grants []runs.WrapperGrant, source string) string {
 	if source == runs.WrapperSourceWorking {
 		b.WriteString("These root wrapper scripts will be renewed to THIS run's own (not-yet-merged) version:\n")
 	} else {
-		b.WriteString("These root wrapper scripts will be renewed to their standard-branch (merged) version:\n")
+		b.WriteString("These root wrapper scripts will be renewed to their stack-tip version:\n")
 	}
 	for _, g := range grants {
 		if g.Summary != "" {
@@ -310,10 +310,11 @@ func renderWrapperGrants(grants []runs.WrapperGrant, source string) string {
 }
 
 // applyApprovedWrapperRenewal is the WRITE half's trigger on resume: if this execution's own
-// wrapper-renewal question was answered AND approved, install the approved standard-branch wrappers
-// through the root tool BEFORE the delivery re-checks the guard. It is idempotent — a renewal already
-// applied (or partly applied) is skipped per file in the deploy layer — and a failure never marks the
-// approval consumed, so the delivery simply re-checks and may ask again.
+// wrapper-renewal question was answered AND approved, install the approved wrappers (from the stack tip
+// or this run's delivering branch, per the question's source) through the root tool BEFORE the delivery
+// re-checks the guard. It is idempotent — a renewal already applied (or partly applied) is skipped per
+// file in the deploy layer — and a failure never marks the approval consumed, so the delivery simply
+// re-checks and may ask again.
 func (rc *RepoCtx) applyApprovedWrapperRenewal(ctx context.Context) {
 	q, err := rc.Deps.Questions().AnsweredForExec(ctx, rc.Doc.ID, rc.Repo)
 	if err != nil || q == nil || q.QKind != runs.QuestionWrapperRenewal || !q.Approved || len(q.Wrappers) == 0 {
@@ -327,7 +328,7 @@ func (rc *RepoCtx) applyApprovedWrapperRenewal(ctx context.Context) {
 	for i, g := range q.Wrappers {
 		names[i] = g.Name
 	}
-	rc.logf("renewed root wrapper scripts from the standard branch under your approval: %s", strings.Join(names, ", "))
+	rc.logf("renewed root wrapper scripts from %s under your approval: %s", wrapperSourceLabel(q.WrapperSource), strings.Join(names, ", "))
 	if err := rc.Deps.Questions().Resolve(ctx, q.ID); err != nil {
 		rc.logf("root wrappers renewed but the question could not be marked resolved: %v", err)
 	}

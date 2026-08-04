@@ -379,6 +379,24 @@ func (d *ChainDeps) GitHub() executor.GitHubOps { return chainGitHub{d: d} }
 // Deliver is the ONE pull-request path, reached through package deliver.
 func (d *ChainDeps) Deliver() executor.DeliverOps { return chainDeliver{d: d} }
 
+// deliveringBranchFor names the branch a run delivers for one repo — the run's own task branch, cut
+// per (this target's new-service flag, run title, run id). It is the tree the wrapper gate and the
+// working-source renewal measure against, read from its committed ref (never the shared working tree,
+// which sits on the standard branch on a resume).
+func deliveringBranchFor(run runs.Run, repo string) string {
+	create := false
+	for _, t := range run.Targets {
+		if sameRepo(t.Repo, repo) {
+			create = t.Create
+			break
+		}
+	}
+	return runs.TaskBranch(create, run.Title, run.ID)
+}
+
+// deliveringBranch is deliveringBranchFor bound to THIS execution's run.
+func (d *ChainDeps) deliveringBranch(repo string) string { return deliveringBranchFor(d.run, repo) }
+
 // Deploy is the delivery-to-host machinery (S11).
 func (d *ChainDeps) Deploy() executor.DeployOps { return chainDeploy{d: d} }
 
@@ -397,14 +415,7 @@ func (d *ChainDeps) Preflight(ctx context.Context, repo string, run runs.Run) (p
 // when the runner has no checkout, the branch carries no work, or the tip cannot be resolved: a
 // branch with nothing on it is never behind, so there is simply nothing to record.
 func (d *ChainDeps) StackPosition(ctx context.Context, repo string, run runs.Run) (*preflight.Understack, error) {
-	create := false
-	for _, t := range run.Targets {
-		if sameRepo(t.Repo, repo) {
-			create = t.Create
-			break
-		}
-	}
-	taskBranch := runs.TaskBranch(create, run.Title, run.ID)
+	taskBranch := deliveringBranchFor(run, repo)
 
 	b, ok, err := d.observeBench(ctx, repo)
 	if err != nil || !ok {
@@ -1054,11 +1065,14 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	if self {
 		// The chain ships only the daemon binary; the root wrappers under sbin are replaced solely
 		// by a human with sudo (E §7.4). So BEFORE installing a new binary, prove the installed
-		// wrappers still match this checkout — otherwise a change touching deploy/devlab-install or
-		// deploy/devlab-exec would go live half-shipped and report green (measured 31.07./01.08.2026).
+		// wrappers still match the branch BEING DELIVERED — otherwise a change touching
+		// deploy/devlab-install or deploy/devlab-exec would go live half-shipped and report green
+		// (measured 31.07./01.08.2026, and the false negative on 2026-08-04 where the shared working
+		// tree sat on the standard branch and hid the run's own change). The gate measures the
+		// delivering branch's committed ref, not the working tree, so a run's change is seen.
 		// A drift is a NAMED failure that installs nothing (no half state, K-4); it names each stale
 		// wrapper and the one line a human runs to make them current, then resumes the execution.
-		if err := deploy.GuardWrappersCurrent(wt); err != nil {
+		if err := deploy.GuardWrappersCurrent(wt, c.d.deliveringBranch(repo)); err != nil {
 			// The refusal is real — nothing is installed. Instead of failing silently every night, the
 			// deliver-dev stage turns it into a wrapper-renewal question the user must approve. We name
 			// the refusal with the motor's sentinel and carry the exact difference; the guard above STILL
@@ -1182,9 +1196,10 @@ func prodConfigFromEnv(knownHosts string) (deploy.ProdConfig, error) {
 	return deploy.ProdConfig{RsyncTarget: target, Identity: id, Trigger: deploy.SSHTrigger(recv, id)}, nil
 }
 
-// MainWrapperDrift reports which root wrappers' installed copies differ from the STANDARD BRANCH
-// (merged content). Only the self repo ships the root wrappers, so a foreign repo has none.
-func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
+// StackTipWrapperDrift reports which root wrappers' installed copies differ from the STACK TIP
+// (deliver.NextPRBase — another open delivery's branch, else the standard branch), never main alone.
+// Only the self repo ships the root wrappers, so a foreign repo has none.
+func (c chainDeploy) StackTipWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
 	if repoShort(repo) != selfRepo() {
 		return nil, nil
 	}
@@ -1192,22 +1207,20 @@ func (c chainDeploy) MainWrapperDrift(ctx context.Context, repo string) ([]runs.
 	if err != nil {
 		return nil, err
 	}
-	drifts, err := deploy.MainWrapperDrift(wt)
+	tip, err := c.d.Deliver().NextPRBase(ctx, repo, c.d.deliveringBranch(repo))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve the stack tip for the wrapper drift probe: %w", err)
 	}
-	grants := make([]runs.WrapperGrant, 0, len(drifts))
-	for _, d := range drifts {
-		grants = append(grants, runs.WrapperGrant{Name: d.Name, SHA: d.WantSHA, Summary: d.Summary})
-	}
-	return grants, nil
+	return wrapperGrants(deploy.StackTipWrapperDrift(wt, tip))
 }
 
-// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own working
-// branch — the content the run itself changed but has not yet merged. It is the second renewal source
-// (beside MainWrapperDrift): when the installed scripts already match the standard branch, this is what
-// lets a run that changed a root script ask for approval instead of halting for good. Only the self
-// repo owns these root wrappers, so a foreign repo has none.
+// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own
+// delivering branch — the content the run itself changed but has not yet merged. It is the second
+// renewal source (beside StackTipWrapperDrift): when the installed scripts already match the stack tip,
+// this is what lets a run that changed a root script ask for approval instead of halting for good. It
+// reads the delivering branch's committed ref (the same tree the gate measures), so a run's change is
+// seen even when the shared working tree sits on the standard branch. Only the self repo owns these
+// root wrappers, so a foreign repo has none.
 func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
 	if repoShort(repo) != selfRepo() {
 		return nil, nil
@@ -1216,7 +1229,12 @@ func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]ru
 	if err != nil {
 		return nil, err
 	}
-	drifts, err := deploy.WorkingWrapperDrift(wt)
+	return wrapperGrants(deploy.DeliveringBranchWrapperDrift(wt, c.d.deliveringBranch(repo)))
+}
+
+// wrapperGrants projects deploy drifts onto the (name, checksum, summary) grants a renewal question
+// carries — one shared projection for both drift sources (Keine Redundanz).
+func wrapperGrants(drifts []deploy.WrapperDrift, err error) ([]runs.WrapperGrant, error) {
 	if err != nil {
 		return nil, err
 	}
@@ -1228,8 +1246,8 @@ func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]ru
 }
 
 // RenewApprovedWrappers is the daemon side of the WRITE half: for each wrapper the user approved, it
-// re-reads the content from the SAME source the approval was built from (the standard branch or this
-// run's working branch, per q.WrapperSource), stages a run-unwritable grant, and calls the root tool
+// re-reads the content from the SAME source the approval was built from (the stack tip or this run's
+// delivering branch, per q.WrapperSource), stages a run-unwritable grant, and calls the root tool
 // (`sudo devlab-install --renew-wrapper`). It skips a wrapper already at the approved checksum
 // (idempotent) and refuses a non-self repo — only the self repo owns these root wrappers.
 func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q runs.Question) error {
@@ -1242,13 +1260,19 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	}
 	grantDir := c.d.s.paths.WrapperGrants()
 	renewer := deploy.SudoWrapperRenewer{}
-	// Bind the re-read to the SAME source the approval named. An empty source is the original merged
-	// case (standard branch); WrapperSourceWorking re-reads this run's own working branch. Either way
-	// the daemon re-reads the bytes and RenewApprovedWrapper refuses any that no longer hash to the
-	// approved checksum, so a source that changed after the approval installs nothing.
-	src := deploy.MergedWrapperContent(wt)
+	// Bind the re-read to the SAME source the approval named. WrapperSourceWorking re-reads this run's
+	// own delivering branch; anything else (WrapperSourceStackTip, empty, or the retired "merged") the
+	// stack tip. Either way the daemon re-reads the bytes and RenewApprovedWrapper refuses any that no
+	// longer hash to the approved checksum, so a source that changed after the approval installs nothing.
+	var src deploy.WrapperContentAt
 	if q.WrapperSource == runs.WrapperSourceWorking {
-		src = deploy.WorkingWrapperContent(wt)
+		src = deploy.DeliveringBranchContent(wt, c.d.deliveringBranch(repo))
+	} else {
+		tip, terr := c.d.Deliver().NextPRBase(ctx, repo, c.d.deliveringBranch(repo))
+		if terr != nil {
+			return fmt.Errorf("resolve the stack tip for the approved wrapper renewal: %w", terr)
+		}
+		src = deploy.StackTipContent(wt, tip)
 	}
 	by := q.AnsweredBy.User
 	if by == "" {
