@@ -40,6 +40,11 @@ const maintainMaxBackoff = time.Hour
 // block that was only ever a prune whose branch had already vanished — a goal reached, not a fault.
 const prunePrefix = "pruning the delivery branch failed: "
 
+// retargetPrefix opens the fault reason recorded when re-homing a stacked pull request onto the
+// default branch fails — the "umhaengen vor loeschen" step that must complete BEFORE the merged
+// delivery's branch is pruned, so GitHub never closes the successor by deleting its base under it.
+const retargetPrefix = "re-targeting the stacked pull request failed: "
+
 // readFailPrefix opens the fault reason recorded when READING a tracked pull request fails. It is a
 // named constant because the maintenance loop matches against it to recognise a block that was only
 // ever a read GitHub answered 404/410 — a vanished pull request, which is a reached goal, not a
@@ -65,6 +70,13 @@ type GitHubOps interface {
 	MergePullRequest(ctx context.Context, repo string, number int, method string) error
 	ClosePullRequest(ctx context.Context, repo string, number int, reason string) error
 	DeleteBranch(ctx context.Context, repo, branch string) error
+	// The stacked-PR heal (umhaengen vor loeschen + restore): re-home an open pull request off a
+	// branch about to be pruned, and — for one already wrongly closed — recreate its vanished base
+	// branch and reopen it. BranchTip proves whether a base branch is still there.
+	RetargetPullRequest(ctx context.Context, repo string, number int, base string) error
+	CreateBranch(ctx context.Context, repo, branch, sha string) error
+	ReopenPullRequest(ctx context.Context, repo string, number int) error
+	BranchTip(ctx context.Context, repo, branch string) (string, error)
 	CreateRepo(ctx context.Context, name string, private bool) (fullName string, err error)
 	ProtectDefaultBranch(ctx context.Context, repo, requiredStatus string) error
 	GetProtection(ctx context.Context, repo string) (Protection, error)
@@ -1195,7 +1207,8 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 			// production stamp while main carried nothing of their work). Recognise it from the base,
 			// mark the delivery FAILED so it becomes the tip and the stack halts until the work is
 			// re-delivered properly, and deliver the finding.
-			if base, ok := defaultBranchOf(p.Repo); ok && st.BaseRef != "" && st.BaseRef != base {
+			base, baseKnown := defaultBranchOf(p.Repo)
+			if baseKnown && st.BaseRef != "" && st.BaseRef != base {
 				recordMisdelivery(ledger, prs, res, n, pub, p, st, base, now)
 				continue
 			}
@@ -1203,14 +1216,25 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 			if st.MergedAt != nil {
 				mergedAt = st.MergedAt.UTC()
 			}
-			if err := finalizeMerged(ctx, gh, prs, ledger, res, n, pub, p, st, mergedAt, now); err != nil {
+			if err := finalizeMerged(ctx, gh, prs, ledger, res, n, pub, p, st, base, mergedAt, now); err != nil {
 				queueBlocked[p.Repo] = true
 				if firstErr == nil {
 					firstErr = err
 				}
 			}
 		case st.State == "closed":
-			// Closed without merge — a human rejection. Mirror it with its reason; the run stays
+			base, _ := defaultBranchOf(p.Repo)
+			// A pull request GitHub reports closed-without-merge is USUALLY a human rejection — but not
+			// always. When a merged predecessor's branch was deleted under a green, due delivery, GitHub
+			// CLOSES the stacked successor instead of re-homing it (measured 2026-08-04). That close is no
+			// human's decision, and booking it as a rejection loses a finished delivery. Tell the two apart
+			// and, for the wrongful close, restore it (recreate the vanished base branch, reopen, re-base on
+			// the default branch) so it merges normally next pass — never booked as rejected.
+			if healWrongfulClose(ctx, gh, ledger, n, pub, p, st, base, now) {
+				queueBlocked[p.Repo] = true // the heal already spent this repo's one write op for the tick
+				continue
+			}
+			// Closed without merge by a human — a rejection. Mirror it with its reason; the run stays
 			// restartable (nothing is silently marked done).
 			mirrorClosed(ledger, p, st, "pull request #"+fmt.Sprint(p.Number)+" was closed without merging", now)
 			_ = prs.Remove(p.Repo, p.Number)
@@ -1223,15 +1247,16 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 				continue
 			}
 			// Never merge a delivery whose base is not the default branch. Stacked pull requests merge
-			// ONE per pass and each base is pruned right after (finalizeMerged) — that prune is what makes
-			// GitHub re-target the next pull request onto the default branch. So the oldest open pull
-			// request, the only one this pass would merge, has its base at the default branch by the time
-			// its turn comes. A base still pointing at a sibling delivery branch means that predecessor
-			// has not merged+pruned yet: merging now would land the work on a stale base and never reach
-			// main. Hold the repo instead and report it; the predecessor merges first, its prune re-targets
-			// this one, and the next pass merges it correctly. This is the WRITE-side twin of the
-			// merged-into-non-default detection above — the misdelivery is prevented, not only recognised.
-			if base, ok := defaultBranchOf(p.Repo); ok && st.BaseRef != "" && st.BaseRef != base {
+			// ONE per pass, and each merged delivery's branch is pruned right after (finalizeMerged) —
+			// which first re-homes the next pull request onto the default branch (retargetStacked). So the
+			// oldest open pull request, the only one this pass would merge, has its base at the default
+			// branch by the time its turn comes. A base still pointing at a sibling delivery branch means
+			// that predecessor has not merged+pruned yet: merging now would land the work on a stale base
+			// and never reach main. Hold the repo instead and report it; the predecessor merges first, its
+			// prune re-homes this one, and the next pass merges it correctly. This is the WRITE-side twin of
+			// the merged-into-non-default detection above — the misdelivery is prevented, not only recognised.
+			base, baseKnown := defaultBranchOf(p.Repo)
+			if baseKnown && st.BaseRef != "" && st.BaseRef != base {
 				queueBlocked[p.Repo] = true
 				notify(n, runs.NoticeMisdelivered, p.Repo, misdeliverPreReason(p.Number, st.BaseRef, base))
 				continue
@@ -1253,7 +1278,7 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 				}
 				continue
 			}
-			if err := finalizeMerged(ctx, gh, prs, ledger, res, n, pub, p, st, now, now); err != nil && firstErr == nil {
+			if err := finalizeMerged(ctx, gh, prs, ledger, res, n, pub, p, st, base, now, now); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -1296,7 +1321,7 @@ func Maintain(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs
 // finalizeMerged is the ONE place a merged delivery is completed: the ledger mirrors MergedAt,
 // the SAME place deletes the delivery branch (404 = Satisfied; the workbench branch never),
 // the pool entry goes, and the execution's result closes per the B-8 rule.
-func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs.DeliveryStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, p runs.PendingPR, st PRState, mergedAt, now time.Time) error {
+func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger *runs.DeliveryStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, p runs.PendingPR, st PRState, defaultBranch string, mergedAt, now time.Time) error {
 	d, ok := deliveryFor(ledger, p)
 	if ok && d.MergedAt == nil {
 		d.MergedAt = &mergedAt
@@ -1309,6 +1334,17 @@ func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger
 		branch = d.Branch
 	}
 	if branch != "" && branch != workbench.LegacyShared {
+		// UMHAENGEN VOR LOESCHEN. Before this merged delivery's branch is deleted, re-home every open
+		// pull request stacked on it onto the default branch. GitHub does NOT reliably re-home a stacked
+		// pull request when its base branch vanishes — measured twice on 2026-08-04 it CLOSED the
+		// successor instead (PR 86 after 85, PR 90 after 89, both green and ready). So the chain performs
+		// the re-home itself and only then prunes. If a dependent exists but the default branch is
+		// unreadable, retargetStacked REFUSES rather than delete blindly — the prune stays owed and the
+		// next pass retries it, which is safe because the merge is already mirrored.
+		if err := retargetStacked(ctx, gh, p.Repo, branch, defaultBranch); err != nil {
+			recordFault(prs, n, p, retargetPrefix+err.Error(), err, now)
+			return err
+		}
 		if err := gh.DeleteBranch(ctx, p.Repo, branch); err != nil && !isSatisfiedDelete(err) {
 			// The delete stays owed: keep the record tracked with a backoff so the next tick
 			// retries the prune (the merge itself is already mirrored — re-finalizing is safe).
@@ -1319,6 +1355,32 @@ func finalizeMerged(ctx context.Context, gh GitHubOps, prs *runs.PRStore, ledger
 	_ = prs.Remove(p.Repo, p.Number)
 	settleExecutionOf(ledger, res, p)
 	publishDeliveries(pub)
+	return nil
+}
+
+// retargetStacked re-homes every OPEN pull request based on `branch` onto defaultBranch — the
+// "umhaengen vor loeschen" step run right before a merged delivery's branch is pruned. It reads the
+// repo's open pull requests and moves exactly those whose base is the branch about to vanish; a pull
+// request already on the default branch (or on any other base) is left untouched. When a dependent
+// exists but defaultBranch is empty (the default branch could not be read this pass), it REFUSES with
+// an error rather than let the branch be deleted with nowhere to re-home the successor — deleting the
+// base with an unknown target is precisely the move that closes the next pull request.
+func retargetStacked(ctx context.Context, gh GitHubOps, repo, branch, defaultBranch string) error {
+	open, err := gh.ListOpenPullRequests(ctx, repo)
+	if err != nil {
+		return err
+	}
+	for _, h := range open {
+		if h.BaseRef != branch {
+			continue
+		}
+		if defaultBranch == "" {
+			return fmt.Errorf("cannot re-home pull request #%d off %q: the default branch is unreadable", h.Number, branch)
+		}
+		if err := gh.RetargetPullRequest(ctx, repo, h.Number, defaultBranch); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1379,6 +1441,83 @@ func deliveryFor(ledger *runs.DeliveryStore, p runs.PendingPR) (runs.Delivery, b
 		}
 	}
 	return runs.Delivery{}, false
+}
+
+// healWrongfulClose recognises — and repairs — a pull request GitHub closed WITHOUT a human's
+// decision: the base branch of a green, due delivery vanished under it (a merged predecessor's branch
+// was pruned) and GitHub closed the stacked successor rather than re-homing it. It returns true when
+// it has taken the case over (recognised and healed, or attempted the heal); false when the close is a
+// genuine human rejection that the caller must book as one. The two must never be confused (the test's
+// case c): a human close leaves the base branch in place, an auto-close removes it.
+//
+// The tells, all MEASURED not assumed:
+//   - the delivery is GREEN (its head is a recorded delivery — originVerdict), and
+//   - it was DUE (the auto-merge window had passed; the chain would have merged it), and
+//   - its base branch is GONE (a read answers 404) — the signature of an auto-close from a prune,
+//     never of a human closing a pull request whose base still exists.
+//
+// The repair follows the sequence proven by hand on 2026-08-04: recreate the vanished base branch (so
+// GitHub allows the reopen), reopen the pull request, re-base it on the default branch, then drop the
+// scaffold branch. The recreated branch is a momentary scaffold — its commit is immaterial, the default
+// branch tip serves — because the pull request is re-based onto the default branch immediately after.
+func healWrongfulClose(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, n *runs.NoticeStore, pub live.Publisher, p runs.PendingPR, st PRState, defaultBranch string, now time.Time) bool {
+	// Never reopen a delivery that is already settled — merged, or closed by a rollback. Only a
+	// still-OPEN delivery can be a wrongful-close victim; a settled delivery closing is expected, not a
+	// loss to heal. (A rolled-back delivery's pull request is closed on purpose; reopening it would
+	// resurrect withdrawn work.)
+	if d, ok := deliveryFor(ledger, p); ok && !d.OpenState() {
+		return false
+	}
+	// A human closing a red or not-yet-due pull request is a real rejection — leave it to the caller.
+	if ok, _, err := originVerdict(ledger, p.Repo, st.HeadRef, st.HeadSHA); err != nil || !ok {
+		return false
+	}
+	if now.Before(p.MergeBy) {
+		return false
+	}
+	if st.BaseRef == "" || defaultBranch == "" {
+		return false // cannot prove the base vanished, or nowhere to re-home to — treat as a human close
+	}
+	// Read the base branch: still there ⇒ a human closed this pull request (case c); gone (404) ⇒ the
+	// auto-close under a pruned base (case b). A transient read error proves neither — do not misread it
+	// as a wrongful close; the caller books nothing final either, the next pass re-establishes the state.
+	if _, err := gh.BranchTip(ctx, p.Repo, st.BaseRef); err == nil {
+		return false
+	} else if !isReadGone(err) {
+		return false
+	}
+	tip, err := gh.BranchTip(ctx, p.Repo, defaultBranch)
+	if err != nil {
+		return false // the default branch tip is needed to scaffold the base branch; retry next pass
+	}
+	if err := gh.CreateBranch(ctx, p.Repo, st.BaseRef, tip); err != nil && !isBranchExists(err) {
+		return false
+	}
+	if err := gh.ReopenPullRequest(ctx, p.Repo, p.Number); err != nil {
+		return false
+	}
+	if err := gh.RetargetPullRequest(ctx, p.Repo, p.Number, defaultBranch); err != nil {
+		return false
+	}
+	// The scaffold base branch has served its purpose; drop it (already-gone is fine). A lingering
+	// scaffold does not block the merge, so a failed delete is not fatal to the heal.
+	_ = gh.DeleteBranch(ctx, p.Repo, st.BaseRef)
+	notify(n, runs.NoticeDeliverySelfCheck, p.Repo, fmt.Sprintf(
+		"pull request #%d was closed without a human's decision when its base branch %q vanished under a green, due delivery — the chain restored it, re-based it on %q, and left it open to merge",
+		p.Number, st.BaseRef, defaultBranch))
+	publishDeliveries(pub)
+	return true
+}
+
+// isBranchExists reports the CreateBranch Satisfied: the ref is ALREADY there, which is the goal of
+// the recreate — GitHub answers 422 "Reference already exists". Recognising it keeps a heal that races
+// a re-created branch from faulting on reaching exactly what it wanted.
+func isBranchExists(err error) bool {
+	var se *github.StatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Status == 422 && strings.Contains(se.Msg, "Reference already exists")
 }
 
 // mirrorClosed mirrors a closed-without-merge PR onto its delivery with the reason.

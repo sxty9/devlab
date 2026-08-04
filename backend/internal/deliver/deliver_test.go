@@ -48,6 +48,12 @@ type fakeGH struct {
 	createdRepos []string
 	listOpen     map[string][]PRState
 
+	// The stacked-PR heal surface (umhaengen vor loeschen + restore).
+	branchTips      map[string]string // "repo|branch" → tip SHA; presence = the branch exists
+	retargeted      []string          // "repo|number|base"
+	reopened        []string          // "repo|number"
+	createdBranches []string          // "repo|branch|sha"
+
 	cb           CounterBookResult
 	cbErr        error
 	cbCalls      []string // "repo|reversalBranch"
@@ -65,6 +71,7 @@ func newFakeGH() *fakeGH {
 		prState:       map[string]PRState{},
 		protection:    map[string]Protection{},
 		listOpen:      map[string][]PRState{},
+		branchTips:    map[string]string{},
 	}
 }
 
@@ -114,7 +121,19 @@ func (f *fakeGH) GetPullRequest(_ context.Context, repo string, number int) (PRS
 func (f *fakeGH) ListOpenPullRequests(_ context.Context, repo string) ([]PRState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.listOpen[repo], nil
+	// An explicitly seeded list wins (a few tests pin the origin-status pass's view directly);
+	// otherwise the open pull requests are DERIVED from prState, so the fake stays honest — the
+	// retarget-before-prune step and the origin pass see the same open set the merges act on.
+	if v, ok := f.listOpen[repo]; ok {
+		return v, nil
+	}
+	out := []PRState{}
+	for k, st := range f.prState {
+		if strings.HasPrefix(k, repo+"|") && st.State == "open" {
+			out = append(out, st)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeGH) MergePullRequest(_ context.Context, repo string, number int, method string) error {
@@ -147,16 +166,58 @@ func (f *fakeGH) DeleteBranch(_ context.Context, repo, branch string) error {
 		return f.deleteErr
 	}
 	f.deleted = append(f.deleted, repo+"|"+branch)
-	// Model GitHub: deleting a branch re-targets every OPEN pull request based on it. Real GitHub
-	// re-targets onto the deleted branch's own base; for a linear delivery stack that resolves to the
-	// default branch, which is what the maintenance relies on to merge the next pull request correctly.
+	delete(f.branchTips, repo+"|"+branch)
+	// Model GitHub's REAL behavior, measured twice on 2026-08-04: deleting a branch does NOT reliably
+	// re-home a pull request stacked on it — it CLOSES the successor. So a pull request still based on
+	// this branch at delete time is closed WITHOUT a merge (State "closed", Merged false), exactly the
+	// gap the "umhaengen vor loeschen" step must close by re-homing dependents BEFORE the prune.
 	for k, st := range f.prState {
 		if strings.HasPrefix(k, repo+"|") && st.State == "open" && st.BaseRef == branch {
-			st.BaseRef = f.defaultBranch
+			st.State = "closed"
 			f.prState[k] = st
 		}
 	}
 	return nil
+}
+
+func (f *fakeGH) RetargetPullRequest(_ context.Context, repo string, number int, base string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retargeted = append(f.retargeted, key(repo, number)+"|"+base)
+	st := f.prState[key(repo, number)]
+	st.BaseRef = base
+	f.prState[key(repo, number)] = st
+	return nil
+}
+
+func (f *fakeGH) CreateBranch(_ context.Context, repo, branch, sha string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createdBranches = append(f.createdBranches, repo+"|"+branch+"|"+sha)
+	f.branchTips[repo+"|"+branch] = sha
+	return nil
+}
+
+func (f *fakeGH) ReopenPullRequest(_ context.Context, repo string, number int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reopened = append(f.reopened, key(repo, number))
+	st := f.prState[key(repo, number)]
+	st.State, st.Merged = "open", false
+	f.prState[key(repo, number)] = st
+	return nil
+}
+
+func (f *fakeGH) BranchTip(_ context.Context, repo, branch string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if branch == f.defaultBranch {
+		return "tip-" + repo, nil // the default branch always exists
+	}
+	if sha, ok := f.branchTips[repo+"|"+branch]; ok {
+		return sha, nil
+	}
+	return "", &github.StatusError{Status: 404, Msg: "Branch not found"}
 }
 
 func (f *fakeGH) CreateRepo(_ context.Context, name string, _ bool) (string, error) {
@@ -1139,12 +1200,13 @@ func TestMaintainHoldsMergeUntilBaseIsDefault(t *testing.T) {
 	}
 }
 
-// TestMaintainStackedMergesOnePerPassThenRetargets is the NACHWEIS for point 4's ORDER: stacked pull
-// requests are merged ONE per pass, the base branch is deleted right after, and only the DELETION
-// re-targets the next pull request onto the default branch so the following pass merges it correctly.
-// Two stacked deliveries: #5 (base main) below #6 (base = #5's branch). Pass 1 merges ONLY #5 and
-// prunes its branch, which re-targets #6 onto main; #6 stays open and untouched. Pass 2 merges #6,
-// now correctly based on main. No misdelivery is ever recorded — each merge lands on the default branch.
+// TestMaintainStackedMergesOnePerPassThenRetargets is the NACHWEIS for the ORDER: stacked pull
+// requests are merged ONE per pass, and BEFORE the merged delivery's branch is pruned the chain
+// re-homes the next pull request onto the default branch itself (retargetStacked) — it does NOT rely
+// on GitHub re-homing it, because GitHub CLOSES the successor instead (the honest fake now models
+// that). Two stacked deliveries: #5 (base main) below #6 (base = #5's branch). Pass 1 merges ONLY #5,
+// re-homes #6 onto main, THEN prunes #5's branch; #6 stays OPEN and now based on main. Pass 2 merges
+// #6. No misdelivery is ever recorded — each merge lands on the default branch.
 func TestMaintainStackedMergesOnePerPassThenRetargets(t *testing.T) {
 	armMaintain(t)
 	stubClassification(t)
@@ -1170,7 +1232,13 @@ func TestMaintainStackedMergesOnePerPassThenRetargets(t *testing.T) {
 		t.Fatalf("pass 1 must prune #5's branch right after the merge, deleted = %v", gh.deleted)
 	}
 	if gh.prState["o/x|6"].BaseRef != "main" {
-		t.Fatalf("pruning #5's branch must re-target #6 onto main, base = %q", gh.prState["o/x|6"].BaseRef)
+		t.Fatalf("the chain must re-home #6 onto main before pruning #5's branch, base = %q", gh.prState["o/x|6"].BaseRef)
+	}
+	if gh.prState["o/x|6"].State != "open" {
+		t.Fatalf("#6 must stay OPEN through #5's merge+prune, state = %q", gh.prState["o/x|6"].State)
+	}
+	if len(gh.retargeted) != 1 || gh.retargeted[0] != "o/x|6|main" {
+		t.Fatalf("the chain itself must re-home #6 onto main (umhaengen vor loeschen), retargeted = %v", gh.retargeted)
 	}
 	if m1, _, _ := ledger.ByID("dlv_1"); m1.MergedAt == nil {
 		t.Errorf("#5 must be recorded merged, got %+v", m1)
@@ -1195,6 +1263,159 @@ func TestMaintainStackedMergesOnePerPassThenRetargets(t *testing.T) {
 		if note.Kind == runs.NoticeMisdelivered {
 			t.Errorf("a correctly stacked merge must raise NO misdelivery notice, got %+v", note)
 		}
+	}
+}
+
+// TestMaintainThreeStackedMergeBottomLeavesRestOpenOnDefault is TEST (a) of the task: three stacked
+// pull requests, the bottom one merges, and the two above it stay OPEN and end up on the default
+// branch — not closed. It is the direct guard against "merging the bottom kills the next": before
+// the fix, deleting #5's branch (the honest fake models GitHub's real close-the-successor behavior)
+// would have closed #6, and then #7 in the following pass. Each pass merges ONE, re-homes the rest.
+func TestMaintainThreeStackedMergeBottomLeavesRestOpenOnDefault(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH() // defaultBranch = "main"
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d1 := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", ToCommit: "c1", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	d2 := runs.Delivery{ID: "dlv_2", Repo: "o/x", Branch: "fix/two-bbb222", ToCommit: "c2", PRNumber: 6, CreatedAt: t0.Add(time.Minute), ExecutionID: "exec_2"}
+	d3 := runs.Delivery{ID: "dlv_3", Repo: "o/x", Branch: "fix/three-ccc333", ToCommit: "c3", PRNumber: 7, CreatedAt: t0.Add(2 * time.Minute), ExecutionID: "exec_3"}
+	for _, d := range []runs.Delivery{d1, d2, d3} {
+		_ = ledger.Put(d)
+		_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	}
+	// A linear stack: #5→main, #6→#5's branch, #7→#6's branch.
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open", HeadRef: d1.Branch, HeadSHA: "c1", BaseRef: "main"}
+	gh.prState["o/x|6"] = PRState{Number: 6, State: "open", HeadRef: d2.Branch, HeadSHA: "c2", BaseRef: d1.Branch}
+	gh.prState["o/x|7"] = PRState{Number: 7, State: "open", HeadRef: d3.Branch, HeadSHA: "c3", BaseRef: d2.Branch}
+
+	// Pass 1: merge the BOTTOM (#5). #6 is re-homed onto main; #7 is NOT touched yet (it stacks on #6,
+	// which still exists). Both must remain OPEN.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if gh.prState["o/x|6"].State != "open" || gh.prState["o/x|7"].State != "open" {
+		t.Fatalf("merging the bottom must leave the two above OPEN, states = %q / %q",
+			gh.prState["o/x|6"].State, gh.prState["o/x|7"].State)
+	}
+	if gh.prState["o/x|6"].BaseRef != "main" {
+		t.Fatalf("#6 must be re-homed onto the default branch, base = %q", gh.prState["o/x|6"].BaseRef)
+	}
+
+	// Pass 2: #6 (now on main) merges; #7 is re-homed onto main and stays OPEN.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if gh.prState["o/x|7"].State != "open" {
+		t.Fatalf("#7 must still be OPEN after #6 merges, state = %q", gh.prState["o/x|7"].State)
+	}
+	if gh.prState["o/x|7"].BaseRef != "main" {
+		t.Fatalf("#7 must be re-homed onto the default branch, base = %q", gh.prState["o/x|7"].BaseRef)
+	}
+
+	// Pass 3: #7 merges. All three delivered, none closed-without-merge.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	for id, num := range map[string]int{"dlv_1": 5, "dlv_2": 6, "dlv_3": 7} {
+		m, _, _ := ledger.ByID(id)
+		if m.MergedAt == nil {
+			t.Errorf("delivery %s (#%d) must be recorded merged, got %+v", id, num, m)
+		}
+		if m.ClosedAt != nil {
+			t.Errorf("delivery %s (#%d) must NOT be booked closed-without-merge, got %+v", id, num, m)
+		}
+	}
+}
+
+// TestMaintainWrongfulCloseIsHealedNotRejected is TEST (b) of the task: a pull request whose base
+// branch vanished under it WHILE its delivery was green and due — GitHub closed it without a merge —
+// is RESTORED by the chain (base branch recreated, pull request reopened, re-based on the default
+// branch) and merges, instead of being booked as a rejection.
+func TestMaintainWrongfulCloseIsHealedNotRejected(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/two-bbb222", FromCommit: "c1", ToCommit: "c2", PRNumber: 6, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour))) // due: the window has passed
+	// The pull request was CLOSED (auto-closed), its head is a recorded delivery (green), and its base
+	// branch "fix/one-aaa111" is GONE — never registered in the fake's branchTips, so a read 404s.
+	gh.prState["o/x|6"] = PRState{Number: 6, State: "closed", HeadRef: d.Branch, HeadSHA: "c2", BaseRef: "fix/one-aaa111"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	// The delivery must NOT be booked as closed/rejected.
+	if got, _, _ := ledger.ByID("dlv_1"); got.ClosedAt != nil {
+		t.Fatalf("a wrongful close must NOT be booked as a rejection, got %+v", got)
+	}
+	// The heal ran: base branch recreated, pull request reopened, re-based on main.
+	if len(gh.createdBranches) != 1 || !strings.HasPrefix(gh.createdBranches[0], "o/x|fix/one-aaa111|") {
+		t.Errorf("the vanished base branch must be recreated, createdBranches = %v", gh.createdBranches)
+	}
+	if len(gh.reopened) != 1 || gh.reopened[0] != "o/x|6" {
+		t.Errorf("the pull request must be reopened, reopened = %v", gh.reopened)
+	}
+	if len(gh.retargeted) != 1 || gh.retargeted[0] != "o/x|6|main" {
+		t.Errorf("the pull request must be re-based on the default branch, retargeted = %v", gh.retargeted)
+	}
+	if gh.prState["o/x|6"].State != "open" || gh.prState["o/x|6"].BaseRef != "main" {
+		t.Errorf("the restored pull request must be OPEN on main, got %+v", gh.prState["o/x|6"])
+	}
+	// The record stays tracked so it merges next pass.
+	if cur, _ := prs.List(); len(cur) != 1 {
+		t.Fatalf("the restored pull request must stay tracked, got %+v", cur)
+	}
+	// A self-check notice records the heal (nothing happens silently).
+	notes, _ := n.List()
+	found := false
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliverySelfCheck {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the heal must be recorded as a self-check notice, got %+v", notes)
+	}
+
+	// Next pass: now open on main and due, it merges — the delivery is not lost.
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain (pass 2): %v", err)
+	}
+	if got, _, _ := ledger.ByID("dlv_1"); got.MergedAt == nil {
+		t.Fatalf("the restored delivery must merge on the next pass, got %+v", got)
+	}
+}
+
+// TestMaintainHumanCloseStaysRejection is TEST (c) of the task: a pull request a HUMAN closes without
+// merging — its base branch still exists — remains a rejection. It must NOT be confused with the
+// wrongful-close case (b): the base branch present is the tell of a human's decision.
+func TestMaintainHumanCloseStaysRejection(t *testing.T) {
+	armMaintain(t)
+	stubClassification(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/two-bbb222", FromCommit: "c1", ToCommit: "c2", PRNumber: 6, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	// Closed, green, due — BUT its base branch "main" still exists. A human closed it.
+	gh.prState["o/x|6"] = PRState{Number: 6, State: "closed", HeadRef: d.Branch, HeadSHA: "c2", BaseRef: "main"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("Maintain: %v", err)
+	}
+	// No heal — the base branch is intact.
+	if len(gh.createdBranches) != 0 || len(gh.reopened) != 0 {
+		t.Fatalf("a human close must NOT be healed, createdBranches = %v reopened = %v", gh.createdBranches, gh.reopened)
+	}
+	// It is booked as a rejection (closed with a reason), the record untracked.
+	got, _, _ := ledger.ByID("dlv_1")
+	if got.ClosedAt == nil || got.ClosedReason == "" {
+		t.Fatalf("a human close must be booked as a rejection, got %+v", got)
+	}
+	if cur, _ := prs.List(); len(cur) != 0 {
+		t.Fatalf("a rejected pull request must be untracked, got %+v", cur)
 	}
 }
 
