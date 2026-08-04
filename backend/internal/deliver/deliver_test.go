@@ -1202,22 +1202,28 @@ func TestMaintainTransientNeverBlocks(t *testing.T) {
 
 // TestMaintainPermanentBlocks is the NACHWEIS point 7(b): a DURABLE obstacle — one no repetition can
 // change — is stilled at once and waits for an explicit release, and the blockade surfaces as a
-// disturbance the user is told about.
+// disturbance the user is told about. A missing right on a READ (403) is exactly such an obstacle:
+// unlike a vanished pull request (404), "forbidden" is not a reached goal, and the split hangs on the
+// status number — so this runs the REAL classifier (no stub) to prove it where the distinction is
+// actually made.
 func TestMaintainPermanentBlocks(t *testing.T) {
 	armMaintain(t)
-	stubClassification(t)
 	gh := newFakeGH()
 	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
 	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
 	_ = ledger.Put(d)
 	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
-	// The pull request is gone (404) — a durable obstacle a person alone can resolve.
-	gh.getPRErr = &github.StatusError{Status: 404, Msg: "no such pull request"}
+	// The read is forbidden (403) — a missing right, which a person alone can resolve. This is NOT a
+	// vanished pull request: it stays blocked.
+	gh.getPRErr = &github.StatusError{Status: 403, Msg: "Resource not accessible by integration"}
 
 	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err == nil {
 		t.Fatalf("a permanent fault must be reported")
 	}
 	cur, _ := prs.List()
+	if len(cur) != 1 {
+		t.Fatalf("a forbidden read stays tracked and blocked, got %+v", cur)
+	}
 	if !cur[0].Blocked || cur[0].BlockedReason == "" || cur[0].BlockedAt.IsZero() {
 		t.Fatalf("a durable obstacle must be stilled honestly (reason/time), got %+v", cur[0])
 	}
@@ -1233,6 +1239,114 @@ func TestMaintainPermanentBlocks(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("the blockade must surface as a %q notice", runs.NoticeDeliveryBlocked)
+	}
+}
+
+// TestMaintainReadGoneUntracksNotBlocks is the NACHWEIS: a pull request GitHub no longer knows (404
+// on the READ) is a reached goal, not a blockade. The record is UNTRACKED — dropped from the tracked
+// set, its ledger entry mirrored closed so NextPRBase stops counting it open — never stilled for a
+// person, and the untracking is announced so nothing vanishes silently. This runs the REAL classifier
+// (no stub): 404 would classify Permanent, yet the read-side goal is decided BEFORE recordFault, on
+// the status number.
+func TestMaintainReadGoneUntracksNotBlocks(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0, ExecutionID: "exec_1"}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	_ = res.Put(runs.Result{ID: "exec_1", RunID: "run_1", Kind: model.KindTodo, StartedAt: t0})
+	// The pull request is gone: GitHub answers the READ with 404 (as sxty9/axioma #5 does today).
+	gh.getPRErr = &github.StatusError{Status: 404, Msg: "Not Found"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("a vanished pull request is a reached goal, not an error: %v", err)
+	}
+	if left, _ := prs.List(); len(left) != 0 {
+		t.Errorf("a vanished pull request must be UNTRACKED, not kept, left %+v", left)
+	}
+	// The ledger is pulled along so NextPRBase no longer counts it open.
+	got, ok, _ := ledger.ByID("dlv_1")
+	if !ok || got.OpenState() {
+		t.Errorf("the ledger entry must be mirrored closed, got %+v (ok=%v)", got, ok)
+	}
+	// It is untracked VISIBLY, never silently, and never as a blockade.
+	notes, _ := n.List()
+	sawUntrack, sawBlock := false, false
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliverySelfCheck && strings.Contains(note.Message(), "no longer exists") {
+			sawUntrack = true
+		}
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			sawBlock = true
+		}
+	}
+	if !sawUntrack {
+		t.Errorf("the untracking must be announced, notices = %+v", notes)
+	}
+	if sawBlock {
+		t.Errorf("a vanished pull request must raise NO blockade notice, notices = %+v", notes)
+	}
+}
+
+// TestMaintainReadGoneResolvesExistingBlock is the NACHWEIS point 4: a block ALREADY recorded for a
+// vanished pull request (the state sxty9/axioma #5 is in today) dissolves by itself on the next
+// maintenance run — the record is untracked, no restart and no human release needed.
+func TestMaintainReadGoneResolvesExistingBlock(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
+	_ = ledger.Put(d)
+	p := trackedPR(d, time.Now().Add(-time.Hour))
+	// The record was stilled by the OLD reading: a read 404 filed as a durable blockade.
+	p.Blocked = true
+	p.BlockedReason = readFailPrefix + (&github.StatusError{Status: 404, Msg: "Not Found"}).Error()
+	p.BlockedAt = t0
+	_ = prs.Add(p)
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err != nil {
+		t.Fatalf("resolving a stale vanished-PR block is not an error: %v", err)
+	}
+	if left, _ := prs.List(); len(left) != 0 {
+		t.Errorf("the stale block must be untracked on the next run, left %+v", left)
+	}
+	// No GitHub read is even needed — the block reason already proves the pull request is gone.
+	if gh.getPRCalls != 0 {
+		t.Errorf("resolving the stale block needs no GitHub read, reads = %d", gh.getPRCalls)
+	}
+}
+
+// TestMaintainServerErrorBacksOffNotBlocked is the NACHWEIS point 5c: a read that fails with a server
+// error (500) is a SELF-ENDING obstacle. It earns a growing backoff and keeps retrying — never a
+// standstill waiting on a person. Runs the REAL classifier where the distinction is made.
+func TestMaintainServerErrorBacksOffNotBlocked(t *testing.T) {
+	armMaintain(t)
+	gh := newFakeGH()
+	ledger, prs, res, n, pub := tempLedger(t), tempPRs(t), tempResults(t), tempNotices(t), &fakePub{}
+	d := runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", PRNumber: 5, CreatedAt: t0}
+	_ = ledger.Put(d)
+	_ = prs.Add(trackedPR(d, time.Now().Add(-time.Hour)))
+	gh.getPRErr = &github.StatusError{Status: 500, Msg: "Internal Server Error"}
+
+	if err := Maintain(context.Background(), gh, prs, ledger, res, n, pub); err == nil {
+		t.Fatalf("a failing read must be reported")
+	}
+	cur, _ := prs.List()
+	if len(cur) != 1 {
+		t.Fatalf("the record must stay tracked, got %+v", cur)
+	}
+	if cur[0].Blocked {
+		t.Fatalf("a 500 must NEVER still a record — it ends by itself, got %+v", cur[0])
+	}
+	if cur[0].Backoff == nil || cur[0].Backoff.NextAt.IsZero() {
+		t.Fatalf("a 500 must earn a growing backoff with a next attempt, got %+v", cur[0])
+	}
+	notes, _ := n.List()
+	for _, note := range notes {
+		if note.Kind == runs.NoticeDeliveryBlocked {
+			t.Errorf("a self-ending server error must raise no blockade notice, got %+v", note)
+		}
 	}
 }
 
