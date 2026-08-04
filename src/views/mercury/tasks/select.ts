@@ -8,13 +8,31 @@
 import type { Run, RunResult } from '../../../types';
 import type { OpenDeliveryFacts } from '../deliveries/deliveries';
 
-/** Whether an execution is history-ready: it ENDED and none of its deliveries is still open
- *  (open = neither merged nor closed with a reason). `openDeliveryExecutionIds` is the set of
- *  execution ids that still hold an open delivery, read from the delivery ledger by the
- *  caller — an execution the ledger never names historizes on ending (a failed run delivered
- *  nothing). */
+/** Whether an execution is history-ready. HISTORISED IS STRICT (WHAT-4): the whole chain ran
+ *  through — up to and including the production delivery — with no intervention and no approval
+ *  needed. Anything short of that is not a history entry but a CURRENT state, and belongs in the
+ *  tab that holds that state.
+ *
+ *  The old rule asked only "did it end, and does a delivery still hang on it". That let an execution
+ *  which blocked or failed on an EARLY stage count as history: it produced no delivery, so nothing
+ *  hung on it, so it slipped in — even though its chain never ran through. The positive proof the
+ *  chain DID run through is the server's `mergedAt` stamp: the server sets it only once EVERY
+ *  delivery of the execution is settled through production (runs.SettleExecution, B-8 + WHAT-1), or,
+ *  for a startup-reconciliation check-off, once the work verifiably arrived in the default branch. A
+ *  blocked or failed execution never earns that stamp.
+ *
+ *  So an execution historises iff it ENDED and either it is a frozen archive record (legacy — a
+ *  closed past, display-only, that has no live tab to move to), or it carries the `mergedAt` stamp
+ *  AND the live ledger agrees no delivery of it is still open (`openDeliveryExecutionIds`, the set of
+ *  execution ids the ledger still holds open — read by the caller, never derived from a chain stage,
+ *  B-35). */
 export function executionCompleted(res: RunResult, openDeliveryExecutionIds?: ReadonlySet<string>): boolean {
   if (!res.endedAt) return false;
+  // A frozen archive record is a closed past — history by construction, with no live state to move to.
+  if (res.legacy) return true;
+  // No production-settled stamp ⇒ the chain did not run through: a current state, not history.
+  if (!res.mergedAt) return false;
+  // The stamp says every delivery settled; the live ledger must agree it holds nothing open.
   return !openDeliveryExecutionIds?.has(res.id);
 }
 
@@ -63,21 +81,31 @@ export function splitOpenHistory(
  *
  *  A remainder computed as "everything minus the history" is a number without a subject: it counts
  *  records the list hides without saying what they are, so a count can stand beside an empty list
- *  and nobody can point at what it counts. The two reasons are the only two there are, and each has
- *  a place the record IS shown:
+ *  and nobody can point at what it counts. The three reasons are the only three there are, and each
+ *  has a place the record IS shown:
  *
  *   - `inFlight` — no end stamp: the execution is running, and the Active surface shows it.
- *   - `awaitingDelivery` — ended, but the ledger still holds a delivery of it open (B-8): the
- *     delivery ledger shows it, and its todo stays in the open list. */
+ *   - `awaitingDelivery` — ended, and the ledger still holds a delivery of it open (B-8): a live
+ *     automatic step is under way (an open pull request, or a merged delivery still owing its
+ *     production step). The delivery ledger shows it, and its todo waits in the open list.
+ *   - `failed` — ended, no live delivery, and no production-settled stamp: the chain did not run
+ *     through and nothing automatic is in progress. It is not a wait — it needs attention, so it
+ *     stands in Blocked as a failed task. This is the case the old two-way split wrongly hid in the
+ *     history (a run that blocked early delivered nothing, so nothing "hung" on it). */
 export function outsideHistory(
   results: RunResult[],
   openDeliveryExecutionIds?: ReadonlySet<string>,
-): { inFlight: RunResult[]; awaitingDelivery: RunResult[] } {
-  const out: { inFlight: RunResult[]; awaitingDelivery: RunResult[] } = { inFlight: [], awaitingDelivery: [] };
+): { inFlight: RunResult[]; awaitingDelivery: RunResult[]; failed: RunResult[] } {
+  const out: { inFlight: RunResult[]; awaitingDelivery: RunResult[]; failed: RunResult[] } = {
+    inFlight: [],
+    awaitingDelivery: [],
+    failed: [],
+  };
   for (const res of results) {
     if (executionCompleted(res, openDeliveryExecutionIds)) continue;
     if (!res.endedAt) out.inFlight.push(res);
-    else out.awaitingDelivery.push(res);
+    else if (openDeliveryExecutionIds?.has(res.id)) out.awaitingDelivery.push(res);
+    else out.failed.push(res);
   }
   return out;
 }
@@ -89,7 +117,8 @@ export function outsideHistory(
  *   - `not-run`        — no execution exists yet; nobody has built it.
  *   - `running`        — an execution is in flight (the Active surface shows it move).
  *   - `awaiting-merge` — the chain ran through and shipped; its pull request is open and waits out
- *                        the auto-merge window. `mergeBy` names that deadline so the wait is visible.
+ *                        the auto-merge window. `mergeBy` names that deadline when the maintenance
+ *                        has stamped one; a freshly opened pull request is a wait even without it.
  *   - `blocked`        — the delivery's merge retries are spent and it waits for an explicit release
  *                        (K-5); `reason` says why. The release is the ONE that already exists in the
  *                        notices surface — this only names the state, it does not add a second exit.
@@ -159,13 +188,15 @@ export function openTodoState(
   if (outside.inFlight.length > 0) return { kind: 'running' };
 
   if (outside.awaitingDelivery.length > 0) {
-    // Read the blockade, the merge deadline and the production wait off exactly the executions that
-    // await a delivery — the facts the caller joined from the ledger. The order of precedence is the
-    // order of the lifecycle: a blocked delivery (a person is the only way out) outranks everything;
-    // a merge still pending outranks a production wait, because a delivery only reaches production
-    // AFTER it merges; a production wait is the last thing left.
+    // Read the blockade, the open pull request, the merge deadline and the production wait off exactly
+    // the executions that hold a delivery open — the facts the caller joined from the ledger. The
+    // order of precedence is the order of the lifecycle: a blocked delivery (a person is the only way
+    // out) outranks everything; an open pull request (with or without a stamped deadline) outranks a
+    // production wait, because a delivery only reaches production AFTER it merges; a production wait is
+    // the last thing left.
     let reason: string | undefined;
     let blocked = false;
+    let awaitingMerge = false;
     let mergeBy: string | undefined;
     let prodPending = false;
     let prodFailed = false;
@@ -177,6 +208,7 @@ export function openTodoState(
         blocked = true;
         reason ??= f.reason;
       }
+      if (f.awaitingMerge) awaitingMerge = true;
       if (f.mergeBy && (!mergeBy || f.mergeBy < mergeBy)) mergeBy = f.mergeBy;
       if (f.prodPending) prodPending = true;
       if (f.prodFailed) {
@@ -185,10 +217,19 @@ export function openTodoState(
       }
     }
     if (blocked) return { kind: 'blocked', reason };
-    if (mergeBy) return { kind: 'awaiting-merge', mergeBy };
+    // An open pull request is a live automatic step, so it is a wait — even before a deadline is
+    // stamped (`mergeBy` may be undefined; the row then says "merges once its window elapses").
+    if (awaitingMerge || mergeBy) return { kind: 'awaiting-merge', mergeBy };
     if (prodPending) return { kind: 'awaiting-prod', retrying: prodFailed, reason: prodReason };
-    return { kind: 'awaiting-merge', mergeBy };
+    // No blockade, no open pull request, no production wait: there is no live automatic step, so this
+    // is NOT a wait. Never invent an 'awaiting-merge' with no deadline and nothing running behind it —
+    // that is exactly how a failed delivery landed in Pending. It needs attention: it is failed.
+    // (Unreachable in practice — every ledger-held delivery sets one of the flags above — but the
+    // default states the intent: absent a live step, the state is failed, never a fabricated wait.)
+    return { kind: 'failed' };
   }
 
+  // An ended execution with no live delivery and no production-settled stamp (outside.failed): the
+  // chain did not run through and nothing automatic is pending. It needs a person — it is failed.
   return { kind: 'failed' };
 }
