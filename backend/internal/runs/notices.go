@@ -83,6 +83,15 @@ const (
 	// silent: it is named here and the reconciliation brings production up to the standard branch
 	// over the existing production path. A disturbance the user sees.
 	NoticeProdDrift = "prod-drift"
+	// A service that BELONGS to the landscape is not on production AT ALL — no delivery ever put it
+	// there. This is the finding the old reconciliation could never make: it derived "what production
+	// should carry" from its own delivery history, so a service the chain never shipped was never
+	// missed, never reported, never re-delivered — it was simply silent. The landscape roster (derived
+	// from the edge routes the way Atlas derives ports, plus the two load-bearing members that carry no
+	// route of their own — devlab itself and the central dashboard) is the SOURCE OF TRUTH for what
+	// production must carry, and a member of it absent from production is named here and delivered over
+	// the existing production path. A disturbance the user sees ("Kein stummes Ausbleiben").
+	NoticeProdMissing = "prod-missing"
 	// The production target's ssh host key CHANGED — the machine was reinstalled (the honest case here:
 	// prizm/presentr arriving on a freshly set-up host), or the connection is intercepted. Every
 	// production send fails the host-key check, so this is its OWN distinct reason (never a masked

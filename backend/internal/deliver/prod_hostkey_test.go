@@ -70,7 +70,7 @@ func TestMaintainProd_HostKeyChange_RaisesDistinctReasonAndQuestion(t *testing.T
 		err: map[string]error{"o/x": errors.New("REMOTE HOST IDENTIFICATION HAS CHANGED")},
 	}
 	gate := &fakeHostKey{target: "prod.example", fp: "SHA256:NEWKEY"}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, q, gate); err == nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, q, gate); err == nil {
 		t.Fatal("a failed production send must still surface its error")
 	}
 
@@ -122,7 +122,7 @@ func TestMaintainProd_HostKeyChange_AskedOncePerHost(t *testing.T) {
 		},
 	}
 	gate := &fakeHostKey{target: "prod.example", fp: "SHA256:NEWKEY"}
-	_ = MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, q, gate)
+	_ = MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, q, gate)
 
 	if oq := openHostKeyQuestions(t, q); len(oq) != 1 {
 		t.Fatalf("two deliveries to one changed host must raise ONE approval, got %d", len(oq))
@@ -153,7 +153,7 @@ func TestMaintainProd_HostKeyApproval_AcceptsAndResumes(t *testing.T) {
 	// With the key accepted, the send now proves running.
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {Running: true}}}
 	gate := &fakeHostKey{target: "prod.example", fp: "SHA256:NEWKEY"}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, q, gate); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, q, gate); err != nil {
 		t.Fatalf("MaintainProd after approval: %v", err)
 	}
 
@@ -184,7 +184,7 @@ func TestMaintainProd_HostKeyApproval_RefusesAKeyThatChangedAgain(t *testing.T) 
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {HostKeyChanged: true, HostKeyTarget: "prod.example"}},
 		err: map[string]error{"o/x": errors.New("REMOTE HOST IDENTIFICATION HAS CHANGED")}}
 	gate := &fakeHostKey{target: "prod.example", fp: "SHA256:CHANGED-AGAIN"}
-	_ = MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, q, gate)
+	_ = MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, q, gate)
 
 	if len(gate.accepted) != 0 {
 		t.Fatalf("a key that changed again must NOT be accepted, got %v", gate.accepted)

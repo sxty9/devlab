@@ -83,7 +83,7 @@ func TestMaintainProd_HistorizesOnlyAfterProd(t *testing.T) {
 	}
 
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {Running: true}}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestMaintainProd_FailureDoesNotHistorizeAndKeepsStackValid(t *testing.T) {
 	endedExecution(t, res, "exec_1")
 
 	prod := &fakeProd{err: map[string]error{"o/x": errors.New("receiver unreachable")}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err == nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err == nil {
 		t.Fatal("a failed production send must surface its error")
 	}
 
@@ -159,7 +159,7 @@ func TestMaintainProd_FailureDoesNotHistorizeAndKeepsStackValid(t *testing.T) {
 	_ = ledger.Put(d2)
 	prod.err = nil
 	prod.out = map[string]ProdOutcome{"o/x": {Running: true}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd retry: %v", err)
 	}
 	if !completed(t, ledger, res, "exec_1") {
@@ -176,7 +176,7 @@ func TestMaintainProd_NotAService(t *testing.T) {
 	endedExecution(t, res, "exec_1")
 
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/lib": {NotApplicable: true, Evidence: "no cmd/ daemon and no service manifest"}}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 	d, _, _ := ledger.ByID("dlv_1")
@@ -197,7 +197,7 @@ func TestMaintainProd_SkipsUnmerged(t *testing.T) {
 	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 	_ = ledger.Put(runs.Delivery{ID: "dlv_open", Repo: "o/x", Branch: "fix/o-1", CreatedAt: t0, ExecutionID: "exec_1"})
 	prod := &fakeProd{out: map[string]ProdOutcome{"o/x": {Running: true}}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 	if len(prod.calls) != 0 {

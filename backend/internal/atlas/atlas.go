@@ -269,6 +269,26 @@ func snapshot() map[string]*Node {
 	return out
 }
 
+// RoutedServiceIDs returns the ids of every service the edge actually routes on this host — the
+// services reachable at /api/services/<id>/, read straight off the Caddy drop-ins the same way the
+// port ledger is (derived from the host's own configuration, never stored, recomputed behind the
+// short TTL). It is the DERIVED backbone of the production landscape roster: a service is part of the
+// landscape because the edge routes it, not because the delivery history happens to remember shipping
+// it. The two load-bearing members that carry no route of their own — devlab itself and the central
+// dashboard — are NOT here (they have no /api/services/<id>/ route); the caller adds them. A source
+// that cannot be read yields fewer ids rather than an error, exactly as the rest of Atlas degrades.
+func RoutedServiceIDs() []string {
+	byID := snapshot()
+	out := make([]string, 0, len(byID))
+	for id, n := range byID {
+		if n.HasRoute {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // GraphFor builds the landscape as this caller can see it. repoIDs are the repos DevLab resolved for
 // them from GitHub — used only to link a deployed service back to its repo, never to filter the host
 // nodes, so a service the caller cannot see on GitHub is still shown as deployed. catalogKnown says
