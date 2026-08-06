@@ -61,6 +61,28 @@ type HostKeyGate interface {
 	Accept(ctx context.Context, approvedFingerprint string) error
 }
 
+// LandscapeSource names the services that make up the Holistic landscape — the SOURCE OF TRUTH for
+// what production must carry. It exists to break a circle: the reconciliation used to define "what
+// production should carry" as "what the chain already delivered there", so a service the chain never
+// shipped stood in no work-list, was never missed, and stayed silent. The roster is DERIVED from what
+// the instance actually deploys (the edge routes, the way Atlas derives ports and stores nothing),
+// never from the delivery history and never from a hand-kept list that goes stale.
+//
+// Services returns the FULL repository name (owner/repo) of every landscape member, in a deterministic
+// order. It includes the two load-bearing members that carry no edge route of their own and so are
+// invisible to a routes-only read: devlab itself (which holds Mercury and the chain — without it on
+// production, production cannot even keep itself supplied) and the central dashboard (built
+// differently from the Go services, but part of the landscape all the same). A repository that is no
+// service is not a member: it carries no route, so it never enters the roster and raises nothing.
+//
+// A nil source, or an error from Services, leaves the roster unknown for that pass: the reconciliation
+// then falls back to what production is KNOWN to have run (the ledger) and never guesses a service
+// into or out of existence — the same "degrade to what can be read" stance the rest of the derivation
+// takes.
+type LandscapeSource interface {
+	Services(ctx context.Context) ([]string, error)
+}
+
 // ProdDeployer ships a merged delivery's default-branch state to production and PROVES it runs there
 // — the SAME honest gate the dev delivery uses (WHAT-2), executed on the target host. It returns
 // Running only when the service is up in production; a NotApplicable outcome names the proven
@@ -96,7 +118,7 @@ type ProdDeployer interface {
 // A MISSING production configuration is NOT such a property — it is a deficiency, so the deployer
 // surfaces it as an error and it is booked as a failure that keeps retrying and reporting, never as
 // a silent skip ("Kein stummes Ausbleiben").
-func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryStore, prodState *runs.ProdStateStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, questions *runs.QuestionStore, hostkey HostKeyGate) error {
+func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSource, ledger *runs.DeliveryStore, prodState *runs.ProdStateStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, questions *runs.QuestionStore, hostkey HostKeyGate) error {
 	if ledger == nil {
 		return errors.New("deliver: the production pass needs the delivery ledger")
 	}
@@ -200,33 +222,66 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryS
 		}
 	}
 
-	// After the booked deliveries, close the SILENT-DRIFT gap: a repository whose standard branch has
-	// advanced past what production carries WITHOUT a booked delivery to account for it. Nothing above
-	// would ever notice — the production send only ever fires for a merged delivery that still owes
-	// production, so the standard branch moving on another path (a hand-merged pull request) leaves
-	// production quietly behind while the ledger reads "delivered". reconcileProd measures that gap,
-	// names it ("Kein stummes Ausbleiben"), and brings production up over the SAME production path.
-	reconcileProd(ctx, prod, all, prodState, n, pub, handled, now)
+	// After the booked deliveries, close BOTH silent gaps the landscape roster now makes visible:
+	//   - a service that BELONGS to the landscape but is not on production at all (never delivered), and
+	//   - a service production runs at an OLDER state than the standard branch, with no delivery to
+	//     account for it (a hand-merged pull request).
+	// Neither is visible from the ledger alone: the booked loop only ever fires for a merged delivery
+	// that still owes production, so a service the chain never shipped — or one the standard branch
+	// moved past on another path — stays silent. reconcileProd measures both against the roster and the
+	// recorded production state, names each ("Kein stummes Ausbleiben"), and brings production up over
+	// the SAME production path.
+	reconcileProd(ctx, prod, landscapeRoster(ctx, landscape), all, prodState, n, pub, handled, now)
 	return firstErr
 }
 
-// reconcileProd is the gap-closing pass: for every repository production is expected to run but that
-// the booked-delivery loop did NOT just handle, it MEASURES the standard-branch tip against the
-// commit production is recorded to carry. When they differ — the standard branch advanced with no
-// delivery to account for it — it NAMES the drift (a disturbance the user sees) and brings production
-// up to the standard branch over the existing production send. When they match it does nothing at
-// all: no message, no send (test b).
+// landscapeRoster reads the landscape's service roster for this pass — the full repository names of
+// every service production must carry, derived (edge routes + devlab + the dashboard), never the
+// delivery history. A nil source or a read error yields no roster: the reconciliation then reasons
+// only about what production is KNOWN to have run, rather than guess a service into or out of
+// existence. The read failure is deliberately quiet — Atlas-style, the derivation degrades to what it
+// can see and the next pass re-reads — and never masks a real production failure of this pass.
+func landscapeRoster(ctx context.Context, landscape LandscapeSource) []string {
+	if landscape == nil {
+		return nil
+	}
+	svc, err := landscape.Services(ctx)
+	if err != nil {
+		return nil
+	}
+	return svc
+}
+
+// reconcileProd is the gap-closing pass: for every service the landscape expects on production but
+// that the booked-delivery loop did NOT just handle, it MEASURES the standard-branch tip against the
+// commit production is recorded to carry, and reports the truth honestly in three cases:
+//   - MATCH: production carries exactly the standard branch — nothing at all, no message, no send.
+//   - DRIFT: production runs the service but at an OLDER state than the standard branch (a change
+//     reached the standard branch on another path). Named as a drift and brought current.
+//   - MISSING: production does not run the service at all — no delivery ever put it there. Named as
+//     missing and delivered for the first time, over the SAME production path.
 //
-// It only ever considers a repository production actually runs (one whose delivery reached production
-// before) and only when that repository is quiescent — no open, failed, or production-owing delivery,
+// Both DRIFT and MISSING are brought up to the standard branch over the existing production send; no
+// second path is built. Which of the two a service is in is decided by whether production is known to
+// have EVER run it — a recorded production commit, or a delivery that reached production before.
+//
+// It only considers a service that is quiescent — no open, failed, or production-owing delivery,
 // because those the chain itself is still driving. A read it cannot complete (the tip could not be
 // resolved) is left for the next pass rather than guessed at; a reconciliation read failure is never
 // the production pass's error, so it does not mask a real delivery failure.
-func reconcileProd(ctx context.Context, prod ProdDeployer, all []runs.Delivery, prodState *runs.ProdStateStore, n *runs.NoticeStore, pub live.Publisher, handled map[string]bool, now time.Time) {
+func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, n *runs.NoticeStore, pub live.Publisher, handled map[string]bool, now time.Time) {
 	if prodState == nil {
 		return // nowhere to record what production carries — the reconciliation has no reference
 	}
-	for _, repo := range reconcileRepos(all, handled) {
+	// Which services production is KNOWN to have run before — used only to tell an OLD-state drift from
+	// a never-delivered MISSING service, so each is reported by its own honest name.
+	ranBefore := map[string]bool{}
+	for _, d := range all {
+		if d.ProdDeployedAt != nil {
+			ranBefore[d.Repo] = true
+		}
+	}
+	for _, repo := range reconcileRepos(roster, all, handled) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -242,8 +297,13 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, all []runs.Delivery, 
 			continue // production carries the standard branch — no drift, no message, no send
 		}
 
-		// The standard branch moved past what production carries with no delivery to account for it.
-		notify(n, runs.NoticeProdDrift, repo, prodDriftText(tip, rec.Commit, ok))
+		// Name the gap by its true kind. A service production has run before but that now trails (or
+		// whose carried commit is unknown) is a DRIFT; a service production has never run is MISSING.
+		if ok || ranBefore[repo] {
+			notify(n, runs.NoticeProdDrift, repo, prodDriftText(tip, rec.Commit, ok))
+		} else {
+			notify(n, runs.NoticeProdMissing, repo, prodMissingText(tip))
+		}
 		publishDeliveries(pub)
 
 		// Bring production up over the EXISTING production path (no second path is built). On proof it
@@ -257,10 +317,11 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, all []runs.Delivery, 
 			recordProdCarries(prodState, repo, out.Commit, now)
 			publishDeliveries(pub)
 		case derr == nil && out.NotApplicable:
-			// The reference said production runs this repository, yet the send proves it no service now
-			// (it was reshaped). Nothing runs in production, so there is nothing to keep even.
+			// The roster listed this repository, yet the send proves it no service (a routed id whose
+			// repository is a library, or a member that was reshaped). Nothing runs in production, so
+			// there is nothing to keep even — and nothing further to report.
 		default:
-			// The drift is named, but production could not be brought current (an unreachable receiver,
+			// The gap is named, but production could not be brought current (an unreachable receiver,
 			// an unconfigured target). Report it the same way a merged delivery's failed send is.
 			notify(n, runs.NoticeProdUndelivered, repo, prodUndeliveredText(prodFailReason(out, derr)))
 			publishDeliveries(pub)
@@ -268,18 +329,26 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, all []runs.Delivery, 
 	}
 }
 
-// reconcileRepos is the work list of the reconciliation: every repository production is expected to
-// run (a delivery of it reached production) that is quiescent (no open, failed, or production-owing
-// delivery) and was not just handled by the booked-delivery loop. The order is stable (repository
-// name) so a pass is deterministic.
-func reconcileRepos(all []runs.Delivery, handled map[string]bool) []string {
+// reconcileRepos is the work list of the reconciliation: every service the landscape expects on
+// production, UNION every repository production is known to have run before, minus the ones the
+// chain is still driving (an open, failed, or production-owing delivery) or the booked loop just
+// handled. The landscape roster is the SOURCE OF TRUTH for what production should carry; the
+// ledger-derived set is only a safety net, so a drift is still reconciled for a service the roster
+// read happened to miss this pass. The order is stable (repository name) so a pass is deterministic.
+func reconcileRepos(roster []string, all []runs.Delivery, handled map[string]bool) []string {
 	expected := map[string]bool{}
+	for _, repo := range roster {
+		if repo != "" {
+			expected[repo] = true
+		}
+	}
 	blocked := map[string]bool{}
 	for _, d := range all {
+		// Production is known to run it — reconcile drift even if the roster read missed it this pass.
 		if d.ProdDeployedAt != nil {
 			expected[d.Repo] = true
 		}
-		// A repository the chain is still driving is not a silent drift: an unmerged (open) delivery, a
+		// A repository the chain is still driving is not a silent gap: an unmerged (open) delivery, a
 		// failed dev tip, or a merged delivery still owing production all mean the chain will act on it.
 		if d.OpenState() || d.Failed() || d.NeedsProd() {
 			blocked[d.Repo] = true
@@ -323,6 +392,19 @@ func prodDriftText(tip, carried string, carriedKnown bool) string {
 		"'delivered'. Production is being brought up to the standard branch over the existing production "+
 		"path. A change that reaches the standard branch outside a recorded delivery should be delivered "+
 		"as an order.", shortSHA(tip), shortSHA(carried))
+}
+
+// prodMissingText is the disturbance the user sees when a service that belongs to the landscape is
+// not on production at all. It states the effect (a landscape service is absent, so production is
+// incomplete), the governance finding (it was never delivered, so nothing ever missed it — the exact
+// silence the roster now breaks), and that it is being delivered for the first time over the existing
+// production path.
+func prodMissingText(tip string) string {
+	return fmt.Sprintf("this service belongs to the landscape but is NOT on production — no delivery "+
+		"ever put it there, so production has been running WITHOUT it and nothing flagged the gap. The "+
+		"standard branch is at %s; the service is being delivered to production for the first time over "+
+		"the existing production path so production carries the whole landscape, not only what happened "+
+		"to be delivered before.", shortSHA(tip))
 }
 
 // settleAfterProd re-runs the B-8 completion rule for the delivery's execution now that its

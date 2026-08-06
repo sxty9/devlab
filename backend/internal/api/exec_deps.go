@@ -16,10 +16,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"devlab/backend/internal/atlas"
 	"devlab/backend/internal/deliver"
 	"devlab/backend/internal/deploy"
 	"devlab/backend/internal/discover"
@@ -1043,6 +1046,63 @@ func selfRepo() string {
 	return "devlab"
 }
 
+// dashboardRepo names the central dashboard's repository (short name). The dashboard is a landscape
+// member built differently from the Go services and reachable without a service route of its own, so
+// the edge routes never name it — the roster adds it explicitly. Its identity is instance
+// configuration, never a literal (Keine Instanz-Spezifika): DEVLAB_HOLISTIC_DASHBOARD_REPO names it
+// outright, else it is the directory name of the configured holistic checkout (DEVLAB_HOLISTIC_REPO),
+// which IS that repository's working copy — so the dashboard's desired production state is that
+// repository's standard-branch tip, determined the same derived way as any service, never from the
+// delivery history. "" when neither is configured: the dashboard is then not asserted onto the roster
+// (a configuration gap named in the report, not a false claim that production is complete without it).
+func dashboardRepo() string {
+	if v := strings.TrimSpace(os.Getenv("DEVLAB_HOLISTIC_DASHBOARD_REPO")); v != "" {
+		return v
+	}
+	if p := strings.TrimSpace(os.Getenv("DEVLAB_HOLISTIC_REPO")); p != "" {
+		return filepath.Base(filepath.Clean(p))
+	}
+	return ""
+}
+
+// chainLandscape derives the production landscape roster — the SOURCE OF TRUTH for what production
+// must carry — the way Atlas derives the port ledger: from the edge routes the host actually serves
+// (a service is a landscape member because the edge routes it), never stored, never the delivery
+// history. To the routed services it adds the two load-bearing members that carry no edge route of
+// their own: devlab itself (which holds Mercury and the chain — without it on production, production
+// cannot keep itself supplied) and the central dashboard (built differently from the Go services).
+// Every id is mapped to its full owner/repo name so the reconciliation, the ledger and the send all
+// speak the one value form.
+type chainLandscape struct{}
+
+func (chainLandscape) Services(_ context.Context) ([]string, error) {
+	owner, err := discover.Owner()
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(short string) {
+		short = strings.TrimSpace(short)
+		if short == "" {
+			return
+		}
+		full := owner + "/" + short
+		if seen[full] {
+			return
+		}
+		seen[full] = true
+		out = append(out, full)
+	}
+	for _, id := range atlas.RoutedServiceIDs() {
+		add(id)
+	}
+	add(selfRepo())
+	add(dashboardRepo())
+	sort.Strings(out)
+	return out, nil
+}
+
 func (c chainDeploy) Detect(ctx context.Context, repo string) (executor.Detection, error) {
 	_, wt, err := c.d.bench(ctx, repo)
 	if err != nil {
@@ -1150,6 +1210,22 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	det, err := deploy.Detect(wt)
 	if err != nil {
 		return deliver.ProdOutcome{}, err
+	}
+	// The central dashboard is a landscape member built differently from the Go services (a frontend,
+	// no cmd/<id>d daemon), so Detect classifies it a library. Left there it would settle as "not a
+	// service" and vanish silently — but a landscape member absent from production is a Mangel, not a
+	// proven not-applicable property (das Fehlen einer Einrichtung ist keine solche Eigenschaft). Its
+	// production build-and-serve — build the holistic bundle on the dev host, ship it over THIS send,
+	// the receiver installs it into the production serve root — is the receiver's half, the same
+	// division that already governs the Go-service receiver (a separate root artifact on the prod host,
+	// outside this repo). Until that half is armed the dashboard is surfaced as a NAMED, retrying
+	// deficiency, never a silent skip ("Kein stummes Ausbleiben").
+	if repoShort(repo) == dashboardRepo() && det.Kind != deploy.KindService {
+		return deliver.ProdOutcome{Commit: shipped, Detail: "the central dashboard belongs on production, but its " +
+				"production build-and-serve path is not yet wired into the chain (it is built differently from the Go " +
+				"services); this is a deficiency reported until the dashboard receiver half is armed, never a silent skip"},
+			fmt.Errorf("deploy: the central dashboard %s has no production delivery path yet — determine its desired "+
+				"state from the holistic checkout and ship its built bundle over this send once the receiver installs it", repo)
 	}
 	switch det.Kind {
 	case deploy.KindLibrary, deploy.KindExcluded, deploy.KindTemplate:

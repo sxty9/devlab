@@ -167,7 +167,7 @@ func (e *env) maintain(ctx context.Context) error {
 	// merges, ships every merged delivery to production and proves it running there. The fixture
 	// deployer models a healthy production host — a delivery that merged runs there and answers — so
 	// the loop reaches "done" exactly as it will in production, and the execution historizes only then.
-	return deliver.MaintainProd(ctx, e.prod, e.deliveries, e.prodState, e.results, e.notices, e.broker, nil, nil)
+	return deliver.MaintainProd(ctx, e.prod, nil, e.deliveries, e.prodState, e.results, e.notices, e.broker, nil, nil)
 }
 
 // fixtureProd is the harness ProdDeployer: it models a healthy production host by proving every

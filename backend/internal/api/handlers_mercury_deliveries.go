@@ -642,7 +642,7 @@ func (s *Server) MaintainProdDeliveries(ctx context.Context) error {
 	if recv := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_RECV")); recv != "" {
 		hostkey = deploy.NewHostKeyManager(recv, s.paths.ProdKnownHosts())
 	}
-	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, pub, s.runQuestions, hostkey)
+	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, chainLandscape{}, s.deliveries, s.prodState, s.results, s.runNotices, pub, s.runQuestions, hostkey)
 }
 
 // protectionEnforcementArmed reports whether the operator has armed protection WRITES.

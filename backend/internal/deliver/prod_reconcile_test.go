@@ -42,7 +42,7 @@ func TestReconcileProd_DriftIsNamedAndBroughtCurrent(t *testing.T) {
 		tips: map[string]string{"o/x": "new111111"},
 		out:  map[string]ProdOutcome{"o/x": {Running: true, Commit: "new111111"}},
 	}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestReconcileProd_EvenIsSilent(t *testing.T) {
 	}
 
 	prod := &fakeProd{tips: map[string]string{"o/x": "same00000"}}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestReconcileProd_UnknownCarriedIsHealed(t *testing.T) {
 		tips: map[string]string{"o/x": "tip222222"},
 		out:  map[string]ProdOutcome{"o/x": {Running: true, Commit: "tip222222"}},
 	}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func TestReconcileProd_SkipsRepoWithPendingWork(t *testing.T) {
 		tips: map[string]string{"o/x": "new111111"},
 		out:  map[string]ProdOutcome{"o/x": {Running: true, Commit: "new111111"}},
 	}
-	if err := MaintainProd(context.Background(), prod, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 	if len(prod.calls) != 1 {
