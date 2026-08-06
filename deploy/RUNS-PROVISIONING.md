@@ -71,6 +71,14 @@ prints its decision without touching the host, so the security logic is verifiab
 | `DEVLAB_RUNS_PROD_RECV` | ssh destination of the install-only receiver's deploy key (`user@host`) |
 | `DEVLAB_RUNS_PROD_KEY` | path to the deploy private key BOTH prod calls (file send + trigger) sign in with — readable by the service user; the file content never enters a log |
 
+**One source for the production target.** The production target lives in exactly ONE place: this runtime
+environment (delivered as the devlabd systemd drop-in). The daemon reads `DEVLAB_RUNS_PROD_TARGET` /
+`_RECV` / `_KEY` via the environment and nothing else — proven by `TestNoDaemonCodeReadsDeadProdTarget`.
+A file such as `/etc/devlab/prod-target` that looks like the target but steers nothing is the worse kind
+of redundancy: someone edits it and changes nothing, then hunts the fault elsewhere. `--provision`
+removes that dead twin and never recreates it (a self-check confirms it is gone), so the target exists
+exactly once on the host.
+
 **Removed from the contract (do not set):** the operating-mode ladder (REQ-027.1 — the one
 chain always runs preflight → implement → deliver-dev → publish → pull-request), any cost
 cap (REQ-017 — consumption is reported live, never capped), and every activity marker file
@@ -178,3 +186,42 @@ Naming any service (e.g. `… --provision --deploy-pubkey deploy.pub prizm prese
 services up immediately from the artifact a prior send already staged, over the same install path the
 chain uses. Instance values (the public key, the receiver login, the roots) are arguments or
 environment — none is baked into the repository.
+
+### 8.1 The transport is the FIRST stage, not an accessory
+
+`DEVLAB_RUNS_PROD_TARGET` names a host the chain can only reach over a private WireGuard overlay (the
+chain speaks to the overlay address, e.g. `root@10.10.0.1`, never a public one). Until that overlay
+carries, the target does not exist — no key, no receiver and no delivery helps. So `--provision` sets up
+**this host's side of the overlay in the same run** (Keine ähnlichen Geschwister — the same entry point,
+no second script), when the overlay is named:
+
+```sh
+sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <deploy.pub> \
+     --overlay-address <this-host-overlay-cidr> --overlay-listen-port <port> \
+     --overlay-peer-pubkey <home-side-PUBLIC-key> --overlay-peer-allowed <home-overlay-cidr> \
+     --overlay-endpoint <this-host-public-address:port>
+```
+
+Each side generates its **own** keypair and hands out only the **public** half; a private overlay key is
+never transmitted in either direction (Geheimnisse entstehen auf der Seite, die sie behält). This host's
+private key is generated locally into `/etc/wireguard/<iface>.key` and stays there; the run prints this
+host's **public** key. It is idempotent (a standing overlay carrying the intended config is reported, not
+torn down) and reversible.
+
+Because the far side was just rebuilt, the chain's **home side** still holds the old public key and the
+tunnel is dead until it is caught up — the exact failure seen on 2026-08-06. The provision run prints the
+**one line** that catches the home side up (with this host's fresh public key and endpoint already filled
+in); run it as root on the chain's host:
+
+```sh
+sudo ./deploy/devlab-install-recv --overlay-here \
+     --overlay-address <home-overlay-cidr> --overlay-peer-pubkey <this-host-PUBLIC-key> \
+     --overlay-peer-allowed <this-host-overlay-cidr> --overlay-peer-endpoint <this-host-public-address:port> \
+     --overlay-keepalive 25 --overlay-verify-peer <this-host-overlay-ip>
+```
+
+`--overlay-here` swaps in the far side's new public key and **proves** the tunnel with numbers — a
+completed handshake and a ping with its loss/round-trip. If the peer does not answer it fails closed with
+the real reason (no half-built path), leaving the correctly-built local side in place. Two commands, one
+per host, is the irreducible minimum: the two machines share no filesystem, and the private keys must not
+travel. All addresses, port and keys are arguments — none is baked into the repository.

@@ -31,10 +31,28 @@
 #     sudo /path/to/deploy/devlab-install-recv [service ...]                       # refresh receiver
 #     sudo /path/to/deploy/devlab-install-recv --provision \
 #          --deploy-pubkey <path|-|literal> [--recv-user <user>] \
-#          [--staging <dir>] [--www <dir>] [--caddyfile <file>] [--no-pkg] [service ...]
+#          [--staging <dir>] [--www <dir>] [--caddyfile <file>] [--no-pkg] \
+#          [--overlay-address <cidr> --overlay-listen-port <port> \
+#           --overlay-peer-pubkey <key|path|-> --overlay-peer-allowed <cidr> \
+#           [--overlay-endpoint <host:port>] [--overlay-verify-peer <ip>]] [service ...]
 #   e.g.  sudo ./deploy/devlab-install-recv --provision --deploy-pubkey /root/deploy.pub prizm presentr
 # With no service names it installs/refreshes (and, with --provision, provisions) the host and proves
 # it, but triggers no service.
+#
+#   3. --overlay-here: catch up THIS (home/chain) host's side of the production overlay after the far
+#      side was rebuilt — swap in the far side's NEW public key and PROVE the tunnel. Same script, no
+#      sibling. It configures only the overlay (the home side is not a delivery target):
+#          sudo ./deploy/devlab-install-recv --overlay-here \
+#               --overlay-address <cidr> --overlay-peer-pubkey <key|path|-> \
+#               --overlay-peer-allowed <cidr> --overlay-peer-endpoint <host:port> \
+#               [--overlay-keepalive <secs>] --overlay-verify-peer <ip>
+#
+# THE TRANSPORT IS THE FIRST STAGE, NOT AN ACCESSORY: the chain reaches production over a private
+# WireGuard overlay; DEVLAB_RUNS_PROD_TARGET names a host that only EXISTS once the overlay carries.
+# --provision sets up THIS host's side of that overlay in the same run; the closing report prints the
+# ONE line that catches up the home side. Each side generates its OWN keypair and hands out only the
+# PUBLIC half — a private overlay key is NEVER transmitted in either direction (Geheimnisse entstehen
+# auf der Seite, die sie behält). All addresses/port/keys are arguments; none is baked into the repo.
 #
 # It is IDEMPOTENT (an already-current server is only reported), FAIL-CLOSED (it stops at the first
 # problem rather than half-installing), and REVERSIBLE (every file it replaces is backed up first and
@@ -73,6 +91,26 @@ CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
 CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
 
+# ── overlay (WireGuard) transport ────────────────────────────────────────────────────────────────────
+# The private transport the chain reaches production over is the FIRST stage of a production target, not
+# an accessory: DEVLAB_RUNS_PROD_TARGET names a host that only EXISTS once this overlay carries. These
+# are the tools and the store; the addresses, port and peer key are NEVER baked in — they arrive as
+# arguments (Keine Instanz-Spezifika). WG_DIR/WG_BIN/WGQUICK_BIN/PING_BIN are overridable ONLY as direct
+# test seams, mirroring CADDY_BIN, never as instance values in the repo.
+WG_DIR="${DEVLAB_WG_DIR:-/etc/wireguard}"
+WG_BIN="${DEVLAB_WG_BIN:-wg}"
+WGQUICK_BIN="${DEVLAB_WGQUICK_BIN:-wg-quick}"
+PING_BIN="${DEVLAB_PING_BIN:-ping}"
+OVERLAY_IFACE="${DEVLAB_OVERLAY_IFACE:-wg0}"   # generic default name, not an instance value
+OVERLAY_PING_COUNT="${DEVLAB_OVERLAY_PING_COUNT:-3}"
+
+# ── the dead-twin sweep (Part 2) ─────────────────────────────────────────────────────────────────────
+# The ONE source of the production target is the runtime environment the daemon actually reads
+# (DEVLAB_RUNS_PROD_TARGET / _RECV / _KEY, delivered as the devlabd systemd drop-in). A file that LOOKS
+# like the target but steers nothing is worse than absent — someone edits it and changes nothing. This
+# is the known dead twin; --provision removes it and never writes it. Overridable ONLY as a test seam.
+PROD_TARGET_DEAD_FILE="${DEVLAB_PROD_TARGET_FILE:-/etc/devlab/prod-target}"
+
 log()  { echo "devlab-install-recv: $*" >&2; }
 # die rolls back what THIS run changed before it exits — a fail-closed abort leaves nothing half-done,
 # whether the failure came from a bare command (the ERR trap) or from an explicit die. rollback clears
@@ -87,6 +125,19 @@ PROVISION=0
 DEPLOY_PUBKEY=""      # PUBLIC deploy key: a path, '-' for stdin, or the literal key line
 RECV_USER="root"      # the account whose authorized_keys carries the forced command (the deploy login)
 USE_PKG=1             # ask the package manager for a missing OS prerequisite (idempotent, fail-closed)
+# Overlay transport (same entry point — Keine ähnlichen Geschwister; there is no second script for it).
+# --overlay-here brings THIS host's side up WITHOUT the receiver (the home side is not a delivery
+# target); under --provision the overlay is set up alongside the receiver. Every value below is an
+# instance value and arrives as an argument — none is baked into the repository (Part 1.5).
+OVERLAY_HERE=0
+OVERLAY_ADDRESS=""       # this host's overlay CIDR (e.g. 10.10.0.1/24) — required to set the overlay up
+OVERLAY_LISTEN_PORT=""   # this host's WireGuard listen port (the side others dial; the roaming side omits)
+OVERLAY_PEER_PUBKEY=""   # the OTHER side's PUBLIC key (path|-|literal) — the private half never travels
+OVERLAY_PEER_ALLOWED=""  # the peer's overlay address (e.g. 10.10.0.2/32)
+OVERLAY_PEER_ENDPOINT="" # how THIS host dials the peer (host:port); the roaming→listener side sets it
+OVERLAY_ENDPOINT=""      # how the peer dials THIS host (host:port) — only to print the peer's one-liner
+OVERLAY_KEEPALIVE=""     # PersistentKeepalive seconds (the side behind NAT holds the tunnel open)
+OVERLAY_VERIFY_PEER=""   # overlay IP to prove reachability against; when set, the proof is fail-closed
 declare -a SERVICES=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -102,6 +153,25 @@ while [ "$#" -gt 0 ]; do
     --caddyfile)      CADDY_MAIN="${2:-}"; shift 2 ;;
     --caddyfile=*)    CADDY_MAIN="${1#*=}"; shift ;;
     --no-pkg)         USE_PKG=0; shift ;;
+    --overlay-here)          OVERLAY_HERE=1; shift ;;
+    --overlay-iface)         OVERLAY_IFACE="${2:-}"; shift 2 ;;
+    --overlay-iface=*)       OVERLAY_IFACE="${1#*=}"; shift ;;
+    --overlay-address)       OVERLAY_ADDRESS="${2:-}"; shift 2 ;;
+    --overlay-address=*)     OVERLAY_ADDRESS="${1#*=}"; shift ;;
+    --overlay-listen-port)   OVERLAY_LISTEN_PORT="${2:-}"; shift 2 ;;
+    --overlay-listen-port=*) OVERLAY_LISTEN_PORT="${1#*=}"; shift ;;
+    --overlay-peer-pubkey)   OVERLAY_PEER_PUBKEY="${2:-}"; shift 2 ;;
+    --overlay-peer-pubkey=*) OVERLAY_PEER_PUBKEY="${1#*=}"; shift ;;
+    --overlay-peer-allowed)  OVERLAY_PEER_ALLOWED="${2:-}"; shift 2 ;;
+    --overlay-peer-allowed=*) OVERLAY_PEER_ALLOWED="${1#*=}"; shift ;;
+    --overlay-peer-endpoint) OVERLAY_PEER_ENDPOINT="${2:-}"; shift 2 ;;
+    --overlay-peer-endpoint=*) OVERLAY_PEER_ENDPOINT="${1#*=}"; shift ;;
+    --overlay-endpoint)      OVERLAY_ENDPOINT="${2:-}"; shift 2 ;;
+    --overlay-endpoint=*)    OVERLAY_ENDPOINT="${1#*=}"; shift ;;
+    --overlay-keepalive)     OVERLAY_KEEPALIVE="${2:-}"; shift 2 ;;
+    --overlay-keepalive=*)   OVERLAY_KEEPALIVE="${1#*=}"; shift ;;
+    --overlay-verify-peer)   OVERLAY_VERIFY_PEER="${2:-}"; shift 2 ;;
+    --overlay-verify-peer=*) OVERLAY_VERIFY_PEER="${1#*=}"; shift ;;
     --) shift; while [ "$#" -gt 0 ]; do SERVICES+=("$1"); shift; done ;;
     -*) die "unknown option '$1' (see the header for usage)" ;;
     *)  SERVICES+=("$1"); shift ;;
@@ -363,6 +433,171 @@ install_forced_command() {
   log "installed the deploy-key forced command in $ak"
 }
 
+# ── dead-twin sweep (Part 2) ─────────────────────────────────────────────────────────────────────────
+# Remove the one file that impersonates the production target without steering anything. Reversible (the
+# removed file is backed up so the run can be undone), idempotent (absence is a clean no-op), and NEVER
+# recreated by this script. Under the test seam the sweep only runs when a fixture path is named, so a
+# developer's real /etc is never touched by the effect-free logic tests.
+sweep_dead_prod_target() {
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && [ -z "${DEVLAB_PROD_TARGET_FILE:-}" ]; then
+    return 0
+  fi
+  if [ -e "$PROD_TARGET_DEAD_FILE" ]; then
+    backup_file "$PROD_TARGET_DEAD_FILE"
+    rm -f -- "$PROD_TARGET_DEAD_FILE"
+    log "removed the dead production-target twin $PROD_TARGET_DEAD_FILE — no code reads it; the ONE source is the runtime environment (DEVLAB_RUNS_PROD_TARGET / _RECV / _KEY)"
+  else
+    log "no dead production-target twin at $PROD_TARGET_DEAD_FILE — the ONE source is the runtime environment (DEVLAB_RUNS_PROD_TARGET / _RECV / _KEY)"
+  fi
+}
+
+# ── overlay (WireGuard) transport helpers (Part 1) ────────────────────────────────────────────────────
+# resolve_key_arg <path|-|literal> — echo a single trimmed public-key line, REFUSING a private key. A
+# private overlay key is never handed to this script — it stays on the host that generated it (Part 1.2).
+resolve_key_arg() {
+  local v="$1" key=""
+  if [ "$v" = "-" ]; then key="$(cat)"
+  elif [ -f "$v" ]; then key="$(cat -- "$v")"
+  else key="$v"; fi
+  key="$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  case "$key" in *"PRIVATE KEY"*) die "a value that must be a PUBLIC key looks like a PRIVATE key — a private overlay key is never passed to or written by this script (Geheimnisse entstehen auf der Seite, die sie behält)" ;; esac
+  [ "$(printf '%s\n' "$key" | grep -c .)" = 1 ] || die "the overlay peer public key must be exactly one line"
+  printf '%s' "$key"
+}
+
+# A WireGuard public key is 32 bytes as base64: 44 characters ending in '='.
+valid_wg_pubkey() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; }
+
+overlay_key_path()  { echo "$WG_DIR/${OVERLAY_IFACE}.key"; }
+overlay_conf_path() { echo "$WG_DIR/${OVERLAY_IFACE}.conf"; }
+
+# ensure_wg_tools — WireGuard is host bring-up (like rsync/caddy), not a service build: install the one
+# named package only when absent, fail-closed, and never with --no-pkg.
+ensure_wg_tools() {
+  if command -v "$WG_BIN" >/dev/null 2>&1 && command -v "$WGQUICK_BIN" >/dev/null 2>&1; then return 0; fi
+  pkg_install wireguard-tools
+  command -v "$WG_BIN" >/dev/null 2>&1 && command -v "$WGQUICK_BIN" >/dev/null 2>&1 \
+    || die "wireguard-tools is installed but '$WG_BIN'/'$WGQUICK_BIN' are not on PATH — the overlay cannot be brought up"
+}
+
+overlay_iface_up() { "$WG_BIN" show "$OVERLAY_IFACE" >/dev/null 2>&1; }
+
+# overlay_conf_render <keyfile> <peerpubkey> — the desired wg-quick config for THIS host's side. The
+# private key is inlined as wg-quick expects; the file is 0600 and its bytes are never logged.
+overlay_conf_render() {
+  local kf="$1" peerpub="$2"
+  printf '# generated by devlab-install-recv — this host'\''s side of the production overlay\n'
+  printf '[Interface]\n'
+  printf 'Address = %s\n' "$OVERLAY_ADDRESS"
+  [ -n "$OVERLAY_LISTEN_PORT" ] && printf 'ListenPort = %s\n' "$OVERLAY_LISTEN_PORT"
+  printf 'PrivateKey = %s\n' "$(cat -- "$kf")"
+  printf '\n[Peer]\n'
+  printf 'PublicKey = %s\n' "$peerpub"
+  printf 'AllowedIPs = %s\n' "$OVERLAY_PEER_ALLOWED"
+  [ -n "$OVERLAY_PEER_ENDPOINT" ] && printf 'Endpoint = %s\n' "$OVERLAY_PEER_ENDPOINT"
+  [ -n "$OVERLAY_KEEPALIVE" ]     && printf 'PersistentKeepalive = %s\n' "$OVERLAY_KEEPALIVE"
+  return 0
+}
+
+# overlay_setup_this_side — bring up THIS host's side of the overlay from arguments. Generates this
+# host's keypair once (private stays here — Part 1.2), writes the config, and brings the interface up
+# idempotently: an already-up interface carrying the intended config is REPORTED, not torn down (Part
+# 1.6); a changed config is applied with `syncconf`, which never drops the link. Sets OVERLAY_OURPUB.
+overlay_setup_this_side() {
+  [ -n "$OVERLAY_ADDRESS" ]      || die "the overlay needs --overlay-address (this host's overlay CIDR, e.g. 10.10.0.1/24) — no instance address is baked in"
+  [ -n "$OVERLAY_PEER_PUBKEY" ]  || die "the overlay needs --overlay-peer-pubkey (the OTHER side's PUBLIC key; the private half never leaves its own host)"
+  [ -n "$OVERLAY_PEER_ALLOWED" ] || die "the overlay needs --overlay-peer-allowed (the peer's overlay address, e.g. 10.10.0.2/32)"
+  ensure_wg_tools
+  local peerpub; peerpub="$(resolve_key_arg "$OVERLAY_PEER_PUBKEY")"
+  valid_wg_pubkey "$peerpub" || die "--overlay-peer-pubkey is not a WireGuard public key (expected 44 base64 characters ending in '=')"
+
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0700 "$WG_DIR"
+  local kf cf; kf="$(overlay_key_path)"; cf="$(overlay_conf_path)"
+  if [ ! -s "$kf" ]; then
+    ( umask 077; "$WG_BIN" genkey > "$kf" ) || die "could not generate this host's overlay private key"
+    chmod 0600 "$kf"
+    log "generated this host's overlay private key at $kf (it never leaves this host)"
+  else
+    log "overlay private key already present at $kf — kept, not regenerated (Part 1.6)"
+  fi
+  OVERLAY_OURPUB="$("$WG_BIN" pubkey < "$kf")" || die "could not derive this host's overlay public key from $kf"
+
+  local desired; desired="$(overlay_conf_render "$kf" "$peerpub")"
+  if [ -f "$cf" ] && [ "$(cat -- "$cf")" = "$desired" ] && overlay_iface_up; then
+    log "overlay $OVERLAY_IFACE already up with the intended config — a standing connection is reported, not interrupted (Part 1.6)"
+    return 0
+  fi
+  if [ -f "$cf" ]; then backup_file "$cf"; else push_backup "$cf" "" 1; fi
+  printf '%s\n' "$desired" > "$cf"; chmod 0600 "$cf"
+  if overlay_iface_up; then
+    log "overlay $OVERLAY_IFACE already up — applying the updated config in place (syncconf; the link is not dropped)"
+    if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
+      "$WG_BIN" syncconf "$OVERLAY_IFACE" <("$WGQUICK_BIN" strip "$OVERLAY_IFACE") \
+        || die "could not sync the updated overlay config onto the running interface $OVERLAY_IFACE"
+    fi
+  else
+    log "bringing the overlay interface $OVERLAY_IFACE up"
+    "$WGQUICK_BIN" up "$OVERLAY_IFACE" || die "could not bring the overlay interface $OVERLAY_IFACE up"
+  fi
+}
+
+# overlay_prove — prove the tunnel CARRIES with numbers (Part 1.4): the peer's latest handshake age and
+# a ping's loss/round-trip. When --overlay-verify-peer is set the proof is FAIL-CLOSED (a peer that does
+# not answer aborts with the real reason, no half-built path — test c). Returns the report on stdout.
+overlay_prove() {
+  local peerip="$1"
+  local hs age rc pingout
+  hs="$("$WG_BIN" show "$OVERLAY_IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $NF}')"
+  if [ -n "${hs:-}" ] && [ "$hs" != "0" ]; then
+    if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then age="(seam)"; else age="$(( $(date +%s) - hs ))s ago"; fi
+    echo "handshake: last completed $age"
+  else
+    echo "handshake: none yet"
+  fi
+  set +e
+  pingout="$("$PING_BIN" -c "$OVERLAY_PING_COUNT" -W 3 "$peerip" 2>&1)"; rc=$?
+  set -e
+  # The loss/rtt summary lines carry the numbers; print them, not the whole trace.
+  printf '%s\n' "$pingout" | grep -E 'packet loss|min/avg|rtt|round-trip' || printf '%s\n' "$pingout" | tail -n 2
+  return $rc
+}
+overlay_report_pubkey() { [ -n "${OVERLAY_OURPUB:-}" ] && echo "  this host's overlay public key: $OVERLAY_OURPUB"; }
+
+# ── overlay-here: catch up THIS (home) side, no receiver (Part 1.3) ───────────────────────────────────
+# The chain's home side must be caught up when the far side was reinstalled: its old public key is
+# swapped for the new one and the tunnel is PROVEN. This is the SAME script, not a sibling (Part 1.1). It
+# does NOT install the receiver — the home side is not a delivery target.
+if [ "$OVERLAY_HERE" = 1 ]; then
+  if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
+    [ "$(id -u)" = 0 ] || die "--overlay-here must run as root (it writes $WG_DIR and configures the $OVERLAY_IFACE interface)"
+  fi
+  [ "$PROVISION" = 1 ] && die "--overlay-here catches up THIS host's overlay side only; do not combine it with --provision (the home side is not a delivery target)"
+  log "── catching up this host's side of the production overlay ──"
+  overlay_setup_this_side
+  echo
+  echo "devlab-install-recv — overlay (this side):"
+  overlay_report_pubkey
+  if [ -n "$OVERLAY_VERIFY_PEER" ]; then
+    echo "  proving the tunnel to $OVERLAY_VERIFY_PEER carries:"
+    if out="$(overlay_prove "$OVERLAY_VERIFY_PEER")"; then
+      printf '%s\n' "$out" | sed 's/^/    /'
+      echo "  the production overlay carries — the chain can reach $OVERLAY_VERIFY_PEER."
+    else
+      # This side is fully built; the PEER did not answer. Report the real reason and fail closed —
+      # WITHOUT tearing this side's correct config back down (rollback here would undo a good local
+      # side over an external condition). Not a die: the ERR-rollback must not fire.
+      trap - ERR
+      printf '%s\n' "$out" | sed 's/^/    /'
+      echo "devlab-install-recv: the overlay peer $OVERLAY_VERIFY_PEER did not answer over $OVERLAY_IFACE — this host's side is up but the transport does NOT carry yet (see the numbers above). Bring the FAR side up, then re-run; nothing on this side is half-built." >&2
+      exit 1
+    fi
+  else
+    echo "  (no --overlay-verify-peer given — reachability was not proven)"
+  fi
+  exit 0
+fi
+
 # ── PROVISION (bare host → production target) ───────────────────────────────────────────────────────
 # Runs BEFORE the receiver install so the receiver lands into an already-prepared host; everything here
 # is idempotent and reversible, and the ERR trap above unwinds every file it touched on any failure.
@@ -373,6 +608,14 @@ if [ "$PROVISION" = 1 ]; then
   ensure_roots
   ensure_caddy
   install_forced_command "$PUBKEY"
+  sweep_dead_prod_target
+  # The transport the chain reaches this host over is the FIRST stage of the target, set up in the SAME
+  # run (Part 1.1). It is opt-in by naming the overlay address, so a host reached over an already-standing
+  # transport is provisioned without touching it.
+  if [ -n "$OVERLAY_ADDRESS" ]; then
+    log "── setting up this host's side of the production overlay ──"
+    overlay_setup_this_side
+  fi
 fi
 
 # ── receiver install (REUSED by both modes) ─────────────────────────────────────────────────────────
@@ -455,8 +698,53 @@ if [ "$PROVISION" = 1 ]; then
   fi
 fi
 
+# 7. the overlay transport (only when we set it up). The interface must be up and carry the intended
+#    config; the deep proof (handshake + ping) is reported below and, when --overlay-verify-peer is
+#    given, is fail-closed there. The dead production-target twin must NOT be present after a provision.
+if [ "$PROVISION" = 1 ] && [ -n "$OVERLAY_ADDRESS" ]; then
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then
+    [ -f "$(overlay_conf_path)" ] && sc_ok "overlay config written ($(overlay_conf_path))" || sc_fail "overlay config missing ($(overlay_conf_path))"
+  else
+    overlay_iface_up && sc_ok "overlay interface $OVERLAY_IFACE is up" || sc_fail "overlay interface $OVERLAY_IFACE is NOT up"
+  fi
+fi
+if [ "$PROVISION" = 1 ]; then
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && [ -z "${DEVLAB_PROD_TARGET_FILE:-}" ]; then
+    sc_skip "dead production-target twin check (test seam without a fixture path — the real /etc is not touched)"
+  elif [ -e "$PROD_TARGET_DEAD_FILE" ]; then
+    sc_fail "the dead production-target twin still exists ($PROD_TARGET_DEAD_FILE) — the ONE source is the runtime environment"
+  else
+    sc_ok "no dead production-target twin ($PROD_TARGET_DEAD_FILE); the ONE source is the runtime environment"
+  fi
+fi
+
 if [ "$selfcheck_failed" != 0 ]; then die "self-check FAILED — the host is NOT a ready production target (see the lines above); nothing is left half-done because the run is fail-closed"; fi
 echo "  all self-checks passed."
+
+# The overlay's deep proof (Part 1.4): the handshake age and ping numbers. On the FIRST provision the
+# peer (the home side) is usually not yet caught up, so the prod side reports the tunnel as PENDING (it
+# cannot force the far side up) rather than faking a green link — unless --overlay-verify-peer is given,
+# in which case the proof is fail-closed here too. The far side is completed and PROVEN by the one-liner
+# printed in the closing report.
+if [ "$PROVISION" = 1 ] && [ -n "$OVERLAY_ADDRESS" ]; then
+  if [ -n "$OVERLAY_VERIFY_PEER" ]; then
+    echo "  proving the overlay to $OVERLAY_VERIFY_PEER carries:"
+    if out="$(overlay_prove "$OVERLAY_VERIFY_PEER")"; then
+      printf '%s\n' "$out" | sed 's/^/    /'
+    else
+      # The receiver, edge and this host's overlay side are all correctly built; the PEER did not
+      # answer. Fail closed on the proof WITHOUT rolling the whole provision back over an external
+      # condition (a die here would undo the receiver install too). ERR-rollback already cleared? No —
+      # so drop it explicitly before the honest non-zero exit.
+      trap - ERR
+      printf '%s\n' "$out" | sed 's/^/    /'
+      echo "devlab-install-recv: the overlay peer $OVERLAY_VERIFY_PEER did not answer over $OVERLAY_IFACE — this host is provisioned and its overlay side is up, but the transport does NOT carry yet (see the numbers above). Bring the FAR side up, then re-run to prove it." >&2
+      exit 1
+    fi
+  else
+    echo "  overlay: this host's side is up; the peer handshake is PENDING until the home side is caught up (see the one-liner below) — not a green link claimed over a dead peer."
+  fi
+fi
 
 # Past this point the receiver is installed and PROVEN; the file work is DONE. Triggering services is a
 # per-service action whose failure must NOT roll the receiver back (the receiver is correct and other
@@ -485,6 +773,22 @@ echo
 echo "devlab-install-recv — done."
 if [ "$PROVISION" = 1 ]; then
   echo "  provisioned: rrsync, staging ($STAGING_ROOT), web ($WWW_DIR), edge ($CADDY_MAIN), deploy-key forced command ($RECV_USER)"
+  if [ -n "$OVERLAY_ADDRESS" ]; then
+    echo "  overlay:   this host's side up on $OVERLAY_IFACE at $OVERLAY_ADDRESS${OVERLAY_LISTEN_PORT:+ (listening on $OVERLAY_LISTEN_PORT)}"
+    overlay_report_pubkey
+    # The exact next one-liner for the HOME side — its old copy of this host's key is now stale (Part
+    # 1.3). Instance values already filled in from what this run generated and was told; the operator
+    # runs ONE line on the home host, and it proves the tunnel.
+    if [ -n "${OVERLAY_OURPUB:-}" ]; then
+      here_ip="${OVERLAY_ADDRESS%%/*}"; peer_ip="${OVERLAY_PEER_ALLOWED%%/*}"
+      echo "  Catch up the HOME side (run as root on the chain's host), then the transport carries:"
+      echo "    sudo ./deploy/devlab-install-recv --overlay-here \\"
+      echo "      --overlay-iface $OVERLAY_IFACE --overlay-address ${peer_ip}/${OVERLAY_ADDRESS#*/} \\"
+      echo "      --overlay-peer-pubkey '$OVERLAY_OURPUB' --overlay-peer-allowed ${here_ip}/32 \\"
+      echo "      --overlay-peer-endpoint ${OVERLAY_ENDPOINT:-<this-host-public-address>:${OVERLAY_LISTEN_PORT:-51820}} \\"
+      echo "      --overlay-keepalive 25 --overlay-verify-peer ${here_ip}"
+    fi
+  fi
 fi
 echo "  receiver:  $SBIN/$RECV   (sha256 $(sha "$SBIN/$RECV"))"
 echo "  library:   $SBIN/$LIB    (sha256 $(sha "$SBIN/$LIB"))"
