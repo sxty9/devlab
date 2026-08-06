@@ -127,3 +127,42 @@ func TestQuestionStoreAnswerIsFinal(t *testing.T) {
 		t.Fatalf("unknown id should be ErrNotFound, got %v", err)
 	}
 }
+
+// A host-key question holds the PRODUCTION send, not a dev branch: OpenForRepo (the branch-halt) skips
+// it, so new orders on the same repository are not blocked by it — a production failure never blocks
+// the stack (WHAT-3). Its own lookups (open + approved-per-host) find it instead.
+func TestQuestionStoreHostKeyDoesNotHoldDevBranch(t *testing.T) {
+	s := newTestQuestions(t)
+	raised, err := s.Raise(Question{QKind: QuestionProdHostKey, Repo: "org/app", HostKeyTarget: "prod.example", HostKeyFingerprint: "SHA256:K", Question: "approve?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The branch-halt must NOT return a host-key question.
+	if held, _ := s.OpenForRepo("org/app", "some-other-run"); held != nil {
+		t.Fatal("a host-key question must not hold a repository's dev branch")
+	}
+	// The host-level lookup finds it.
+	if q, _ := s.OpenHostKeyQuestion("prod.example"); q == nil || q.ID != raised.ID {
+		t.Fatal("OpenHostKeyQuestion must find the open host-key question by target")
+	}
+	// Not approved yet → not returned as an approval.
+	if q, _ := s.ApprovedHostKeyQuestion("prod.example"); q != nil {
+		t.Fatal("an unanswered host-key question is not an approval")
+	}
+	// After an explicit approval it is redeemable, and no longer 'open'.
+	if _, err := s.Answer(raised.ID, "ok", true, model.Actor{}); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.ApprovedHostKeyQuestion("prod.example"); q == nil || q.ID != raised.ID {
+		t.Fatal("an approved host-key question must be redeemable per host")
+	}
+	if q, _ := s.OpenHostKeyQuestion("prod.example"); q != nil {
+		t.Fatal("an answered host-key question is no longer open")
+	}
+	// A declined (answered but not approved) question is never returned as an approval.
+	other, _ := s.Raise(Question{QKind: QuestionProdHostKey, Repo: "org/b", HostKeyTarget: "h2", HostKeyFingerprint: "SHA256:X"})
+	_, _ = s.Answer(other.ID, "no", false, model.Actor{})
+	if q, _ := s.ApprovedHostKeyQuestion("h2"); q != nil {
+		t.Fatal("a declined host-key question must not count as an approval")
+	}
+}

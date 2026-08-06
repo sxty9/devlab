@@ -142,3 +142,39 @@ Stop admissions by setting the slot capacity to 0 in the service configuration
     prod-failed and retries; a **half-installed target** cannot arise, because the receiver reports
     success ONLY after the unit is proven active — a receiver that installs but does not come up exits
     non-zero, so the sending side records a failure rather than a green half-delivery.
+  - **A CHANGED production host key** (the machine was reinstalled) is NOT a masked connection failure:
+    it gets its own reason (`prod-host-key-changed`) and production is HELD until the new key is
+    deliberately approved on the Blocked surface — the same approval path the root-wrapper renewal uses.
+    Nothing is trusted silently: the approval pins the fingerprint the host now presents, and the accept
+    path re-reads the key and refuses it if it changed again since the approval. See
+    `backend/internal/deploy/prod_hostkey.go`.
+
+## 8. Bring a NAKED production host up — one self-checking run, no prose to transcribe
+
+A freshly installed, empty production host is made into a target the delivery chain can reach with ONE
+command — there is no stretch of manual steps to copy out of this file. Run it ON the production host,
+as root, from a checkout of the merged standard branch. It takes only the PUBLIC half of the deploy key
+(a private key is never created on or written to the target):
+
+```sh
+sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <path-to-deploy.pub> [service ...]
+```
+
+It is one pass, idempotent, fail-closed and reversible, and it PROVES the result instead of claiming it.
+In that single run it: ensures `rrsync` is present (the receiver confines every rsync receive through
+it); creates the staging root it receives into and the web root it serves from (both derived from
+`DEVLAB_STATE_DIR`, overridable with `--staging` / `--www`); installs Caddy as the edge and makes the
+main Caddyfile import the per-service route directory the receiver drops routes into; writes the
+locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
+the receiver login's `authorized_keys` (default `root`, override with `--recv-user`); and installs the
+receiver + shared library themselves (the SAME install path the receiver-only mode uses — no second
+copy). It closes with a self-check: `rrsync` resolves, the forced command actually rejects a shell
+request, the receiver and library carry the expected checksums, the staging and web roots exist, and
+the edge validates. Any failure is fail-closed (non-zero exit, nothing half-done). After it passes,
+**no further step on the target is needed to accept a delivery** — arm the DEV side by naming this host
+in the environment (`DEVLAB_RUNS_PROD_TARGET`, `DEVLAB_RUNS_PROD_RECV`, `DEVLAB_RUNS_PROD_KEY`, §5).
+
+Naming any service (e.g. `… --provision --deploy-pubkey deploy.pub prizm presentr`) also brings those
+services up immediately from the artifact a prior send already staged, over the same install path the
+chain uses. Instance values (the public key, the receiver login, the roots) are arguments or
+environment — none is baked into the repository.

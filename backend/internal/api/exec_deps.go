@@ -1180,6 +1180,13 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	// The send expects the SHORT repo id (its name grammar rejects a slash); the ledger carries the
 	// full "owner/repo", so it is reduced here — the same value-form seam that the workbench needs.
 	if err := c.d.sendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
+		// A CHANGED production host key is not a plain failure: it is carried up as its own signal so the
+		// production pass can hold the send and ask for a deliberate approval, instead of masking it as a
+		// generic "connection failed" retried in silence (task part 2).
+		var hk *deploy.HostKeyChangedError
+		if errors.As(err, &hk) {
+			return deliver.ProdOutcome{HostKeyChanged: true, HostKeyTarget: hk.Target, Detail: err.Error()}, err
+		}
 		return deliver.ProdOutcome{Detail: err.Error()}, err
 	}
 	// The receiver installed the prebuilt artifact AND proved the service running on the target, so a

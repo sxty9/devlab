@@ -135,3 +135,128 @@ func TestInstallRecvFailsClosedOnMissingSetup(t *testing.T) {
 		t.Errorf("the receiver must be installed even when a named service is refused: %v", err)
 	}
 }
+
+// provisionEnv builds a fixture host (sbin + staging/www/caddy/authorized_keys under a temp root) and
+// returns the env the --provision path runs against in its test seam. Everything is derived under the
+// temp root so no real host path is touched; the caddy validate + sshd checks are skipped by the seam.
+func provisionEnv(t *testing.T) (env map[string]string, sbin, staging, www, caddyMain, ak string) {
+	t.Helper()
+	root := t.TempDir()
+	sbin = filepath.Join(root, "sbin")
+	staging = filepath.Join(root, "staging")
+	www = filepath.Join(root, "www")
+	caddyMain = filepath.Join(root, "caddy", "Caddyfile")
+	ak = filepath.Join(root, "home", ".ssh", "authorized_keys")
+	if err := os.MkdirAll(sbin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env = map[string]string{
+		"DEVLAB_RECV_TEST":  "1",
+		"DEVLAB_SBIN":       sbin,
+		"DEVLAB_STAGING":    staging,
+		"DEVLAB_STATIC_DIR": www,
+		"DEVLAB_CADDY_CONF": filepath.Join(root, "caddy", "conf.d"),
+		"DEVLAB_CADDY_MAIN": caddyMain,
+		"DEVLAB_RECV_AK":    ak, // test seam: authorized_keys at a fixture, not a real home
+	}
+	return env, sbin, staging, www, caddyMain, ak
+}
+
+const testDeployPubKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURE000000000000000000000000000000 devlab-prod-deploy"
+
+// A bare host is brought to a production target in ONE pass: rrsync is present, the staging and web
+// roots exist, the edge imports the per-service route directory, the deploy key is pinned behind the
+// forced command, and the closing self-check passes (proof, not a claim — Part 1.6).
+func TestProvisionBareHost(t *testing.T) {
+	env, sbin, staging, www, caddyMain, ak := provisionEnv(t)
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit != 0 {
+		t.Fatalf("provisioning a bare host must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	for _, d := range []string{staging, www} {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Errorf("provisioning must create the root %s: %v", d, err)
+		}
+	}
+	for _, f := range []string{"devlab-deploy-recv", "devlab-setup-lib.sh"} {
+		if _, err := os.Stat(filepath.Join(sbin, f)); err != nil {
+			t.Errorf("provisioning must install %s (reusing the receiver install): %v", f, err)
+		}
+	}
+	// The forced command pins EVERY login of this key to the receiver — the line that turns a normal
+	// key into a locked-down deploy key.
+	akb, err := os.ReadFile(ak)
+	if err != nil {
+		t.Fatalf("authorized_keys not written: %v", err)
+	}
+	if !strings.Contains(string(akb), `command="`+filepath.Join(sbin, "devlab-deploy-recv")+`",restrict `) {
+		t.Errorf("authorized_keys must carry the forced command + restrict:\n%s", string(akb))
+	}
+	if !strings.Contains(string(akb), "AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURE") {
+		t.Errorf("authorized_keys must carry the deploy public key:\n%s", string(akb))
+	}
+	// The edge imports the route directory the receiver drops per-service .caddy files into.
+	cb, _ := os.ReadFile(caddyMain)
+	if !strings.Contains(string(cb), "import "+filepath.Join(env["DEVLAB_CADDY_CONF"], "*.caddy")) {
+		t.Errorf("the Caddyfile must import the route directory:\n%s", string(cb))
+	}
+	if !strings.Contains(res.out, "all self-checks passed") {
+		t.Errorf("provisioning must end with a passing self-check:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "rejects a shell request") {
+		t.Errorf("the self-check must prove the forced command rejects a shell request:\n%s", res.out)
+	}
+}
+
+// A second provision run changes nothing — the deploy key line is not duplicated, the edge import is
+// not re-added, and the receiver is left untouched (idempotent).
+func TestProvisionIdempotent(t *testing.T) {
+	env, _, _, _, caddyMain, ak := provisionEnv(t)
+	if res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey); res.exit != 0 {
+		t.Fatalf("first provision failed: %d\n%s", res.exit, res.out)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit != 0 {
+		t.Fatalf("the idempotent re-run must succeed, got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "already carries the forced command") {
+		t.Errorf("a re-run must report the deploy key already pinned:\n%s", res.out)
+	}
+	akb, _ := os.ReadFile(ak)
+	if n := strings.Count(string(akb), "devlab-prod-deploy"); n != 1 {
+		t.Errorf("the deploy key line must appear exactly once after a re-run, got %d:\n%s", n, string(akb))
+	}
+	cb, _ := os.ReadFile(caddyMain)
+	if n := strings.Count(string(cb), "import "); n != 1 {
+		t.Errorf("the edge import must appear exactly once after a re-run, got %d:\n%s", n, string(cb))
+	}
+}
+
+// A PRIVATE key handed to --deploy-pubkey is refused — a private key is never written to the target
+// (Geheimnisse entstehen nicht auf dem Ziel). Likewise a missing or malformed key.
+func TestProvisionRefusesBadKey(t *testing.T) {
+	cases := []struct {
+		name, key, want string
+		omit            bool
+	}{
+		{name: "private", key: "-----BEGIN OPENSSH PRIVATE KEY-----\nxxx\n-----END OPENSSH PRIVATE KEY-----", want: "looks like a PRIVATE key"},
+		{name: "garbage", key: "hello world", want: "does not look like an ssh public key"},
+		{name: "missing", omit: true, want: "needs --deploy-pubkey"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env, _, _, _, _, _ := provisionEnv(t)
+			args := []string{"--provision"}
+			if !c.omit {
+				args = append(args, "--deploy-pubkey", c.key)
+			}
+			res := runInstallRecv(t, env, args...)
+			if res.exit == 0 {
+				t.Fatalf("provisioning must refuse the %s key (exit != 0):\n%s", c.name, res.out)
+			}
+			if !strings.Contains(res.out, c.want) {
+				t.Errorf("the refusal must name %q, got:\n%s", c.want, res.out)
+			}
+		})
+	}
+}

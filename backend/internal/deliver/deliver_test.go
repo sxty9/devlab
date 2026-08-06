@@ -325,6 +325,12 @@ func tempProdState(t *testing.T) *runs.ProdStateStore {
 	return runs.NewProdStateStore(nil)
 }
 
+func tempQuestions(t *testing.T) *runs.QuestionStore {
+	t.Helper()
+	t.Setenv("DEVLAB_MERCURY_RUNS_QUESTIONS", filepath.Join(t.TempDir(), "questions.json"))
+	return runs.NewQuestionStore(nil)
+}
+
 func tempRuns(t *testing.T) *runs.Store {
 	t.Helper()
 	dir := t.TempDir()

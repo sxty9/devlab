@@ -149,7 +149,7 @@ func TestMaintainProd_WholePathAgainstRealRepo(t *testing.T) {
 		},
 	}
 
-	if err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, nil); err != nil {
+	if err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, nil, nil, nil); err != nil {
 		t.Fatalf("the whole path up to the send must complete against a real repository: %v", err)
 	}
 

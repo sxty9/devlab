@@ -143,6 +143,11 @@ func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) err
 	dest := strings.TrimRight(cfg.RsyncTarget, "/") + "/" + repo + "/"
 	full := rsyncArgs(cfg, strings.TrimRight(artifactDir, "/")+"/", dest)
 	if out, err := exec.CommandContext(ctx, "rsync", full...).CombinedOutput(); err != nil {
+		// A CHANGED host key gets its OWN distinct reason (the target was reinstalled, or the connection
+		// is intercepted) — never a masked "connection failed". Any other rsync failure keeps its detail.
+		if hk := asHostKeyChanged(cfg.RsyncTarget, string(out), err); hk != err {
+			return hk
+		}
 		return fmt.Errorf("deploy: prod send failed: %w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 	}
 
@@ -176,6 +181,10 @@ func SSHTrigger(recv string, id ProdIdentity) func(ctx context.Context, repo str
 		}
 		cmd := exec.CommandContext(ctx, "ssh", triggerCmdArgs(id, recv, repo)...)
 		if out, err := cmd.CombinedOutput(); err != nil {
+			// A CHANGED host key is surfaced by its own reason, exactly as on the file transport.
+			if hk := asHostKeyChanged(recv, string(out), err); hk != err {
+				return hk
+			}
 			return fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 		}
 		return nil

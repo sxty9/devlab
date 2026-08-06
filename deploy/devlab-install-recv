@@ -1,32 +1,54 @@
 #!/usr/bin/env bash
-# devlab-install-recv — install (or refresh) the prod-side deploy receiver on the PRODUCTION host,
-# in ONE self-checking pass. This is the "Handarbeit kommt als Skript" for the one root artifact the
-# delivery chain can NOT deliver to itself: devlab-deploy-recv (and the library it sources,
-# devlab-setup-lib.sh) live in /usr/local/sbin on the production host and are the forced command
-# behind the deploy key — that key can only rsync into staging and trigger an install, so it can
-# never overwrite the receiver with a new version (that would be self-escalation; see the receiver
-# header and backend/internal/deploy/wrappers.go, where `selfWrappers` deliberately EXCLUDES the
-# receiver). A receiver fix therefore reaches production ONLY through an operator with root on the
-# target running this script. Until it runs, a merged receiver fix has no effect in production.
+# devlab-install-recv — put the PRODUCTION host in order, in ONE self-checking pass. It has two jobs
+# behind the SAME entry point (Keine ähnlichen Geschwister — there is no second script that installs
+# the receiver a second way):
 #
-# WHY THIS EXISTS: the first-time-setup fix (a service's systemd unit now travels in the delivery
-# artifact and the receiver installs it on first arrival) was merged, but every service that had
-# never been set up on the production host kept failing `systemctl restart <repo>: Unit not found`,
+#   1. DEFAULT (no --provision): install (or refresh) the prod-side deploy receiver — the one root
+#      artifact the delivery chain can NOT deliver to itself: devlab-deploy-recv and the library it
+#      sources, devlab-setup-lib.sh, live in /usr/local/sbin and are the forced command behind the
+#      deploy key. That key can only rsync into staging and trigger an install, so it can never
+#      overwrite the receiver with a new version (that would be self-escalation; see the receiver
+#      header and backend/internal/deploy/wrappers.go, where `selfWrappers` deliberately EXCLUDES the
+#      receiver). A receiver fix therefore reaches production ONLY through an operator with root on the
+#      target running this script.
+#
+#   2. --provision: bring a NAKED, freshly-installed server all the way to being a production target
+#      the chain can deliver to — in ONE run, with no prose left to hand-copy. Before today the naked
+#      host needed a person to transcribe an authorized_keys forced-command line, ensure rrsync,
+#      create the staging and web roots, and stand up Caddy, all from deploy/RUNS-PROVISIONING.md. That
+#      manual stretch was not reproducible, not checkable, not repeatable. This mode does all of it and
+#      then PROVES it, and it REUSES the receiver install above (install_one) rather than growing a
+#      second copy of it.
+#
+# WHY THE DEFAULT MODE EXISTS: the first-time-setup fix (a service's systemd unit now travels in the
+# delivery artifact and the receiver installs it on first arrival) was merged, but every service that
+# had never been set up on the production host kept failing `systemctl restart <repo>: Unit not found`,
 # because the OLD receiver on the target only ever restarted an existing unit. This script puts the
 # fixed receiver on the target and, for each service named, brings it up from the artifact the last
-# (failed) send already staged — so the missing setup happens immediately instead of on the next
-# retry.
+# (failed) send already staged — so the missing setup happens immediately instead of on the next retry.
 #
 # RUN IT ON THE PRODUCTION HOST, AS ROOT, FROM A CHECKOUT OF THE MERGED STANDARD BRANCH:
-#     sudo /path/to/deploy/devlab-install-recv [service ...]
-#   e.g.  sudo ./deploy/devlab-install-recv prizm presentr
-# With no service names it installs/refreshes the receiver and proves it, but triggers no service.
+#     sudo /path/to/deploy/devlab-install-recv [service ...]                       # refresh receiver
+#     sudo /path/to/deploy/devlab-install-recv --provision \
+#          --deploy-pubkey <path|-|literal> [--recv-user <user>] \
+#          [--staging <dir>] [--www <dir>] [--caddyfile <file>] [--no-pkg] [service ...]
+#   e.g.  sudo ./deploy/devlab-install-recv --provision --deploy-pubkey /root/deploy.pub prizm presentr
+# With no service names it installs/refreshes (and, with --provision, provisions) the host and proves
+# it, but triggers no service.
 #
-# It is IDEMPOTENT (an already-current receiver is left untouched, only reported), FAIL-CLOSED (it
-# stops at the first problem rather than half-installing), and REVERSIBLE (every file it replaces is
-# backed up first and restored automatically if a later step fails). It NEVER builds and NEVER
+# It is IDEMPOTENT (an already-current server is only reported), FAIL-CLOSED (it stops at the first
+# problem rather than half-installing), and REVERSIBLE (every file it replaces is backed up first and
+# restored automatically if a later step fails). For the DEPLOY PAYLOAD it NEVER builds and NEVER
 # fetches: it installs the exact bytes sitting beside it in deploy/, and prints their SHA-256 so the
-# installed receiver can be checked against the standard branch.
+# installed receiver can be checked against the standard branch. Standing up the host's OS
+# prerequisites (rsync/rrsync, Caddy) is a different thing from building a service: --provision may ask
+# the system package manager for those two named packages when they are absent (idempotent, and
+# fail-closed with the exact missing name if the package manager cannot supply them, or with --no-pkg).
+# It NEVER creates a private key on the target and never writes one there — it takes only the PUBLIC
+# half of the deploy key (Geheimnisse entstehen nicht auf dem Ziel).
+#
+# Instance-neutral: no hostname, domain, or instance path is baked in. Every such value is a default
+# derived from the state root (like the receiver's own paths) or comes in as an argument.
 set -euo pipefail
 
 # The two artifacts this installs, and where they go. SBIN mirrors the receiver's own install target;
@@ -39,34 +61,87 @@ SRC_DIR="${DEVLAB_RECV_SRC:-$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOUR
 RECV="devlab-deploy-recv"
 LIB="devlab-setup-lib.sh"
 
+# The ONE state-root derivation the receiver itself carries: every host path DERIVES from it, so a
+# provisioned host stages, serves and confines under the same root the running daemon expects. These
+# are DEFAULTS; --staging / --www override them, and the receiver reads the same env at run time.
+STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
+STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
+WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
+# The edge the receiver reloads. conf.d holds the per-service routes the receiver drops in; the main
+# Caddyfile must import them. Instance-neutral defaults; the receiver reads the same env at run time.
+CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
+CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
+
 log()  { echo "devlab-install-recv: $*" >&2; }
-die()  { log "$*"; exit 1; }
+# die rolls back what THIS run changed before it exits — a fail-closed abort leaves nothing half-done,
+# whether the failure came from a bare command (the ERR trap) or from an explicit die. rollback clears
+# its own list, so the two paths never double-restore.
+die()  { log "$*"; rollback; exit 1; }
+sha()  { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# ── arguments ──────────────────────────────────────────────────────────────────────────────────────
+# --provision turns on the bare-server bring-up; the rest configure it. Everything that is NOT a flag
+# is a service name (today's positional contract), collected in SERVICES and passed on unchanged.
+PROVISION=0
+DEPLOY_PUBKEY=""      # PUBLIC deploy key: a path, '-' for stdin, or the literal key line
+RECV_USER="root"      # the account whose authorized_keys carries the forced command (the deploy login)
+USE_PKG=1             # ask the package manager for a missing OS prerequisite (idempotent, fail-closed)
+declare -a SERVICES=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --provision)      PROVISION=1; shift ;;
+    --deploy-pubkey)  DEPLOY_PUBKEY="${2:-}"; shift 2 ;;
+    --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}"; shift ;;
+    --recv-user)      RECV_USER="${2:-}"; shift 2 ;;
+    --recv-user=*)    RECV_USER="${1#*=}"; shift ;;
+    --staging)        STAGING_ROOT="${2:-}"; shift 2 ;;
+    --staging=*)      STAGING_ROOT="${1#*=}"; shift ;;
+    --www)            WWW_DIR="${2:-}"; shift 2 ;;
+    --www=*)          WWW_DIR="${1#*=}"; shift ;;
+    --caddyfile)      CADDY_MAIN="${2:-}"; shift 2 ;;
+    --caddyfile=*)    CADDY_MAIN="${1#*=}"; shift ;;
+    --no-pkg)         USE_PKG=0; shift ;;
+    --) shift; while [ "$#" -gt 0 ]; do SERVICES+=("$1"); shift; done ;;
+    -*) die "unknown option '$1' (see the header for usage)" ;;
+    *)  SERVICES+=("$1"); shift ;;
+  esac
+done
+set -- "${SERVICES[@]+"${SERVICES[@]}"}"
 
 # Backups made THIS run, newest first, so the rollback restores them in the reverse of install order.
+# Each entry is a TAB-separated triple "target<TAB>backup<TAB>abs": target is the file to restore
+# (relative sbin name or an absolute path), backup is the timestamped copy or empty (file did not exist
+# before this run), abs is 1 when target is already an absolute path. TAB cannot appear in our paths.
 declare -a BACKUPS=()
+TAB="$(printf '\t')"
+push_backup() { BACKUPS=("$1${TAB}$2${TAB}$3" "${BACKUPS[@]}"); }
 rollback() {
   [ "${#BACKUPS[@]}" -eq 0 ] && return 0
   log "a step failed — rolling back the files this run replaced"
-  local pair name bak
-  for pair in "${BACKUPS[@]}"; do
-    name="${pair%%::*}"; bak="${pair##*::}"
+  local entry target bak abs path
+  for entry in "${BACKUPS[@]}"; do
+    target="${entry%%${TAB}*}"; entry="${entry#*${TAB}}"
+    bak="${entry%%${TAB}*}";    abs="${entry#*${TAB}}"
+    if [ "$abs" = 1 ]; then path="$target"; else path="$SBIN/$target"; fi
     if [ -n "$bak" ] && [ -e "$bak" ]; then
-      cp -a -- "$bak" "$SBIN/$name" && log "restored $SBIN/$name from $bak"
+      cp -a -- "$bak" "$path" && log "restored $path from $bak"
     else
-      # No backup means the file did not exist before this run — remove what we put there.
-      rm -f -- "$SBIN/$name" && log "removed $SBIN/$name (it did not exist before this run)"
+      rm -f -- "$path" && log "removed $path (it did not exist before this run)"
     fi
   done
+  BACKUPS=()   # cleared so a following die/ERR cannot restore the same files twice
 }
 trap 'rollback' ERR
 
-# Root is required to write $SBIN and to install/start a systemd service. DEVLAB_RECV_TEST is a
-# DIRECT-INVOCATION test seam (never set in operation): it lets the install/backup/rollback logic be
-# proven against a fixture SBIN without root, mirroring the receiver's own --check seam.
+# Root is required to write $SBIN, root's authorized_keys, the edge config, and to install/start a
+# systemd service. DEVLAB_RECV_TEST is a DIRECT-INVOCATION test seam (never set in operation): it lets
+# the install/backup/rollback and provisioning logic be proven against fixture directories without
+# root, mirroring the receiver's own --check seam.
 if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
-  [ "$(id -u)" = 0 ] || die "must run as root (it writes $SBIN and installs a systemd service)"
+  [ "$(id -u)" = 0 ] || die "must run as root (it writes $SBIN, the deploy login's authorized_keys, the edge config, and installs a systemd service)"
 fi
-[ -d "$SBIN" ]     || die "target directory $SBIN does not exist"
+[ -d "$SBIN" ] || die "target directory $SBIN does not exist"
 
 # The source bytes must be present and the receiver must at least PARSE before it can be trusted as a
 # root command — a syntactically broken receiver installed to sbin would break every future deploy.
@@ -76,7 +151,17 @@ done
 bash -n -- "$SRC_DIR/$RECV" || die "$SRC_DIR/$RECV does not parse — refusing to install a broken receiver"
 bash -n -- "$SRC_DIR/$LIB"  || die "$SRC_DIR/$LIB does not parse — refusing to install a broken library"
 
-sha() { sha256sum -- "$1" | cut -d' ' -f1; }
+# backup_file <abs> — record a timestamped backup of an arbitrary file we are about to change (or note
+# its absence), so the rollback can restore the host exactly. Idempotent callers back up once.
+backup_file() {
+  local abs="$1" bak=""
+  if [ -e "$abs" ]; then
+    bak="$abs.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a -- "$abs" "$bak" || die "could not back up $abs before changing it"
+    log "backed up $abs to $bak"
+  fi
+  push_backup "$abs" "$bak" 1
+}
 
 # install_one <name> <mode> — install SRC_DIR/<name> to SBIN/<name> with the given mode, root-owned.
 # An identical installed copy is left untouched (idempotent). A differing or missing copy is backed
@@ -93,7 +178,7 @@ install_one() {
     cp -a -- "$dst" "$bak" || die "could not back up $dst before replacing it"
     log "backed up the existing $name to $bak"
   fi
-  BACKUPS=("$name::$bak" "${BACKUPS[@]}")
+  push_backup "$name" "$bak" 0
   # Ownership is root:root in operation; the test seam (non-root fixture) cannot chown, so it omits it.
   local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
   install "${own[@]}" -m "$mode" -- "$src" "$dst"
@@ -101,20 +186,207 @@ install_one() {
   log "installed $name -> $dst (mode $mode, sha256 $(sha "$dst"))"
 }
 
-# The library is installed FIRST because the receiver sources it; installing the receiver over a
-# stale library would leave a moment where a deploy runs new receiver logic against old templates.
+# ── provisioning helpers (only reached under --provision) ────────────────────────────────────────────
+
+# rrsync_path — echo an executable rrsync the receiver would find (its own search list), or empty. The
+# receiver searches: rrsync (PATH), /usr/bin/rrsync, /usr/share/rsync/scripts/rrsync, /usr/lib/rsync/rrsync.
+rrsync_path() {
+  local c p
+  for c in rrsync /usr/bin/rrsync /usr/share/rsync/scripts/rrsync /usr/lib/rsync/rrsync; do
+    p="$(command -v "$c" 2>/dev/null || true)"; [ -z "$p" ] && [ -x "$c" ] && p="$c"
+    [ -n "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# pkg_install <package> — ask the system package manager for a MISSING OS prerequisite. This is host
+# bring-up, not the deploy doctrine (which never builds/fetches a SERVICE): only the two named packages
+# (rsync, caddy) ever pass through here, only when absent, and --no-pkg forbids it entirely. Fail-closed.
+pkg_install() {
+  local pkg="$1"
+  [ "$USE_PKG" = 1 ] || die "'$pkg' is required but missing and --no-pkg was given — install it and re-run"
+  if command -v apt-get >/dev/null 2>&1; then
+    log "installing OS prerequisite '$pkg' via apt-get"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" >&2 \
+      || die "package manager could not install '$pkg' — provide it and re-run (fail-closed, nothing half-done)"
+  else
+    die "'$pkg' is required but missing and no supported package manager (apt-get) was found — install '$pkg' and re-run"
+  fi
+}
+
+# ensure_rrsync — the transport confinement the receiver depends on (it exits 5 without it). If rsync's
+# rrsync is present only as a gzipped script (older Debian shipped /usr/share/rsync/scripts/rrsync.gz),
+# materialize an executable copy where the receiver looks; otherwise ensure the rsync package.
+ensure_rrsync() {
+  if rrsync_path >/dev/null; then log "rrsync present at $(rrsync_path)"; return 0; fi
+  local gz="/usr/share/rsync/scripts/rrsync.gz"
+  if [ -f "$gz" ]; then
+    log "materializing rrsync from $gz -> /usr/local/bin/rrsync"
+    zcat -- "$gz" > /usr/local/bin/rrsync && chmod 0755 /usr/local/bin/rrsync
+    rrsync_path >/dev/null && return 0
+  fi
+  command -v rsync >/dev/null 2>&1 || pkg_install rsync
+  if ! rrsync_path >/dev/null && [ -f "$gz" ]; then
+    zcat -- "$gz" > /usr/local/bin/rrsync && chmod 0755 /usr/local/bin/rrsync
+  fi
+  rrsync_path >/dev/null || die "rsync is installed but no rrsync helper was found — the receiver cannot confine an rsync receive without it"
+  log "rrsync ready at $(rrsync_path)"
+}
+
+# ensure_roots — the two host paths the receiver stages into and serves from. Pure filesystem, no
+# fetch; created only when absent (idempotent), root-owned.
+ensure_roots() {
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0755 "$STAGING_ROOT" && log "staging root ready: $STAGING_ROOT"
+  install -d "${own[@]}" -m 0755 "$WWW_DIR"      && log "web root ready:     $WWW_DIR"
+}
+
+# ensure_caddy — the edge. Caddy must be installed, its conf.d route directory must exist, and the main
+# Caddyfile must IMPORT that directory so the per-service routes the receiver drops in take effect. A
+# pre-existing Caddyfile is backed up before the import line is added; the assembled config is validated
+# before caddy is (re)started, so a bad edit never leaves the edge broken (fail-closed).
+ensure_caddy() {
+  command -v "$CADDY_BIN" >/dev/null 2>&1 || pkg_install caddy
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0755 "$CADDY_CONF" && log "edge route dir ready: $CADDY_CONF"
+
+  local import_line="import ${CADDY_CONF}/*.caddy"
+  if [ -f "$CADDY_MAIN" ]; then
+    if grep -Fqx -- "$import_line" "$CADDY_MAIN"; then
+      log "Caddyfile already imports $CADDY_CONF — left untouched"
+    else
+      backup_file "$CADDY_MAIN"
+      printf '\n# added by devlab-install-recv --provision: pull in per-service routes\n%s\n' "$import_line" >> "$CADDY_MAIN"
+      log "added '$import_line' to $CADDY_MAIN"
+    fi
+  else
+    backup_file "$CADDY_MAIN"      # records absence, so rollback removes what we create
+    install -d "${own[@]}" -m 0755 "$(dirname -- "$CADDY_MAIN")"
+    printf '# created by devlab-install-recv --provision\n%s\n' "$import_line" > "$CADDY_MAIN"
+    log "created $CADDY_MAIN importing $CADDY_CONF"
+  fi
+
+  # Validate the ASSEMBLED config before touching the running edge (the same guard the receiver uses).
+  if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
+    "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1 \
+      || die "the edge configuration does not validate after the import was added — rolled back so the edge keeps its last good config"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl enable caddy >/dev/null 2>&1 || true
+      if systemctl is-active --quiet caddy; then
+        systemctl reload caddy || die "caddy reload failed after provisioning the edge"
+        log "caddy reloaded with the imported route directory"
+      else
+        systemctl start caddy || die "caddy could not be started after provisioning the edge"
+        log "caddy started"
+      fi
+    fi
+  fi
+}
+
+# read_pubkey — resolve the PUBLIC deploy key from a path, stdin ('-'), or a literal argument. It
+# REFUSES anything that looks like a private key (Geheimnisse entstehen nicht auf dem Ziel) and anything
+# that is not a single ssh public-key line.
+read_pubkey() {
+  [ -n "$DEPLOY_PUBKEY" ] || die "--provision needs --deploy-pubkey (the PUBLIC half of the deploy key: a path, '-', or the literal key)"
+  local key=""
+  if [ "$DEPLOY_PUBKEY" = "-" ]; then
+    key="$(cat)"
+  elif [ -f "$DEPLOY_PUBKEY" ]; then
+    key="$(cat -- "$DEPLOY_PUBKEY")"
+  else
+    key="$DEPLOY_PUBKEY"
+  fi
+  key="$(printf '%s' "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  case "$key" in
+    *"PRIVATE KEY"*) die "the value given to --deploy-pubkey looks like a PRIVATE key — pass ONLY the public half; a private key is never written to the target" ;;
+  esac
+  [ "$(printf '%s\n' "$key" | grep -c .)" = 1 ] || die "--deploy-pubkey must be exactly one public-key line"
+  case "$key" in
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*\ *|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-*\ *) : ;;
+    *) die "--deploy-pubkey does not look like an ssh public key (want 'ssh-ed25519 …', 'ssh-rsa …', or 'ecdsa-sha2-… …')" ;;
+  esac
+  printf '%s' "$key"
+}
+
+# authorized_keys_path — where the receiver user's authorized_keys lives. Derived from the account's
+# home in operation; DEVLAB_RECV_AK overrides it only under the direct-invocation test seam.
+authorized_keys_path() {
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && [ -n "${DEVLAB_RECV_AK:-}" ]; then
+    echo "$DEVLAB_RECV_AK"; return 0
+  fi
+  local home
+  home="$(getent passwd "$RECV_USER" 2>/dev/null | cut -d: -f6)"
+  [ -n "$home" ] || die "receiver user '$RECV_USER' has no home directory (does the account exist?)"
+  echo "$home/.ssh/authorized_keys"
+}
+
+# install_forced_command — write the locked-down deploy-key line into the receiver user's
+# authorized_keys: command="<recv>",restrict <pubkey>. `restrict` strips agent/port/pty/X11/user-rc
+# forwarding and `command=` pins EVERY login to the receiver, so the key can do nothing but rsync into
+# staging and trigger an install. Idempotent: an identical line already present is left as is; a line
+# for the SAME key with a different/absent forced command is replaced (the file is backed up first).
+install_forced_command() {
+  local pubkey="$1"
+  local keytype keydata
+  keytype="$(printf '%s' "$pubkey" | awk '{print $1}')"
+  keydata="$(printf '%s' "$pubkey" | awk '{print $2}')"
+  local forced="command=\"$SBIN/$RECV\",restrict $keytype $keydata devlab-prod-deploy"
+
+  # Where the receiver user's authorized_keys lives (default root → /root/.ssh/authorized_keys).
+  # DEVLAB_RECV_AK is a DIRECT-INVOCATION test seam (points authorized_keys at a fixture file), honoured
+  # only under the test seam; in operation the location is always derived from the account's home.
+  local ak dir
+  ak="$(authorized_keys_path)"
+  dir="$(dirname -- "$ak")"
+  local own=(-o "$RECV_USER" -g "$RECV_USER"); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0700 "$dir"
+
+  if [ -f "$ak" ] && grep -Fq -- "$keydata" "$ak"; then
+    # The line carrying this key already carries our forced command → nothing to do (idempotent).
+    if grep -F -- "$keydata" "$ak" | grep -Fq -- "command=\"$SBIN/$RECV\""; then
+      log "deploy key already carries the forced command in $ak — left untouched"
+      return 0
+    fi
+    # Same key present but NOT behind the forced command — replace only its line(s), back up first.
+    backup_file "$ak"
+    grep -Fv -- "$keydata" "$ak" > "$ak.tmp.$$" || true
+    printf '%s\n' "$forced" >> "$ak.tmp.$$"
+    install "${own[@]}" -m 0600 "$ak.tmp.$$" "$ak"; rm -f "$ak.tmp.$$"
+    log "re-pinned the deploy key behind the forced command in $ak"
+    return 0
+  fi
+
+  if [ -e "$ak" ]; then backup_file "$ak"; else push_backup "$ak" "" 1; fi
+  printf '%s\n' "$forced" >> "$ak"
+  chmod 0600 "$ak"; [ "${DEVLAB_RECV_TEST:-0}" != 1 ] && chown "$RECV_USER":"$RECV_USER" "$ak"
+  log "installed the deploy-key forced command in $ak"
+}
+
+# ── PROVISION (bare host → production target) ───────────────────────────────────────────────────────
+# Runs BEFORE the receiver install so the receiver lands into an already-prepared host; everything here
+# is idempotent and reversible, and the ERR trap above unwinds every file it touched on any failure.
+if [ "$PROVISION" = 1 ]; then
+  log "── provisioning this host as a production target ──"
+  PUBKEY="$(read_pubkey)"
+  ensure_rrsync
+  ensure_roots
+  ensure_caddy
+  install_forced_command "$PUBKEY"
+fi
+
+# ── receiver install (REUSED by both modes) ─────────────────────────────────────────────────────────
+# The library is installed FIRST because the receiver sources it; installing the receiver over a stale
+# library would leave a moment where a deploy runs new receiver logic against old templates.
 install_one "$LIB"  0644
 install_one "$RECV" 0755
 
 # Prove the receiver loads and makes the right first-time-vs-update decision WITHOUT effect, via its
 # own --check dry-run. With a service name it also proves that service's artifact is staged and its
-# delivered unit passes the identity checks — the exact gate the real trigger will apply. This is the
-# "prüft nach jedem Abschnitt selbst" step: we do not trigger a real install until the dry-run is
-# clean.
+# delivered unit passes the identity checks — the exact gate the real trigger will apply.
 check_ok=1
 if [ "$#" -eq 0 ]; then
-  # No service to check against; prove at least that the receiver + library load without error.
-  DEVLAB_STAGING="${DEVLAB_STAGING:-/tmp/devlab-install-recv-selftest.$$}" \
+  DEVLAB_STAGING="${DEVLAB_STAGING:-$STAGING_ROOT}" \
     "$SBIN/$RECV" --check __selftest__ >/dev/null 2>&1 || true  # exit 3 (no such artifact) is expected
   log "receiver installed and parses; no service named, so nothing was triggered"
 else
@@ -129,15 +401,71 @@ else
   done
 fi
 
-# Past this point the receiver is installed and verified; the file work is DONE. Triggering services
-# is a per-service action whose failure must NOT roll the receiver back (the receiver is correct and
-# other services depend on it), so the ERR-rollback is cleared here.
+# ── self-check: PROVE the host is a production target, do not claim it (Part 1.6) ────────────────────
+# Every check reports its own line; any failure makes the whole pass fail-closed (non-zero exit) so the
+# operator never reads a green result over a half-ready host. In the test seam the effect-free checks
+# still run; the ones that need root/systemd (caddy validate, forced-command over sshd) are skipped and
+# named as skipped rather than faked.
+selfcheck_failed=0
+sc_ok()   { echo "  [ok]   $*"; }
+sc_fail() { echo "  [FAIL] $*"; selfcheck_failed=1; }
+sc_skip() { echo "  [skip] $*"; }
+echo
+echo "devlab-install-recv — self-check:"
+
+# 1. rrsync present (the receiver exits 5 without it).
+if rp="$(rrsync_path)"; then sc_ok "rrsync present ($rp)"; else sc_fail "rrsync NOT found — an rsync receive cannot be confined"; fi
+
+# 2. receiver + library installed with the expected checksums (rechecked against the source beside us).
+if [ -f "$SBIN/$RECV" ] && cmp -s -- "$SRC_DIR/$RECV" "$SBIN/$RECV"; then sc_ok "receiver $SBIN/$RECV matches source (sha256 $(sha "$SBIN/$RECV"))"; else sc_fail "receiver at $SBIN/$RECV does not match the source beside this script"; fi
+if [ -f "$SBIN/$LIB" ] && cmp -s -- "$SRC_DIR/$LIB" "$SBIN/$LIB"; then sc_ok "library  $SBIN/$LIB matches source (sha256 $(sha "$SBIN/$LIB"))"; else sc_fail "library at $SBIN/$LIB does not match the source beside this script"; fi
+
+# 3. the forced command really bites: a request for ANYTHING that is not an rsync receive or an install
+#    trigger must be refused (the receiver falls through to repo-name validation and exits non-zero). We
+#    prove this against the INSTALLED receiver by handing it a shell request the way sshd would.
+if SSH_ORIGINAL_COMMAND="exec bash -i" DEVLAB_STAGING="$STAGING_ROOT" "$SBIN/$RECV" >/dev/null 2>&1; then
+  sc_fail "the receiver ACCEPTED a shell request — the forced command is not confining input"
+else
+  sc_ok "the receiver rejects a shell request (a login can only rsync-into-staging or trigger an install)"
+fi
+
+# 4. the deploy-key line under the forced command is present (only meaningful when we provisioned it).
+if [ "$PROVISION" = 1 ]; then
+  ak="$(authorized_keys_path)"
+  if [ -f "$ak" ] && grep -Fq -- "command=\"$SBIN/$RECV\"" "$ak"; then sc_ok "deploy key is pinned to the forced command in $ak"; else sc_fail "no forced-command deploy-key line in $ak"; fi
+fi
+
+# 5. the staging and web roots exist (a provisioning guarantee; the receiver-only refresh does not own
+#    them — the receiver creates its staging at run time — so this is checked only when we provisioned).
+if [ "$PROVISION" = 1 ]; then
+  [ -d "$STAGING_ROOT" ] && sc_ok "staging root exists ($STAGING_ROOT)" || sc_fail "staging root missing ($STAGING_ROOT)"
+  [ -d "$WWW_DIR" ]      && sc_ok "web root exists ($WWW_DIR)"         || sc_fail "web root missing ($WWW_DIR)"
+fi
+
+# 6. the edge validates and its route directory is imported (needs the real caddy; skipped in the seam).
+if [ "$PROVISION" = 1 ]; then
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then
+    sc_skip "caddy validation (test seam has no caddy) — Caddyfile imports checked textually below"
+    grep -Fq -- "import ${CADDY_CONF}/*.caddy" "$CADDY_MAIN" 2>/dev/null && sc_ok "Caddyfile imports $CADDY_CONF" || sc_fail "Caddyfile does not import $CADDY_CONF"
+  elif command -v "$CADDY_BIN" >/dev/null 2>&1 && "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1; then
+    sc_ok "edge configuration validates ($CADDY_MAIN)"
+    command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet caddy && sc_ok "caddy is active" || sc_fail "caddy is not active"; }
+  else
+    sc_fail "edge configuration does not validate ($CADDY_MAIN)"
+  fi
+fi
+
+if [ "$selfcheck_failed" != 0 ]; then die "self-check FAILED — the host is NOT a ready production target (see the lines above); nothing is left half-done because the run is fail-closed"; fi
+echo "  all self-checks passed."
+
+# Past this point the receiver is installed and PROVEN; the file work is DONE. Triggering services is a
+# per-service action whose failure must NOT roll the receiver back (the receiver is correct and other
+# services depend on it), so the ERR-rollback is cleared here.
 trap - ERR
 
 # Bring each named service up from its already-staged artifact, over the SAME install path the chain
-# uses (no separate first-install path). A first-time service is set up; an already-running one is
-# only refreshed. Each result is reported; a failure here is named, not swallowed, and does not stop
-# the others.
+# uses (no separate first-install path). A first-time service is set up; an already-running one is only
+# refreshed. Each result is reported; a failure here is named, not swallowed, and does not stop others.
 declare -a WENT_UP=() STAYED_DOWN=()
 for svc in "$@"; do
   if [ "$check_ok" != 1 ] && ! "$SBIN/$RECV" --check "$svc" >/dev/null 2>&1; then
@@ -155,6 +483,9 @@ done
 # ── closing report: what is done, and what remains and why (Handarbeit kommt als Skript) ──
 echo
 echo "devlab-install-recv — done."
+if [ "$PROVISION" = 1 ]; then
+  echo "  provisioned: rrsync, staging ($STAGING_ROOT), web ($WWW_DIR), edge ($CADDY_MAIN), deploy-key forced command ($RECV_USER)"
+fi
 echo "  receiver:  $SBIN/$RECV   (sha256 $(sha "$SBIN/$RECV"))"
 echo "  library:   $SBIN/$LIB    (sha256 $(sha "$SBIN/$LIB"))"
 if [ "${#WENT_UP[@]}" -gt 0 ]; then
@@ -164,10 +495,16 @@ if [ "${#STAYED_DOWN[@]}" -gt 0 ]; then
   echo "  NOT brought up: ${STAYED_DOWN[*]}"
 fi
 echo
-echo "  Any service NOT named above that is merged but never set up on this host is now unblocked:"
-echo "  the running DevLab service re-sends every production-owing delivery on its own schedule and"
-echo "  the fixed receiver will set it up on the next attempt. To bring one up immediately instead,"
-echo "  re-run this script with its name, e.g.:  sudo $0 <service>"
+if [ "$PROVISION" = 1 ]; then
+  echo "  This host is now a production target: the delivery chain can rsync into staging behind the"
+  echo "  deploy key's forced command and trigger an install. No further step on the target is needed to"
+  echo "  ACCEPT a delivery. Arm the chain on the DEV side by naming this host in the runtime"
+  echo "  configuration (DEVLAB_RUNS_PROD_TARGET, DEVLAB_RUNS_PROD_RECV, DEVLAB_RUNS_PROD_KEY)."
+fi
+echo "  Any service NOT named above that is merged but never set up on this host is unblocked: the"
+echo "  running DevLab service re-sends every production-owing delivery on its own schedule and the"
+echo "  receiver sets it up on the next attempt. To bring one up immediately, re-run with its name,"
+echo "  e.g.:  sudo $0 <service>"
 if [ "${#STAYED_DOWN[@]}" -gt 0 ]; then
   exit 1  # at least one named service did not come up — honest non-zero for the operator
 fi

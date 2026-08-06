@@ -113,7 +113,7 @@ func TestMaintainProd_LedgerFullNameReachesSend(t *testing.T) {
 	}
 
 	deps := &ChainDeps{s: s, user: user, benches: map[string]*repoBench{}, full: map[string]string{}}
-	err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, nil)
+	err := deliver.MaintainProd(context.Background(), chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, nil, nil, nil)
 	if err == nil {
 		t.Fatal("the send cannot complete against a fixture (no real remote/target) — it must surface a failure")
 	}

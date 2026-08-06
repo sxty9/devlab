@@ -37,6 +37,28 @@ type ProdOutcome struct {
 	Evidence      string
 	Detail        string
 	Commit        string
+	// HostKeyChanged is set when the send failed specifically because the production target's ssh host
+	// key no longer matches the recorded one — a reinstalled (or intercepted) host, NOT a plain
+	// connection failure. HostKeyTarget names that host. The production pass turns this into its own
+	// distinct reason and a deliberate approval, rather than a masked retry (task part 2).
+	HostKeyChanged bool
+	HostKeyTarget  string
+}
+
+// HostKeyGate is the deliberate accept path for a CHANGED production host key, wired in the api layer
+// (deploy.HostKeyManager) and faked in tests. The production pass NEVER trusts a new key on its own:
+// ScanFingerprint only READS the key the target currently presents (to show the human and to pin the
+// approval); Accept re-pins the known-hosts file to that key ONLY after re-confirming it still matches
+// the approved fingerprint, so an approval covers exactly one key and nothing that changed after it.
+// nil means production is unarmed or no gate is wired — the change is still reported, just not accepted.
+type HostKeyGate interface {
+	// Target is the production host whose key the gate manages (for dedup and the approval record).
+	Target() string
+	// ScanFingerprint reads the SHA256 fingerprint the target currently presents. Reading is not trust.
+	ScanFingerprint(ctx context.Context) (string, error)
+	// Accept re-pins the known-hosts file to the target's current key iff it still hashes to
+	// approvedFingerprint; a key that changed again is refused (the approval was for a different key).
+	Accept(ctx context.Context, approvedFingerprint string) error
 }
 
 // ProdDeployer ships a merged delivery's default-branch state to production and PROVES it runs there
@@ -74,7 +96,7 @@ type ProdDeployer interface {
 // A MISSING production configuration is NOT such a property — it is a deficiency, so the deployer
 // surfaces it as an error and it is booked as a failure that keeps retrying and reporting, never as
 // a silent skip ("Kein stummes Ausbleiben").
-func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryStore, prodState *runs.ProdStateStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher) error {
+func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryStore, prodState *runs.ProdStateStore, res *runs.ResultStore, n *runs.NoticeStore, pub live.Publisher, questions *runs.QuestionStore, hostkey HostKeyGate) error {
 	if ledger == nil {
 		return errors.New("deliver: the production pass needs the delivery ledger")
 	}
@@ -86,6 +108,10 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryS
 		return err
 	}
 	now := time.Now().UTC()
+	// Before any send: if the operator APPROVED a new production host key on the Blocked surface,
+	// accept it now (verified against the pinned fingerprint) so the held sends below can succeed. This
+	// never trusts a key on its own — the gate re-reads it and refuses a key that changed again.
+	applyApprovedHostKey(ctx, questions, hostkey, n, pub)
 	var firstErr error
 	// The repositories this pass touched through a booked delivery — the reconciliation below leaves
 	// them alone, because the chain just handled them: re-measuring the same repository in the same
@@ -157,10 +183,18 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, ledger *runs.DeliveryS
 				firstErr = orFirst(firstErr, err)
 				continue
 			}
-			// The message carries NO attempt count or next-time on purpose, so a repeat of the SAME
-			// failure coalesces into one record (the user hears it once) while the growing retry state
-			// stays visible on the delivery itself (ProdBackoff). A CHANGED reason is a new finding.
-			notify(n, runs.NoticeProdUndelivered, d.Repo, prodUndeliveredText(reason))
+			// A CHANGED production host key gets its OWN distinct reason and a deliberate approval — never
+			// a masked "connection failed" retried in silence (task part 2). Everything else reports as a
+			// plain undelivered production send. Both keep the merged layer beneath untouched.
+			if out.HostKeyChanged {
+				raiseHostKeyQuestion(ctx, questions, hostkey, out.HostKeyTarget, d.Repo)
+				notify(n, runs.NoticeProdHostKeyChanged, d.Repo, prodHostKeyChangedText(out.HostKeyTarget, reason))
+			} else {
+				// The message carries NO attempt count or next-time on purpose, so a repeat of the SAME
+				// failure coalesces into one record (the user hears it once) while the growing retry state
+				// stays visible on the delivery itself (ProdBackoff). A CHANGED reason is a new finding.
+				notify(n, runs.NoticeProdUndelivered, d.Repo, prodUndeliveredText(reason))
+			}
 			publishDeliveries(pub)
 			firstErr = orFirst(firstErr, derr)
 		}
@@ -317,6 +351,86 @@ func prodUndeliveredText(reason string) string {
 	return fmt.Sprintf("the merged work has NOT reached production yet — %s. The task stays open until "+
 		"the service runs in production; the production send is retried by itself and never given up on. "+
 		"The merged work on the default branch is unaffected.", reason)
+}
+
+// applyApprovedHostKey redeems an operator's approval of a new production host key: it accepts the
+// key the human approved (re-verified against the pinned fingerprint) and re-pins the known-hosts file
+// so the held production sends resume. It runs once per pass, before any send. The approval is
+// single-use — it is consumed (Resolve) whether the accept succeeds or is refused, so a key that
+// changed AGAIN after approval does not silently carry the stale approval forward: the next send fails
+// afresh and asks again for the key now present. A success is a positive transition the user sees;
+// a refusal is reported with its own reason.
+func applyApprovedHostKey(ctx context.Context, questions *runs.QuestionStore, hostkey HostKeyGate, n *runs.NoticeStore, pub live.Publisher) {
+	if questions == nil || hostkey == nil {
+		return
+	}
+	target := hostkey.Target()
+	if target == "" {
+		return
+	}
+	q, err := questions.ApprovedHostKeyQuestion(target)
+	if err != nil || q == nil {
+		return
+	}
+	acceptErr := hostkey.Accept(ctx, q.HostKeyFingerprint)
+	_ = questions.Resolve(q.ID) // single-use: consumed whether it took or was refused
+	if acceptErr != nil {
+		// The key changed again since the approval, or could not be read: name it, do not trust it.
+		notify(n, runs.NoticeProdHostKeyChanged, q.Repo, "the approval of the production host key could NOT be applied: "+acceptErr.Error()+
+			" — nothing was trusted; the next production send will surface the key now present so it can be approved afresh.")
+		publishDeliveries(pub)
+		return
+	}
+	notify(n, runs.NoticeProdHostKeyAccepted, q.Repo, fmt.Sprintf("the new ssh host key of the production target %q was approved and recorded (%s); "+
+		"the held production sends resume on this pass.", target, q.HostKeyFingerprint))
+	publishDeliveries(pub)
+}
+
+// raiseHostKeyQuestion asks the user, ONCE per host, to deliberately approve the changed production
+// host key — the same Blocked/approval path the root-wrapper renewal uses (task part 2.8: reuse the
+// existing approval, do not build a second one beside it). It reads (does not trust) the fingerprint
+// the target now presents and pins the question to it, so the later approval covers exactly that key.
+// A question already open for the host is left as is (asked once); if the key cannot even be read,
+// no question is raised this pass (there is nothing to pin) — the distinct notice already told the
+// user, and a later pass retries the read.
+func raiseHostKeyQuestion(ctx context.Context, questions *runs.QuestionStore, hostkey HostKeyGate, target, repo string) {
+	if questions == nil || hostkey == nil || target == "" {
+		return
+	}
+	if existing, err := questions.OpenHostKeyQuestion(target); err != nil || existing != nil {
+		return
+	}
+	fp, err := hostkey.ScanFingerprint(ctx)
+	if err != nil || fp == "" {
+		return // cannot read the new key to pin it — the notice stands; a later pass tries again
+	}
+	_, _ = questions.Raise(runs.Question{
+		QKind:              runs.QuestionProdHostKey,
+		Repo:               repo,
+		RunTitle:           "Production host key",
+		HostKeyTarget:      target,
+		HostKeyFingerprint: fp,
+		Question: fmt.Sprintf("The production target %q presents a NEW ssh host key (fingerprint %s). "+
+			"Every production delivery is held until this key is deliberately approved — it is never trusted "+
+			"silently. Approve ONLY if you can confirm the host was reinstalled (or the key otherwise changed "+
+			"for a reason you know); a key that changed without cause is exactly the interception this check "+
+			"guards against.", target, fp),
+		Recommendation: "If the production machine was just reinstalled, verify this fingerprint against the host " +
+			"out-of-band (e.g. on its console) and approve. Otherwise do NOT approve — investigate why the key changed.",
+		Detail: fmt.Sprintf("host: %s\nnew key fingerprint: %s\n\nApproving records this exact key in the durable "+
+			"known-hosts file. The acceptance re-reads the host's key at apply time and refuses to install it if it "+
+			"no longer matches this fingerprint, so the approval covers this one key only.", target, fp),
+	})
+}
+
+// prodHostKeyChangedText is the disturbance the user sees when the production host key changed — its
+// OWN reason, stating the effect (production delivery is held) and the cause (a reinstalled or
+// intercepted host), never a masked connection error.
+func prodHostKeyChangedText(target, reason string) string {
+	return fmt.Sprintf("production delivery is HELD: the ssh host key of the production target %q has CHANGED. "+
+		"The machine was reinstalled, or the connection is being intercepted — this is NOT a plain connection "+
+		"failure. Nothing is trusted automatically; approve the new key on the Blocked surface after confirming it, "+
+		"and the held sends resume. (%s)", target, reason)
 }
 
 // orFirst keeps the FIRST error of a pass, so a later one does not mask the one that started it.

@@ -635,7 +635,14 @@ func (s *Server) MaintainProdDeliveries(ctx context.Context) error {
 	if s.broker != nil {
 		pub = s.broker
 	}
-	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, pub)
+	// The host-key gate is armed only when production names a receiver host: a changed key on that host
+	// is then given its own reason and a deliberate approval. A nil gate (production unarmed) leaves the
+	// change reported but unaccepted — nothing is trusted without a target to verify against.
+	var hostkey deliver.HostKeyGate
+	if recv := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_RECV")); recv != "" {
+		hostkey = deploy.NewHostKeyManager(recv, s.paths.ProdKnownHosts())
+	}
+	return deliver.MaintainProd(ctx, chainDeploy{d: deps}, s.deliveries, s.prodState, s.results, s.runNotices, pub, s.runQuestions, hostkey)
 }
 
 // protectionEnforcementArmed reports whether the operator has armed protection WRITES.
