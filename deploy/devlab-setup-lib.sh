@@ -158,3 +158,74 @@ setup_unit_declares_user() {
   local file="$1" repo="$2"
   grep -Eq "^[[:space:]]*User[[:space:]]*=[[:space:]]*${repo}[[:space:]]*$" -- "$file"
 }
+
+# setup_unit_state <unit-name> <unit-dir> [<systemctl>] — the ONE first-time-vs-update-vs-foreign
+# judgement, asked of SYSTEMD (setup_fragment_path), not of a directory, so a vendor unit under /lib
+# or /usr/lib is seen and can be refused instead of silently shadowed. It echoes exactly one word so
+# every consumer branches the same way instead of copying the case:
+#   first           no unit anywhere — a first-time setup.
+#   update          OUR unit (its fragment is <unit-dir>/<unit-name>.service, or systemd names none
+#                   but the unit file is already present) — replace the program and restart.
+#   foreign:<path>  a fragment OUTSIDE <unit-dir> holds the name — the caller refuses (it neither
+#                   shadows nor overwrites a unit that is not its own).
+# Always returns 0; the caller maps the word to its own die/exit code, so the receiver's generic
+# service branch and its self-repo branch keep their established exit codes while sharing the one
+# rule. The unit NAME is a parameter because the self repo's daemon (devlabd) is not named after its
+# repository (devlab) — the judgement must not assume unit-name == repo-name.
+setup_unit_state() {
+  local unit="$1" unit_dir="$2" systemctl="${3:-systemctl}"
+  local unit_file="$unit_dir/${unit}.service" frag
+  frag="$(setup_fragment_path "$unit" "$systemctl")"
+  case "$frag" in
+    "$unit_file") echo update ;;
+    "")           if [ -e "$unit_file" ]; then echo update; else echo first; fi ;;
+    *)            echo "foreign:$frag" ;;
+  esac
+}
+
+# setup_install_rights <rights-file> <perms-dir> <name> — install a DELIVERED rights manifest (a
+# validated file COPY, never executed) into <perms-dir>/<name>.json and ensure the hp_* system groups
+# it declares exist. The manifest layout and its grouping are identical for every service, so the
+# receiver's generic branch and its self-repo branch install rights through this ONE function rather
+# than each carrying its own copy of the grep+groupadd.
+setup_install_rights() {
+  local rights="$1" perms_dir="$2" name="$3" g
+  install -d -m 0755 "$perms_dir"
+  install -m 0644 "$rights" "$perms_dir/$name.json"
+  grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$rights" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
+    while read -r g; do groupadd -f "$g"; done
+}
+
+# setup_install_route <route-file> <route-dest> <conf-dir> <caddy-bin> <caddy-main> <systemctl> [unwind ...]
+# Install a DELIVERED edge route into the SHARED route directory and prove the ASSEMBLED edge still
+# validates before reloading it. The route directory is shared by every service of the host, so an
+# unparseable file of ours would break the whole edge at the next reload: the route is validated IN
+# PLACE and taken back out — together with every <unwind> file the caller names (e.g. the unit it just
+# wrote) — on any failure, so the edge keeps its last good configuration. The reason is printed to
+# stderr; the exit code lets the caller keep its own contract:
+#   0  installed and the edge reloaded.
+#   2  no route directory on this host — nothing installed (a delivered route is optional; the caller
+#      decides whether that is fatal, and never creates the shared edge itself).
+#   4  the assembled edge did not validate with the route, or caddy did not reload — an external-tool
+#      failure; the route and the unwind files were removed.
+#   5  the shared edge cannot be validated at all (no caddy / no main Caddyfile) — a config-state
+#      failure; refusing to write into a directory serving every other service. Route removed.
+setup_install_route() {
+  local route="$1" dest="$2" conf_dir="$3" caddy_bin="$4" caddy_main="$5" systemctl="$6"; shift 6
+  local unwind=("$@") out
+  [ -d "$conf_dir" ] || return 2
+  install -o root -g root -m 0644 "$route" "$dest"
+  if command -v "$caddy_bin" >/dev/null 2>&1 && [ -f "$caddy_main" ]; then
+    if ! out="$("$caddy_bin" validate --config "$caddy_main" 2>&1)"; then
+      rm -f "$dest" "${unwind[@]}"
+      echo "the edge configuration does not validate with the delivered route — route and unit removed, edge untouched: $(printf '%s' "$out" | tail -n 3)" >&2
+      return 4
+    fi
+  else
+    rm -f "$dest" "${unwind[@]}"
+    echo "cannot validate the shared edge configuration ($caddy_bin / $caddy_main) — refusing to write into a config directory serving every other service" >&2
+    return 5
+  fi
+  "$systemctl" reload caddy || { rm -f "$dest" "${unwind[@]}"; echo "caddy reload failed — route and unit removed so the edge keeps its last good configuration" >&2; return 4; }
+  return 0
+}

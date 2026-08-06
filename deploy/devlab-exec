@@ -184,13 +184,31 @@ case "$verb" in
     [ -d "$art" ] || die "no artifact at $art — build before emitting setup"
     dst="$art/setup"
     rm -rf -- "$dst"; mkdir -p -- "$dst"
-    setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
-    setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
+    # A uniform service's unit is GENERATED from the shared template with the resolved port. The self
+    # repo is the one exception, and only in the SHAPE of its unit: its daemon (devlabd) is not named
+    # after the repository and its unit is a CHECKED-IN template (deploy/<repo>d.service) with a fixed
+    # loopback address, tuned for a service that escalates through the pinned sudo wrappers — the
+    # generated locked-down template cannot run it. So when the checkout carries deploy/<repo>d.service
+    # we EMIT that unit under its real name (<repo>d.service) and take the route's port FROM the unit
+    # itself, so the two always agree; the <port> argument (an atlas proposal) is irrelevant for a
+    # daemon whose port is fixed. The receiver installs whichever unit is emitted, unchanged.
+    self_unit="$wt/deploy/${repo}d.service"
+    if [ -f "$self_unit" ]; then
+      cp -- "$self_unit" "$dst/${repo}d.service"
+      uport="$(grep -oE 'DEVLAB_ADDR=[^[:space:]]+' -- "$self_unit" | head -n1 | grep -oE '[0-9]+$' || true)"
+      [ -n "$uport" ] || die "could not read the listen port from $self_unit (expected an Environment=DEVLAB_ADDR=host:port line)"
+      setup_route_text "$repo" "$uport" > "$dst/${repo}.caddy"
+      emit_port="$uport"
+    else
+      setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
+      setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
+      emit_port="$port"
+    fi
     # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
     if [ -f "$wt/permissions/${repo}.json" ]; then
       cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
     fi
-    echo "devlab-exec: emitted setup product for '$repo' (port $port) into $dst"
+    echo "devlab-exec: emitted setup product for '$repo' (port $emit_port) into $dst"
     ;;
 
   *)

@@ -152,18 +152,118 @@ SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}
 . "$SETUP_LIB"
 
 # Install the prebuilt artifact into concrete prod paths + unit. NO build, and no per-repo
-# scripts (B-44): every uniform service takes the ONE generic branch below; only the self repo
-# has a different artifact shape (daemon + web SPA) and therefore its own layout.
+# scripts (B-44). BOTH branches below reach the SAME first-time-vs-update-vs-foreign decision
+# (setup_unit_state) and install the delivered unit/route/rights through the SAME shared helpers
+# (setup_install_route / setup_install_rights) — the self repo is not a second, hand-written setup
+# path, only a different LAYOUT: its daemon is named devlabd and lives in /usr/local/bin, and it
+# carries a dashboard SPA served from the web root. Everything that is not forced by that layout
+# falls back into the common way.
 case "$REPO" in
   devlab)
-    BIN="$real/devlabd"; WEB="$real/web"
-    [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
-    [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
-    run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
-    run mkdir -p "$WWW_DIR"
-    run rsync -a --delete "$WEB"/ "$WWW_DIR"/
-    run "$SYSTEMCTL" restart devlabd
-    prove_running devlabd
+    # THE ONE genuine special case, and only in its LAYOUT: the self repo's artifact is a daemon PLUS
+    # a web SPA, so (1) the daemon is named devlabd and installs to /usr/local/bin/devlabd — the unit
+    # is named after the daemon, not the repository — and (2) the dashboard SPA is mirrored into the
+    # host web root the edge serves, not proxied to a loopback port. NOT special: the decision between
+    # first-time and update, the refusal of a foreign unit, and the way the delivered unit/route/rights
+    # are installed — all shared with the generic branch below. This is the parity that was missing:
+    # before, devlab only ever `systemctl restart devlabd`, so on a bare host it failed "Unit not found".
+    #
+    # The (re)start is the EXISTING handover, never a second path: this receiver runs as the ssh forced
+    # command, a separate root process from devlabd, so `systemctl start/restart devlabd` drives the
+    # (re)start from OUTSIDE the daemon's own process — nothing restarts inline. That one handover
+    # serves both the first-time start and the update restart.
+    SELF_UNIT="devlabd"
+    BIN="$real/${SELF_UNIT}"; WEB="$real/web"
+    [[ -f "$BIN" ]] || die "staged self binary missing: $BIN" 10
+    [[ -d "$WEB" ]] || die "staged self web dir missing:  $WEB" 10
+
+    UNIT_FILE="$UNIT_DIR/${SELF_UNIT}.service"
+    state="$(setup_unit_state "$SELF_UNIT" "$UNIT_DIR" "$SYSTEMCTL")"
+    case "$state" in
+      first)     FIRST_TIME=1 ;;
+      update)    FIRST_TIME=0 ;;
+      foreign:*) die "unit ${SELF_UNIT}.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
+      *)         die "could not determine the state of ${SELF_UNIT}.service" 4 ;;
+    esac
+
+    if [ "$FIRST_TIME" = 1 ]; then
+      # ── FIRST-TIME SETUP — install the DELIVERED unit/route/rights (the receiver erzeugt nichts) ──
+      log "Erstinstallation of 'devlab' — no ${SELF_UNIT} unit on this host; installing the delivered setup product"
+      SETUP="$real/setup"
+      DELIV_UNIT="$SETUP/${SELF_UNIT}.service"
+      [ -d "$SETUP" ] || die "first-time setup of 'devlab' needs a delivered setup/ in the artifact, but none was shipped — the build did not attach the unit (a change without its delivery is a failure)" 10
+      [ -f "$DELIV_UNIT" ] || die "first-time setup of 'devlab' has no delivered unit at $DELIV_UNIT" 10
+      # The delivered unit must run as its OWN account (User=devlab) — the same gate the generic branch
+      # applies; a unit that starts something else or runs as root is never installed.
+      setup_unit_declares_user "$DELIV_UNIT" "devlab" \
+        || die "delivered unit $DELIV_UNIT does not run as 'User=devlab' — refusing (a unit that starts something else or runs as root is not installed)" 2
+
+      DELIV_ROUTE="$SETUP/devlab.caddy"
+      DELIV_RIGHTS="$SETUP/devlab.json"
+
+      if [ "$CHECK" = 1 ]; then
+        echo "PLAN: Erstinstallation of 'devlab' (no ${SELF_UNIT} unit on this host)"
+        echo "PLAN: create nologin system account 'devlab' (home /var/lib/devlab) if missing; add it to group 'holistic' when that group exists"
+        echo "PLAN: install self binary $BIN -> /usr/local/bin/${SELF_UNIT}"
+        echo "PLAN: mirror web SPA $WEB -> $WWW_DIR (the dashboard the edge serves)"
+        echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=devlab)"
+        [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/devlab.caddy (caddy validate + reload; unwind on failure)" \
+                              || echo "PLAN: no delivered route in the artifact — none installed"
+        [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/devlab.json + groupadd its hp_* groups" \
+                               || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
+        echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable ${SELF_UNIT} && $SYSTEMCTL start ${SELF_UNIT} (the existing handover restart, driven from outside the daemon)"
+        prove_running "$SELF_UNIT"
+        echo "PLAN: prod deploy of 'devlab' done (first-time setup)"
+        exit 0
+      fi
+
+      setup_ensure_account "devlab"
+      # devlabd reads the landscape's shared session secret through the 'holistic' group
+      # (SupplementaryGroups=holistic in its unit). Join it when the landscape has provisioned that
+      # group; warn otherwise — exactly as the interactive `service setup` does. The 'holistic' group is
+      # a landscape prerequisite, not this receiver's to invent (Keine Instanz-Spezifika).
+      if getent group holistic >/dev/null 2>&1; then
+        usermod -aG holistic devlab || true
+      else
+        log "group 'holistic' is missing — devlabd cannot read the shared session secret until the landscape provides it"
+      fi
+
+      install -o root -g root -m 0755 "$BIN" "/usr/local/bin/${SELF_UNIT}"
+      mkdir -p "$WWW_DIR"
+      rsync -a --delete "$WEB"/ "$WWW_DIR"/
+      install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
+
+      # Route + rights: the SAME shared helpers the generic branch uses (no second copy of the
+      # shared-edge validate/unwind or the rights grep+groupadd). A delivered route is optional; a
+      # missing route DIR is logged and the install continues, any harder failure unwinds and exits.
+      if [ -f "$DELIV_ROUTE" ]; then
+        rc=0
+        setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/devlab.caddy" "$CADDY_CONF" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" || rc=$?
+        case "$rc" in
+          0) : ;;
+          2) log "no route dir at $CADDY_CONF — delivered route NOT installed" ;;
+          *) exit "$rc" ;;
+        esac
+      fi
+      if [ -f "$DELIV_RIGHTS" ]; then
+        setup_install_rights "$DELIV_RIGHTS" "$PERMS_DIR" "devlab"
+      else
+        log "no delivered rights for 'devlab' — installed without declared rights"
+      fi
+
+      "$SYSTEMCTL" daemon-reload
+      "$SYSTEMCTL" enable "$SELF_UNIT" >/dev/null 2>&1 || true
+      "$SYSTEMCTL" start "$SELF_UNIT"
+      prove_running "$SELF_UNIT"
+    else
+      # ── UPDATE — the unit already exists: replace program + web and hand the restart to systemd ──
+      log "Aktualisierung of 'devlab' — ${SELF_UNIT} already present; replacing the program + web and restarting"
+      run install -o root -g root -m 0755 "$BIN" "/usr/local/bin/${SELF_UNIT}"
+      run mkdir -p "$WWW_DIR"
+      run rsync -a --delete "$WEB"/ "$WWW_DIR"/
+      run "$SYSTEMCTL" restart "$SELF_UNIT"
+      prove_running "$SELF_UNIT"
+    fi
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
@@ -172,16 +272,15 @@ case "$REPO" in
     gbin="$real/${REPO}d"
     [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
 
-    # FIRST-TIME vs UPDATE is decided by systemd, not by a path: `systemctl show -p FragmentPath` sees a
-    # vendor unit under /lib or /usr/lib that a test on $UNIT_DIR would miss. Our own unit (or one we
-    # already installed) → UPDATE. No unit at all → FIRST-TIME. A FOREIGN unit → refuse: we neither
-    # shadow nor overwrite a unit that is not ours (the same refusal devlab-install makes).
+    # FIRST-TIME vs UPDATE vs FOREIGN is the shared judgement (setup_unit_state), asked of systemd and
+    # not of a path: a vendor unit under /lib or /usr/lib is seen and REFUSED, never silently shadowed.
     UNIT_FILE="$UNIT_DIR/${REPO}.service"
-    frag="$(setup_fragment_path "$REPO" "$SYSTEMCTL")" || die "could not ask systemd about ${REPO}.service" 4
-    case "$frag" in
-      "$UNIT_FILE") FIRST_TIME=0 ;;
-      "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
-      *) die "unit ${REPO}.service already exists outside this receiver's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
+    state="$(setup_unit_state "$REPO" "$UNIT_DIR" "$SYSTEMCTL")"
+    case "$state" in
+      first)     FIRST_TIME=1 ;;
+      update)    FIRST_TIME=0 ;;
+      foreign:*) die "unit ${REPO}.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
+      *)         die "could not determine the state of ${REPO}.service" 4 ;;
     esac
 
     if [ "$FIRST_TIME" = 1 ]; then
@@ -195,7 +294,7 @@ case "$REPO" in
       # The delivered unit is NOT trusted blindly (the same three gates devlab-install applies):
       #  1) the NAME must pass the service grammar + reserved-identity list (shared rule);
       #  2) the unit must run as its OWN account — exactly `User=<repo>`, never root, never something else;
-      #  3) systemd must not already know a FOREIGN unit under this name (checked above — frag was empty).
+      #  3) systemd must not already know a FOREIGN unit under this name (checked above by setup_unit_state).
       setup_valid_repo_name "$REPO" || die "refusing first-time setup of '$REPO' (name/namespace)" 2
       setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
         || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
@@ -223,34 +322,17 @@ case "$REPO" in
       install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
       install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
-      # The route dir is SHARED by every service of the host: an unparseable file of ours breaks the
-      # whole edge at the next reload, so the ASSEMBLED config is validated first and OUR file is taken
-      # back out (with the freshly written unit) when it does not hold — the same guard devlab-install
-      # uses. A delivered route is optional; its failure is NAMED, never swallowed.
-      if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
-        ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
-        install -o root -g root -m 0644 "$DELIV_ROUTE" "$ROUTE_FILE"
-        unwind_first_time() { rm -f "$ROUTE_FILE" "$UNIT_FILE"; }
-        if command -v "$CADDY_BIN" >/dev/null 2>&1 && [ -f "$CADDY_MAIN" ]; then
-          if ! validate_out="$("$CADDY_BIN" validate --config "$CADDY_MAIN" 2>&1)"; then
-            unwind_first_time
-            die "the edge configuration does not validate with the delivered route — route and unit removed, edge untouched: $(printf '%s' "$validate_out" | tail -n 3)" 4
-          fi
-        else
-          unwind_first_time
-          die "cannot validate the shared edge configuration ($CADDY_BIN / $CADDY_MAIN) — refusing to write into a config directory serving every other service" 5
-        fi
-        "$SYSTEMCTL" reload caddy || { unwind_first_time; die "caddy reload failed — route and unit removed so the edge keeps its last good configuration" 4; }
-      elif [ -f "$DELIV_ROUTE" ]; then
-        log "no route dir at $CADDY_CONF — delivered route NOT installed"
+      if [ -f "$DELIV_ROUTE" ]; then
+        rc=0
+        setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/$REPO.caddy" "$CADDY_CONF" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" || rc=$?
+        case "$rc" in
+          0) : ;;
+          2) log "no route dir at $CADDY_CONF — delivered route NOT installed" ;;
+          *) exit "$rc" ;;
+        esac
       fi
-
-      # Rights manifest: a validated FILE COPY of the delivered manifest (never executed).
       if [ -f "$DELIV_RIGHTS" ]; then
-        install -d -m 0755 "$PERMS_DIR"
-        install -m 0644 "$DELIV_RIGHTS" "$PERMS_DIR/$REPO.json"
-        grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$DELIV_RIGHTS" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
-          while read -r g; do groupadd -f "$g"; done
+        setup_install_rights "$DELIV_RIGHTS" "$PERMS_DIR" "$REPO"
       else
         log "no delivered rights for '$REPO' — installed without declared rights"
       fi
