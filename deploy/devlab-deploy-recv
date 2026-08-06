@@ -32,9 +32,13 @@
 #             4 external tool failed (caddy) · 5 rrsync missing / foreign unit / missing setup library ·
 #             10 staged input missing · 11 unit did not come up after start.
 #
-# Install (on the VPS): sudo install -o root -g root -m 0755 devlab-deploy-recv /usr/local/sbin/devlab-deploy-recv
-#   and, beside it, the shared library:
-#   sudo install -o root -g root -m 0644 devlab-setup-lib.sh /usr/local/sbin/devlab-setup-lib.sh
+# Install/refresh (on the VPS) with the ONE self-checking script beside this file — it installs this
+# receiver AND the shared library together, backs up what it replaces, proves the result, and can
+# bring already-staged services up in the same pass (Handarbeit kommt als Skript):
+#   sudo /path/to/deploy/devlab-install-recv [service ...]
+# This receiver cannot deliver itself: the deploy key behind it is a forced command limited to
+# rsync-into-staging and install-trigger, so a new receiver version reaches this host only through
+# that operator script (backend/internal/deploy/wrappers.go — selfWrappers deliberately excludes it).
 set -euo pipefail
 
 # The ONE state-root derivation shared by every DevLab wrapper (devlab-install, devlab-exec,
@@ -131,7 +135,8 @@ real="$(realpath -e -- "$SRC" 2>/dev/null)" || die "no staged artifact for '$REP
 rootreal="$(realpath -e -- "$STAGING_ROOT")"
 case "$real/" in "$rootreal"/*) : ;; *) die "staged path escapes staging root" 2 ;; esac
 
-log "install-only prod deploy of '$REPO' from $real${CHECK:+ (dry-run)}"
+dryrun_note=""; [ "$CHECK" = 1 ] && dryrun_note=" (dry-run)"
+log "install-only prod deploy of '$REPO' from $real$dryrun_note"
 
 # The shared first-time SETUP product + rules — the SAME library devlab-install sources on the dev host,
 # so the receiver INSTALLS exactly what that one template produced and applies the identical name,
