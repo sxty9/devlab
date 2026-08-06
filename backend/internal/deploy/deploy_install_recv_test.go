@@ -10,6 +10,7 @@ package deploy
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -258,5 +259,172 @@ func TestProvisionRefusesBadKey(t *testing.T) {
 				t.Errorf("the refusal must name %q, got:\n%s", c.want, res.out)
 			}
 		})
+	}
+}
+
+// ── the edge shape: the delivered routes must have a site block to live in ──────────────────────────
+// The receiver drops each service's route into the route directory as a NAKED `handle` block, valid in
+// Caddy only INSIDE a site block. Provisioning must therefore build the edge as a site block that
+// imports the route directory from inside it — not as a bare top-level import (the state that made
+// every first install fail with "ambiguous site definition" on a freshly built host).
+
+// The built edge is a SITE BLOCK whose body imports the route directory — the import is indented inside
+// braces, never a bare top-level directive.
+func TestProvisionEdgeWrapsRoutesInSiteBlock(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey); res.exit != 0 {
+		t.Fatalf("provisioning must succeed: %d\n%s", res.exit, res.out)
+	}
+	edge, err := os.ReadFile(caddyMain)
+	if err != nil {
+		t.Fatalf("Caddyfile not written: %v", err)
+	}
+	s := string(edge)
+	conf := env["DEVLAB_CADDY_CONF"]
+	// the import lives on an INDENTED line (inside the site block), never at column zero.
+	if !strings.Contains(s, "\n\timport "+conf+"/*.caddy") {
+		t.Errorf("the route import must be indented inside a site block, got:\n%s", s)
+	}
+	// a site block opens and closes, and the static fallback is present (as a grown holistic host has).
+	for _, want := range []string{"{", "\n}", "file_server"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("the edge must be a site block with a file_server fallback (missing %q):\n%s", want, s)
+		}
+	}
+}
+
+// Ubuntu's shipped example Caddyfile (root * /usr/share/caddy) is NOT the holistic edge; provisioning
+// replaces it (backing it up) rather than appending an import beside its site block — the appended-import
+// state is exactly what failed. This models the freshly built host the bug report measured.
+func TestProvisionReplacesUbuntuExample(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ubuntu := ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n"
+	if err := os.WriteFile(caddyMain, []byte(ubuntu), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit != 0 {
+		t.Fatalf("provisioning over Ubuntu's example must succeed: %d\n%s", res.exit, res.out)
+	}
+	edge, _ := os.ReadFile(caddyMain)
+	if strings.Contains(string(edge), "/usr/share/caddy") {
+		t.Errorf("Ubuntu's example must be replaced, not kept:\n%s", string(edge))
+	}
+	if !strings.Contains(string(edge), "import "+env["DEVLAB_CADDY_CONF"]+"/*.caddy") {
+		t.Errorf("the replacement must import the route directory:\n%s", string(edge))
+	}
+	if !strings.Contains(res.out, "replaced Ubuntu's shipped example") {
+		t.Errorf("the replacement must be named:\n%s", res.out)
+	}
+	if m, _ := filepath.Glob(caddyMain + ".bak-*"); len(m) == 0 {
+		t.Errorf("the replaced Ubuntu example must be backed up first:\n%s", res.out)
+	}
+}
+
+// A grown holistic edge — one that already imports the route directory from inside a site block, as the
+// home host does — is left EXACTLY as it is and named, never overwritten (the home host must keep
+// running unchanged when its shape is adopted as the source).
+func TestProvisionKeepsGrownEdge(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	conf := env["DEVLAB_CADDY_CONF"]
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grown := "example.test {\n\timport " + conf + "/*.caddy\n\thandle /api/* {\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n\thandle {\n\t\troot * /opt/holistic/www\n\t\tfile_server\n\t}\n}\n"
+	if err := os.WriteFile(caddyMain, []byte(grown), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit != 0 {
+		t.Fatalf("provisioning over a grown edge must succeed: %d\n%s", res.exit, res.out)
+	}
+	edge, _ := os.ReadFile(caddyMain)
+	if string(edge) != grown {
+		t.Errorf("a grown edge must be left byte-for-byte unchanged, got:\n%s", string(edge))
+	}
+	if !strings.Contains(res.out, "left untouched (a grown") {
+		t.Errorf("keeping a grown edge must be named:\n%s", res.out)
+	}
+}
+
+// A foreign Caddyfile — one that is neither Ubuntu's example nor a holistic edge and does not import the
+// route directory — is NAMED and refused, never destroyed. The operator reconciles it by hand.
+func TestProvisionRefusesForeignEdge(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "someones.site {\n\treverse_proxy 127.0.0.1:3000\n}\n"
+	if err := os.WriteFile(caddyMain, []byte(foreign), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit == 0 {
+		t.Fatalf("provisioning must refuse a foreign edge (exit != 0):\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "refusing to overwrite a foreign edge") {
+		t.Errorf("the refusal must be named:\n%s", res.out)
+	}
+	if edge, _ := os.ReadFile(caddyMain); string(edge) != foreign {
+		t.Errorf("a foreign edge must be left untouched, got:\n%s", string(edge))
+	}
+}
+
+// bashRenderTemplate sources the shared library and echoes ONE template function's output — proving the
+// caddy tests below run against the SAME template the receiver and installer use, not a Go copy of it.
+func bashRenderTemplate(t *testing.T, call string) string {
+	t.Helper()
+	lib := filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh")
+	out, err := exec.Command("bash", "-c", ". "+lib+" && "+call).CombinedOutput()
+	if err != nil {
+		t.Fatalf("rendering %q failed: %v\n%s", call, err, out)
+	}
+	return string(out)
+}
+
+// DECISIVE, against the real caddy: the edge shell the template builds VALIDATES with a delivered route
+// present, and the old bare-top-level-import shape does NOT ("ambiguous site definition"). This is the
+// bug and its fix, proven at the level caddy actually parses — not a claim on an empty edge.
+func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
+	if _, err := exec.LookPath("caddy"); err != nil {
+		t.Skip("caddy not installed — the shape is proven by the seam tests above")
+	}
+	root := t.TempDir()
+	conf := filepath.Join(root, "conf.d")
+	www := filepath.Join(root, "www")
+	if err := os.MkdirAll(conf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(www, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// a delivered route, from the very template the receiver drops into conf.d.
+	route := bashRenderTemplate(t, "setup_route_text prizm 18811")
+	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(route), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	validate := func(caddyfile string) (string, bool) {
+		p := filepath.Join(root, "Caddyfile")
+		if err := os.WriteFile(p, []byte(caddyfile), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("caddy", "validate", "--config", p, "--adapter", "caddyfile").CombinedOutput()
+		return string(out), err == nil
+	}
+
+	// The FIX: the edge shell from the shared template, WITH the delivered route present, must validate.
+	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www)
+	if out, ok := validate(edge); !ok {
+		t.Fatalf("the holistic edge shell must validate WITH a delivered route present:\n%s", out)
+	}
+
+	// The DEFECT: Ubuntu's example plus a bare top-level import beside it (what --provision used to
+	// leave) must be rejected — the delivered route cannot live at top level next to a site block.
+	broken := ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n\nimport " + conf + "/*.caddy\n"
+	if out, ok := validate(broken); ok {
+		t.Fatalf("the old bare-top-level-import edge must NOT validate (that was the bug):\n%s", out)
 	}
 }

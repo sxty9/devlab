@@ -86,7 +86,9 @@ STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
 STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
 WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 # The edge the receiver reloads. conf.d holds the per-service routes the receiver drops in; the main
-# Caddyfile must import them. Instance-neutral defaults; the receiver reads the same env at run time.
+# Caddyfile is a site block that imports them from INSIDE it (each route is a naked handle, valid only
+# inside a site block — see setup_edge_caddyfile_text). Instance-neutral defaults; the receiver reads
+# the same env at run time.
 CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
 CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
@@ -221,6 +223,15 @@ done
 bash -n -- "$SRC_DIR/$RECV" || die "$SRC_DIR/$RECV does not parse — refusing to install a broken receiver"
 bash -n -- "$SRC_DIR/$LIB"  || die "$SRC_DIR/$LIB does not parse — refusing to install a broken library"
 
+# The edge shell the receiver's routes must live in is authored by ONE template, shared with the route
+# it must contain (setup_route_text / setup_edge_caddyfile_text in the library beside us). We source the
+# library so --provision builds the edge from that one source rather than a second, hand-written shape.
+# shellcheck source=/dev/null
+. "$SRC_DIR/$LIB" || die "could not source $SRC_DIR/$LIB — the edge shell and route templates are unavailable"
+# A port used only to PROVE the edge accepts a route (a probe route is dropped in, the edge is validated
+# with it, and it is removed). It is never served; any valid port number does.
+CADDY_PROBE_PORT="${DEVLAB_CADDY_PROBE_PORT:-65535}"
+
 # backup_file <abs> — record a timestamped backup of an arbitrary file we are about to change (or note
 # its absence), so the rollback can restore the host exactly. Idempotent callers back up once.
 backup_file() {
@@ -312,42 +323,91 @@ ensure_roots() {
   install -d "${own[@]}" -m 0755 "$WWW_DIR"      && log "web root ready:     $WWW_DIR"
 }
 
-# ensure_caddy — the edge. Caddy must be installed, its conf.d route directory must exist, and the main
-# Caddyfile must IMPORT that directory so the per-service routes the receiver drops in take effect. A
-# pre-existing Caddyfile is backed up before the import line is added; the assembled config is validated
-# before caddy is (re)started, so a bad edit never leaves the edge broken (fail-closed).
+# caddy_validates_with_probe — PROVE the edge accepts a route, not merely that it parses empty (an empty
+# edge validates even when its shape cannot hold a single delivered route — the exact defect this fixes).
+# A probe route (the very shape setup_route_text emits) is dropped into the route directory, the ASSEMBLED
+# edge is validated with it present, and the probe is ALWAYS removed. Returns caddy's verdict. Requires
+# the real caddy; callers gate it behind the test seam. If a probe cannot be written, that is itself a
+# failure (return 2), never a silent pass.
+caddy_validates_with_probe() {
+  local probe="$CADDY_CONF/zz-devlab-provision-probe.caddy"
+  setup_route_text "devlabprovisionprobe" "$CADDY_PROBE_PORT" > "$probe" 2>/dev/null \
+    || { rm -f -- "$probe"; return 2; }
+  local rc=0
+  "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1 || rc=1
+  rm -f -- "$probe"
+  return "$rc"
+}
+
+# edge_imports_holistic_routes <file> — true when the edge already pulls in our route directory (the
+# grown holistic edge, e.g. the home host, does this inside its site block). Matched loosely so a grown
+# file that imports the same directory under a slightly different spelling still counts.
+edge_imports_holistic_routes() {
+  grep -Eq "^[[:space:]]*import[[:space:]]+.*${CADDY_CONF//\//\\/}/\*\.caddy" -- "$1" 2>/dev/null
+}
+
+# ensure_caddy — the edge, built in THE shape the delivered routes require. Caddy must be installed and
+# its route directory must exist; the main Caddyfile must be a SITE BLOCK that imports that directory
+# from INSIDE it (setup_edge_caddyfile_text — the one source, shared with the route it contains), not a
+# bare top-level import beside some other site block. What it does with a pre-existing Caddyfile depends
+# on what that file IS (test c — a grown edge is named and kept, not destroyed):
+#   * our own shell already in place            → left untouched (idempotent).
+#   * Ubuntu's shipped example (root * /usr/share/caddy), with or without our old top-level import
+#     appended — the very state that fails today → REPLACED; Ubuntu's example is not the holistic edge.
+#   * our own OLDER output (carries our marker)  → REPLACED (self-heal a shell we wrote before this fix).
+#   * a grown holistic edge that imports our routes → kept if it validates WITH a route; a grown edge
+#     that does NOT is NAMED and refused, never silently overwritten (the home host must stay unchanged).
+#   * any other foreign Caddyfile               → NAMED and refused (never destroyed).
+# Every replacement backs the old file up first; the assembled edge is proven to validate WITH a route
+# before the running edge is touched, so a bad shape never reaches the live edge (fail-closed).
 ensure_caddy() {
   command -v "$CADDY_BIN" >/dev/null 2>&1 || pkg_install caddy
   local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
   install -d "${own[@]}" -m 0755 "$CADDY_CONF" && log "edge route dir ready: $CADDY_CONF"
 
-  local import_line="import ${CADDY_CONF}/*.caddy"
-  if [ -f "$CADDY_MAIN" ]; then
-    if grep -Fqx -- "$import_line" "$CADDY_MAIN"; then
-      log "Caddyfile already imports $CADDY_CONF — left untouched"
+  local desired; desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$WWW_DIR")"
+  local seam=0; [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && seam=1
+
+  write_edge() {  # back up (backup_file notes absence too, so rollback removes what we create), then write
+    backup_file "$CADDY_MAIN"
+    install -d "${own[@]}" -m 0755 "$(dirname -- "$CADDY_MAIN")"
+    printf '%s\n' "$desired" > "$CADDY_MAIN"
+  }
+
+  if [ ! -f "$CADDY_MAIN" ]; then
+    write_edge
+    log "created the holistic edge shell at $CADDY_MAIN (a site block importing $CADDY_CONF)"
+  elif [ "$(cat -- "$CADDY_MAIN")" = "$desired" ]; then
+    log "the holistic edge shell is already in place at $CADDY_MAIN — left untouched"
+  elif grep -Fq -- "/usr/share/caddy" "$CADDY_MAIN"; then
+    write_edge
+    log "replaced Ubuntu's shipped example Caddyfile at $CADDY_MAIN with the holistic edge shell (the example is not the holistic edge; the delivered routes could not live beside it)"
+  elif grep -Fq -- "devlab-install-recv" "$CADDY_MAIN"; then
+    write_edge
+    log "replaced an older devlab-install-recv edge at $CADDY_MAIN with the current holistic edge shell (self-heal)"
+  elif edge_imports_holistic_routes "$CADDY_MAIN"; then
+    if [ "$seam" = 1 ] || caddy_validates_with_probe; then
+      log "found a grown edge at $CADDY_MAIN that already imports $CADDY_CONF and holds a delivered route — left untouched (a grown, working edge is not overwritten)"
     else
-      backup_file "$CADDY_MAIN"
-      printf '\n# added by devlab-install-recv --provision: pull in per-service routes\n%s\n' "$import_line" >> "$CADDY_MAIN"
-      log "added '$import_line' to $CADDY_MAIN"
+      die "found a grown edge at $CADDY_MAIN that imports $CADDY_CONF but does NOT validate with a delivered route — refusing to overwrite a hand-grown edge; reconcile it so the route import lives inside a single site block, then re-run"
     fi
   else
-    backup_file "$CADDY_MAIN"      # records absence, so rollback removes what we create
-    install -d "${own[@]}" -m 0755 "$(dirname -- "$CADDY_MAIN")"
-    printf '# created by devlab-install-recv --provision\n%s\n' "$import_line" > "$CADDY_MAIN"
-    log "created $CADDY_MAIN importing $CADDY_CONF"
+    die "found an existing Caddyfile at $CADDY_MAIN that is neither Ubuntu's example nor a holistic edge and does not import $CADDY_CONF — refusing to overwrite a foreign edge; move it aside (or make it import $CADDY_CONF from inside a site block) and re-run"
   fi
 
-  # Validate the ASSEMBLED config before touching the running edge (the same guard the receiver uses).
-  if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
-    "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1 \
-      || die "the edge configuration does not validate after the import was added — rolled back so the edge keeps its last good config"
+  # PROVE the assembled edge validates WITH a route before the running edge is touched (a leaf that only
+  # validates empty is exactly the defect this fixes), then bring the edge up. Skipped in the test seam,
+  # which has no caddy; the seam checks the written shape textually in the self-check below.
+  if [ "$seam" != 1 ]; then
+    caddy_validates_with_probe \
+      || die "the edge configuration does not validate WITH a delivered route ($CADDY_MAIN) — rolled back so the edge keeps its last good config; a route dropped into $CADDY_CONF could not take effect"
     if command -v systemctl >/dev/null 2>&1; then
       systemctl enable caddy >/dev/null 2>&1 || true
       if systemctl is-active --quiet caddy; then
-        systemctl reload caddy || die "caddy reload failed after provisioning the edge"
-        log "caddy reloaded with the imported route directory"
+        systemctl reload caddy || die "caddy reload failed after building the edge"
+        log "caddy reloaded with the holistic edge shell"
       else
-        systemctl start caddy || die "caddy could not be started after provisioning the edge"
+        systemctl start caddy || die "caddy could not be started after building the edge"
         log "caddy started"
       fi
     fi
@@ -685,16 +745,21 @@ if [ "$PROVISION" = 1 ]; then
   [ -d "$WWW_DIR" ]      && sc_ok "web root exists ($WWW_DIR)"         || sc_fail "web root missing ($WWW_DIR)"
 fi
 
-# 6. the edge validates and its route directory is imported (needs the real caddy; skipped in the seam).
+# 6. the edge validates WITH a delivered route (not merely empty) and imports the route directory from
+#    inside a site block (needs the real caddy; the seam checks the written shape textually).
 if [ "$PROVISION" = 1 ]; then
   if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then
-    sc_skip "caddy validation (test seam has no caddy) — Caddyfile imports checked textually below"
-    grep -Fq -- "import ${CADDY_CONF}/*.caddy" "$CADDY_MAIN" 2>/dev/null && sc_ok "Caddyfile imports $CADDY_CONF" || sc_fail "Caddyfile does not import $CADDY_CONF"
-  elif command -v "$CADDY_BIN" >/dev/null 2>&1 && "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1; then
-    sc_ok "edge configuration validates ($CADDY_MAIN)"
+    sc_skip "caddy validation (test seam has no caddy) — edge shape checked textually below"
+    if grep -Fq -- "import ${CADDY_CONF}/*.caddy" "$CADDY_MAIN" 2>/dev/null && grep -Eq '^[^#]*\{[[:space:]]*$' "$CADDY_MAIN" 2>/dev/null; then
+      sc_ok "edge is a site block importing $CADDY_CONF ($CADDY_MAIN)"
+    else
+      sc_fail "edge does not import $CADDY_CONF from inside a site block ($CADDY_MAIN)"
+    fi
+  elif command -v "$CADDY_BIN" >/dev/null 2>&1 && caddy_validates_with_probe; then
+    sc_ok "edge configuration validates WITH a delivered route ($CADDY_MAIN)"
     command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet caddy && sc_ok "caddy is active" || sc_fail "caddy is not active"; }
   else
-    sc_fail "edge configuration does not validate ($CADDY_MAIN)"
+    sc_fail "edge configuration does not validate WITH a delivered route ($CADDY_MAIN) — a route dropped into $CADDY_CONF could not take effect"
   fi
 fi
 

@@ -16,6 +16,12 @@
 # foreign systemd unit, a unit that would not run as its own service account) live here too — so
 # devlab-install and devlab-deploy-recv can never drift apart on what a valid setup is.
 #
+# The route template's CONTAINER lives here too: a route is a naked `handle` block, valid only inside a
+# site block, so setup_edge_caddyfile_text — the edge shell that devlab-install-recv --provision builds
+# a bare host's edge from — sits beside setup_route_text. The container and its contents are one
+# contract; keeping them in one file is what stops --provision from erecting an edge the delivered
+# routes cannot live in.
+#
 # This file carries NO instance-specific value: every path is derived from the repo name (/opt/<repo>,
 # /var/lib/<repo>) exactly as the wrappers that source it do. It must be root-owned and world-readable
 # (mode 0755/0644), like the wrappers, so the unprivileged runner can source it during the build.
@@ -84,6 +90,10 @@ UNIT
 
 # setup_route_text <repo> <port> — THE edge route template. Maps the service's API prefix to its
 # loopback port; unit and route always carry the same port because they come from the same call.
+# It is a NAKED `handle` block — a Caddy directive with no surrounding site block — because it is
+# dropped into the shared route directory and IMPORTED into the edge's site block (see
+# setup_edge_caddyfile_text). A naked directive is valid ONLY inside a site block; that is the
+# contract these two templates share, and why they live together.
 setup_route_text() {
   local repo="$1" port="$2"
   cat <<ROUTE
@@ -92,6 +102,32 @@ handle /api/services/${repo}/* {
 	reverse_proxy 127.0.0.1:${port}
 }
 ROUTE
+}
+
+# setup_edge_caddyfile_text <conf_dir> <www_dir> [<site>] — THE host edge shell: the ONE site block
+# the per-service routes REQUIRE. Every route from setup_route_text is a naked `handle` block that is
+# valid only inside a site block, so the shell imports the whole route directory INSIDE one and adds a
+# static fallback for the dashboard. This is the SAME shape a grown holistic host carries (a site block
+# whose body imports conf.d and ends in a file_server), reduced to its instance-neutral core: no
+# hostname (the site is a bare port so no domain is baked in — Keine Instanz-Spezifika), the conf.d and
+# web paths supplied by the caller. It lives HERE, beside the route template, so the container and the
+# thing it must contain can never drift into two incompatible descriptions of the same edge.
+setup_edge_caddyfile_text() {
+  local conf_dir="$1" www_dir="$2" site="${3:-:80}"
+  cat <<EDGE
+# Managed by devlab-install-recv — the Holistic edge shell. The per-service routes the receiver drops
+# into ${conf_dir} are naked \`handle\` blocks; a naked directive is valid ONLY inside a site block, so
+# they are imported INSIDE one here. Never add a bare directive or a second site block beside this one:
+# Caddy refuses that as an ambiguous site definition and then NO delivered route validates. Regenerated
+# on --provision; do not edit by hand.
+${site} {
+	import ${conf_dir}/*.caddy
+	handle {
+		root * ${www_dir}
+		file_server
+	}
+}
+EDGE
 }
 
 # setup_ensure_account <repo> — the service's own identity: a nologin SYSTEM account whose home is

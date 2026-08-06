@@ -171,14 +171,21 @@ sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <path-to-deploy.pu
 It is one pass, idempotent, fail-closed and reversible, and it PROVES the result instead of claiming it.
 In that single run it: ensures `rrsync` is present (the receiver confines every rsync receive through
 it); creates the staging root it receives into and the web root it serves from (both derived from
-`DEVLAB_STATE_DIR`, overridable with `--staging` / `--www`); installs Caddy as the edge and makes the
-main Caddyfile import the per-service route directory the receiver drops routes into; writes the
-locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
+`DEVLAB_STATE_DIR`, overridable with `--staging` / `--www`); installs Caddy and builds the edge as a
+**site block** that imports the per-service route directory from INSIDE it (each route the receiver
+drops in is a naked `handle` block, valid in Caddy only inside a site block — the shell comes from the
+one template beside the route, `setup_edge_caddyfile_text`, so the container and its contents cannot
+drift). Ubuntu's shipped example Caddyfile is not the holistic edge and is replaced (backed up first),
+never appended to; a grown holistic edge that already imports the route directory and validates with a
+route is left untouched and named, and any other foreign Caddyfile is named and refused, never
+destroyed. It writes the locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
 the receiver login's `authorized_keys` (default `root`, override with `--recv-user`); and installs the
 receiver + shared library themselves (the SAME install path the receiver-only mode uses — no second
 copy). It closes with a self-check: `rrsync` resolves, the forced command actually rejects a shell
 request, the receiver and library carry the expected checksums, the staging and web roots exist, and
-the edge validates. Any failure is fail-closed (non-zero exit, nothing half-done). After it passes,
+the edge validates **with a delivered route present** (not merely empty — an empty edge validates even
+when its shape could not hold a single route). Any failure is fail-closed (non-zero exit, nothing
+half-done). After it passes,
 **no further step on the target is needed to accept a delivery** — arm the DEV side by naming this host
 in the environment (`DEVLAB_RUNS_PROD_TARGET`, `DEVLAB_RUNS_PROD_RECV`, `DEVLAB_RUNS_PROD_KEY`, §5).
 
