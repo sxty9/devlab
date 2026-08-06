@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# devlab-install-recv — install (or refresh) the prod-side deploy receiver on the PRODUCTION host,
+# in ONE self-checking pass. This is the "Handarbeit kommt als Skript" for the one root artifact the
+# delivery chain can NOT deliver to itself: devlab-deploy-recv (and the library it sources,
+# devlab-setup-lib.sh) live in /usr/local/sbin on the production host and are the forced command
+# behind the deploy key — that key can only rsync into staging and trigger an install, so it can
+# never overwrite the receiver with a new version (that would be self-escalation; see the receiver
+# header and backend/internal/deploy/wrappers.go, where `selfWrappers` deliberately EXCLUDES the
+# receiver). A receiver fix therefore reaches production ONLY through an operator with root on the
+# target running this script. Until it runs, a merged receiver fix has no effect in production.
+#
+# WHY THIS EXISTS: the first-time-setup fix (a service's systemd unit now travels in the delivery
+# artifact and the receiver installs it on first arrival) was merged, but every service that had
+# never been set up on the production host kept failing `systemctl restart <repo>: Unit not found`,
+# because the OLD receiver on the target only ever restarted an existing unit. This script puts the
+# fixed receiver on the target and, for each service named, brings it up from the artifact the last
+# (failed) send already staged — so the missing setup happens immediately instead of on the next
+# retry.
+#
+# RUN IT ON THE PRODUCTION HOST, AS ROOT, FROM A CHECKOUT OF THE MERGED STANDARD BRANCH:
+#     sudo /path/to/deploy/devlab-install-recv [service ...]
+#   e.g.  sudo ./deploy/devlab-install-recv prizm presentr
+# With no service names it installs/refreshes the receiver and proves it, but triggers no service.
+#
+# It is IDEMPOTENT (an already-current receiver is left untouched, only reported), FAIL-CLOSED (it
+# stops at the first problem rather than half-installing), and REVERSIBLE (every file it replaces is
+# backed up first and restored automatically if a later step fails). It NEVER builds and NEVER
+# fetches: it installs the exact bytes sitting beside it in deploy/, and prints their SHA-256 so the
+# installed receiver can be checked against the standard branch.
+set -euo pipefail
+
+# The two artifacts this installs, and where they go. SBIN mirrors the receiver's own install target;
+# it is overridable ONLY as a direct test seam, never an instance value baked into the repo.
+SBIN="${DEVLAB_SBIN:-/usr/local/sbin}"
+# The source is the deploy/ directory this script lives in (the merged checkout), so the installed
+# receiver is exactly the reviewed one — no second copy of its bytes exists to drift from.
+SRC_DIR="${DEVLAB_RECV_SRC:-$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)}"
+
+RECV="devlab-deploy-recv"
+LIB="devlab-setup-lib.sh"
+
+log()  { echo "devlab-install-recv: $*" >&2; }
+die()  { log "$*"; exit 1; }
+
+# Backups made THIS run, newest first, so the rollback restores them in the reverse of install order.
+declare -a BACKUPS=()
+rollback() {
+  [ "${#BACKUPS[@]}" -eq 0 ] && return 0
+  log "a step failed — rolling back the files this run replaced"
+  local pair name bak
+  for pair in "${BACKUPS[@]}"; do
+    name="${pair%%::*}"; bak="${pair##*::}"
+    if [ -n "$bak" ] && [ -e "$bak" ]; then
+      cp -a -- "$bak" "$SBIN/$name" && log "restored $SBIN/$name from $bak"
+    else
+      # No backup means the file did not exist before this run — remove what we put there.
+      rm -f -- "$SBIN/$name" && log "removed $SBIN/$name (it did not exist before this run)"
+    fi
+  done
+}
+trap 'rollback' ERR
+
+# Root is required to write $SBIN and to install/start a systemd service. DEVLAB_RECV_TEST is a
+# DIRECT-INVOCATION test seam (never set in operation): it lets the install/backup/rollback logic be
+# proven against a fixture SBIN without root, mirroring the receiver's own --check seam.
+if [ "${DEVLAB_RECV_TEST:-0}" != 1 ]; then
+  [ "$(id -u)" = 0 ] || die "must run as root (it writes $SBIN and installs a systemd service)"
+fi
+[ -d "$SBIN" ]     || die "target directory $SBIN does not exist"
+
+# The source bytes must be present and the receiver must at least PARSE before it can be trusted as a
+# root command — a syntactically broken receiver installed to sbin would break every future deploy.
+for f in "$RECV" "$LIB"; do
+  [ -r "$SRC_DIR/$f" ] || die "source $SRC_DIR/$f not found or unreadable — run this from a checkout's deploy/ directory"
+done
+bash -n -- "$SRC_DIR/$RECV" || die "$SRC_DIR/$RECV does not parse — refusing to install a broken receiver"
+bash -n -- "$SRC_DIR/$LIB"  || die "$SRC_DIR/$LIB does not parse — refusing to install a broken library"
+
+sha() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# install_one <name> <mode> — install SRC_DIR/<name> to SBIN/<name> with the given mode, root-owned.
+# An identical installed copy is left untouched (idempotent). A differing or missing copy is backed
+# up (when it exists) and replaced; the replacement is verified byte-for-byte before we move on.
+install_one() {
+  local name="$1" mode="$2" src="$SRC_DIR/$1" dst="$SBIN/$1"
+  if [ -f "$dst" ] && cmp -s -- "$src" "$dst"; then
+    log "$name already current at $dst (sha256 $(sha "$dst")) — left untouched"
+    return 0
+  fi
+  local bak=""
+  if [ -e "$dst" ]; then
+    bak="$dst.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -a -- "$dst" "$bak" || die "could not back up $dst before replacing it"
+    log "backed up the existing $name to $bak"
+  fi
+  BACKUPS=("$name::$bak" "${BACKUPS[@]}")
+  # Ownership is root:root in operation; the test seam (non-root fixture) cannot chown, so it omits it.
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install "${own[@]}" -m "$mode" -- "$src" "$dst"
+  cmp -s -- "$src" "$dst" || die "installed $dst does not match the source — rolled back"
+  log "installed $name -> $dst (mode $mode, sha256 $(sha "$dst"))"
+}
+
+# The library is installed FIRST because the receiver sources it; installing the receiver over a
+# stale library would leave a moment where a deploy runs new receiver logic against old templates.
+install_one "$LIB"  0644
+install_one "$RECV" 0755
+
+# Prove the receiver loads and makes the right first-time-vs-update decision WITHOUT effect, via its
+# own --check dry-run. With a service name it also proves that service's artifact is staged and its
+# delivered unit passes the identity checks — the exact gate the real trigger will apply. This is the
+# "prüft nach jedem Abschnitt selbst" step: we do not trigger a real install until the dry-run is
+# clean.
+check_ok=1
+if [ "$#" -eq 0 ]; then
+  # No service to check against; prove at least that the receiver + library load without error.
+  DEVLAB_STAGING="${DEVLAB_STAGING:-/tmp/devlab-install-recv-selftest.$$}" \
+    "$SBIN/$RECV" --check __selftest__ >/dev/null 2>&1 || true  # exit 3 (no such artifact) is expected
+  log "receiver installed and parses; no service named, so nothing was triggered"
+else
+  for svc in "$@"; do
+    log "── dry-run for '$svc' ──"
+    if "$SBIN/$RECV" --check "$svc"; then
+      log "dry-run for '$svc' is clean"
+    else
+      log "dry-run for '$svc' did NOT pass (see the receiver's message above) — '$svc' will NOT be triggered"
+      check_ok=0
+    fi
+  done
+fi
+
+# Past this point the receiver is installed and verified; the file work is DONE. Triggering services
+# is a per-service action whose failure must NOT roll the receiver back (the receiver is correct and
+# other services depend on it), so the ERR-rollback is cleared here.
+trap - ERR
+
+# Bring each named service up from its already-staged artifact, over the SAME install path the chain
+# uses (no separate first-install path). A first-time service is set up; an already-running one is
+# only refreshed. Each result is reported; a failure here is named, not swallowed, and does not stop
+# the others.
+declare -a WENT_UP=() STAYED_DOWN=()
+for svc in "$@"; do
+  if [ "$check_ok" != 1 ] && ! "$SBIN/$RECV" --check "$svc" >/dev/null 2>&1; then
+    STAYED_DOWN+=("$svc (dry-run not clean — nothing triggered)")
+    continue
+  fi
+  log "── triggering install of '$svc' ──"
+  if "$SBIN/$RECV" "$svc"; then
+    WENT_UP+=("$svc")
+  else
+    STAYED_DOWN+=("$svc (install trigger failed — see the message above)")
+  fi
+done
+
+# ── closing report: what is done, and what remains and why (Handarbeit kommt als Skript) ──
+echo
+echo "devlab-install-recv — done."
+echo "  receiver:  $SBIN/$RECV   (sha256 $(sha "$SBIN/$RECV"))"
+echo "  library:   $SBIN/$LIB    (sha256 $(sha "$SBIN/$LIB"))"
+if [ "${#WENT_UP[@]}" -gt 0 ]; then
+  echo "  brought up now: ${WENT_UP[*]}"
+fi
+if [ "${#STAYED_DOWN[@]}" -gt 0 ]; then
+  echo "  NOT brought up: ${STAYED_DOWN[*]}"
+fi
+echo
+echo "  Any service NOT named above that is merged but never set up on this host is now unblocked:"
+echo "  the running DevLab service re-sends every production-owing delivery on its own schedule and"
+echo "  the fixed receiver will set it up on the next attempt. To bring one up immediately instead,"
+echo "  re-run this script with its name, e.g.:  sudo $0 <service>"
+if [ "${#STAYED_DOWN[@]}" -gt 0 ]; then
+  exit 1  # at least one named service did not come up — honest non-zero for the operator
+fi
