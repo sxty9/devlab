@@ -33,6 +33,14 @@ const (
 	// scripts under /usr/local/sbin and waits for the user's explicit, single-use approval. Detail
 	// carries the exact difference to the installed scripts.
 	QuestionWrapperRenewal = "wrapper-renewal"
+	// QuestionProdHostKey is the SECOND guarded handle, the same shape as the wrapper renewal: the
+	// production target presented a CHANGED ssh host key (a reinstall, or an interception), so every
+	// production send is held until the user deliberately approves the new key. Approved frees the
+	// acceptance of exactly the fingerprint pinned in HostKeyFingerprint and nothing else — the accept
+	// path re-reads the key at apply time and refuses if it changed again (content-pin, single-use).
+	// It is a production-only hold: unlike a wrapper-renewal or decision question it does NOT hold a
+	// repository's dev branch (a production failure never blocks the stack), so OpenForRepo skips it.
+	QuestionProdHostKey = "prod-host-key"
 )
 
 // Wrapper renewal SOURCES — where the approved content is re-read from at install time. Both flow
@@ -93,6 +101,14 @@ type Question struct {
 	// exact checksums and nothing else: if the source content changes after the approval, the recorded
 	// sha no longer matches and the renewal is refused (single-use and content-pinned, never blanket).
 	Wrappers []WrapperGrant `json:"wrappers,omitempty"`
+
+	// HostKeyTarget and HostKeyFingerprint pin a QuestionProdHostKey to ONE production host and ONE
+	// key: Target is the host whose key changed; Fingerprint is the SHA256 of the key now presented,
+	// the exact key the approval covers. The accept path re-reads the host's current key and installs it
+	// ONLY when it still hashes to this fingerprint (content-pin), so an approval never carries over to a
+	// key that changed again after the human looked. Set only on a host-key question.
+	HostKeyTarget      string `json:"hostKeyTarget,omitempty"`
+	HostKeyFingerprint string `json:"hostKeyFingerprint,omitempty"`
 
 	// WrapperSource names WHERE the approved wrapper content is re-read from at install time — the stack
 	// tip (WrapperSourceStackTip) or this run's own delivering branch (WrapperSourceWorking). It is set
@@ -231,11 +247,56 @@ func (s *QuestionStore) OpenForRepo(repo, exceptRunID string) (*Question, error)
 	}
 	for i := range cur {
 		q := cur[i]
+		// A host-key question holds the PRODUCTION send, not a dev branch: a production failure never
+		// blocks the stack (WHAT-3), so it must not halt new orders branching on this repository.
+		if q.QKind == QuestionProdHostKey {
+			continue
+		}
 		if q.Open() && sameRepoID(q.Repo, repo) && q.RunID != exceptRunID {
 			return &q, nil
 		}
 	}
 	return nil, nil
+}
+
+// OpenHostKeyQuestion returns the oldest still-open host-key question for a production target, or nil.
+// The production pass calls it to avoid raising a second question while one already waits for the same
+// host: the changed key is a property of the HOST, not of any one delivery, so it is asked once.
+func (s *QuestionStore) OpenHostKeyQuestion(target string) (*Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	for i := range cur {
+		if cur[i].Open() && cur[i].QKind == QuestionProdHostKey && cur[i].HostKeyTarget == target {
+			q := cur[i]
+			return &q, nil
+		}
+	}
+	return nil, nil
+}
+
+// ApprovedHostKeyQuestion returns the newest ANSWERED-and-APPROVED, not-yet-consumed host-key question
+// for a production target — the approval the production pass redeems to accept the new key. An answered
+// question that was NOT approved (the user declined) is not returned: nothing is accepted without an
+// explicit green light. nil when none waits.
+func (s *QuestionStore) ApprovedHostKeyQuestion(target string) (*Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	var found *Question
+	for i := range cur {
+		if cur[i].Answered() && cur[i].Approved && cur[i].QKind == QuestionProdHostKey && cur[i].HostKeyTarget == target {
+			q := cur[i]
+			found = &q
+		}
+	}
+	return found, nil
 }
 
 // AnsweredForRun returns the ORDER's own answered, not-yet-consumed question for the repo — the

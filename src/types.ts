@@ -686,8 +686,10 @@ export interface RunNotice {
 }
 
 /** One blocking question on the Blocked surface (runs.Question): a run that stopped and asked, plus
- *  the answer once given. qKind 'wrapper-renewal' is the one guarded handle whose detail carries the
- *  exact difference to the installed root scripts and whose freeing needs explicit approval. */
+ *  the answer once given. Two qKinds are GUARDED handles whose freeing needs an explicit approval:
+ *  'wrapper-renewal' (detail carries the exact difference to the installed root scripts) and
+ *  'prod-host-key' (the production host presented a new ssh key; hostKeyFingerprint pins the key the
+ *  approval covers). Everything else is a plain 'decision' answered with free text. */
 export interface RunQuestion {
   id: string;
   runId: string;
@@ -695,7 +697,7 @@ export interface RunQuestion {
   kind?: RunKind;
   executionId: string;
   repo: string;
-  qKind: 'decision' | 'wrapper-renewal';
+  qKind: 'decision' | 'wrapper-renewal' | 'prod-host-key';
   autonomy?: AutonomyLevel;
   question: string;
   recommendation?: string;
@@ -713,6 +715,10 @@ export interface RunQuestion {
    *  covers. Approving installs only these named files with these checksums; detail renders the same
    *  set for the reader. */
   wrappers?: { name: string; sha: string }[];
+  /** For a 'prod-host-key' question: the production host whose key changed and the SHA256 fingerprint
+   *  of the key now presented — the exact key the approval covers (the accept path re-verifies it). */
+  hostKeyTarget?: string;
+  hostKeyFingerprint?: string;
 }
 
 export interface PlannedRun {

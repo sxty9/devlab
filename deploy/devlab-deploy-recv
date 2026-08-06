@@ -8,6 +8,9 @@
 #
 #   command="/usr/local/sbin/devlab-deploy-recv",restrict ssh-ed25519 AAAA...devkey... devlab-prod-deploy
 #
+# You do NOT transcribe this line by hand: `devlab-install-recv --provision --deploy-pubkey <pubkey>`
+# writes it (and stands up rrsync, the staging/web roots and the Caddy edge) in one self-checking pass.
+#
 #   `restrict` = no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding (and any
 #   future restrictions). Combined with command="…" it means: whatever the client asks for, sshd runs
 #   ONLY this script. The client's requested command arrives in $SSH_ORIGINAL_COMMAND (no argv).

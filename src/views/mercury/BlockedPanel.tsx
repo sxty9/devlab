@@ -4,10 +4,12 @@
 // answers here and the run continues with the answer — it does not start over. An unanswered
 // question never vanishes and names since when it has been waiting (REQ point 6).
 //
-// One kind is special: a wrapper-renewal question moves a security boundary, so it is presented as
-// an explicit approval with the exact difference to the installed root scripts. The approval never
-// writes anything — the run re-checks the scripts actually match before it installs (see the
-// executor); this surface only carries the user's decision.
+// Two kinds are special: a GUARDED question moves a security boundary, so it is presented as an
+// explicit approval rather than a free-text answer. A wrapper-renewal carries the exact difference to
+// the installed root scripts; a prod-host-key carries the fingerprint of a production host's new ssh
+// key. Approving never writes anything on its own — the chain re-checks the exact content (the scripts
+// still match / the host still presents the approved key) before it acts; this surface only carries
+// the user's decision.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useLiveTopic } from '@/state/live';
@@ -146,22 +148,30 @@ function QuestionRow({
   onAnswer: (q: RunQuestion, text: string, approve: boolean) => void | Promise<void>;
 }) {
   const wrapper = q.qKind === 'wrapper-renewal';
+  const hostKey = q.qKind === 'prod-host-key';
+  const guarded = wrapper || hostKey;
   const [text, setText] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const waited = waitingSince(q.askedAt, Date.now());
 
-  const canSend = wrapper ? confirmed : text.trim().length > 0;
+  const approveNote = wrapper
+    ? 'Approved renewing the root wrapper scripts to their standard-branch version.'
+    : 'Approved trusting the new production host key.';
+  const consent = wrapper
+    ? 'I approve installing the standard-branch (merged) version of these root scripts. This approval is single-use and covers only the files and checksums shown above; the run installs and re-verifies them.'
+    : 'I confirm this fingerprint matches the production host (verified out-of-band) and approve trusting its new ssh key. This approval is single-use and covers only this exact key; the chain re-reads and re-verifies it before trusting it.';
+  const canSend = guarded ? confirmed : text.trim().length > 0;
   const send = () => {
     if (!canSend) return;
-    const body = wrapper ? text.trim() || 'Approved renewing the root wrapper scripts to their standard-branch version.' : text.trim();
-    void onAnswer(q, body, wrapper);
+    const body = guarded ? text.trim() || approveNote : text.trim();
+    void onAnswer(q, body, guarded);
   };
 
   return (
-    <li className={cn('rounded-md border px-3 py-2.5', wrapper ? 'border-danger/40 bg-danger/[0.05]' : 'border-separator bg-fill/[0.04]')}>
+    <li className={cn('rounded-md border px-3 py-2.5', guarded ? 'border-danger/40 bg-danger/[0.05]' : 'border-separator bg-fill/[0.04]')}>
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className={cn('rounded px-1.5 py-0.5 text-caption', wrapper ? 'bg-danger/[0.12] text-danger' : 'bg-fill/10 text-text-secondary')}>
-          {wrapper ? 'Approval required' : 'Question'}
+        <span className={cn('rounded px-1.5 py-0.5 text-caption', guarded ? 'bg-danger/[0.12] text-danger' : 'bg-fill/10 text-text-secondary')}>
+          {guarded ? 'Approval required' : 'Question'}
         </span>
         <span className="text-caption font-medium text-text-primary">{q.runTitle || q.runId}</span>
         <span className="text-caption text-text-secondary">{q.repo}</span>
@@ -188,9 +198,11 @@ function QuestionRow({
         </details>
       )}
 
-      {wrapper && q.detail && (
+      {guarded && q.detail && (
         <details className="mt-2" open>
-          <summary className="cursor-pointer text-caption text-danger">What would be installed (the standard-branch version)</summary>
+          <summary className="cursor-pointer text-caption text-danger">
+            {wrapper ? 'What would be installed (the standard-branch version)' : 'The new host key that would be trusted'}
+          </summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-fill/[0.04] px-2.5 py-1.5 text-caption text-text-secondary">
             {q.detail}
           </pre>
@@ -201,11 +213,11 @@ function QuestionRow({
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          rows={wrapper ? 2 : 3}
-          placeholder={wrapper ? 'Optional note' : 'Your answer — the run continues with it'}
+          rows={guarded ? 2 : 3}
+          placeholder={guarded ? 'Optional note' : 'Your answer — the run continues with it'}
           className="w-full resize-y rounded border border-separator bg-bg-raised px-2.5 py-1.5 text-footnote text-text-primary placeholder:text-text-tertiary"
         />
-        {wrapper && (
+        {guarded && (
           <label className="flex items-start gap-2 text-caption text-text-secondary">
             <input
               type="checkbox"
@@ -213,15 +225,12 @@ function QuestionRow({
               onChange={(e) => setConfirmed(e.target.checked)}
               className="mt-0.5"
             />
-            <span>
-              I approve installing the standard-branch (merged) version of these root scripts. This approval is
-              single-use and covers only the files and checksums shown above; the run installs and re-verifies them.
-            </span>
+            <span>{consent}</span>
           </label>
         )}
         <div className="flex items-center gap-2">
-          <Button variant={wrapper ? 'secondary' : 'primary'} size="sm" disabled={busy || !canSend} onClick={send}>
-            {wrapper ? 'Approve & continue' : 'Answer & continue'}
+          <Button variant={guarded ? 'secondary' : 'primary'} size="sm" disabled={busy || !canSend} onClick={send}>
+            {guarded ? 'Approve & continue' : 'Answer & continue'}
           </Button>
         </div>
       </div>

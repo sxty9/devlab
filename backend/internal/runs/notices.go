@@ -83,6 +83,16 @@ const (
 	// silent: it is named here and the reconciliation brings production up to the standard branch
 	// over the existing production path. A disturbance the user sees.
 	NoticeProdDrift = "prod-drift"
+	// The production target's ssh host key CHANGED — the machine was reinstalled (the honest case here:
+	// prizm/presentr arriving on a freshly set-up host), or the connection is intercepted. Every
+	// production send fails the host-key check, so this is its OWN distinct reason (never a masked
+	// "connection failed"), and production is HELD until the new key is deliberately approved on the
+	// Blocked surface — it is never trusted silently. A disturbance the user sees.
+	NoticeProdHostKeyChanged = "prod-host-key-changed"
+	// The new production host key was DELIBERATELY approved and the known-hosts file re-pinned to it, so
+	// production delivery can resume. A routine positive transition (operational, not a disturbance): it
+	// records that the held production sends were released, not that anything is wrong.
+	NoticeProdHostKeyAccepted = "prod-host-key-accepted"
 	// The standstill of the delivery maintenance: its writing half is not armed, so nothing is
 	// merged, pruned or stamped. A STATE the operator ends, and the reason nothing moves.
 	NoticeDeliveryHeld = "delivery-held"

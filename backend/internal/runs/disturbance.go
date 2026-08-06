@@ -22,10 +22,11 @@ import "strings"
 // client mirrors the same rule (isDisturbance = alarm tone) so the outward voice and the dashboard's
 // attention signal never disagree.
 var operationalKinds = map[string]bool{
-	"restart-requested": true,
-	"restart-completed": true,
-	"startup-reconcile": true,
-	NoticeAssigned:      true,
+	"restart-requested":       true,
+	"restart-completed":       true,
+	"startup-reconcile":       true,
+	NoticeAssigned:            true,
+	NoticeProdHostKeyAccepted: true, // a positive transition: the new host key was approved, sends resume
 }
 
 // IsDisturbance reports whether a notice of this kind is a fault to be delivered to the user, as
