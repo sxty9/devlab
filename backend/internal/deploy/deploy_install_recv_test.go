@@ -428,3 +428,43 @@ func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
 		t.Fatalf("the old bare-top-level-import edge must NOT validate (that was the bug):\n%s", out)
 	}
 }
+
+// The SELF route (devlab's /api/* block, its layout exception) must live in the SAME shared route
+// directory beside a uniform service's /api/services/<repo>/* route and the whole edge must still
+// validate — proving devlab's first-time route coexists with every other service's, at the level caddy
+// actually parses. This is the "Der Web-Anteil und die Route gehoeren zur Ersteinrichtung" half (task
+// point 4): a devlabd that runs but is unreachable is not set up.
+func TestSelfRouteCoexistsInEdgeCaddy(t *testing.T) {
+	if _, err := exec.LookPath("caddy"); err != nil {
+		t.Skip("caddy not installed — the template shape is proven by the seam tests above")
+	}
+	root := t.TempDir()
+	conf := filepath.Join(root, "conf.d")
+	www := filepath.Join(root, "www")
+	for _, d := range []string{conf, www} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// devlab's OWN route (from the self template) and a uniform service's route, both in the shared dir.
+	self := bashRenderTemplate(t, "setup_self_route_text 8781")
+	if err := os.WriteFile(filepath.Join(conf, "devlab.caddy"), []byte(self), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	uniform := bashRenderTemplate(t, "setup_route_text prizm 18811")
+	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(uniform), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www)
+	p := filepath.Join(root, "Caddyfile")
+	if err := os.WriteFile(p, []byte(edge), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("caddy", "validate", "--config", p, "--adapter", "caddyfile").CombinedOutput(); err != nil {
+		t.Fatalf("the edge shell must validate with BOTH the self /api/* route and a uniform service route present:\n%s", out)
+	}
+	// The self template must target the whole /api/* prefix, not the per-service /api/services path.
+	if !strings.Contains(self, "handle /api/* {") {
+		t.Errorf("the self route must handle the whole /api/* prefix, got:\n%s", self)
+	}
+}

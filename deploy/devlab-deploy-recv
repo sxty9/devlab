@@ -213,18 +213,102 @@ ensure_secrets_for() {
 # has a different artifact shape (daemon + web SPA) and therefore its own layout.
 case "$REPO" in
   devlab)
+    # The self repo is a genuine LAYOUT special case (its Code-Struktur differs by necessity): a daemon
+    # PLUS a web SPA, its binary at /usr/local/bin/devlabd, its dashboard mirrored into the www root, and
+    # its unit named devlabd.service (not devlab.service). What is NOT special is the DECISION between a
+    # first-time setup and a renewal, nor the refusal of a foreign unit — those are the SAME shared logic
+    # the uniform branch uses (setup_unit_state), so a bare host sets devlab up completely instead of
+    # dying on `systemctl restart: Unit devlabd.service not found` (measured 2026-08-06). The unit NAME
+    # and the own-file PATH are the only differences fed into that shared decision.
     BIN="$real/devlabd"; WEB="$real/web"
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
+
+    DEVLABD_UNIT_FILE="$UNIT_DIR/devlabd.service"
+    state="$(setup_unit_state devlabd "$DEVLABD_UNIT_FILE" "$SYSTEMCTL")" || die "could not ask systemd about devlabd.service" 4
+    case "$state" in
+      first-time) SELF_FIRST=1 ;;
+      update)     SELF_FIRST=0 ;;
+      foreign:*)  die "unit devlabd.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
+      *)          die "unexpected unit state '$state' for devlabd.service" 2 ;;
+    esac
+
+    # The program and the web SPA are installed the SAME way in both cases — the layout is what makes
+    # devlab special, and the layout does not change between a first-time setup and a renewal.
     run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     run mkdir -p "$WWW_DIR"
     run rsync -a --delete "$WEB"/ "$WWW_DIR"/
-    # devlabd needs the same host instance secrets (its unit reads /etc/holistic/jwt-secret); mint them
-    # here too so a bare host self-heals rather than looping. Derive from the installed unit.
-    DEVLABD_UNIT="$(setup_fragment_path devlabd "$SYSTEMCTL")"; [ -n "$DEVLABD_UNIT" ] || DEVLABD_UNIT="$UNIT_DIR/devlabd.service"
-    ensure_secrets_for devlab "$DEVLABD_UNIT"
-    run "$SYSTEMCTL" restart devlabd
-    prove_running devlabd "$(setup_unit_listen_port "$DEVLABD_UNIT")"
+
+    if [ "$SELF_FIRST" = 1 ]; then
+      # ── FIRST-TIME SETUP of devlab — install the DELIVERED unit/route/rights (the receiver erzeugt
+      # nichts). The unit is devlab's CHECKED-IN deploy/devlabd.service, carried in the artifact under
+      # setup/; the route is devlab's own /api/* route. A devlabd that runs but is unreachable is NOT
+      # set up (task point 4), so the route belongs to the setup exactly as the unit does. ──
+      log "Erstinstallation of 'devlab' — no devlabd.service on this host; installing the delivered setup product"
+      SETUP="$real/setup"
+      DELIV_UNIT="$SETUP/devlabd.service"
+      [ -d "$SETUP" ] || die "first-time setup of 'devlab' needs a delivered setup/ in the artifact, but none was shipped — the build did not attach the unit (a change without its delivery is a failure)" 10
+      [ -f "$DELIV_UNIT" ] || die "first-time setup of 'devlab' has no delivered unit at $DELIV_UNIT" 10
+      # The delivered unit is not trusted blindly: it must run as its OWN service account, exactly
+      # `User=devlab` (the same gate the uniform branch applies; a foreign unit was already refused above).
+      setup_unit_declares_user "$DELIV_UNIT" devlab \
+        || die "delivered unit $DELIV_UNIT does not run as 'User=devlab' — refusing (a unit that starts something else or runs as root is not installed)" 2
+
+      DELIV_ROUTE="$SETUP/devlab.caddy"
+      DELIV_RIGHTS="$SETUP/devlab.json"
+
+      if [ "$CHECK" = 1 ]; then
+        echo "PLAN: Erstinstallation of 'devlab' (no devlabd.service on this host)"
+        echo "PLAN: create nologin system account 'devlab' (home /var/lib/devlab) if missing"
+        echo "PLAN: install delivered unit $DELIV_UNIT -> $DEVLABD_UNIT_FILE (verified User=devlab)"
+        [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/devlab.caddy (caddy validate + reload; unwind on failure)" \
+                              || echo "PLAN: no delivered route in the artifact — none installed"
+        [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/devlab.json + groupadd its hp_* groups" \
+                               || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
+        setup_plan_secrets "$DELIV_UNIT"
+        echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable devlabd"
+        echo "PLAN: restart devlabd (the existing self-repo restart; no second, inline start path is built)"
+        prove_running devlabd "$(setup_unit_listen_port "$DELIV_UNIT")"
+        echo "PLAN: prod deploy of 'devlab' done (first-time setup)"
+        exit 0
+      fi
+
+      setup_ensure_account devlab
+      install -o root -g root -m 0644 "$DELIV_UNIT" "$DEVLABD_UNIT_FILE"
+
+      if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
+        rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/devlab.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$DEVLABD_UNIT_FILE" 2>&1)" || rc=$?
+        [ "$rc" = 0 ] || die "$reason" "$rc"
+      elif [ -f "$DELIV_ROUTE" ]; then
+        log "no route dir at $CADDY_CONF — delivered route NOT installed"
+      fi
+
+      if [ -f "$DELIV_RIGHTS" ]; then
+        setup_install_rights "$DELIV_RIGHTS" "$PERMS_DIR" devlab
+      else
+        log "no delivered rights for 'devlab' — installed without declared rights"
+      fi
+
+      # Mint the host's instance secrets from what the delivered unit demands, BEFORE the first start —
+      # otherwise devlabd comes up and dies on the missing JWT secret and the gate (correctly) fails.
+      ensure_secrets_for devlab "$DEVLABD_UNIT_FILE"
+      "$SYSTEMCTL" daemon-reload
+      "$SYSTEMCTL" enable devlabd >/dev/null 2>&1 || true
+      # The self repo is restarted through its EXISTING restart, not a new inline start path (task point
+      # 3): on a first-time host the unit is stopped, so `restart` starts it, and on a renewal it restarts
+      # it — one path for both. devlabd never restarts itself inline (that happens on the DEV host through
+      # devlab-install --handover); HERE the receiver is a separate root process, so a direct restart is
+      # correct and does not kill the caller.
+      "$SYSTEMCTL" restart devlabd
+      prove_running devlabd "$(setup_unit_listen_port "$DEVLABD_UNIT_FILE")"
+    else
+      # ── RENEWAL — devlabd.service already present: replace the program + web (done above) and restart,
+      # minting any secret a host set up before secrets existed still lacks (idempotent self-heal). ──
+      log "Aktualisierung of 'devlab' — devlabd.service already present; replacing the program and restarting"
+      ensure_secrets_for devlab "$DEVLABD_UNIT_FILE"
+      run "$SYSTEMCTL" restart devlabd
+      prove_running devlabd "$(setup_unit_listen_port "$DEVLABD_UNIT_FILE")"
+    fi
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
@@ -233,16 +317,17 @@ case "$REPO" in
     gbin="$real/${REPO}d"
     [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
 
-    # FIRST-TIME vs UPDATE is decided by systemd, not by a path: `systemctl show -p FragmentPath` sees a
-    # vendor unit under /lib or /usr/lib that a test on $UNIT_DIR would miss. Our own unit (or one we
-    # already installed) → UPDATE. No unit at all → FIRST-TIME. A FOREIGN unit → refuse: we neither
-    # shadow nor overwrite a unit that is not ours (the same refusal devlab-install makes).
+    # FIRST-TIME vs UPDATE vs FOREIGN is decided by systemd, not by a path (setup_unit_state): the shared
+    # decision the self branch below makes too. Our own unit (or one we already installed) → UPDATE. No
+    # unit at all → FIRST-TIME. A FOREIGN unit → refuse: we neither shadow nor overwrite a unit that is
+    # not ours (the same refusal devlab-install makes).
     UNIT_FILE="$UNIT_DIR/${REPO}.service"
-    frag="$(setup_fragment_path "$REPO" "$SYSTEMCTL")" || die "could not ask systemd about ${REPO}.service" 4
-    case "$frag" in
-      "$UNIT_FILE") FIRST_TIME=0 ;;
-      "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
-      *) die "unit ${REPO}.service already exists outside this receiver's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
+    state="$(setup_unit_state "$REPO" "$UNIT_FILE" "$SYSTEMCTL")" || die "could not ask systemd about ${REPO}.service" 4
+    case "$state" in
+      first-time) FIRST_TIME=1 ;;
+      update)     FIRST_TIME=0 ;;
+      foreign:*)  die "unit ${REPO}.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
+      *)          die "unexpected unit state '$state' for ${REPO}.service" 2 ;;
     esac
 
     if [ "$FIRST_TIME" = 1 ]; then
@@ -285,34 +370,19 @@ case "$REPO" in
       install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
       install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
-      # The route dir is SHARED by every service of the host: an unparseable file of ours breaks the
-      # whole edge at the next reload, so the ASSEMBLED config is validated first and OUR file is taken
-      # back out (with the freshly written unit) when it does not hold — the same guard devlab-install
-      # uses. A delivered route is optional; its failure is NAMED, never swallowed.
+      # The route dir is SHARED by every service of the host (setup_install_route validates the ASSEMBLED
+      # config and takes OUR file — plus the freshly written unit — back out on failure). A delivered
+      # route is optional; its failure is NAMED, never swallowed.
       if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
-        ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
-        install -o root -g root -m 0644 "$DELIV_ROUTE" "$ROUTE_FILE"
-        unwind_first_time() { rm -f "$ROUTE_FILE" "$UNIT_FILE"; }
-        if command -v "$CADDY_BIN" >/dev/null 2>&1 && [ -f "$CADDY_MAIN" ]; then
-          if ! validate_out="$("$CADDY_BIN" validate --config "$CADDY_MAIN" 2>&1)"; then
-            unwind_first_time
-            die "the edge configuration does not validate with the delivered route — route and unit removed, edge untouched: $(printf '%s' "$validate_out" | tail -n 3)" 4
-          fi
-        else
-          unwind_first_time
-          die "cannot validate the shared edge configuration ($CADDY_BIN / $CADDY_MAIN) — refusing to write into a config directory serving every other service" 5
-        fi
-        "$SYSTEMCTL" reload caddy || { unwind_first_time; die "caddy reload failed — route and unit removed so the edge keeps its last good configuration" 4; }
+        rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/$REPO.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" 2>&1)" || rc=$?
+        [ "$rc" = 0 ] || die "$reason" "$rc"
       elif [ -f "$DELIV_ROUTE" ]; then
         log "no route dir at $CADDY_CONF — delivered route NOT installed"
       fi
 
       # Rights manifest: a validated FILE COPY of the delivered manifest (never executed).
       if [ -f "$DELIV_RIGHTS" ]; then
-        install -d -m 0755 "$PERMS_DIR"
-        install -m 0644 "$DELIV_RIGHTS" "$PERMS_DIR/$REPO.json"
-        grep -oE '"group"[[:space:]]*:[[:space:]]*"hp_[a-z0-9_]+"' "$DELIV_RIGHTS" | grep -oE 'hp_[a-z0-9_]+' | sort -u |
-          while read -r g; do groupadd -f "$g"; done
+        setup_install_rights "$DELIV_RIGHTS" "$PERMS_DIR" "$REPO"
       else
         log "no delivered rights for '$REPO' — installed without declared rights"
       fi

@@ -184,13 +184,31 @@ case "$verb" in
     [ -d "$art" ] || die "no artifact at $art — build before emitting setup"
     dst="$art/setup"
     rm -rf -- "$dst"; mkdir -p -- "$dst"
-    setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
-    setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
-    # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
-    if [ -f "$wt/permissions/${repo}.json" ]; then
-      cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
+    if [ "$repo" = "${DEVLAB_SELF_REPO:-devlab}" ]; then
+      # The self repo (devlab) is a LAYOUT special case: its unit is NOT the generated /opt/<repo>
+      # template but the CHECKED-IN deploy/devlabd.service (User=devlab, /usr/local/bin/devlabd, its own
+      # fixed listen port), and its route answers the whole /api/* prefix. So the delivered setup product
+      # is that checked-in unit verbatim under its real name devlabd.service, plus devlab's own route on
+      # the port the unit itself declares — the receiver installs these unchanged on a bare host. The
+      # atlas-proposed <port> is not used for self: devlab's port is fixed in its committed unit.
+      src_unit="$wt/deploy/devlabd.service"
+      [ -f "$src_unit" ] || die "self setup needs the checked-in unit at $src_unit"
+      cp -- "$src_unit" "$dst/devlabd.service"
+      selfport="$(setup_unit_listen_port "$src_unit")"; [ -n "$selfport" ] || selfport="$port"
+      setup_self_route_text "$selfport" > "$dst/devlab.caddy"
+      if [ -f "$wt/permissions/${repo}.json" ]; then
+        cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
+      fi
+      echo "devlab-exec: emitted self setup product (devlabd.service + /api/* route on :$selfport) into $dst"
+    else
+      setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
+      setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
+      # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
+      if [ -f "$wt/permissions/${repo}.json" ]; then
+        cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
+      fi
+      echo "devlab-exec: emitted setup product for '$repo' (port $port) into $dst"
     fi
-    echo "devlab-exec: emitted setup product for '$repo' (port $port) into $dst"
     ;;
 
   *)
