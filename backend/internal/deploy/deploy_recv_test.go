@@ -60,6 +60,141 @@ func runRecv(t *testing.T, env map[string]string, fragment, repo string) wrapper
 	return runWrapper(t, "deploy/devlab-deploy-recv", env, "--check", repo)
 }
 
+// recvSelfFixture stages the SELF repo's artifact (devlab): its daemon binary devlabd, its web SPA
+// directory, and the setup/ product a self build attaches — the CHECKED-IN devlabd.service (User=devlab,
+// its fixed port) plus devlab's own /api/* route and rights manifest. devlab is a layout special case
+// (daemon + web, unit named devlabd.service), so it needs its own fixture; the FRAGMENT is still faked
+// so the test decides whether devlabd.service already exists. Returns env plus the own unit path.
+func recvSelfFixture(t *testing.T, userLine string) (env map[string]string, unitPath string) {
+	t.Helper()
+	staging := t.TempDir()
+	unitDir := t.TempDir()
+	art := filepath.Join(staging, "devlab")
+	setup := filepath.Join(art, "setup")
+	web := filepath.Join(art, "web")
+	for _, d := range []string{setup, web} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(art, "devlabd"), []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The delivered unit is devlab's real unit name (devlabd.service), declares the JWT secret it reads,
+	// and binds its fixed loopback port — exactly what emit-setup ships (the checked-in unit verbatim).
+	unit := "[Unit]\nDescription=DevLab backend (devlabd)\nAfter=network.target\n\n[Service]\nType=simple\n" +
+		userLine + "\nEnvironment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret" +
+		"\nEnvironment=DEVLAB_ADDR=127.0.0.1:8781\nExecStart=/usr/local/bin/devlabd\n\n[Install]\nWantedBy=multi-user.target\n"
+	if err := os.WriteFile(filepath.Join(setup, "devlabd.service"), []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(setup, "devlab.caddy"), []byte("handle /api/* {\n\treverse_proxy 127.0.0.1:8781\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(setup, "devlab.json"), []byte(`{"group":"hp_devlab_access"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{"DEVLAB_STAGING": staging, "DEVLAB_UNIT_DIR": unitDir},
+		filepath.Join(unitDir, "devlabd.service")
+}
+
+// TEST a) DECISIVE: a host with NO devlabd.service — the regular delivery of the SELF repo sets devlab up
+// completely (account, the delivered unit + /api/* route + rights, the minted JWT secret) and proves it
+// running, instead of dying on `systemctl restart: Unit devlabd.service not found` (measured 2026-08-06).
+// It reaches the SAME first-time decision the uniform branch makes, only with devlab's own layout.
+func TestRecvSelfFirstTimeWhenUnitMissing(t *testing.T) {
+	env, _ := recvSelfFixture(t, "User=devlab")
+	res := runRecv(t, env, "", "devlab") // empty FragmentPath — systemd knows no devlabd unit
+	if res.exit != 0 {
+		t.Fatalf("a missing devlabd.service must dry-run a first-time setup (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	for _, want := range []string{
+		"Erstinstallation of 'devlab'",
+		"create nologin system account 'devlab'",
+		"install delivered unit", "verified User=devlab",
+		// the web anteil AND the route belong to the setup (task point 4)
+		"/usr/local/bin/devlabd", "/var/lib/devlab/www",
+		"install delivered route", "devlab.caddy",
+		"groupadd",
+		// the instance secret the delivered unit demands is minted on THIS host
+		"mint instance secret 'jwt-secret'",
+		// restarted through the EXISTING self restart, and proven to STAY up holding its fixed port
+		"restart devlabd", "STAYS up", "(:8781)"} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("first-time self setup plan must mention %q:\n%s", want, res.out)
+		}
+	}
+	// No inline second start path is built (task point 3): the restart is the ONE self restart path, so
+	// the plan names it as such and does not add a separate `systemctl start devlabd` step beside it.
+	if !strings.Contains(res.out, "no second, inline start path is built") {
+		t.Errorf("the self setup must restart through the existing path, not build an inline start:\n%s", res.out)
+	}
+}
+
+// TEST b) a host with devlabd.service already present is a RENEWAL: replace the program + web and restart
+// (today's behaviour), never a first-time setup — no account creation, no unit write, no route write.
+func TestRecvSelfUpdateWhenUnitPresent(t *testing.T) {
+	env, unitPath := recvSelfFixture(t, "User=devlab")
+	res := runRecv(t, env, unitPath, "devlab") // FragmentPath is OUR devlabd.service → renewal
+	if res.exit != 0 {
+		t.Fatalf("an already-installed devlabd.service must dry-run a renewal (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "Aktualisierung of 'devlab'") || !strings.Contains(res.out, "restart devlabd") {
+		t.Errorf("a renewal must be named and plan the restart:\n%s", res.out)
+	}
+	if strings.Contains(res.out, "Erstinstallation") || strings.Contains(res.out, "install delivered unit") {
+		t.Errorf("a renewal must NOT set up a unit:\n%s", res.out)
+	}
+}
+
+// TEST c) a FOREIGN devlabd.service (one this receiver did not install, e.g. a vendor unit under /lib) is
+// refused — the receiver neither shadows nor overwrites it, exactly as it refuses a foreign uniform unit.
+func TestRecvSelfRefusesForeignUnit(t *testing.T) {
+	env, _ := recvSelfFixture(t, "User=devlab")
+	res := runRecv(t, env, "/lib/systemd/system/devlabd.service", "devlab")
+	if res.exit != 5 {
+		t.Fatalf("a foreign devlabd.service must be refused (exit 5), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "foreign unit") {
+		t.Errorf("the refusal must name the foreign unit:\n%s", res.out)
+	}
+	if strings.Contains(res.out, "PLAN:") {
+		t.Errorf("a refused self install must plan nothing:\n%s", res.out)
+	}
+}
+
+// A first-time self setup with NO delivered devlabd.service in the artifact is a named failure (the build
+// did not attach the unit) — never a silent green, never a fall-through to a restart that would fail.
+func TestRecvSelfFirstTimeNeedsDeliveredUnit(t *testing.T) {
+	env, _ := recvSelfFixture(t, "User=devlab")
+	if err := os.RemoveAll(filepath.Join(env["DEVLAB_STAGING"], "devlab", "setup")); err != nil {
+		t.Fatal(err)
+	}
+	res := runRecv(t, env, "", "devlab")
+	if res.exit != 10 {
+		t.Fatalf("a first-time self setup without a delivered unit must fail (exit 10), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "did not attach the unit") {
+		t.Errorf("the failure must name the missing delivered setup:\n%s", res.out)
+	}
+}
+
+// A delivered self unit that would NOT run as User=devlab (here User=root) is refused — a unit that runs
+// as root or starts something else is never installed, the same gate the uniform branch applies.
+func TestRecvSelfRefusesWrongUser(t *testing.T) {
+	env, _ := recvSelfFixture(t, "User=root")
+	res := runRecv(t, env, "", "devlab")
+	if res.exit != 2 {
+		t.Fatalf("a delivered self unit with the wrong User= must be refused (exit 2), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "User=devlab") {
+		t.Errorf("the refusal must name the required account:\n%s", res.out)
+	}
+}
+
 // A missing unit is a first-time setup: the receiver installs the DELIVERED product and creates the
 // account — it does not fail like `systemctl restart` on a bare host, and it does not generate a unit
 // of its own (it plans installing the shipped one, verified to run as User=<repo>).
