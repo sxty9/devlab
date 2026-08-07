@@ -171,15 +171,74 @@ SBIN_DIR="${DEVLAB_SBIN_DIR:-/usr/local/sbin}"
 # record of what root installed or what was there before (task point 5). Env seam for tests.
 WRENEW_AUDIT_DIR="${DEVLAB_WRAPPER_AUDIT_DIR:-/var/lib/devlab-wrapper-audit}"
 
+# HANDING THE WRITE OUT OF THE SERVICE'S CGROUP. The devlab service runs with ProtectSystem=strict and
+# deliberately does NOT list /usr/local/sbin in its ReadWritePaths — so the service, and EVERY child it
+# starts (this wrapper among them, even started root via the sudoers pin), is locked out of the very
+# directory the root wrappers live in. That lock is the point: it is what stops the service from
+# rewriting its own root scripts on its own, without a human's approval. But the lock also reached this
+# wrapper AFTER the human approved a renewal — `mktemp` in /usr/local/sbin failed with "Read-only file
+# system", so the approval installed nothing, the delivery found the drift again, and the same question
+# came back: a loop the user could not win (measured 2026-08-06). The fix keeps the service locked out
+# and runs the ONE approved renewal OUTSIDE the cgroup, in a transient systemd unit — the same escape the
+# self-repo restart already uses (--handover). systemd-run is the seam; env-overridable for tests only,
+# and stripped by sudo's env_reset in production exactly like every other seam here.
+SYSTEMD_RUN="${DEVLAB_SYSTEMD_RUN:-systemd-run}"
+
 # own_root sets root:root ownership when we ARE root (production, via sudo). In a direct-invocation
 # test the tool runs as the unprivileged test user and the files stay that user's — the security
 # property (root-owned) holds in production, where the tool always runs as root.
 own_root() { [ "$(id -u)" -eq 0 ] && chown root:root -- "$@" || true; }
 
+# maybe_hand_out_renewal escapes the service's ProtectSystem=strict sandbox when — and ONLY when — this
+# invocation cannot write the wrapper directory. In production the devlab service starts this tool as a
+# confined child (root via the sudoers pin, but inside the cgroup where /usr/local/sbin is read-only), so
+# the atomic write below fails; the fix is to run the SAME renewal in a transient unit outside the cgroup,
+# exactly as the self-repo restart hands its work out (see --handover). The handed-out unit runs
+# unconfined as root and RE-ENTERS this very tool with the SAME three arguments, so all four bindings —
+# the renewable name, the run-unwritable source, the approved checksum, and single-use — are re-checked
+# OUTSIDE the boundary; nothing the caller says is trusted across it. It returns here, to run the checks
+# and write in THIS context, when:
+#   * --check: a dry run writes nothing and needs no escape;
+#   * the recursion marker is set: we ARE the transient unit — do the work;
+#   * the target is already writable: there is no confinement to escape (an unconfined root install, or a
+#     direct-invocation test against a throwaway sbin dir).
+# When the target is NOT writable it MUST escape or FAIL BY NAME — it never falls through to a write that
+# would fail again, which is the silent loop the user cannot win (task points 3/4). A failed hand-out
+# (systemd-run absent or the transient unit erroring) fails the renewal WITH the real reason, which the
+# daemon surfaces as one disturbance rather than re-asking.
+maybe_hand_out_renewal() {  # <name> <content-file> <grant-file>
+  [ "$CHECK" = 1 ] && return 0
+  [ "${DEVLAB_WRENEW_HANDED_OUT:-0}" = 1 ] && return 0
+  [ -w "$SBIN_DIR" ] && return 0
+  command -v "$SYSTEMD_RUN" >/dev/null 2>&1 \
+    || die "cannot write $SBIN_DIR — the devlab service confines it read-only (ProtectSystem=strict) and '$SYSTEMD_RUN' is not available to hand the renewal out of the service; the approved renewal of '$1' cannot be installed" 4
+  local self
+  self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "cannot resolve this wrapper's own path to hand the renewal out" 4
+  log "cannot write $SBIN_DIR from inside the service (ProtectSystem=strict) — handing the approved renewal of '$1' out to a transient unit outside the cgroup (like the self-repo restart)"
+  # --wait: block and adopt the unit's exit status · --pipe: forward the unit's output back to the daemon
+  # that invoked us · --collect: reap the unit even on failure. --setenv carries the recursion marker and
+  # the already-resolved (pinned) paths so the transient unit measures the identical state. A non-zero
+  # exit propagates out of this wrapper: the renewal fails with the transient unit's real reason.
+  "$SYSTEMD_RUN" --quiet --wait --pipe --collect \
+    --unit="devlab-wrapper-renew-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
+    --setenv=DEVLAB_WRENEW_HANDED_OUT=1 \
+    --setenv="DEVLAB_STATE_DIR=$STATE_DIR" \
+    --setenv="DEVLAB_SBIN_DIR=$SBIN_DIR" \
+    --setenv="DEVLAB_WRAPPER_AUDIT_DIR=$WRENEW_AUDIT_DIR" \
+    -- "$self" --renew-wrapper "$1" "$2" "$3"
+  exit $?
+}
+
 renew_wrapper() {
   [ "${#POSITIONAL[@]}" -eq 3 ] \
     || die "usage: devlab-install --renew-wrapper <name> <content-file> <grant-file>" 2
   local name="${POSITIONAL[0]}" contentf="${POSITIONAL[1]}" grantf="${POSITIONAL[2]}"
+
+  # 0) IF THE SERVICE CONFINES US OUT OF /usr/local/sbin, run this SAME renewal outside the cgroup and
+  #    exit with its result. This is what lets an approved renewal actually take effect; it returns here
+  #    only when the write can happen in this context (see maybe_hand_out_renewal). Every check below then
+  #    runs OUTSIDE the boundary too — root re-verifies, it does not trust the confined caller.
+  maybe_hand_out_renewal "$name" "$contentf" "$grantf"
 
   # 1) THE NAME IS ON THE RENEWABLE LIST — the list lives here, not in the call (task point 4). No
   #    path, no pattern, no extension beyond the list. The INSTALL MODE comes from the list too (0755
