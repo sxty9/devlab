@@ -217,6 +217,133 @@ func TestRenewIsAuditableAndReversible(t *testing.T) {
 }
 
 
+// ── the write is HANDED OUT of the service's cgroup when confined (task point 1, tests a/b/d) ──────
+// The whole defect was physical: the devlab service runs ProtectSystem=strict without /usr/local/sbin in
+// its ReadWritePaths, so the confined wrapper could not write the target and an approved renewal never
+// took effect. The fix runs the SAME renewal in a transient unit outside the cgroup (like the self-repo
+// restart). These tests drive that escape through the DEVLAB_SYSTEMD_RUN seam: a fake stands in for the
+// transient unit — it records the call, applies the --setenv values, and makes the target writable (the
+// world outside the sandbox), then runs the handed-out command. Confinement is simulated by making the
+// sbin dir unwritable to the (non-root) test user, which is exactly what makes `test -w` false.
+
+// fakeSystemdRun writes a test double for systemd-run and returns its path plus the log file it appends
+// each invocation to. The double proves the tool escaped: it applies the --setenv env (carrying the
+// recursion marker), simulates leaving the sandbox by making DEVLAB_SBIN_DIR writable, and execs the
+// handed-out command that follows `--`.
+func fakeSystemdRun(t *testing.T) (path, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	path = filepath.Join(dir, "fake-systemd-run")
+	logPath = filepath.Join(dir, "calls.log")
+	script := "#!/usr/bin/env bash\n" +
+		"set -euo pipefail\n" +
+		"printf '%s\\n' \"$*\" >> \"" + logPath + "\"\n" +
+		"declare -a cmd=(); after=0\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$after\" = 1 ]; then cmd+=(\"$a\"); continue; fi\n" +
+		"  case \"$a\" in\n" +
+		"    --setenv=*) export \"${a#--setenv=}\" ;;\n" +
+		"    --) after=1 ;;\n" +
+		"  esac\n" +
+		"done\n" +
+		// Stand in for escaping the cgroup: outside the service's ProtectSystem sandbox the wrapper dir is
+		// writable. The handed-out command then writes it for real.
+		"chmod u+w \"$DEVLAB_SBIN_DIR\"\n" +
+		"exec \"${cmd[@]}\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path, logPath
+}
+
+// confine makes the sbin dir unwritable to the non-root test user, so `test -w` in the wrapper is false —
+// the same signal the ProtectSystem read-only mount gives a confined child in production.
+func confine(t *testing.T, f renewFixture) {
+	t.Helper()
+	if err := os.Chmod(f.sbinDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.sbinDir, 0o755) })
+}
+
+// (task test a) DECISIVE: when the target is read-only, the approved renewal is HANDED OUT of the cgroup
+// and the file ends up carrying the approved checksum — measured, not asserted. And the escape passed the
+// recursion marker, so the transient unit does the work instead of looping back.
+func TestRenewHandsWriteOutWhenTargetIsReadOnly(t *testing.T) {
+	f := newRenewFixture(t)
+	sr, srLog := fakeSystemdRun(t)
+	f.env["DEVLAB_SYSTEMD_RUN"] = sr
+	confine(t, f)
+
+	content := []byte("#!/usr/bin/env bash\necho merged devlab-install\n")
+	sha := sha256of(content)
+	c, g := f.writeGrant(t, "qst_h1", "devlab-install", content, sha, "operator")
+
+	res := f.renew(t, "devlab-install", c, g)
+	if res.exit != 0 {
+		t.Fatalf("a confined renewal must be handed out and succeed, got exit %d\n%s", res.exit, res.out)
+	}
+	got, err := os.ReadFile(filepath.Join(f.sbinDir, "devlab-install"))
+	if err != nil || sha256of(got) != sha {
+		t.Fatalf("after an approved handed-out renewal the file must carry the approved checksum; err=%v got sha %s want %s", err, sha256of(got), sha)
+	}
+	log, _ := os.ReadFile(srLog)
+	if !strings.Contains(string(log), "DEVLAB_WRENEW_HANDED_OUT=1") {
+		t.Fatalf("the escape must carry the recursion marker so the transient unit does the work, not loop; systemd-run got:\n%s", log)
+	}
+	if !strings.Contains(string(log), "devlab-wrapper-renew-") {
+		t.Fatalf("the escape must name a transient renewal unit; systemd-run got:\n%s", log)
+	}
+}
+
+// (task test b, wrapper layer) When the target is read-only and there is NO way to hand out (systemd-run
+// absent), the renewal FAILS BY NAME with the real reason and installs nothing — never a silent success
+// and never a fall-through to a write that would fail again (the loop). The daemon turns this failure into
+// one disturbance, not a repeat of the same question.
+func TestRenewFailsByNameWhenConfinedAndNoEscape(t *testing.T) {
+	f := newRenewFixture(t)
+	f.env["DEVLAB_SYSTEMD_RUN"] = filepath.Join(t.TempDir(), "does-not-exist")
+	confine(t, f)
+
+	content := []byte("#!/usr/bin/env bash\necho merged\n")
+	c, g := f.writeGrant(t, "qst_h2", "devlab-install", content, sha256of(content), "operator")
+
+	res := f.renew(t, "devlab-install", c, g)
+	if res.exit == 0 {
+		t.Fatalf("a confined renewal with no escape must fail, got exit 0\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "cannot write") || !strings.Contains(res.out, "cannot be installed") {
+		t.Fatalf("the failure must name the real reason (read-only sbin, no escape), got:\n%s", res.out)
+	}
+	if _, err := os.Stat(filepath.Join(f.sbinDir, "devlab-install")); !os.IsNotExist(err) {
+		t.Fatalf("nothing must be installed when the renewal could not be handed out")
+	}
+}
+
+// (task tests c/d, through the escape) The hand-out does NOT weaken the four bindings: a handed-out
+// renewal whose content no longer matches the approved checksum is refused OUTSIDE the cgroup too, and
+// nothing is installed. So even the escaped, unconfined path cannot change a root script without a valid,
+// content-pinned approval.
+func TestHandoutStillEnforcesTheApprovedChecksum(t *testing.T) {
+	f := newRenewFixture(t)
+	sr, _ := fakeSystemdRun(t)
+	f.env["DEVLAB_SYSTEMD_RUN"] = sr
+	confine(t, f)
+
+	approvedSHA := sha256of([]byte("APPROVED CONTENT A\n"))
+	// Staged content is B; the grant pins the checksum of A. The escape runs, but the re-check outside
+	// refuses before any write.
+	c, g := f.writeGrant(t, "qst_h3", "devlab-exec", []byte("DIFFERENT CONTENT B\n"), approvedSHA, "operator")
+
+	res := f.renew(t, "devlab-exec", c, g)
+	if res.exit == 0 || !strings.Contains(res.out, "does not match the approved") {
+		t.Fatalf("a handed-out renewal must still refuse content that mismatches the approved checksum, got exit %d\n%s", res.exit, res.out)
+	}
+	if _, err := os.Stat(filepath.Join(f.sbinDir, "devlab-exec")); !os.IsNotExist(err) {
+		t.Fatalf("nothing must be installed on a checksum mismatch, even through the hand-out")
+	}
+}
+
 // DeliveringBranchWrapperDrift offers THIS run's own delivering-branch content — the second renewal
 // source, for when the run itself changed a root script that is not yet merged. It reports the drift
 // against the installed copy and pins the offered checksum to the delivering branch. With no branch ref
