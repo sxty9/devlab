@@ -106,10 +106,42 @@ case "$verb" in
     built=0
     if [ -f package.json ]; then
       npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      # Where the built web bundle lands is READ FROM THE BUILD'S OWN RESULT, never guessed from a
+      # fixed ./dist|./build list at the repo root. A hardcoded list ages the moment a project
+      # restructures — holistic is a pnpm monorepo whose bundle lives in frontend/app/dist, not at the
+      # root, so the old list found nothing and this wrapper wrongly reported 'nothing to build' right
+      # after a successful build, pointing every reader at the innocent repository. The build itself
+      # names its output: a deployable web bundle is the directory into which it writes an index.html —
+      # the browser's start page, and exactly what the installer later demands (serve_readable requires
+      # index.html). We tell that output apart from the checkout's source files by MODIFICATION TIME: a
+      # marker stamped just before the build makes the freshly written index.html newer than everything
+      # the clone brought in. This is tool-agnostic (vite, webpack, parcel, CRA all emit index.html into
+      # their outDir) and survives any future layout change.
+      marker="$art/.build-start"; : > "$marker"
       CI=true npm run build
-      for d in dist build; do
-        if [ -d "$d" ]; then cp -a "$d" "$art/web"; built=1; break; fi
-      done
+      # Directories holding an index.html the build just wrote, newest-independent, with the checkout's
+      # own machinery excluded: node_modules can carry package index.html files; .git and the artifact
+      # under construction are ours.
+      mapfile -t webdirs < <(
+        find . -type f -name index.html -newer "$marker" \
+          -not -path '*/node_modules/*' -not -path './.git/*' -not -path './.mercury-artifact/*' \
+          -printf '%h\n' 2>/dev/null | sort -u
+      )
+      rm -f -- "$marker"
+      if [ "${#webdirs[@]}" -eq 0 ]; then
+        # A build that SUCCEEDED but whose result we cannot find is a fault of THIS wrapper's output
+        # detection — never the same state as 'there was nothing to build' (no package.json / go.mod),
+        # and never a reason to accuse the repository. Kept as its own named error (task point 2+3).
+        die "build succeeded but its web bundle was not found (no index.html written under $wt after 'npm run build') — this is a fault of devlab-exec, not of the repository: the build itself ran"
+      fi
+      # One deployable SPA is the norm. A multi-app monorepo that writes several is genuinely ambiguous;
+      # pick the shallowest deterministically and NAME the alternatives rather than guess in silence.
+      webdir="${webdirs[0]}"
+      if [ "${#webdirs[@]}" -gt 1 ]; then
+        webdir="$(printf '%s\n' "${webdirs[@]}" | awk -F/ '{print NF, $0}' | sort -n -k1,1 -k2 | head -n1 | cut -d' ' -f2-)"
+        echo "devlab-exec: note: the build wrote more than one web bundle (${webdirs[*]}); delivering the shallowest ($webdir)" >&2
+      fi
+      cp -a "$webdir" "$art/web"; built=1
     fi
     if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
     if [ -n "$gd" ]; then
