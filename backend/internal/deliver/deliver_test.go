@@ -711,6 +711,74 @@ func TestRollbackConflictRaisesTodo(t *testing.T) {
 	}
 }
 
+// TestRollbackConflictIsIdempotent: a conflicting rollback is repeated (a re-clicked button, an MCP
+// retry, a maintenance re-attempt). The by-hand ToDo must not pile up — the standing one is refreshed
+// in place, keeping its id, so exactly ONE ever stands for the delivery. This is the same idempotence
+// the merged (reversal) and no-op paths already keep; the conflict path was the one hole.
+func TestRollbackConflictIsIdempotent(t *testing.T) {
+	gh := newFakeGH()
+	ledger := tempLedger(t)
+	rs := tempRuns(t)
+	_ = ledger.Put(runs.Delivery{ID: "dlv_1", Repo: "o/x", Branch: "fix/one-aaa111", FromCommit: "c0", ToCommit: "c1", PRNumber: 5, CreatedAt: t0})
+	_ = ledger.Put(runs.Delivery{ID: "dlv_2", Repo: "o/x", Branch: "fix/two-bbb222", FromCommit: "c1", ToCommit: "c2", PRNumber: 6, CreatedAt: t0.Add(time.Minute)})
+	gh.prState["o/x|5"] = PRState{Number: 5, State: "open"}
+	gh.cb = CounterBookResult{Conflicted: true, ConflictFiles: []string{"main.go"}}
+
+	first, err := Rollback(context.Background(), gh, ledger, rs, "dlv_1", model.Actor{User: "tester"})
+	if err != nil {
+		t.Fatalf("first Rollback: %v", err)
+	}
+	if first.ConflictTodoID == "" {
+		t.Fatalf("first conflict must raise a todo, got %+v", first)
+	}
+	created := readTodo(t, rs, first.ConflictTodoID)
+
+	second, err := Rollback(context.Background(), gh, ledger, rs, "dlv_1", model.Actor{User: "tester"})
+	if err != nil {
+		t.Fatalf("second Rollback: %v", err)
+	}
+	if second.ConflictTodoID != first.ConflictTodoID {
+		t.Fatalf("a repeated conflict must reuse the SAME todo id, got %q then %q", first.ConflictTodoID, second.ConflictTodoID)
+	}
+	if !strings.Contains(second.Detail, "refreshed the standing by-hand todo") {
+		t.Errorf("the repeated outcome must name the refresh, got %q", second.Detail)
+	}
+
+	// Exactly one by-hand ToDo stands for the delivery — no duplicate piled up.
+	want := rollbackTodoTitle("dlv_1")
+	all, _ := rs.List()
+	n := 0
+	for _, r := range all {
+		if r.Kind == model.KindTodo && r.Title == want {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("a repeated conflict must leave exactly ONE by-hand todo, got %d", n)
+	}
+
+	// The refresh preserves the original creation record; only the update stamp moves on.
+	refreshed := readTodo(t, rs, second.ConflictTodoID)
+	if !refreshed.Authorship.CreatedAt.Equal(created.Authorship.CreatedAt) {
+		t.Errorf("the refresh must keep the original creation time, got %v want %v", refreshed.Authorship.CreatedAt, created.Authorship.CreatedAt)
+	}
+}
+
+func readTodo(t *testing.T, rs *runs.Store, id string) runs.Run {
+	t.Helper()
+	all, err := rs.List()
+	if err != nil {
+		t.Fatalf("run store: %v", err)
+	}
+	for _, r := range all {
+		if r.ID == id {
+			return r
+		}
+	}
+	t.Fatalf("todo %s not in the run store", id)
+	return runs.Run{}
+}
+
 // TestRollbackUnlandedDissolves (REQ-025.4): a delivery that NEVER landed — deliver-dev failed, no
 // PR, nothing on the dev branch, so the reverse conflicts — is DISSOLVED off the stack. "0 later
 // open deliveries" is not a conflict: no manual-work todo is raised, the record settles as rolled
