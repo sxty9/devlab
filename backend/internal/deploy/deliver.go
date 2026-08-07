@@ -231,12 +231,15 @@ func ProdSetupPort(ctx context.Context, d Detection) (int, error) {
 
 // ─── the honest running gate (F10) ───────────────────────────────────────────
 
-// Gate proves a service is up: unit active AND port held. The probes are seams so the gate is
-// testable without a host; the defaults ask systemd and dial the loopback port.
+// Gate proves a service is up AND STAYS up: unit active AND port held, held CONTINUOUSLY over a dwell.
+// The probes are seams so the gate is testable without a host; the defaults ask systemd, dial the
+// loopback port, and read the unit's own journal for the reason a failed start died.
 type Gate struct {
 	UnitActive func(ctx context.Context, unit string) error
 	PortHeld   func(ctx context.Context, port int) error
-	Wait       time.Duration // how long the service gets to come up
+	LogReason  func(ctx context.Context, unit string) string // the line from the unit's log that carries the cause
+	Wait       time.Duration                                 // how long the service gets to COME UP
+	Dwell      time.Duration                                 // how long it must then STAY up, continuously
 	Poll       time.Duration
 }
 
@@ -258,14 +261,32 @@ func DefaultGate() Gate {
 			}
 			return conn.Close()
 		},
-		Wait: 15 * time.Second,
-		Poll: time.Second,
+		LogReason: func(ctx context.Context, unit string) string {
+			out, _ := exec.CommandContext(ctx, "journalctl", "-u", unit, "-n", "5", "--no-pager", "-o", "cat").CombinedOutput()
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			for i := len(lines) - 1; i >= 0; i-- {
+				if s := strings.TrimSpace(lines[i]); s != "" {
+					return s
+				}
+			}
+			return ""
+		},
+		Wait:  15 * time.Second,
+		Dwell: 12 * time.Second,
+		Poll:  time.Second,
 	}
 }
 
-// VerifyRunning polls until the unit is active AND (when known) the port is held, or Wait runs
-// out — then it returns the LAST honest failure. A restart is not a start (F10): success is
-// proven, never assumed.
+// VerifyRunning proves a service is up AND STAYS up (F10): success is proven, never assumed, and a
+// restart is not a start. It runs in two phases with the SAME signals — unit active AND (when known)
+// the port held — applied over TIME rather than at one instant:
+//  1. COME UP: poll until the service is up, or Wait runs out (then return the last honest failure).
+//  2. STAY UP: require it to REMAIN up continuously for Dwell. A service that starts and dies (a
+//     restart loop) drops its port every cycle, so a continuous port-held requirement catches it; if
+//     it drops during the dwell it did not stay, and that is a FAILED delivery.
+//
+// A failure carries the line from the unit's own log that names the cause, so the caller records the
+// real reason (e.g. "no JWT secret …") and never a bare "not active".
 func (g Gate) VerifyRunning(ctx context.Context, unit string, port int) error {
 	if g.Wait <= 0 {
 		g.Wait = time.Millisecond
@@ -273,22 +294,52 @@ func (g Gate) VerifyRunning(ctx context.Context, unit string, port int) error {
 	if g.Poll <= 0 {
 		g.Poll = time.Millisecond
 	}
+	// phase 1 — come up
 	deadline := time.Now().Add(g.Wait)
 	var last error
 	for {
 		last = g.probeOnce(ctx, unit, port)
 		if last == nil {
-			return nil
+			break
 		}
 		if time.Now().After(deadline) || ctx.Err() != nil {
-			return last
+			return g.withReason(ctx, unit, last)
 		}
 		select {
 		case <-ctx.Done():
-			return last
+			return g.withReason(ctx, unit, last)
 		case <-time.After(g.Poll):
 		}
 	}
+	// phase 2 — stay up: continuous over the dwell, or it was a restart loop, not a start
+	if g.Dwell <= 0 {
+		return nil
+	}
+	dwellEnd := time.Now().Add(g.Dwell)
+	for time.Now().Before(dwellEnd) {
+		select {
+		case <-ctx.Done():
+			return g.withReason(ctx, unit, ctx.Err())
+		case <-time.After(g.Poll):
+		}
+		if err := g.probeOnce(ctx, unit, port); err != nil {
+			return g.withReason(ctx, unit,
+				fmt.Errorf("came up but did not stay (a restart loop, not a start): %w", err))
+		}
+	}
+	return nil
+}
+
+// withReason appends the unit's own log line to a gate failure, so a failed delivery names the cause
+// from the service's protocol rather than a bare probe error.
+func (g Gate) withReason(ctx context.Context, unit string, err error) error {
+	if err == nil || g.LogReason == nil {
+		return err
+	}
+	if reason := strings.TrimSpace(g.LogReason(ctx, unit)); reason != "" {
+		return fmt.Errorf("%w — last log line: %s", err, reason)
+	}
+	return err
 }
 
 func (g Gate) probeOnce(ctx context.Context, unit string, port int) error {

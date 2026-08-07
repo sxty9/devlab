@@ -82,20 +82,66 @@ run() {
   "$@"
 }
 
-# The honest running gate (F10), executed HERE on the production host — the SAME proof the dev
-# delivery uses (deploy.VerifyRunning), just run on the target: "installed and started" is reported
-# only once the unit is genuinely ACTIVE. A restart is not a start; a unit that installs but does not
-# come up is a FAILED production delivery, and this receiver exits non-zero so the sending side sees
-# it (WHAT-2). It polls for up to ~15s, matching the dev gate's window. Exit code 11 = did not come up.
-# In --check it never runs (nothing was started) — the plan names it instead.
+# The honest running gate (F10), executed HERE on the production host — the SAME proof the dev delivery
+# uses (deploy.VerifyRunning), just run on the target: "installed and started" is reported only once the
+# unit is genuinely up AND STAYS up. A service that starts and dies immediately is not active — it is in
+# a restart loop, and "active" caught in the fraction before it died is a lie the honest gate must not
+# tell (WHAT-2). So the gate proves it in two phases, using the SAME signals the dev gate uses — the
+# unit is active AND its port is held — applied over TIME rather than at one instant:
+#   1. COME UP: within ~15s the unit is active and (when the port is known) the port is held.
+#   2. STAY UP: it then REMAINS active and port-held continuously for a dwell (~12s). A restart loop
+#      drops its port every cycle, so a continuous port-held requirement catches it; the same reading
+#      the gate already does, just not once. If the service drops during the dwell it did not stay.
+# A unit that never comes up, or comes up and drops, is a FAILED production delivery: the gate names the
+# real reason from the service's own log and exits 11, so the sending side records a failure with the
+# line that carries the cause (not a 'done'). In --check nothing was started — the plan names it instead.
+GATE_COMEUP_SECS="${DEVLAB_GATE_COMEUP_SECS:-15}"
+GATE_DWELL_SECS="${DEVLAB_GATE_DWELL_SECS:-12}"
+
+# port_held <port> — true when something accepts a TCP connect on 127.0.0.1:<port>. Uses bash's own
+# /dev/tcp so the receiver needs no extra tool on the production host.
+port_held() {
+  local port="$1"
+  ( exec 3<>"/dev/tcp/127.0.0.1/$port" ) >/dev/null 2>&1
+}
+
+# gate_up <unit> <port> — one honest reading: unit active AND (when the port is known) port held.
+gate_up() {
+  local unit="$1" port="$2"
+  "$SYSTEMCTL" is-active --quiet "$unit" || return 1
+  [ -n "$port" ] && { port_held "$port" || return 1; }
+  return 0
+}
+
+# gate_reason <unit> — the real cause from the service's OWN log, for a failed delivery message. The
+# last few journal lines carry the line that killed it (e.g. "no JWT secret: set HOLISTIC_SECRET_FILE").
+gate_reason() {
+  local unit="$1" out
+  out="$(journalctl -u "$unit" -n 5 --no-pager -o cat 2>/dev/null | grep -v '^$' | tail -n 2 | tr '\n' ' ' || true)"
+  [ -n "$out" ] && printf '%s' "$out" || printf 'no log line captured'
+}
+
 prove_running() {
-  local unit="$1" deadline=$((SECONDS + 15))
-  if [ "$CHECK" = 1 ]; then echo "PLAN: prove '$unit' is active (F10), else fail the delivery"; return 0; fi
-  while :; do
-    if "$SYSTEMCTL" is-active --quiet "$unit"; then log "prod gate: unit '$unit' is active"; return 0; fi
-    (( SECONDS >= deadline )) && die "prod gate: unit '$unit' is NOT active after start — delivery failed" 11
+  local unit="$1" port="${2:-}" deadline
+  if [ "$CHECK" = 1 ]; then
+    echo "PLAN: prove '$unit' is active AND holds its port${port:+ (:$port)}, then STAYS up for ${GATE_DWELL_SECS}s (F10) — else fail the delivery with the reason from its log"
+    return 0
+  fi
+  # phase 1 — come up
+  deadline=$((SECONDS + GATE_COMEUP_SECS))
+  until gate_up "$unit" "$port"; do
+    (( SECONDS >= deadline )) && die "prod gate: unit '$unit' did NOT come up within ${GATE_COMEUP_SECS}s — delivery failed: $(gate_reason "$unit")" 11
     sleep 1
   done
+  # phase 2 — stay up: continuous over the dwell, or it was a restart loop
+  deadline=$((SECONDS + GATE_DWELL_SECS))
+  while (( SECONDS < deadline )); do
+    sleep 1
+    gate_up "$unit" "$port" \
+      || die "prod gate: unit '$unit' came up but did NOT stay (a restart loop, not a start) — delivery failed: $(gate_reason "$unit")" 11
+  done
+  log "prod gate: unit '$unit' is active and stayed up${port:+ holding :$port} for ${GATE_DWELL_SECS}s"
+  return 0
 }
 
 mkdir -p "$STAGING_ROOT"
@@ -151,6 +197,17 @@ SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}
 # shellcheck source=/dev/null
 . "$SETUP_LIB"
 
+# ensure_secrets_for <repo> <unit-file> — MINT this host's instance secrets before the service starts,
+# derived from what the unit demands (the SAME rule the dev host applies via devlab-install). A blank
+# host has none, so without this the service installs and then dies at start with "no JWT secret …" and
+# loops. Secrets are minted HERE and never transported; a missing OUTSIDE credential is NAMED, not
+# swallowed. In --check it only plans (no effect).
+ensure_secrets_for() {
+  local repo="$1" unit="$2"
+  if [ "$CHECK" = 1 ]; then setup_plan_secrets "$unit"; return 0; fi
+  setup_ensure_secrets "$repo" "$unit"
+}
+
 # Install the prebuilt artifact into concrete prod paths + unit. NO build, and no per-repo
 # scripts (B-44): every uniform service takes the ONE generic branch below; only the self repo
 # has a different artifact shape (daemon + web SPA) and therefore its own layout.
@@ -162,8 +219,12 @@ case "$REPO" in
     run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     run mkdir -p "$WWW_DIR"
     run rsync -a --delete "$WEB"/ "$WWW_DIR"/
+    # devlabd needs the same host instance secrets (its unit reads /etc/holistic/jwt-secret); mint them
+    # here too so a bare host self-heals rather than looping. Derive from the installed unit.
+    DEVLABD_UNIT="$(setup_fragment_path devlabd "$SYSTEMCTL")"; [ -n "$DEVLABD_UNIT" ] || DEVLABD_UNIT="$UNIT_DIR/devlabd.service"
+    ensure_secrets_for devlab "$DEVLABD_UNIT"
     run "$SYSTEMCTL" restart devlabd
-    prove_running devlabd
+    prove_running devlabd "$(setup_unit_listen_port "$DEVLABD_UNIT")"
     ;;
   *)
     # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
@@ -212,8 +273,9 @@ case "$REPO" in
                               || echo "PLAN: no delivered route in the artifact — none installed"
         [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/$REPO.json + groupadd its hp_* groups" \
                                || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
+        setup_plan_secrets "$DELIV_UNIT"
         echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $REPO && $SYSTEMCTL start $REPO"
-        prove_running "$REPO"
+        prove_running "$REPO" "$(setup_unit_listen_port "$DELIV_UNIT")"
         echo "PLAN: prod deploy of '$REPO' done (first-time setup)"
         exit 0
       fi
@@ -255,17 +317,25 @@ case "$REPO" in
         log "no delivered rights for '$REPO' — installed without declared rights"
       fi
 
+      # Mint the host's instance secrets from what the delivered unit demands, BEFORE the first start —
+      # otherwise the service comes up and dies on the missing secret, and the gate below (correctly)
+      # fails the delivery. Secrets are minted on THIS host and never transported.
+      ensure_secrets_for "$REPO" "$UNIT_FILE"
+
       "$SYSTEMCTL" daemon-reload
       "$SYSTEMCTL" enable "$REPO" >/dev/null 2>&1 || true
       "$SYSTEMCTL" start "$REPO"
-      prove_running "$REPO"
+      prove_running "$REPO" "$(setup_unit_listen_port "$UNIT_FILE")"
     else
       # ── UPDATE — the unit already exists: replace the program and restart (today's behaviour) ──
       log "Aktualisierung of '$REPO' — unit already present; replacing the program and restarting"
       run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
       run install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+      # Self-heal a host set up before secrets were minted: ensure them (idempotent) before restart, so
+      # an update of a service that has been looping on a missing secret can finally stay up.
+      ensure_secrets_for "$REPO" "$UNIT_FILE"
       run "$SYSTEMCTL" restart "$REPO"
-      prove_running "$REPO"
+      prove_running "$REPO" "$(setup_unit_listen_port "$UNIT_FILE")"
     fi
     ;;
 esac

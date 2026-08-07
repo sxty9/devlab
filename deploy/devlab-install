@@ -599,6 +599,19 @@ if [ "$FIRST_TIME" = 1 ]; then
   fi
 fi
 
+# Mint this host's instance secrets from what the service's unit demands (setup_ensure_secrets in the
+# shared library — the SAME rule the production receiver applies) BEFORE the restart. A service reads
+# /etc/holistic/jwt-secret; a host that has none makes the program install cleanly and then die at start
+# in a restart loop. Secrets are minted on THIS host and never transported; a missing OUTSIDE credential
+# is NAMED, not swallowed. Derive from the unit that WILL be in place — the generated one (first-time)
+# or the installed one (update); in a first-time dry-run the unit is not on disk yet, so render it.
+secret_unit="$UNIT_FILE"; secret_tmp=0
+if [ ! -r "$secret_unit" ] && [ "$FIRST_TIME" = 1 ] && [ "$PORT" != 0 ]; then
+  secret_unit="$(mktemp)"; secret_tmp=1; setup_unit_text "$REPO" "$PORT" > "$secret_unit"
+fi
+if [ "$CHECK" = 1 ]; then setup_plan_secrets "$secret_unit"; else setup_ensure_secrets "$REPO" "$UNIT_FILE"; fi
+[ "$secret_tmp" = 1 ] && rm -f -- "$secret_unit"
+
 run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
 run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
 run "$SYSTEMCTL" restart "$REPO"
