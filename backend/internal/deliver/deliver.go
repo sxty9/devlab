@@ -470,15 +470,30 @@ func Rollback(ctx context.Context, gh GitHubOps, ledger *runs.DeliveryStore, rs 
 		// A real contradiction remains — the last resort. Either later open work builds on this
 		// delivery, or a merged delivery's reverse collides with the current default-branch state.
 		// The ToDo names WHAT collides with WHAT, never a bare "0".
-		todo := buildRollbackTodo(d, later, cb.ConflictFiles, by, now)
 		if rs == nil {
 			return out, errors.New("deliver: rollback conflicts but no run store to raise the todo in")
+		}
+		todo := buildRollbackTodo(d, later, cb.ConflictFiles, by, now)
+		// Idempotence, as everywhere else in Rollback (do nothing twice): a repeated conflicting
+		// rollback — a re-clicked button, an MCP retry, a maintenance re-attempt — REFRESHES the one
+		// standing by-hand ToDo instead of stacking a duplicate for the same delivery. A ToDo already
+		// raised for this delivery keeps its id and its creation record; only the current conflict
+		// picture (the later work, the conflicting files) and the update stamp move on. The match is
+		// the same deterministic title retireObsoleteRollbackTodos deletes by, so the two agree.
+		refreshed := false
+		if prev, ok := existingRollbackTodo(rs, d.ID); ok {
+			todo.ID = prev.ID
+			todo.Authorship.Created, todo.Authorship.CreatedAt = prev.Authorship.Created, prev.Authorship.CreatedAt
+			refreshed = true
 		}
 		if err := rs.Put(todo); err != nil {
 			return out, err
 		}
 		out.ConflictTodoID = todo.ID
 		out.Detail = rollbackConflictDetail(later, todo.ID)
+		if refreshed {
+			out.Detail += " — refreshed the standing by-hand todo rather than raising a duplicate"
+		}
 		return out, nil
 	}
 
@@ -641,6 +656,29 @@ func retireObsoleteRollbackTodos(rs *runs.Store, deliveryID string) []string {
 		}
 	}
 	return retired
+}
+
+// existingRollbackTodo finds a by-hand counter-booking ToDo already standing for this delivery,
+// matched by the ONE deterministic title. It lets the conflict path REUSE that ToDo instead of piling
+// up a fresh duplicate on every repeated rollback attempt — the same idempotence the merged and no-op
+// paths already keep. Matched exactly as retireObsoleteRollbackTodos matches, so raising, refreshing
+// and retiring all agree on the same set. Best-effort and rs-optional: no store or a read error means
+// no match, and the conflict path raises a fresh ToDo as before.
+func existingRollbackTodo(rs *runs.Store, deliveryID string) (runs.Run, bool) {
+	if rs == nil {
+		return runs.Run{}, false
+	}
+	all, err := rs.List()
+	if err != nil {
+		return runs.Run{}, false
+	}
+	want := rollbackTodoTitle(deliveryID)
+	for _, r := range all {
+		if r.Kind == model.KindTodo && r.Title == want {
+			return r, true
+		}
+	}
+	return runs.Run{}, false
 }
 
 // rollbackTodoTitle is the ONE deterministic title a manual counter-booking ToDo carries, so both
