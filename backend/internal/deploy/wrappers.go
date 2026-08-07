@@ -60,10 +60,9 @@ type WrapperDrift struct {
 	Installed string // <sbin>/<name> — what runs today
 	Reason    string // why it drifted ("not installed" | "installed copy differs …")
 
-	// WantSHA and WantContent are the sha256 (hex) and bytes of the copy — stack-tip or
-	// delivering-branch — that a renewal would install. Every drift the probes (StackTipWrapperDrift /
-	// DeliveringBranchWrapperDrift, which the gate reuses) return now through driftAgainstInstalled
-	// carries them.
+	// WantSHA and WantContent are the sha256 (hex) and bytes of the delivering-branch copy that a
+	// renewal would install. Every drift DeliveringBranchWrapperDrift (which the gate reuses) returns
+	// through driftAgainstInstalled carries them.
 	WantSHA     string
 	WantContent []byte
 

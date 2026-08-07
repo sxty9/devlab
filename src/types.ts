@@ -717,7 +717,10 @@ export interface RunQuestion {
   declinedBy?: Actor;
   /** Closed because its run no longer exists — the question was gegenstandslos and blocks nothing. */
   moot?: boolean;
-  /** Why the question closed without an effective answer (rejected, or its run is gone). */
+  /** Closed because its order FINISHED (the run still exists but its execution ended, so answering can
+   *  no longer take effect) — distinct from moot (run gone) and declined (rejected). */
+  ended?: boolean;
+  /** Why the question closed without an effective answer (rejected, its run is gone, or its order finished). */
   closeNote?: string;
   /** For a 'wrapper-renewal' question: the exact standard-branch (file, checksum) set the approval
    *  covers. Approving installs only these named files with these checksums; detail renders the same

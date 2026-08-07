@@ -191,7 +191,7 @@ func TestWrapperDriftRaisesApprovalQuestionAndReVerifies(t *testing.T) {
 	drift := "root wrapper(s) devlab-install differ from the stack tip"
 	deps.deploy.wrapperDrift = drift
 	// The renewal offers EXACTLY the stack-tip content — one file, one checksum.
-	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
 	sink := newFakeSink()
 
 	// Even at the autonomous level the wrapper renewal asks — it is a security gate, not a decision.
@@ -248,7 +248,7 @@ func TestWrapperApprovalRedeemedByLaterExecution(t *testing.T) {
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
 	deps.deploy.wrapperDrift = "root wrapper(s) devlab-install differ from the stack tip"
-	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
 
 	// exec_test raises the approval question and blocks.
 	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), newFakeSink()); err == nil {
@@ -286,7 +286,7 @@ func TestWrapperApprovalNotRedeemedWhenContentChanged(t *testing.T) {
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
 	deps.deploy.wrapperDrift = "root wrapper(s) devlab-install differ from the stack tip"
-	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
 
 	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), newFakeSink()); err == nil {
 		t.Fatalf("expected the first execution to block on the wrapper drift")
@@ -297,7 +297,7 @@ func TestWrapperApprovalNotRedeemedWhenContentChanged(t *testing.T) {
 	// The source content moved after the approval: the write half refuses (checksum mismatch), and the
 	// stack tip now offers a DIFFERENT checksum for the same file.
 	deps.deploy.renewErr = fmt.Errorf("renew devlab-install: stack-tip content is now different, not the approved sha — refusing")
-	deps.deploy.mainGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("c", 64)}}
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("c", 64)}}
 
 	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
 	req.Doc.ID = "exec_restart"
@@ -334,8 +334,7 @@ func TestRunChangedRootScriptRaisesWorkingSourceQuestionAndRenews(t *testing.T) 
 	shrinkRetries(t)
 	deps := newFakeDeps("org/devlab")
 	deps.deploy.wrapperDrift = "installed devlab-install differs from this run's delivering branch"
-	deps.deploy.mainGrants = nil // nothing on the stack tip differs from what is installed …
-	// … but THIS run changed devlab-install on its own delivering branch.
+	// THIS run changed devlab-install on its own delivering branch — the sole reference the renewal offers.
 	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("b", 64),
 		Summary: "+7/-2 lines vs the installed script"}}
 	sink := newFakeSink()
@@ -382,5 +381,127 @@ func TestRunChangedRootScriptRaisesWorkingSourceQuestionAndRenews(t *testing.T) 
 	}
 	if dd, ok := sink2.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepExecuted {
 		t.Fatalf("deliver-dev should succeed after the renewal, got %+v", dd)
+	}
+}
+
+// hasNotice reports whether the sink recorded a notice of the given kind (a disturbance raised instead
+// of a question).
+func hasNotice(s *fakeSink, kind string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.notices {
+		if n.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// (a) TASK TEST a — TWO CHECKS DEMAND OPPOSITE ⇒ NO QUESTION, A NAMED STÖRUNG. The self-delivery gate
+// refused the root wrappers as stale, but the stand it is measured against (this run's delivering
+// branch) shows NO difference from the installed scripts: the two checks contradict, so no approval
+// could resolve it. The chain names the contradiction as a disturbance and holds — it never hands the
+// user a click that resolves nothing (the pendulum's root, BEFUND 1).
+func TestWrapperContradictionRaisesDisturbanceNotQuestion(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "installed root wrappers are stale"
+	deps.deploy.workingGrants = nil // the authoritative stand shows NO drift — the two checks contradict
+	sink := newFakeSink()
+
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), sink); err == nil {
+		t.Fatalf("expected the delivery to be held on the contradiction")
+	}
+	// No question was posed — a click could not resolve it.
+	if len(deps.questions.raised) != 0 {
+		t.Fatalf("a contradiction must not be posed as a question, raised=%d", len(deps.questions.raised))
+	}
+	// It is a NAMED disturbance, and the repo is held with the contradiction class.
+	rp, _ := sink.done("org/devlab")
+	if rp.Block == nil || rp.Block.Class != "wrapper-check-contradiction" {
+		t.Fatalf("expected a wrapper-check-contradiction hold, got %+v", rp.Block)
+	}
+	if !hasNotice(sink, questionUnresolvableNotice) {
+		t.Fatalf("the contradiction must be recorded as a disturbance notice, got %+v", sink.notices)
+	}
+}
+
+// (b) TASK TEST b — AN APPROVAL THAT DID NOT TAKE EFFECT IS NOT RE-ASKED. The user approved renewing
+// exactly these scripts, but the install physically failed and the same drift persists unchanged. The
+// identical question is NOT posed a second time (its answer is presumed wirkungslos, points 3 & 5); the
+// chain names the real reason as a disturbance and holds (BEFUND 3).
+func TestIneffectiveApprovalRaisesDisturbanceNotSecondQuestion(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "installed devlab-install differs from this run's delivering branch"
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), newFakeSink()); err == nil {
+		t.Fatalf("expected the first execution to block on the wrapper drift")
+	}
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("expected exactly one wrapper question, got %d", len(deps.questions.raised))
+	}
+	// The user approves — but the install will fail and the SAME content stays required.
+	deps.questions.approve(deps.questions.raised[0].ID, "Approved renewing devlab-install.")
+	deps.deploy.renewErr = fmt.Errorf("cannot stage a temp file in /usr/local/sbin: read-only file system")
+
+	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
+	req.Doc.ID = "exec_restart"
+	sink2 := newFakeSink()
+	if err := Execute(context.Background(), deps, req, sink2); err == nil {
+		t.Fatalf("an ineffective approval must hold, not deliver")
+	}
+	// No second identical question was posed.
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("the same question must not be re-asked; raised=%d", len(deps.questions.raised))
+	}
+	// Nothing was installed, and the real reason is named with the ineffective class.
+	if len(deps.deploy.renewed) != 0 {
+		t.Fatalf("a failed renewal installs nothing, got %+v", deps.deploy.renewed)
+	}
+	rp, _ := sink2.done("org/devlab")
+	if rp.Block == nil || rp.Block.Class != "wrapper-approval-ineffective" {
+		t.Fatalf("expected a wrapper-approval-ineffective hold, got %+v", rp.Block)
+	}
+	if !hasNotice(sink2, questionUnresolvableNotice) {
+		t.Fatalf("the ineffective approval must be recorded as a disturbance, got %+v", sink2.notices)
+	}
+}
+
+// (d) TASK TEST d — THE NORMAL CASE STANDS: an approval that WILL take effect is asked exactly once,
+// installs on the resume, and the delivery proceeds — no disturbance, no repeat.
+func TestEffectiveApprovalAskedExactlyOnce(t *testing.T) {
+	shrinkRetries(t)
+	deps := newFakeDeps("org/devlab")
+	deps.deploy.wrapperDrift = "installed devlab-install differs from this run's delivering branch"
+	deps.deploy.workingGrants = []runs.WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("a", 64)}}
+	sink := newFakeSink()
+
+	if err := Execute(context.Background(), deps, withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous), sink); err == nil {
+		t.Fatalf("expected the first execution to block on the drift")
+	}
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("the question must be asked exactly once, got %d", len(deps.questions.raised))
+	}
+	if hasNotice(sink, questionUnresolvableNotice) {
+		t.Fatalf("the normal case must not raise a disturbance, got %+v", sink.notices)
+	}
+	deps.questions.approve(deps.questions.raised[0].ID, "Approved.")
+
+	req := withAutonomy(mkRequest(model.KindTodo, "org/devlab"), model.AutonomyAutonomous)
+	req.Doc.ID = "exec_2"
+	sink2 := newFakeSink()
+	if err := Execute(context.Background(), deps, req, sink2); err != nil {
+		t.Fatalf("resume should deliver once the renewal takes effect, got %v", err)
+	}
+	if len(deps.questions.raised) != 1 {
+		t.Fatalf("an effective approval must not be re-asked, got %d", len(deps.questions.raised))
+	}
+	if len(deps.deploy.renewed) != 1 {
+		t.Fatalf("the approved renewal should have installed once, got %+v", deps.deploy.renewed)
+	}
+	if dd, ok := sink2.terminal("org/devlab", model.StageDeliverDev); !ok || dd.State != model.StepExecuted {
+		t.Fatalf("deliver-dev should succeed, got %+v", dd)
 	}
 }

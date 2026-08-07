@@ -286,11 +286,9 @@ type fakeDeploy struct {
 	// wrapperDrift, when set, makes DeliverDev refuse with ErrWrappersStale carrying this drift — the
 	// self-delivery guard's refusal the deliver-dev stage turns into a wrapper-renewal question.
 	wrapperDrift string
-	// mainGrants is what StackTipWrapperDrift returns — the stack-tip (file, checksum) set the renewal
-	// question offers. Empty means the installed wrappers already match the stack tip.
-	mainGrants []runs.WrapperGrant
-	// workingGrants is what WorkingWrapperDrift returns — the run's OWN delivering-branch (file, checksum)
-	// set, offered when the run itself changed a root script that is not yet merged.
+	// workingGrants is what WorkingWrapperDrift returns — the delivering-branch (file, checksum) set the
+	// renewal question offers (the SOLE reference now). Empty means the installed scripts already match
+	// what this run delivers.
 	workingGrants []runs.WrapperGrant
 	// renewErr, when set, makes RenewApprovedWrappers fail; renewed records the questions it applied.
 	renewErr error
@@ -306,11 +304,6 @@ func (d *fakeDeploy) Detect(ctx context.Context, repo string) (Detection, error)
 	}
 	return d.det, nil
 }
-func (d *fakeDeploy) StackTipWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.mainGrants, nil
-}
 func (d *fakeDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -323,9 +316,11 @@ func (d *fakeDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 		return d.renewErr
 	}
 	d.renewed = append(d.renewed, q)
-	// A successful renewal makes the installed wrappers match the standard branch: clear the drift so
-	// the next DeliverDev proceeds, mirroring the real guard re-check on the same attempt.
+	// A successful renewal makes the installed wrappers match the delivering branch: clear the drift AND
+	// the delivering-branch drift set so the next DeliverDev proceeds and no stale grant lingers,
+	// mirroring the real guard re-check on the same attempt.
 	d.wrapperDrift = ""
+	d.workingGrants = nil
 	return nil
 }
 func (d *fakeDeploy) DeliverDev(ctx context.Context, repo string) (DeployOutcome, error) {

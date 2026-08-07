@@ -82,35 +82,36 @@ func TestGate_OpenDeliveryContentInstalled_NoDrift(t *testing.T) {
 	if err := GuardWrappersCurrent(g.wt, "fix/prior-delivery"); err != nil {
 		t.Fatalf("no drift expected when the installed copy matches the delivering branch, got: %v", err)
 	}
-	// The probe against the stack tip agrees: installed == tip ⇒ nothing to renew (no rollback offer).
-	drifts, err := StackTipWrapperDrift(g.wt, "fix/prior-delivery")
+	// The drift probe agrees: installed == the delivering branch ⇒ nothing to renew (no rollback offer).
+	drifts, err := DeliveringBranchWrapperDrift(g.wt, "fix/prior-delivery")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if d := driftNamed(drifts, "devlab-install"); d != nil {
-		t.Fatalf("the stack-tip probe must not offer a rollback when installed matches the tip, got %+v", d)
+		t.Fatalf("the drift probe must not offer a rollback when installed matches the delivering branch, got %+v", d)
 	}
 }
 
-// (b) The installed copy is main's, and the STACK TIP changed the script. The probe reports drift and
-// offers the TIP's content (never main's).
-func TestGate_StackTipChanged_OffersTipContent(t *testing.T) {
+// (b) The installed copy is main's, and the DELIVERING BRANCH carries a changed script (a stacked
+// wrapper change the run inherited, or its own). The probe reports drift and offers the BRANCH's
+// content (never main's) — the exact set the renewal question pins.
+func TestGate_DeliveringBranchChanged_OffersBranchContent(t *testing.T) {
 	v1 := []byte("#!/usr/bin/env bash\n# devlab-install v1 (main == installed)\n")
-	tip := []byte("#!/usr/bin/env bash\n# devlab-install v2 (stack tip)\n")
+	branch := []byte("#!/usr/bin/env bash\n# devlab-install v2 (delivering branch)\n")
 	g := newGateRepo(t, v1)
-	g.branchWith(t, "fix/prior-delivery", tip)
+	g.branchWith(t, "fix/prior-delivery", branch)
 	g.install(t, v1) // installed still matches main
 
-	drifts, err := StackTipWrapperDrift(g.wt, "fix/prior-delivery")
+	drifts, err := DeliveringBranchWrapperDrift(g.wt, "fix/prior-delivery")
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := driftNamed(drifts, "devlab-install")
 	if got == nil {
-		t.Fatalf("a stack-tip wrapper change must be reported as drift, got %+v", drifts)
+		t.Fatalf("a delivering-branch wrapper change must be reported as drift, got %+v", drifts)
 	}
-	if got.WantSHA != sha256of(tip) || string(got.WantContent) != string(tip) {
-		t.Fatalf("the offered content must be the STACK TIP's, not main's; got sha %s want %s", got.WantSHA, sha256of(tip))
+	if got.WantSHA != sha256of(branch) || string(got.WantContent) != string(branch) {
+		t.Fatalf("the offered content must be the DELIVERING BRANCH's, not main's; got sha %s want %s", got.WantSHA, sha256of(branch))
 	}
 }
 

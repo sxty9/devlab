@@ -43,21 +43,22 @@ const (
 	QuestionProdHostKey = "prod-host-key"
 )
 
-// Wrapper renewal SOURCES — where the approved content is re-read from at install time. Both flow
-// through the SAME question kind, the SAME approval and the SAME root write path; only the source of
-// the offered bytes differs, so a run that changes a root script asks the very question a drifted
-// install already did, never a second kind of question (task point 2).
+// Wrapper renewal SOURCE — where the approved content is re-read from at install time. There is now
+// exactly ONE: the branch this run delivers, which the self-delivery gate proves the install against.
+// An approval that installs that content therefore always resolves the gate, so no second source can
+// contradict it (task point 2 — an earlier design also offered the stack tip and drove a pendulum).
 const (
-	// WrapperSourceStackTip renews from the STACK TIP (deliver.NextPRBase) — another open delivery's
-	// branch when one is open, else the standard branch. The installed scripts drifted from that stand
-	// (a wrapper change that reached the stack but not yet /usr/local/sbin). This is the default when the
-	// field is empty, and it also covers the retired "merged" value persisted by an in-flight question.
-	WrapperSourceStackTip = "stacktip"
-	// WrapperSourceWorking renews from THIS run's own delivering branch — the run itself changed a root
-	// script that is not yet merged. The offered content is the run's, pinned to its sha256; the human
-	// is the gate instead of the merge, and the four bindings (sha, single-use, run-unwritable
-	// approval, re-read-after-approval) keep the root boundary exactly where it was.
+	// WrapperSourceWorking renews from THIS run's own delivering branch — the sole source. Its content is
+	// what deliver-dev is measured against (a change the run itself made, or a stacked change it inherited
+	// from the branch's base); pinned to its sha256, with the human as the gate instead of the merge, and
+	// the four bindings (sha, single-use, run-unwritable approval, re-read-after-approval) keeping the
+	// root boundary exactly where it was.
 	WrapperSourceWorking = "working"
+	// WrapperSourceStackTip is the RETIRED stack-tip source. No question is raised with it any more; it
+	// remains named only so the write half recognises an in-flight question persisted before the change —
+	// which it renews from the delivering branch regardless, refusing on a checksum mismatch (so a stale
+	// stack-tip approval installs nothing and the delivery re-asks with the delivering-branch content).
+	WrapperSourceStackTip = "stacktip"
 )
 
 // Question is one open (or answered) question of one run at one repository.
@@ -110,11 +111,11 @@ type Question struct {
 	HostKeyTarget      string `json:"hostKeyTarget,omitempty"`
 	HostKeyFingerprint string `json:"hostKeyFingerprint,omitempty"`
 
-	// WrapperSource names WHERE the approved wrapper content is re-read from at install time — the stack
-	// tip (WrapperSourceStackTip) or this run's own delivering branch (WrapperSourceWorking). It is set
-	// only on a wrapper-renewal question; an empty value (or the retired "merged") means the stack tip.
-	// The write half re-reads the bytes from exactly this source and re-checks their sha256, so a change
-	// to the source after the approval installs nothing.
+	// WrapperSource names where the approved wrapper content is re-read from at install time. A question
+	// raised today always sets WrapperSourceWorking — this run's own delivering branch, the ONE stand the
+	// self-delivery gate proves against. The retired WrapperSourceStackTip (and an empty value) may still
+	// appear on a question persisted before the change; the write half re-reads from the delivering branch
+	// regardless and re-checks the sha256, so a stale stack-tip approval installs nothing and re-asks.
 	WrapperSource string `json:"wrapperSource,omitempty"`
 
 	// Resolved marks a question whose answer the resumed run has already consumed, so a later resume
@@ -136,6 +137,14 @@ type Question struct {
 	// resolved so it holds nothing and drops off the surface. The set of runs that still exist is
 	// decided by the OWNER and handed to the pool; the pool never queries other stores itself.
 	Moot bool `json:"moot,omitempty"`
+
+	// Ended marks a question closed because the ORDER it belongs to has FINISHED — the run still exists
+	// but reached its goal or was abandoned, so no execution will act on the question again and its
+	// answer can no longer take effect ("Endet der Vorgang, zu dem eine Frage gehört, kann ihre
+	// Beantwortung keine Wirkung mehr entfalten"). Unlike Moot the run is not gone; unlike Declined the
+	// user did not reject it — it simply outlived its order. It is resolved so it holds nothing and drops
+	// off the surface. The OWNER decides which orders have ended and hands the set to the pool.
+	Ended bool `json:"ended,omitempty"`
 
 	// CloseNote is the human-readable reason a question closed WITHOUT an effective answer — the
 	// rejection, or the fact that its run is gone. Display-only; the pool never acts on it.
@@ -489,6 +498,44 @@ func (s *QuestionStore) CloseMoot(liveRunIDs map[string]bool, note string) ([]Qu
 			continue
 		}
 		cur[i].Moot = true
+		cur[i].CloseNote = note
+		cur[i].Resolved = true
+		cur[i].ResolvedAt = &now
+		closed = append(closed, cur[i])
+	}
+	if len(closed) == 0 {
+		return nil, nil
+	}
+	if err := s.save(cur); err != nil {
+		return nil, err
+	}
+	return closed, nil
+}
+
+// CloseEnded closes every OPEN question whose ORDER has ENDED — a run that still exists but is
+// finished (it reached its goal or was abandoned), so its execution will not act on the question again
+// and an answer can no longer resume anything (Selbst prüfen statt fragen: "Endet der Vorgang, zu dem
+// eine Frage gehört, kann ihre Beantwortung keine Wirkung mehr entfalten. Sie bleibt nicht offen,
+// sondern wird geschlossen und als unwirksam gekennzeichnet."). Such a question is resolved so it holds
+// nothing and drops off the surface, and marked Ended with the note as its reason. The CALLER supplies
+// endedRunIDs — the orders it has determined are finished — because the pool is passive and never reads
+// the execution store itself. An ANSWERED, not-yet-consumed question is left untouched: its answer is
+// still redeemed by a resuming or restarting execution, so ending is only ever applied to a question
+// nobody has answered. Returns the questions it closed, so the caller can announce the change.
+func (s *QuestionStore) CloseEnded(endedRunIDs map[string]bool, note string) ([]Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	var closed []Question
+	for i := range cur {
+		if !cur[i].Open() || !endedRunIDs[cur[i].RunID] {
+			continue
+		}
+		cur[i].Ended = true
 		cur[i].CloseNote = note
 		cur[i].Resolved = true
 		cur[i].ResolvedAt = &now

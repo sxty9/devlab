@@ -183,3 +183,45 @@ func TestMootQuestionClosedOnList(t *testing.T) {
 		t.Fatalf("a moot question must hold nothing, got %+v", held)
 	}
 }
+
+// TASK TEST c (end-to-end) — an order whose execution has ENDED (completed) leaves no open question
+// standing: the Blocked read sweeps it, so its answer can no longer be clicked to no effect. A run that
+// is still WAITING on its question (its execution blocked, not ended) keeps its question open.
+func TestEndedOrderQuestionClosedOnList(t *testing.T) {
+	f := newQuestionFixture(t)
+
+	// A run whose execution COMPLETED but left an open question behind (the corpse case).
+	if err := f.runs.Put(runs.Run{ID: "run_done", Kind: model.KindTodo, Title: "done", Targets: []runs.Target{{Repo: "org/app"}}}); err != nil {
+		t.Fatal(err)
+	}
+	doneDoc, err := f.docs.Create("run_done", model.KindTodo, []string{"org/app"}, false, model.Actor{User: "ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.docs.Update(doneDoc.ID, func(d *execstate.Doc) error {
+		d.SetPhase(model.PhaseCompleted, "", model.Actor{Autonomous: true}, time.Now().UTC())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dead, err := f.qs.Raise(runs.Question{RunID: "run_done", ExecutionID: doneDoc.ID, Repo: "org/app", QKind: runs.QuestionDecision, Question: "left open?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A run that is still WAITING on its question (execution blocked, not ended) must keep it open.
+	waiting := f.blockedRun("run_waiting", "org/other", runs.QuestionDecision)
+
+	w := httptest.NewRecorder()
+	f.srv.runsQuestionsList(w, f.req("GET", "/api/mercury/runs/questions", ""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("list: %d %s", w.Code, w.Body)
+	}
+
+	if got, _, _ := f.qs.Get(dead.ID); !got.Ended || got.Open() {
+		t.Fatalf("the ended order's open question must be closed after the read: %+v", got)
+	}
+	if got, _, _ := f.qs.Get(waiting.ID); !got.Open() {
+		t.Fatalf("a run still waiting on its question must keep it open: %+v", got)
+	}
+}
