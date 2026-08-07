@@ -134,6 +134,89 @@ func TestDeclineEndsRunAndFreesRepo(t *testing.T) {
 	<-f.execs
 }
 
+// retiredMergedConsent is the wrong wording this task removes — the consent must never claim the merged
+// (standard-branch) version when a wrapper renewal always installs the run's own delivering branch.
+const retiredMergedConsent = "standard-branch (merged) version"
+
+// TASK TESTS a & b + points 1 & 3 — the consent a human reads and the answer booked afterwards are ONE
+// wording, derived from the question's own subject. The Blocked read fills the derived consent (naming
+// the run's own not-yet-merged version and the exact file+checksum); approving books EXACTLY that same
+// wording — not text the client sent — so the ledger cannot claim a version other than the one installed.
+func TestGuardedApprovalBooksTheDerivedConsent(t *testing.T) {
+	f := newQuestionFixture(t)
+	if err := f.runs.Put(runs.Run{ID: "run_a", Kind: model.KindTodo, Title: "run_a", Targets: []runs.Target{{Repo: "org/app"}}}); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := f.docs.Create("run_a", model.KindTodo, []string{"org/app"}, false, model.Actor{User: "ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.docs.Update(doc.ID, func(d *execstate.Doc) error {
+		d.Repos[0].State = execstate.RepoBlocked
+		d.SetPhase(model.PhaseBlocked, "awaiting an answer", model.Actor{Autonomous: true}, time.Now().UTC())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sha := strings.Repeat("a", 64)
+	q, err := f.qs.Raise(runs.Question{
+		RunID: "run_a", ExecutionID: doc.ID, Repo: "org/app", QKind: runs.QuestionWrapperRenewal,
+		WrapperSource: runs.WrapperSourceWorking, Question: "Renew the root scripts?",
+		Wrappers: []runs.WrapperGrant{{Name: "devlab-install", SHA: sha}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consent := q.GuardedApprovalStatement()
+
+	// The Blocked read carries the derived consent, so the surface shows exactly what will be booked.
+	w := httptest.NewRecorder()
+	f.srv.runsQuestionsList(w, f.req("GET", "/api/mercury/runs/questions", ""))
+	var listed struct {
+		Questions []runs.Question `json:"questions"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Questions) != 1 || listed.Questions[0].ApprovalStatement != consent {
+		t.Fatalf("the surface must carry the derived consent, got %+v", listed.Questions)
+	}
+	if !strings.Contains(consent, "this run") || !strings.Contains(consent, sha) || strings.Contains(consent, retiredMergedConsent) {
+		t.Fatalf("consent must name the run's version and the checksum, never the merged wording: %q", consent)
+	}
+
+	// Approving with NO note books the consent verbatim — the client sent no answer text at all.
+	w = httptest.NewRecorder()
+	f.srv.runsQuestionAnswer(w, f.req("POST", "/api/mercury/runs/questions/answer", `{"id":"`+q.ID+`","approve":true}`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve: %d %s", w.Code, w.Body)
+	}
+	got, _, _ := f.qs.Get(q.ID)
+	if !got.Approved || got.Answer != consent {
+		t.Fatalf("the booked answer must be the derived consent verbatim, got answer=%q approved=%v", got.Answer, got.Approved)
+	}
+	<-f.execs // the run resumed (a fresh execution redeems the approval)
+}
+
+// A user's optional note is appended below the affirmation — the affirmation itself is still the
+// derived consent, so the ledger keeps naming the correct version even when a note is added.
+func TestGuardedApprovalKeepsConsentAndAppendsNote(t *testing.T) {
+	f := newQuestionFixture(t)
+	q := f.blockedRun("run_a", "org/app", runs.QuestionWrapperRenewal)
+	consent := q.GuardedApprovalStatement()
+
+	w := httptest.NewRecorder()
+	f.srv.runsQuestionAnswer(w, f.req("POST", "/api/mercury/runs/questions/answer", `{"id":"`+q.ID+`","approve":true,"answer":"checked on the console"}`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve: %d %s", w.Code, w.Body)
+	}
+	got, _, _ := f.qs.Get(q.ID)
+	if !strings.HasPrefix(got.Answer, consent) || !strings.Contains(got.Answer, "checked on the console") {
+		t.Fatalf("the booked answer must be the consent followed by the note, got %q", got.Answer)
+	}
+	<-f.execs
+}
+
 // A plain decision question is equally rejectable — the co-equal "no" is not reserved for guarded
 // questions. Declining an unknown id is a named 404.
 func TestDeclineDecisionQuestion(t *testing.T) {

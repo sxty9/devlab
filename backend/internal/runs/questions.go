@@ -118,6 +118,14 @@ type Question struct {
 	// regardless and re-checks the sha256, so a stale stack-tip approval installs nothing and re-asks.
 	WrapperSource string `json:"wrapperSource,omitempty"`
 
+	// ApprovalStatement is the EXACT sentence a user affirms to approve a guarded question, derived
+	// wholly from that question's own subject (GuardedApprovalStatement). It is NOT persisted with the
+	// question — it is filled in on read so the surface always shows the current derivation, and it is
+	// the SAME sentence recorded as the answer when the approval is given, so what a human reads while
+	// consenting and what stands in the ledger afterwards are one and the same wording. Empty for a plain
+	// decision (answered with free text, no fixed consent).
+	ApprovalStatement string `json:"approvalStatement,omitempty"`
+
 	// Resolved marks a question whose answer the resumed run has already consumed, so a later resume
 	// does not feed the same answer to the agent twice.
 	Resolved   bool       `json:"resolved,omitempty"`
@@ -161,6 +169,57 @@ type WrapperGrant struct {
 	// "+12/-3 lines vs the installed script"). It is display-only — the approval is bound solely by
 	// Name and SHA — and lets a human decide without opening the branch.
 	Summary string `json:"summary,omitempty"`
+}
+
+// GuardedApprovalStatement is the ONE source of the consent wording for a guarded question (task
+// points 1 & 3): the exact sentence the user affirms when approving, and the exact sentence recorded
+// as the answer afterwards. It is derived wholly from the question's OWN subject — never formulated a
+// second time beside it — so the consent can never describe something other than what the approval
+// actually frees. A wrapper renewal names WHICH version is installed and binds each file to its exact
+// checksum; a host-key names the target host and the exact key fingerprint. A plain decision has no
+// fixed consent, so this returns "" and the question is answered with free text.
+func (q Question) GuardedApprovalStatement() string {
+	switch q.QKind {
+	case QuestionWrapperRenewal:
+		return wrapperApprovalStatement(q.Wrappers)
+	case QuestionProdHostKey:
+		return hostKeyApprovalStatement(q.HostKeyTarget, q.HostKeyFingerprint)
+	default:
+		return ""
+	}
+}
+
+// wrapperApprovalStatement spells out, for the human and for the ledger, WHICH version of the root
+// wrapper scripts an approval installs and EXACTLY which files at which checksums it covers (task point
+// 2). It names one version — this run's own delivering branch, not yet in the standard branch — because
+// that is the sole stand the write half ever installs from: RenewApprovedWrappers re-reads the
+// delivering branch regardless of the recorded source and refuses any byte that no longer hashes to the
+// approved checksum. So the earlier "standard-branch (merged) version" wording named a version that is
+// never the one installed; this names the one that is.
+func wrapperApprovalStatement(grants []WrapperGrant) string {
+	var b strings.Builder
+	b.WriteString("I approve installing the version of these root wrapper scripts that THIS run delivers — " +
+		"the scripts on this run's own delivery branch, which is NOT yet merged into the standard branch. " +
+		"The approval covers exactly these files, each pinned to this checksum, and nothing else:")
+	for _, g := range grants {
+		b.WriteString("\n  - ")
+		b.WriteString(g.Name)
+		b.WriteString(" → sha256 ")
+		b.WriteString(g.SHA)
+	}
+	b.WriteString("\nIt is single-use: the run re-reads the content at install time and installs nothing if " +
+		"it no longer matches these checksums.")
+	return b.String()
+}
+
+// hostKeyApprovalStatement spells out, for the human and for the ledger, WHICH host and WHICH exact key
+// an approval trusts — the same single-source consent as the wrapper renewal, so a host-key approval
+// too reads identically on the surface and in the ledger.
+func hostKeyApprovalStatement(target, fingerprint string) string {
+	return "I approve trusting the NEW ssh host key of the production host " + target + ", whose SHA256 " +
+		"fingerprint is " + fingerprint + ". I have verified out-of-band that this fingerprint belongs to " +
+		"that host. The approval covers exactly this one key and nothing else: it is single-use, and the " +
+		"chain re-reads and re-verifies the host's key before trusting it."
 }
 
 // Open reports whether the question still waits for an answer — it carries no answer AND has not

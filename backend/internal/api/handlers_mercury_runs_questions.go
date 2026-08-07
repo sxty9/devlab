@@ -171,6 +171,12 @@ func (s *Server) runsQuestionsList(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Could not read the questions")
 		return
 	}
+	// Fill the derived consent wording for every guarded question, so the surface shows the ONE sentence
+	// the user affirms — derived from the question's own subject, never a text formulated beside it. The
+	// answer path records the SAME derivation, so consent and ledger read alike.
+	for i := range list {
+		list[i].ApprovalStatement = list[i].GuardedApprovalStatement()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"questions": list})
 }
 
@@ -204,11 +210,30 @@ func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 		s.runsQuestionDecline(w, r, body.ID, body.Answer)
 		return
 	}
-	if body.Answer == "" {
+	// A guarded approval's recorded answer is the question's OWN consent wording (derived from its
+	// subject), NOT text the client supplies — so what stands in the ledger is exactly what the human
+	// affirmed, whichever client sent it (task points 1 & 3). Any note the user typed is appended below
+	// the affirmation. A plain decision keeps requiring a non-empty free-text answer.
+	existing, ok, gerr := s.runQuestions.Get(body.ID)
+	if gerr != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not read the question")
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "No such question")
+		return
+	}
+	answerText := body.Answer
+	if stmt := existing.GuardedApprovalStatement(); stmt != "" && body.Approve {
+		answerText = stmt
+		if body.Answer != "" {
+			answerText = stmt + "\n\nNote: " + body.Answer
+		}
+	} else if body.Answer == "" {
 		writeErr(w, http.StatusBadRequest, "An answer is required — the run continues with it")
 		return
 	}
-	q, err := s.runQuestions.Answer(body.ID, body.Answer, body.Approve, actorFrom(r))
+	q, err := s.runQuestions.Answer(body.ID, answerText, body.Approve, actorFrom(r))
 	if errors.Is(err, runs.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "No such question")
 		return
