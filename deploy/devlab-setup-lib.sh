@@ -158,3 +158,133 @@ setup_unit_declares_user() {
   local file="$1" repo="$2"
   grep -Eq "^[[:space:]]*User[[:space:]]*=[[:space:]]*${repo}[[:space:]]*$" -- "$file"
 }
+
+# ── instance secrets: minted ON the host, never transported ────────────────────────────────────────
+# A delivered unit names the secrets its service reads (Environment=HOLISTIC_SECRET_FILE=/etc/holistic/
+# jwt-secret …). A blank host has none of them, so a service that installs cleanly still dies at start
+# ("no JWT secret …") and loops. The setup of a host therefore MINTS its instance secrets, HERE, from
+# what the services actually demand — derived from the unit, never a hand-kept list that goes stale.
+#
+# THE BOUNDARY: a secret belongs to ONE environment. It is generated on the host that runs the service
+# and it never leaves — not by hand, not by the chain, in no direction. Two hosts sharing a secret are
+# one environment, not two. So these functions MINT (from the kernel CSPRNG) and NAME; they never read
+# a secret off another host and never emit one.
+
+# The shared landscape group that guards instance secrets. A minted secret is root-owned and readable
+# by this group (mode 0640); each service account joins it, so every service reads the ONE shared
+# jwt-secret without the secret being world-readable. `holistic` is a landscape identity (already in
+# SETUP_RESERVED_REPOS — no service may take the name). Overridable ONLY as a direct test seam.
+SETUP_SECRET_GROUP="${DEVLAB_SECRET_GROUP:-holistic}"
+# The directory the landscape keeps its instance secrets in. Instance-neutral default; the env override
+# is the direct-invocation test seam, mirroring the wrappers' path seams.
+SETUP_HOLISTIC_DIR="${DEVLAB_HOLISTIC_DIR:-/etc/holistic}"
+
+# setup_unit_secret_files <unit-file> — DERIVE the /etc/holistic/<file> secret paths a unit demands,
+# read from the unit itself (its Environment=/EnvironmentFile= values and any other reference). This is
+# the SINGLE SOURCE of "which secrets": add a secret to a service's unit and the host mints it; the set
+# never goes stale because it is read from the unit, not maintained here. The shared state directories
+# (permissions.d, config.d) are host state, not secrets, and are excluded. One path per line, sorted
+# and de-duplicated.
+setup_unit_secret_files() {
+  local file="$1"
+  [ -r "$file" ] || return 0
+  grep -hoE "${SETUP_HOLISTIC_DIR}/[A-Za-z0-9._-]+" -- "$file" 2>/dev/null \
+    | grep -vE "/(permissions\.d|config\.d)$" \
+    | sort -u || true
+}
+
+# setup_secret_is_generatable <path-or-name> — a secret is GENERATABLE (a random landscape token this
+# host can mint on its own) when its name ends in `-secret`: the landscape convention for an INTERNALLY
+# shared secret (jwt-secret, notify-secret, <svc>-internal-secret). Anything else referenced under
+# /etc/holistic is a credential to a FOREIGN service (e.g. an `.env` of external access keys) that comes
+# from OUTSIDE and cannot be minted here — it is NAMED as missing, never silently skipped. This is a
+# RULE, not a list, so it stays correct as services add secrets.
+setup_secret_is_generatable() {
+  case "${1##*/}" in *-secret) return 0 ;; *) return 1 ;; esac
+}
+
+# setup_generate_secret_value — a fresh high-entropy token minted from THIS host's kernel CSPRNG. It is
+# never derived from anything transported in and never leaves the host.
+setup_generate_secret_value() {
+  head -c 48 /dev/urandom | base64 | tr -d '\n='
+}
+
+# setup_ensure_secrets <repo> <unit-file> — make this host's instance secrets EXIST before <repo> is
+# started, derived from what its unit demands (setup_unit_secret_files). It runs on the host that will
+# run the service and mints every generatable secret HERE, so no secret is ever transported. For each
+# referenced /etc/holistic secret:
+#   * already present      → left exactly as is (idempotent; a host's own secret is NEVER overwritten,
+#                            so re-running never rotates a live secret and never adopts a foreign one).
+#   * generatable, absent  → minted from the CSPRNG, root:<group> 0640, and the group is created and
+#                            <repo> joined so the service can read the shared secret.
+#   * external, absent     → NAMED (a "MISSING-SECRET: <name>" line plus a human sentence) as an outside
+#                            credential this host cannot mint — not swallowed. Kein stummes Ausbleiben.
+# It returns 0 even when an external secret is missing: a missing OUTSIDE credential is a NAMED
+# condition, not a setup failure — the host is still built and the service still starts (it may run
+# degraded until the operator provides the credential). Idempotent, so it also self-heals a host that
+# was set up before this fix and has a unit but no secret.
+setup_ensure_secrets() {
+  local repo="$1" unit="$2" path name seam=0
+  [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && seam=1
+  local own=(-o root -g "$SETUP_SECRET_GROUP"); [ "$seam" = 1 ] && own=()
+
+  mkdir -p "$SETUP_HOLISTIC_DIR"
+  if [ "$seam" != 1 ]; then
+    groupadd -f "$SETUP_SECRET_GROUP" >/dev/null 2>&1 || true
+    # the service account joins the secret group so it can READ the shared secret (root:group 0640)
+    if getent passwd "$repo" >/dev/null 2>&1 \
+       && ! id -nG "$repo" 2>/dev/null | tr ' ' '\n' | grep -qx "$SETUP_SECRET_GROUP"; then
+      gpasswd -a "$repo" "$SETUP_SECRET_GROUP" >/dev/null 2>&1 \
+        || usermod -aG "$SETUP_SECRET_GROUP" "$repo" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    name="${path##*/}"
+    if [ -e "$path" ]; then
+      echo "devlab: instance secret '$name' already present on this host — left as is (a host's own secret is never overwritten)" >&2
+      continue
+    fi
+    if setup_secret_is_generatable "$path"; then
+      local tmp; tmp="$(mktemp)"
+      ( umask 077; setup_generate_secret_value > "$tmp" )
+      install "${own[@]}" -m 0640 -- "$tmp" "$path"
+      rm -f -- "$tmp"
+      echo "devlab: minted instance secret '$name' on this host (root:$SETUP_SECRET_GROUP 0640) — it never leaves this host" >&2
+    else
+      echo "MISSING-SECRET: $name"
+      echo "devlab: instance secret '$name' comes from OUTSIDE (a foreign-service credential) and cannot be minted here — provide '$path' (root:$SETUP_SECRET_GROUP 0640) and restart '$repo'; until then the parts of '$repo' that need '$name' will not work" >&2
+    fi
+  done <<EOF
+$(setup_unit_secret_files "$unit")
+EOF
+  return 0
+}
+
+# setup_plan_secrets <unit-file> — the --check counterpart of setup_ensure_secrets: it emits a PLAN
+# line per secret the unit demands (mint-if-absent for generatable, name-if-absent for external),
+# WITHOUT any effect, so a dry run proves what the real setup would do.
+setup_plan_secrets() {
+  local unit="$1" path name
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    name="${path##*/}"
+    if setup_secret_is_generatable "$path"; then
+      echo "PLAN: mint instance secret '$name' on this host if absent (root:$SETUP_SECRET_GROUP 0640; never transported)"
+    else
+      echo "PLAN: instance secret '$name' comes from OUTSIDE — NAMED as missing if absent, never minted here"
+    fi
+  done <<EOF
+$(setup_unit_secret_files "$unit")
+EOF
+}
+
+# setup_unit_listen_port <unit-file> — the loopback port the unit's ExecStart binds
+# (--listen 127.0.0.1:<port>), or empty. The honest running gate dials this port to prove the service
+# STAYS up; a unit whose port cannot be read is proven by unit-activity alone.
+setup_unit_listen_port() {
+  local file="$1"
+  [ -r "$file" ] || return 0
+  grep -oE '127\.0\.0\.1:[0-9]+' -- "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true
+}

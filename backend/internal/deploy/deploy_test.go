@@ -444,3 +444,60 @@ func TestGateHonesty(t *testing.T) {
 		t.Fatalf("late-arriving service within the window should pass: %v", err)
 	}
 }
+
+// The honest gate proves a service STAYS up (F10, BEFUND 2): a service that comes up and then drops its
+// port within the dwell is a restart loop, not a start. The gate fails it and carries the reason from
+// the unit's OWN log (point 5), so the delivery records the real cause — not a bare "not active".
+func TestGateFailsServiceThatDoesNotStay(t *testing.T) {
+	probes := 0
+	g := Gate{
+		UnitActive: func(context.Context, string) error { return nil },
+		PortHeld: func(context.Context, int) error {
+			probes++
+			if probes <= 2 { // up briefly, then the process dies and the port is gone
+				return nil
+			}
+			return errors.New("connection refused")
+		},
+		LogReason: func(context.Context, string) string {
+			return "prizmd: no JWT secret: set HOLISTIC_SECRET_FILE or HOLISTIC_SECRET"
+		},
+		Wait: time.Second, Dwell: 500 * time.Millisecond, Poll: time.Millisecond,
+	}
+	err := g.VerifyRunning(context.Background(), "prizm", 8811)
+	if err == nil {
+		t.Fatal("a service that drops during the dwell must fail the gate")
+	}
+	if !strings.Contains(err.Error(), "did not stay") {
+		t.Errorf("the failure must say the service did not stay: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no JWT secret") {
+		t.Errorf("the failure must carry the reason from the unit's log: %v", err)
+	}
+}
+
+// A service that comes up and STAYS up for the whole dwell passes.
+func TestGateServiceThatStaysPasses(t *testing.T) {
+	g := Gate{
+		UnitActive: func(context.Context, string) error { return nil },
+		PortHeld:   func(context.Context, int) error { return nil },
+		Wait:       50 * time.Millisecond, Dwell: 20 * time.Millisecond, Poll: time.Millisecond,
+	}
+	if err := g.VerifyRunning(context.Background(), "u", 8811); err != nil {
+		t.Fatalf("a service that stays up must pass: %v", err)
+	}
+}
+
+// The come-up failure also carries the log reason, so a service that never binds names its cause.
+func TestGateComeUpFailureCarriesLogReason(t *testing.T) {
+	g := Gate{
+		UnitActive: func(context.Context, string) error { return errors.New("inactive") },
+		PortHeld:   func(context.Context, int) error { return nil },
+		LogReason:  func(context.Context, string) string { return "presentrd: no JWT secret" },
+		Wait:       5 * time.Millisecond, Dwell: 5 * time.Millisecond, Poll: time.Millisecond,
+	}
+	err := g.VerifyRunning(context.Background(), "presentr", 8812)
+	if err == nil || !strings.Contains(err.Error(), "no JWT secret") {
+		t.Fatalf("a never-active service must fail with its log reason, got %v", err)
+	}
+}

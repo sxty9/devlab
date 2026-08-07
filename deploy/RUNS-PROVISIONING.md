@@ -99,9 +99,34 @@ Stop admissions by setting the slot capacity to 0 in the service configuration
 - **First-time setup:** a template-conforming service with no unit yet is provisioned by the
   wrapper from its own root-owned inline templates (unit + route + rights manifest copy) with
   a validated port from the atlas proposal (`--port`). No per-repo scripts exist (B-44).
-- **Honest gate (F10):** "installed and started" is reported only after the unit is ACTIVE and
-  the port is HELD (`deploy.VerifyRunning`); otherwise the delivery FAILED, with the port
-  conflict named and a free port proposed where that is the cause.
+- **Instance secrets are minted ON the host (BEFUND 1):** a delivered unit names the secrets its
+  service reads (`Environment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret …`). A blank host has
+  none, so the program installs cleanly and then dies at start ("no JWT secret …") in a restart
+  loop — setup was a delivery TARGET but not an OPERATIONAL host. So first-time setup (both
+  `devlab-install` on dev and `devlab-deploy-recv` on prod, sharing `setup_ensure_secrets` in
+  `devlab-setup-lib.sh`) MINTS them, before the service starts:
+  - **Derived, not listed.** The secret set is read from the unit itself
+    (`setup_unit_secret_files`) — add a secret to a service's unit and the host mints it; the list
+    never goes stale. Shared state dirs (`permissions.d`, `config.d`) are excluded.
+  - **A rule, not a catalogue, decides what is generatable.** A name ending in `-secret` is an
+    internally shared random token this host can mint from its own CSPRNG (jwt-secret,
+    notify-secret, `<svc>-internal-secret`), written `root:holistic 0640` with the service account
+    joined to `holistic`. Anything else (an outside credential such as an `.env` of foreign access
+    keys) CANNOT be minted here.
+  - **The boundary: secrets never travel.** Each host mints its OWN; a secret is never read off
+    another host and never emitted, in any direction — two hosts sharing a secret are one
+    environment, not two. A host's existing secret is never overwritten (idempotent, self-healing).
+  - **Kein stummes Ausbleiben.** A secret that comes from OUTSIDE and is absent is NAMED
+    (`MISSING-SECRET: <name>` plus a human line saying what will not work without it), never
+    silently skipped.
+- **Honest gate (F10) — up AND STAYS up (BEFUND 2):** "installed and started" is reported only
+  after the unit is ACTIVE and the port is HELD, and then STAYS both continuously over a dwell
+  (`deploy.VerifyRunning` on dev; `prove_running` in the receiver on prod — the SAME two-phase
+  proof). A service that starts and dies immediately is a restart loop, not a start: it drops its
+  port every cycle, so the continuous port-held requirement catches it. A unit that never comes up,
+  or comes up and drops, is a FAILED delivery carrying the reason from the service's OWN log (e.g.
+  "no JWT secret …") — never a `done`; a port conflict is named and a free port proposed where that
+  is the cause.
 - **Ports (F9, REQ-044):** the ledger is derived on read from the route drop-ins and
   `/proc/net/tcp{,6}` — never stored, no maintainable list. `GET /api/atlas/ports` serves it;
   `DEVLAB_PORT_BAND` bounds proposals.
