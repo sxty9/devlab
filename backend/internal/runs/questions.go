@@ -121,6 +121,25 @@ type Question struct {
 	// does not feed the same answer to the agent twice.
 	Resolved   bool       `json:"resolved,omitempty"`
 	ResolvedAt *time.Time `json:"resolvedAt,omitempty"`
+
+	// Declined marks the question the user REJECTED — the co-equal "no". A rejection is a full,
+	// always-available answer, not a missing one: it resolves the question (Open()/Answered() both
+	// false, so it feeds no resume and holds no repository) and NAMES the rejection as the reason its
+	// run ended. It never approves, never installs and never continues — the safe exit that leaves the
+	// state exactly as it was before the question. DeclinedBy records who rejected it.
+	Declined   bool        `json:"declined,omitempty"`
+	DeclinedBy model.Actor `json:"declinedBy,omitempty"`
+
+	// Moot marks a question closed because its RUN no longer exists — an order that was removed while
+	// its question still stood open. Such a question is neither sensibly approvable (no branch is
+	// carried forward) nor rejectable-with-effect (there is no run to end); it is gegenstandslos. It is
+	// resolved so it holds nothing and drops off the surface. The set of runs that still exist is
+	// decided by the OWNER and handed to the pool; the pool never queries other stores itself.
+	Moot bool `json:"moot,omitempty"`
+
+	// CloseNote is the human-readable reason a question closed WITHOUT an effective answer — the
+	// rejection, or the fact that its run is gone. Display-only; the pool never acts on it.
+	CloseNote string `json:"closeNote,omitempty"`
 }
 
 // WrapperGrant names ONE root wrapper the user approved for renewal and the exact content (sha256)
@@ -413,6 +432,75 @@ func (s *QuestionStore) Answer(id, answer string, approved bool, by model.Actor)
 		return cur[i], nil
 	}
 	return Question{}, ErrNotFound
+}
+
+// Decline records the user's REJECTION of one open question — the co-equal "no". It resolves the
+// question (so it holds no repository and drops off the surface), marks it declined, and records the
+// note as the reason. It writes NOTHING else: no answer feeds a resume, no approval frees an action.
+// The caller ends the question's run and frees its slot; the pool only records the rejection. Unknown
+// id → ErrNotFound; an already-closed question → returned unchanged (idempotent, never overwritten).
+func (s *QuestionStore) Decline(id, note string, by model.Actor) (Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return Question{}, err
+	}
+	for i := range cur {
+		if cur[i].ID != id {
+			continue
+		}
+		if !cur[i].Open() {
+			return cur[i], nil
+		}
+		now := time.Now().UTC()
+		cur[i].Declined = true
+		cur[i].DeclinedBy = by
+		cur[i].CloseNote = note
+		cur[i].Resolved = true
+		cur[i].ResolvedAt = &now
+		if err := s.save(cur); err != nil {
+			return Question{}, err
+		}
+		return cur[i], nil
+	}
+	return Question{}, ErrNotFound
+}
+
+// CloseMoot closes every OPEN question whose run no longer exists — a question left standing by an
+// order that was removed. It is neither approvable nor rejectable-with-effect, so it is resolved
+// (holds nothing, off the surface) and marked moot with the note as its reason. The CALLER supplies
+// liveRunIDs — the set of orders that still exist — because the pool is passive and never reads other
+// stores; the pool only closes the ids that fall outside the set it is told. Returns the questions it
+// closed, so the caller can announce the change. Best-effort correctness rests on the caller: it must
+// pass the AUTHORITATIVE set (a successful read of the run store), never a partial one — an empty set
+// legitimately means "no orders exist", so every open question is then moot.
+func (s *QuestionStore) CloseMoot(liveRunIDs map[string]bool, note string) ([]Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	var closed []Question
+	for i := range cur {
+		if !cur[i].Open() || liveRunIDs[cur[i].RunID] {
+			continue
+		}
+		cur[i].Moot = true
+		cur[i].CloseNote = note
+		cur[i].Resolved = true
+		cur[i].ResolvedAt = &now
+		closed = append(closed, cur[i])
+	}
+	if len(closed) == 0 {
+		return nil, nil
+	}
+	if err := s.save(cur); err != nil {
+		return nil, err
+	}
+	return closed, nil
 }
 
 // Resolve marks an answered question consumed by the resumed run (idempotent; unknown id is a

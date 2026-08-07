@@ -2030,6 +2030,10 @@
     {
       "subject": "mercuryAnswerRunQuestion",
       "reason": "Answering a run's blocking question is the user's decision by definition — an agent answering its own question would defeat the whole mechanism."
+    },
+    {
+      "subject": "mercuryDeclineRunQuestion",
+      "reason": "Rejecting a run's blocking question is the user's decision by definition — the co-equal 'no' to answering it; an agent declining its own question would defeat the whole mechanism."
     }
   ],
   "untooledRoutes": [

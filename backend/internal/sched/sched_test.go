@@ -890,3 +890,45 @@ func TestFireDueSuppressedByLiveDoc(t *testing.T) {
 		t.Fatalf("a started todo must not refire, got %d live docs", len(l))
 	}
 }
+
+// A rejected question ENDS its run: the live execution — here a running one — is marked FAILED with
+// the rejection as its reason and its slot is freed, so another run on the same repository starts at
+// once. A run with no live execution is a no-op, NOT an error (a moot question's run is already gone).
+func TestFailForDeclinedQuestionFreesTheSlot(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.cap.Store(1) // one slot, so B can only start once A's is freed
+	h.addTodo("run_a", "A", "shared")
+	h.addTodo("run_b", "B", "shared")
+	outA := h.submit("run_a", nil)
+	h.waitPhase(outA.ExecutionID, model.PhaseRunning)
+
+	// B cannot start while A holds the only slot on the shared repo.
+	outB := h.submit("run_b", &Placement{Kind: PlacementQueue})
+	h.sch.pass(context.Background(), false)
+	if d, _, _ := h.docs.Get(outB.ExecutionID); d.Phase != model.PhaseQueued {
+		t.Fatalf("B must wait while A holds the slot, is %s", d.Phase)
+	}
+
+	// The user rejects A's question → A ends as failed, naming the rejection.
+	if err := h.sch.FailForDeclinedQuestion("run_a", model.Actor{User: "ada"}); err != nil {
+		t.Fatal(err)
+	}
+	dA := h.waitPhase(outA.ExecutionID, model.PhaseFailed)
+	if dA.Reason == "" || dA.Reason == "aborted by user" {
+		t.Fatalf("the failure must name the rejection, got %q", dA.Reason)
+	}
+	if last := dA.Transitions[len(dA.Transitions)-1]; last.By.User != "ada" {
+		t.Fatalf("the rejection must carry its actor: %+v", last)
+	}
+
+	// The freed slot lets B start on the same repository at once.
+	h.sch.pass(context.Background(), false)
+	h.waitPhase(outB.ExecutionID, model.PhaseRunning)
+
+	// A run with no live execution is a no-op, never an error.
+	if err := h.sch.FailForDeclinedQuestion("run_a", model.Actor{}); err != nil {
+		t.Fatalf("declining a run with no live execution must be a no-op, got %v", err)
+	}
+	h.exec.releaseExec(outB.ExecutionID)
+	h.waitPhase(outB.ExecutionID, model.PhaseCompleted)
+}

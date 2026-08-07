@@ -1004,6 +1004,43 @@ func (s *Scheduler) Cancel(runID string, by model.Actor) error {
 	return nil
 }
 
+// FailForDeclinedQuestion ends a run because the user REJECTED its blocking question. The run's live
+// execution — running, blocked, paused or interrupted — is marked FAILED with the rejection as its
+// reason and, if a goroutine still runs it, cancelled; either way the execution leaves the live set,
+// so its slot is freed. It clears any repository still marked blocked on that execution, so the
+// rejection leaves NO lingering hold. A run with no live execution is a no-op — nothing holds a slot.
+// It never touches deliveries: a question mints none, so there is no hanging delivery tip to unwind.
+func (s *Scheduler) FailForDeclinedQuestion(runID string, by model.Actor) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	doc, err := s.docs.LiveForRun(runID)
+	if err != nil {
+		return err
+	}
+	if doc == nil {
+		return nil // no live execution — the slot is already free
+	}
+	now := s.now()
+	if _, err := s.docs.Update(doc.ID, func(d *execstate.Doc) error {
+		for i := range d.Repos {
+			if d.Repos[i].State == execstate.RepoBlocked {
+				d.Repos[i].State = execstate.RepoPending
+				d.Repos[i].Block = nil
+			}
+		}
+		d.SetPhase(model.PhaseFailed, "declined by the user — the run's blocking question was rejected", by, now)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if le := s.running[doc.ID]; le != nil {
+		le.cancel(ErrAborted)
+	}
+	s.publish(live.TopicActive)
+	s.publish(live.TopicSlots)
+	return nil
+}
+
 // PauseAllUsageLimit puts every live execution into the ONE shared usage-limit pause
 // (REQ-016): the limit binds in sum, so everyone pauses together and resumes together.
 func (s *Scheduler) PauseAllUsageLimit(msg string, notBefore time.Time) error {

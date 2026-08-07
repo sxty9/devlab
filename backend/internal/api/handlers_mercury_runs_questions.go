@@ -25,6 +25,9 @@ func (s *Server) StartQuestionDelivery() {
 		log.Printf("devlabd: question delivery OFF — question pool unavailable")
 		return
 	}
+	// Retire at boot any question whose run vanished while the daemon was down — it must not hold a
+	// repository the moment the service comes back (the two IDs from the incident are closed here).
+	s.closeMootQuestions()
 	s.runQuestions.SetOnNew(func(q runs.Question) {
 		if s.runNotices != nil {
 			text := "A run stopped and needs your decision: " + firstLineOf(q.Question)
@@ -44,13 +47,49 @@ func (s *Server) StartQuestionDelivery() {
 	log.Printf("devlabd: question delivery ENABLED (disturbance notice per new question)")
 }
 
+// closeMootQuestions retires every open question whose RUN no longer exists — an order removed while
+// its question still stood open. Such a question is gegenstandslos: it cannot be sensibly approved
+// (no branch is carried on) nor rejected-with-effect (there is no run to end), yet as an open question
+// it would hold its repository against every new order — the very deadlock that froze production. The
+// owner decides existence here (the run store is authoritative) and hands the pool the set; the pool,
+// being passive, only closes the ids that fall outside it. Best-effort: a failed run read closes
+// nothing (the set must be authoritative, never partial). Called on every Blocked read, at boot, and
+// before the branch-halt consults an open question, so a moot question never blocks anyone.
+func (s *Server) closeMootQuestions() {
+	if s.runQuestions == nil || s.runs == nil {
+		return
+	}
+	all, err := s.runs.List()
+	if err != nil {
+		log.Printf("devlabd: moot-question sweep skipped (run store unreadable): %v", err)
+		return
+	}
+	existing := make(map[string]bool, len(all))
+	for _, r := range all {
+		existing[r.ID] = true
+	}
+	closed, err := s.runQuestions.CloseMoot(existing, "the run no longer exists — the question is moot and blocks nothing")
+	if err != nil {
+		log.Printf("devlabd: moot-question sweep failed: %v", err)
+		return
+	}
+	if len(closed) > 0 {
+		for _, q := range closed {
+			log.Printf("devlabd: closed moot question %s (run %s no longer exists) — it holds nothing anymore", q.ID, q.RunID)
+		}
+		s.publish(live.TopicQuestions)
+	}
+}
+
 // runsQuestionsList returns the open and answered questions the Blocked surface renders, newest
-// first. It is the ONE read path for the Blocked tab.
+// first. It is the ONE read path for the Blocked tab. It first retires any moot question (its run is
+// gone), so the surface never shows — and a repository is never held by — a question nobody can act on.
 func (s *Server) runsQuestionsList(w http.ResponseWriter, _ *http.Request) {
 	if s.runQuestions == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"questions": []runs.Question{}})
 		return
 	}
+	s.closeMootQuestions()
 	list, err := s.runQuestions.List()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read the questions")
@@ -59,9 +98,11 @@ func (s *Server) runsQuestionsList(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"questions": list})
 }
 
-// runsQuestionAnswer records the user's answer on one open question and resumes its run — the run
-// continues from where it stopped, it does not start over. approve is the single-use green light a
-// guarded handle (the wrapper renewal) needs; for a plain decision it is simply stored.
+// runsQuestionAnswer is the ONE access point for deciding an open question — the two co-equal
+// outcomes share it (no parallel path). With decline=false it records the user's answer and resumes
+// its run, which continues from where it stopped rather than starting over; approve is the single-use
+// green light a guarded handle (the wrapper renewal) needs. With decline=true it REJECTS the question
+// — the always-available "no" — which ends the run and frees its slot (see runsQuestionDecline).
 func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 	if s.runQuestions == nil {
 		writeErr(w, http.StatusServiceUnavailable, "The question pool is unavailable")
@@ -71,6 +112,7 @@ func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 		ID      string `json:"id"`
 		Answer  string `json:"answer"`
 		Approve bool   `json:"approve"`
+		Decline bool   `json:"decline"`
 	}
 	if !decodeJSON(w, r, &body) {
 		return
@@ -79,6 +121,11 @@ func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 	body.Answer = strings.TrimSpace(body.Answer)
 	if body.ID == "" {
 		writeErr(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	// The rejection is a full answer, not a missing one: it needs no text and never approves.
+	if body.Decline {
+		s.runsQuestionDecline(w, r, body.ID, body.Answer)
 		return
 	}
 	if body.Answer == "" {
@@ -127,6 +174,46 @@ func (s *Server) runsQuestionAnswer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"question": q, "resumed": resumed})
+}
+
+// runsQuestionDecline carries out the REJECTION of one open question — the co-equal "no" that ends
+// its run. The order is deliberate and idempotent:
+//  1. record the rejection on the question (resolved+declined) so it holds no repository and drops
+//     off the surface; a note carries the user's optional words;
+//  2. retire ANY other still-open question the same run left for the same repository, so the rejection
+//     leaves no second lingering blocker;
+//  3. end the run: its live execution is marked FAILED with the rejection as the reason and its slot
+//     is freed. A question mints no delivery, so there is no hanging delivery tip to unwind, and
+//     nothing was installed, changed or transferred — the state before the question stands unchanged.
+//
+// The rejection is the safe exit and the way a blocked stack tip is released: after it, another order
+// on the same repository starts at once (no open question holds it). An unknown id is a 404; an
+// already-closed question is a no-op that still reconciles the run, so a double click never errors.
+func (s *Server) runsQuestionDecline(w http.ResponseWriter, r *http.Request, id, note string) {
+	by := actorFrom(r)
+	q, err := s.runQuestions.Decline(id, note, by)
+	if errors.Is(err, runs.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "No such question")
+		return
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not record the rejection")
+		return
+	}
+	if q.RunID != "" {
+		// No second question of this run may keep holding the repository after the run is ended.
+		if _, werr := s.runQuestions.WithdrawForRun(q.RunID, q.Repo, ""); werr != nil {
+			log.Printf("devlabd: retire the declined run's other questions (%s): %v", q.RunID, werr)
+		}
+		if s.scheduler != nil {
+			if ferr := s.scheduler.FailForDeclinedQuestion(q.RunID, by); ferr != nil {
+				log.Printf("devlabd: end run %s after its question was declined: %v", q.RunID, ferr)
+			}
+		}
+	}
+	s.publish(live.TopicQuestions)
+	s.publish(live.TopicNotices)
+	writeJSON(w, http.StatusOK, map[string]any{"question": q, "declined": true})
 }
 
 // firstLineOf is the notice-text condenser: the first line of a possibly multi-line question.

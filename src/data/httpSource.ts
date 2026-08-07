@@ -273,6 +273,9 @@ export const httpSource: DataSource = {
   async mercuryAnswerRunQuestion(id, answer, approve) {
     return json(await post('/api/mercury/runs/questions/answer', { id, answer, approve }));
   },
+  async mercuryDeclineRunQuestion(id, note) {
+    return json(await post('/api/mercury/runs/questions/answer', { id, answer: note ?? '', decline: true }));
+  },
   async mercuryCreateRun(body) {
     return json(await post('/api/mercury/runs', body));
   },
