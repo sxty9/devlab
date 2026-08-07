@@ -102,6 +102,7 @@ export const stubSource: DataSource = {
   mercuryDismissRunNotice: offline,
   mercuryClearRunNotices: offline,
   mercuryAnswerRunQuestion: offline,
+  mercuryDeclineRunQuestion: offline,
   mercuryCreateRun: offline,
   mercuryUpdateRun: offline,
   mercuryDeleteRun: offline,

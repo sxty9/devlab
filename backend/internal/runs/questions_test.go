@@ -166,3 +166,73 @@ func TestQuestionStoreHostKeyDoesNotHoldDevBranch(t *testing.T) {
 		t.Fatal("a declined host-key question must not count as an approval")
 	}
 }
+
+// A REJECTION is a full answer, not a missing one: it resolves the question so it holds no repository
+// and feeds no resume, records who rejected it and why, and never approves. It is the safe exit — it
+// changes nothing on its own; the caller ends the run.
+func TestQuestionDecline(t *testing.T) {
+	s := newTestQuestions(t)
+	q, _ := s.Raise(Question{RunID: "run_a", ExecutionID: "exec_1", Repo: "org/app", QKind: QuestionWrapperRenewal, Question: "Renew the root scripts?"})
+
+	// A second, unrelated order's question must be untouched by the rejection.
+	other, _ := s.Raise(Question{RunID: "run_b", ExecutionID: "exec_x", Repo: "org/app", QKind: QuestionDecision, Question: "unrelated"})
+
+	dq, err := s.Decline(q.ID, "not now", model.Actor{User: "op"})
+	if err != nil {
+		t.Fatalf("decline: %v", err)
+	}
+	if !dq.Declined || dq.Approved || dq.Open() || dq.Answered() {
+		t.Fatalf("a declined question is resolved, not approved, and neither open nor answered: %+v", dq)
+	}
+	if dq.CloseNote != "not now" || dq.DeclinedBy.User != "op" {
+		t.Fatalf("the rejection records its note and who made it: %+v", dq)
+	}
+	// It holds nobody and feeds no resume.
+	if held, _ := s.OpenForRepo("org/app", "run_c"); held == nil || held.RunID != "run_b" {
+		t.Fatalf("only the unrelated order's question should still hold the repo, got %+v", held)
+	}
+	if fed, _ := s.AnsweredForRun("run_a", "org/app"); fed != nil {
+		t.Fatalf("a declined question must not feed a resume")
+	}
+	// Idempotent: declining again returns it unchanged, never an error, and never overwrites.
+	if again, err := s.Decline(q.ID, "second", model.Actor{User: "x"}); err != nil || again.CloseNote != "not now" {
+		t.Fatalf("declining an already-closed question is an unchanged no-op, got %+v err=%v", again, err)
+	}
+	// A different order's question is untouched.
+	if o, _, _ := s.Get(other.ID); o.Resolved {
+		t.Fatalf("decline must not touch another order's question")
+	}
+	// Unknown id is a named miss.
+	if _, err := s.Decline("nope", "", model.Actor{}); err != ErrNotFound {
+		t.Fatalf("unknown id should be ErrNotFound, got %v", err)
+	}
+}
+
+// A question whose run no longer exists is moot: told the set of runs that still exist, the pool
+// closes exactly the questions that fall outside it, so a moot question holds nothing. A question of
+// a run that still exists is left alone, and an empty (authoritative) set closes everything open.
+func TestQuestionCloseMoot(t *testing.T) {
+	s := newTestQuestions(t)
+	gone, _ := s.Raise(Question{RunID: "run_gone", ExecutionID: "e1", Repo: "org/app", QKind: QuestionDecision, Question: "orphan?"})
+	live, _ := s.Raise(Question{RunID: "run_live", ExecutionID: "e2", Repo: "org/app", QKind: QuestionDecision, Question: "still here?"})
+
+	closed, err := s.CloseMoot(map[string]bool{"run_live": true}, "run gone")
+	if err != nil {
+		t.Fatalf("close moot: %v", err)
+	}
+	if len(closed) != 1 || closed[0].ID != gone.ID {
+		t.Fatalf("only the moot question should close, got %+v", closed)
+	}
+	// The moot question holds nothing now; the live one still holds the repo.
+	if g, _, _ := s.Get(gone.ID); !g.Moot || !g.Resolved || g.Open() {
+		t.Fatalf("the moot question must be resolved and hold nothing: %+v", g)
+	}
+	if held, _ := s.OpenForRepo("org/app", "run_c"); held == nil || held.RunID != "run_live" {
+		t.Fatalf("the surviving run's question must still hold the repo, got %+v", held)
+	}
+	// Idempotent: nothing new closes on a second sweep.
+	if again, _ := s.CloseMoot(map[string]bool{"run_live": true}, "run gone"); len(again) != 0 {
+		t.Fatalf("a second sweep closes nothing new, got %+v", again)
+	}
+	_ = live
+}

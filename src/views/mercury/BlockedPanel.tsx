@@ -2,7 +2,14 @@
 // waits for a decision of the user stands here at ONE place: the question in full, which run and
 // which repository it comes from, what the run did so far, and its own recommendation. The user
 // answers here and the run continues with the answer — it does not start over. An unanswered
-// question never vanishes and names since when it has been waiting (REQ point 6).
+// question names since when it has been waiting (REQ point 6).
+//
+// Every question also carries the co-equal "no": Decline rejects it. Rejecting ENDS the run (marked
+// failed, its slot freed), leaves no open question and no hanging delivery, and installs or changes
+// nothing — the state before the question stands. It is always available, never gated by the approval
+// checkbox, because the heavier an approval weighs the more its refusal must be within reach; it is
+// also the way a stack tip a question blocked is released. A question whose run no longer exists is
+// gegenstandslos: the backend retires it on its own, so it neither shows here nor holds a repository.
 //
 // Two kinds are special: a GUARDED question moves a security boundary, so it is presented as an
 // explicit approval rather than a free-text answer. A wrapper-renewal carries the exact difference to
@@ -87,6 +94,25 @@ export function BlockedPanel() {
     }
   };
 
+  // Reject a question — the co-equal "no". It ends the run and frees its slot; nothing is installed
+  // or changed, and no question or delivery is left holding the repository.
+  const decline = async (q: RunQuestion, note: string) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await source.mercuryDeclineRunQuestion(q.id, note || undefined);
+      toast({
+        title: 'Declined — the run was ended',
+        description: 'The run is marked failed and its slot freed. Nothing was installed or changed.',
+      });
+      await reload();
+    } catch (e) {
+      toast({ title: 'Could not decline the question', description: errMsg(e), variant: 'danger' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (failed) {
     return (
       <div className="flex h-full min-h-0 items-center justify-center p-8">
@@ -116,7 +142,7 @@ export function BlockedPanel() {
           <h3 className="mb-2 text-caption font-medium uppercase tracking-wide text-text-tertiary">Questions</h3>
           <ul className="flex flex-col gap-3">
             {open.map((q) => (
-              <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} />
+              <QuestionRow key={q.id} question={q} busy={busy} onAnswer={answer} onDecline={decline} />
             ))}
           </ul>
         </section>
@@ -142,10 +168,12 @@ function QuestionRow({
   question: q,
   busy,
   onAnswer,
+  onDecline,
 }: {
   question: RunQuestion;
   busy: boolean;
   onAnswer: (q: RunQuestion, text: string, approve: boolean) => void | Promise<void>;
+  onDecline: (q: RunQuestion, note: string) => void | Promise<void>;
 }) {
   const wrapper = q.qKind === 'wrapper-renewal';
   const hostKey = q.qKind === 'prod-host-key';
@@ -228,9 +256,15 @@ function QuestionRow({
             <span>{consent}</span>
           </label>
         )}
-        <div className="flex items-center gap-2">
+        {/* The two co-equal outcomes stand side by side. Decline is ALWAYS available — never gated by
+            the approval checkbox — because the heavier the approval, the more its refusal must be
+            within reach. It ends the run; the state before the question stands unchanged. */}
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant={guarded ? 'secondary' : 'primary'} size="sm" disabled={busy || !canSend} onClick={send}>
             {guarded ? 'Approve & continue' : 'Answer & continue'}
+          </Button>
+          <Button variant="danger" size="sm" disabled={busy} onClick={() => void onDecline(q, text.trim())}>
+            Decline & end run
           </Button>
         </div>
       </div>

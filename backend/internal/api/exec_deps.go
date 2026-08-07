@@ -986,6 +986,9 @@ func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptRunID strin
 	if c.d.s.runQuestions == nil {
 		return nil, nil
 	}
+	// A question whose run no longer exists holds nothing: retire it BEFORE reading what still holds
+	// the repository, so a moot question never halts a new order (the deadlock this fixes).
+	c.d.s.closeMootQuestions()
 	return c.d.s.runQuestions.OpenForRepo(repo, exceptRunID)
 }
 

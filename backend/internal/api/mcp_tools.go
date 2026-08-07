@@ -887,6 +887,10 @@ var mcpOmittedOps = []MCPException{
 		Subject: "mercuryAnswerRunQuestion",
 		Reason:  "Answering a run's blocking question is the user's decision by definition — an agent answering its own question would defeat the whole mechanism.",
 	},
+	{
+		Subject: "mercuryDeclineRunQuestion",
+		Reason:  "Rejecting a run's blocking question is the user's decision by definition — the co-equal 'no' to answering it; an agent declining its own question would defeat the whole mechanism.",
+	},
 }
 
 // mcpUntooledRoutes are the routes of the frozen route table that deliberately carry no tool.

@@ -193,6 +193,13 @@ export interface DataSource {
     answer: string,
     approve: boolean,
   ): Promise<{ question: RunQuestion; resumed: boolean }>;
+  /** Reject an open question — the co-equal "no", always available. It ends the question's run
+   *  (marked failed, its slot freed), leaves no open question and no hanging delivery, and installs
+   *  or changes nothing: the state before the question stands. `note` carries optional words. */
+  mercuryDeclineRunQuestion(
+    id: string,
+    note?: string,
+  ): Promise<{ question: RunQuestion; declined: boolean }>;
   mercuryCreateRun(body: RunInput): Promise<Run>;
   mercuryUpdateRun(id: string, body: RunInput): Promise<Run>;
   mercuryDeleteRun(id: string): Promise<void>;

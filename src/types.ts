@@ -711,6 +711,14 @@ export interface RunQuestion {
   answeredBy?: Actor;
   resolved?: boolean;
   resolvedAt?: string;
+  /** The user REJECTED the question (the co-equal "no"): it is resolved, holds nothing, and its run
+   *  ended as failed with the rejection as the reason. */
+  declined?: boolean;
+  declinedBy?: Actor;
+  /** Closed because its run no longer exists — the question was gegenstandslos and blocks nothing. */
+  moot?: boolean;
+  /** Why the question closed without an effective answer (rejected, or its run is gone). */
+  closeNote?: string;
   /** For a 'wrapper-renewal' question: the exact standard-branch (file, checksum) set the approval
    *  covers. Approving installs only these named files with these checksums; detail renders the same
    *  set for the reader. */
