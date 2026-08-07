@@ -281,7 +281,7 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 			ranBefore[d.Repo] = true
 		}
 	}
-	for _, repo := range reconcileRepos(roster, all, handled) {
+	for _, repo := range reconcileRepos(roster, all, prodState, handled) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -331,32 +331,59 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 
 // reconcileRepos is the work list of the reconciliation: every service the landscape expects on
 // production, UNION every repository production is known to have run before, minus the ones the
-// chain is still driving (an open, failed, or production-owing delivery) or the booked loop just
-// handled. The landscape roster is the SOURCE OF TRUTH for what production should carry; the
-// ledger-derived set is only a safety net, so a drift is still reconciled for a service the roster
-// read happened to miss this pass. The order is stable (repository name) so a pass is deterministic.
-func reconcileRepos(roster []string, all []runs.Delivery, handled map[string]bool) []string {
+// booked loop just handled or that an in-flight delivery holds back FOR A REASON THAT APPLIES. The
+// landscape roster is the SOURCE OF TRUTH for what production should carry; the ledger-derived set
+// is only a safety net, so a drift is still reconciled for a service the roster read happened to
+// miss this pass. The order is stable (repository name) so a pass is deterministic.
+//
+// The hold is where absence and drift part ways. An open, in-flight delivery is a change on the way;
+// waiting for it is right ONLY when production ALREADY runs the service and merely trails it (a
+// DRIFT — production carries an older state, the delivery will replace it, so a send now would ship
+// a state the delivery is about to supersede). It is WRONG when production is MISSING the service
+// entirely: an absence is not made good by future work, so the standard branch is delivered NOW,
+// open deliveries or not — otherwise every open delivery of a repository keeps a never-shipped
+// service off production for as long as work keeps coming. A FAILED delivery never holds anything
+// back: its failure concerns its own unmerged content, not the merged state production must carry;
+// and a stuck delivery is not a delivery "in motion". A NeedsProd (merged, owing) delivery is
+// already shipped by the booked loop above (it is in `handled`), so it needs no separate hold here.
+//
+// "Production already runs it" is measured the SAME way reconcileProd tells DRIFT from MISSING: a
+// delivery that reached production before, OR a recorded production-state commit. The two passes
+// must agree on the case, or one would wait while the other delivers.
+func reconcileRepos(roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, handled map[string]bool) []string {
 	expected := map[string]bool{}
 	for _, repo := range roster {
 		if repo != "" {
 			expected[repo] = true
 		}
 	}
-	blocked := map[string]bool{}
-	for _, d := range all {
-		// Production is known to run it — reconcile drift even if the roster read missed it this pass.
-		if d.ProdDeployedAt != nil {
-			expected[d.Repo] = true
+	// The set of repositories production is KNOWN to run — a recorded production commit, or a delivery
+	// that reached production before. Exactly the notion reconcileProd uses for DRIFT-vs-MISSING.
+	onProd := map[string]bool{}
+	if prodState != nil {
+		if recs, err := prodState.All(); err == nil {
+			for _, r := range recs {
+				onProd[r.Repo] = true
+			}
 		}
-		// A repository the chain is still driving is not a silent gap: an unmerged (open) delivery, a
-		// failed dev tip, or a merged delivery still owing production all mean the chain will act on it.
-		if d.OpenState() || d.Failed() || d.NeedsProd() {
-			blocked[d.Repo] = true
+	}
+	for _, d := range all {
+		if d.ProdDeployedAt != nil {
+			onProd[d.Repo] = true
+			expected[d.Repo] = true // production runs it — reconcile drift even if the roster read missed it
+		}
+	}
+	// A repository held back this pass: an open, in-flight (not failed) delivery, but ONLY where
+	// production already runs the service. Missing services fall through and are delivered.
+	waiting := map[string]bool{}
+	for _, d := range all {
+		if d.OpenState() && !d.Failed() && onProd[d.Repo] {
+			waiting[d.Repo] = true
 		}
 	}
 	out := []string{}
 	for repo := range expected {
-		if handled[repo] || blocked[repo] {
+		if handled[repo] || waiting[repo] {
 			continue
 		}
 		out = append(out, repo)
