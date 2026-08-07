@@ -236,3 +236,42 @@ func TestQuestionCloseMoot(t *testing.T) {
 	}
 	_ = live
 }
+
+// TASK TEST c — when the ORDER a question belongs to has ENDED, the question can no longer take
+// effect: it is closed and marked, and holds nothing. A question of an order that is still going is
+// left alone, and an ANSWERED question is never ended (its answer is still redeemed by a resuming
+// execution).
+func TestQuestionCloseEnded(t *testing.T) {
+	s := newTestQuestions(t)
+	ended, _ := s.Raise(Question{RunID: "run_done", ExecutionID: "e1", Repo: "org/app", QKind: QuestionDecision, Question: "left open when the order finished?"})
+	going, _ := s.Raise(Question{RunID: "run_going", ExecutionID: "e2", Repo: "org/app", QKind: QuestionDecision, Question: "still waiting?"})
+	answered, _ := s.Raise(Question{RunID: "run_done", ExecutionID: "e3", Repo: "org/b", QKind: QuestionWrapperRenewal, Question: "approve?"})
+	if _, err := s.Answer(answered.ID, "yes", true, model.Actor{User: "op"}); err != nil {
+		t.Fatal(err)
+	}
+
+	closed, err := s.CloseEnded(map[string]bool{"run_done": true}, "order finished")
+	if err != nil {
+		t.Fatalf("close ended: %v", err)
+	}
+	// Only the OPEN question of the ended order closes — not the still-going order's, not the answered one.
+	if len(closed) != 1 || closed[0].ID != ended.ID {
+		t.Fatalf("only the ended order's open question should close, got %+v", closed)
+	}
+	if g, _, _ := s.Get(ended.ID); !g.Ended || !g.Resolved || g.Open() || g.CloseNote != "order finished" {
+		t.Fatalf("the ended question must be resolved, marked ended, and hold nothing: %+v", g)
+	}
+	// The still-going order's question is untouched and still holds the repo.
+	if held, _ := s.OpenForRepo("org/app", "run_c"); held == nil || held.RunID != "run_going" {
+		t.Fatalf("the still-going order's question must still hold the repo, got %+v", held)
+	}
+	// The answered question of the ended order is untouched — its answer is still redeemable.
+	if a, _, _ := s.Get(answered.ID); a.Ended || !a.Answered() {
+		t.Fatalf("an answered question must not be ended, got %+v", a)
+	}
+	// Idempotent: a second sweep closes nothing new.
+	if again, _ := s.CloseEnded(map[string]bool{"run_done": true}, "order finished"); len(again) != 0 {
+		t.Fatalf("a second sweep closes nothing new, got %+v", again)
+	}
+	_ = going
+}

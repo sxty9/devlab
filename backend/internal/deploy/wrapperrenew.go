@@ -8,13 +8,14 @@ package deploy
 //
 // The boundary is held by three facts, none of which a run can bend:
 //
-//  1. THE SOURCE IS COMMITTED HISTORY THE RUN CANNOT AUTHOR ALONE — one of two committed stands.
-//     For a drifted-installed-script renewal it is the STACK TIP (deliver.NextPRBase): another open
-//     delivery's branch, else the standard branch — content that either merged through a protected
-//     pull request or is a delivered-and-open change. StackTipWrapperDrift reads it from committed
-//     history (origin/<tip>, falling back to the local ref), never from the shared working tree. The
-//     second stand, admissible only under the human-gate spelled out below, is the DELIVERING BRANCH
-//     itself, used when the run's own not-yet-merged change is what drifted.
+//  1. THE SOURCE IS COMMITTED HISTORY — the branch BEING DELIVERED (this run's own task branch), read
+//     from its committed ref (never the shared working tree). It is the ONE reference the self-delivery
+//     gate proves the install against, so an approval that installs it always resolves the gate — there
+//     is deliberately no second stand to contradict it (an earlier design also measured the stack tip
+//     and drove a pendulum; task point 2). The delivering branch is cut from the stack tip, so it also
+//     carries any wrapper change an open delivery stacked before this run, whether or not the run itself
+//     touched a root script. The run CAN author these bytes, so the human — not a merge — is the gate;
+//     that is admissible under the four bindings spelled out below.
 //
 //  2. THE APPROVAL IS SINGLE-USE AND CONTENT-PINNED, AND A RUN CANNOT FORGE IT. The user approves a
 //     named file with a named checksum. That approval lives in the daemon-owned question pool under
@@ -58,23 +59,6 @@ type WrapperContentAt struct {
 	read  func(name string) (content []byte, ok bool)
 }
 
-// StackTipContent reads each wrapper from the STACK TIP — the base the next pull request stacks onto
-// (deliver.NextPRBase): another open delivery's branch when the repository has one open, else the
-// standard branch. It reads committed history via origin/<tip> (falling back to the local ref), never
-// the working tree. This is the reference for a drifted-installed-script renewal, and it is the stack
-// tip rather than main alone BECAUSE an open delivery that already changed a wrapper is part of the
-// stack: measuring against main would report drift against a stand the installed scripts have already
-// moved past, and offer to roll them BACK to the older content (the false positive measured
-// 2026-08-04). Content on the stack tip either merged through a protected pull request or is itself a
-// delivered-and-open change; a run cannot author the tip by itself.
-func StackTipContent(wt, tipBranch string) WrapperContentAt {
-	ref := firstRef(wt, "origin/"+tipBranch, tipBranch)
-	return WrapperContentAt{
-		label: "the stack tip",
-		read:  func(name string) ([]byte, bool) { return refWrapper(wt, ref, name) },
-	}
-}
-
 // DeliveringBranchContent reads each wrapper from the branch BEING DELIVERED — this run's own task
 // branch tip, the tree that is actually shipped. It reads the committed branch ref (local first, since
 // the run just committed onto it; origin/<branch> as the fallback for a freshly-opened checkout that
@@ -110,22 +94,15 @@ func DeliveringBranchContent(wt, branch string) WrapperContentAt {
 	}
 }
 
-// StackTipWrapperDrift compares each renewable root wrapper's INSTALLED copy (<sbin>/<name>,
-// world-readable) against the copy on the STACK TIP (deliver.NextPRBase — never main alone). Every
-// reported drift carries the tip content and its sha256, so the caller can offer EXACTLY that content
-// for the user's approval. A read-only, unprivileged probe throughout. (This is the same probe that
-// used to measure against the standard branch under the name MainWrapperDrift; its reference point
-// moved to the stack tip so an open delivery's wrapper change is not mistaken for drift.)
-func StackTipWrapperDrift(wt, tipBranch string) ([]WrapperDrift, error) {
-	return driftAgainstInstalled(StackTipContent(wt, tipBranch))
-}
-
 // DeliveringBranchWrapperDrift compares each renewable root wrapper's INSTALLED copy against the
-// branch BEING DELIVERED (this run's own task branch). It is the ONE probe both the self-delivery gate
-// (GuardWrappersCurrent) and the working-source renewal question use: the gate halts on any drift, and
-// the question offers the delivering-branch content pinned to its sha256 when the run itself changed a
-// root script that has not merged yet (task point 1). Reading the branch ref rather than the shared
-// working tree is what lets it SEE a run's change even when the tree sits on the standard branch.
+// branch BEING DELIVERED (this run's own task branch). It is the ONE drift probe of the delivery chain:
+// both the self-delivery gate (GuardWrappersCurrent) and the wrapper-renewal question read it, so the
+// gate and the question measure the SAME stand and an approval always resolves the gate (task point 2 —
+// there is no second yardstick to contradict it). The delivering branch is cut from the stack tip, so
+// it carries BOTH a wrapper the run itself changed AND one an open delivery stacked before it; reading
+// its committed ref rather than the shared working tree is what lets the probe SEE a run's change even
+// when the tree sits on the standard branch on a resume (the 2026-08-04 false negative). Every reported
+// drift carries the branch content and its sha256, the exact set the question pins for approval.
 func DeliveringBranchWrapperDrift(wt, branch string) ([]WrapperDrift, error) {
 	return driftAgainstInstalled(DeliveringBranchContent(wt, branch))
 }

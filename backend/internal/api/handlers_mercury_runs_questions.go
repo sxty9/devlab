@@ -9,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"devlab/backend/internal/live"
+	"devlab/backend/internal/model"
 	"devlab/backend/internal/runs"
 	"devlab/backend/internal/sched"
 )
@@ -25,9 +27,9 @@ func (s *Server) StartQuestionDelivery() {
 		log.Printf("devlabd: question delivery OFF — question pool unavailable")
 		return
 	}
-	// Retire at boot any question whose run vanished while the daemon was down — it must not hold a
-	// repository the moment the service comes back (the two IDs from the incident are closed here).
-	s.closeMootQuestions()
+	// Retire at boot any dead question — one whose run vanished, or whose order has since finished —
+	// while the daemon was down, so it never holds a repository the moment the service comes back.
+	s.sweepDeadQuestions()
 	s.runQuestions.SetOnNew(func(q runs.Question) {
 		if s.runNotices != nil {
 			text := "A run stopped and needs your decision: " + firstLineOf(q.Question)
@@ -47,49 +49,123 @@ func (s *Server) StartQuestionDelivery() {
 	log.Printf("devlabd: question delivery ENABLED (disturbance notice per new question)")
 }
 
-// closeMootQuestions retires every open question whose RUN no longer exists — an order removed while
-// its question still stood open. Such a question is gegenstandslos: it cannot be sensibly approved
-// (no branch is carried on) nor rejected-with-effect (there is no run to end), yet as an open question
-// it would hold its repository against every new order — the very deadlock that froze production. The
-// owner decides existence here (the run store is authoritative) and hands the pool the set; the pool,
-// being passive, only closes the ids that fall outside it. Best-effort: a failed run read closes
-// nothing (the set must be authoritative, never partial). Called on every Blocked read, at boot, and
-// before the branch-halt consults an open question, so a moot question never blocks anyone.
-func (s *Server) closeMootQuestions() {
+// sweepDeadQuestions retires every open question that can no longer take effect — the ONE place a
+// question is closed for a reason outside the user's answer. Two families, both drawn from the
+// authoritative stores (never a flag the question keeps about itself):
+//
+//   - MOOT: the question's RUN no longer exists (an order removed while its question stood open). It
+//     cannot be approved (no branch is carried on) nor rejected-with-effect (no run to end), yet as an
+//     open question it would hold its repository against every new order — the deadlock that froze
+//     production.
+//   - ENDED: the run still exists but its ORDER has FINISHED — its latest execution ended completed or
+//     discarded and none is live, so no execution will act on the question again and answering it
+//     resumes nothing (Selbst prüfen statt fragen: "Endet der Vorgang, zu dem eine Frage gehört, kann
+//     ihre Beantwortung keine Wirkung mehr entfalten"). A run merely WAITING on its question is not
+//     ended — its latest execution is failed-with-a-blocked-repo or interrupted (auto-resumes), never
+//     completed/discarded — so a live waiting question is left exactly where it is.
+//
+// The owner decides existence and endedness here (the run and execution stores are authoritative) and
+// hands the pool the sets; the pool, being passive, only closes the ids it is told. Best-effort: an
+// unreadable store closes nothing (a set must be authoritative, never partial). Called on every Blocked
+// read, at boot, and before the branch-halt consults an open question, so a dead question never blocks
+// anyone.
+func (s *Server) sweepDeadQuestions() {
 	if s.runQuestions == nil || s.runs == nil {
 		return
 	}
 	all, err := s.runs.List()
 	if err != nil {
-		log.Printf("devlabd: moot-question sweep skipped (run store unreadable): %v", err)
+		log.Printf("devlabd: question sweep skipped (run store unreadable): %v", err)
 		return
 	}
 	existing := make(map[string]bool, len(all))
 	for _, r := range all {
 		existing[r.ID] = true
 	}
+	changed := false
 	closed, err := s.runQuestions.CloseMoot(existing, "the run no longer exists — the question is moot and blocks nothing")
 	if err != nil {
 		log.Printf("devlabd: moot-question sweep failed: %v", err)
-		return
 	}
-	if len(closed) > 0 {
-		for _, q := range closed {
-			log.Printf("devlabd: closed moot question %s (run %s no longer exists) — it holds nothing anymore", q.ID, q.RunID)
+	for _, q := range closed {
+		log.Printf("devlabd: closed moot question %s (run %s no longer exists) — it holds nothing anymore", q.ID, q.RunID)
+		changed = true
+	}
+	ended, eerr := s.endedRunIDs()
+	if eerr != nil {
+		log.Printf("devlabd: ended-question sweep skipped (execution store unreadable): %v", eerr)
+	} else if len(ended) > 0 {
+		endedClosed, err := s.runQuestions.CloseEnded(ended, "the order has finished — its execution ended, so the question can no longer take effect")
+		if err != nil {
+			log.Printf("devlabd: ended-question sweep failed: %v", err)
 		}
+		for _, q := range endedClosed {
+			log.Printf("devlabd: closed ended question %s (order %s has finished) — its answer can no longer take effect", q.ID, q.RunID)
+			changed = true
+		}
+	}
+	if changed {
 		s.publish(live.TopicQuestions)
 	}
 }
 
+// endedRunIDs is the set of orders whose latest execution has ENDED without leaving the run resumable:
+// no execution is live (queued|running|paused|blocked|interrupted) and the most recent one finalized as
+// completed or discarded. A run whose latest execution is FAILED is deliberately excluded — that is the
+// state a run stands in while it WAITS on its own blocking question (a repo blocked, the question open),
+// and such a question must stay open until it is answered or rejected. An interrupted run auto-resumes,
+// so it is not ended either. The determination reads the execution documents (the authoritative record),
+// never a flag on the question. Nil docs store → empty set (nothing is ended), never a wrong closure.
+func (s *Server) endedRunIDs() (map[string]bool, error) {
+	if s.docs == nil {
+		return map[string]bool{}, nil
+	}
+	docs, err := s.docs.List()
+	if err != nil {
+		return nil, err
+	}
+	type agg struct {
+		latest  model.ExecPhase
+		at      time.Time
+		hasLive bool
+	}
+	byRun := map[string]*agg{}
+	for _, d := range docs {
+		a := byRun[d.RunID]
+		if a == nil {
+			a = &agg{}
+			byRun[d.RunID] = a
+		}
+		if d.Live() {
+			a.hasLive = true
+		}
+		if a.at.IsZero() || d.CreatedAt.After(a.at) {
+			a.at = d.CreatedAt
+			a.latest = d.Phase
+		}
+	}
+	ended := map[string]bool{}
+	for runID, a := range byRun {
+		if a.hasLive {
+			continue
+		}
+		if a.latest == model.PhaseCompleted || a.latest == model.PhaseDiscarded {
+			ended[runID] = true
+		}
+	}
+	return ended, nil
+}
+
 // runsQuestionsList returns the open and answered questions the Blocked surface renders, newest
-// first. It is the ONE read path for the Blocked tab. It first retires any moot question (its run is
-// gone), so the surface never shows — and a repository is never held by — a question nobody can act on.
+// first. It is the ONE read path for the Blocked tab. It first retires any dead question (its run is
+// gone, or its order has finished), so the surface never shows — and a repository is never held by — a
+// question nobody can act on.
 func (s *Server) runsQuestionsList(w http.ResponseWriter, _ *http.Request) {
 	if s.runQuestions == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"questions": []runs.Question{}})
 		return
 	}
-	s.closeMootQuestions()
+	s.sweepDeadQuestions()
 	list, err := s.runQuestions.List()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read the questions")

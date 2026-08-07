@@ -8,9 +8,9 @@ package deploy
 //   (e) after an install, who approved and what was there before is readable, and the previous
 //       content is kept for a rollback.
 // (b) — the source is committed history, never an unpinned working tree — is proven at the Go level
-// (TestStackTipWrapperDriftReadsCommittedTip): the offered checksum is the STACK TIP's committed
-// content, never the working tree's, so content that is not on the tip is never what the approval (and
-// thus the install) is pinned to.
+// (TestDeliveringBranchWrapperDriftReadsTheRunsBranch): the offered checksum is the delivering branch's
+// committed content, never the working tree's, so content that is not committed to the branch is never
+// what the approval (and thus the install) is pinned to.
 
 import (
 	"context"
@@ -216,52 +216,6 @@ func TestRenewIsAuditableAndReversible(t *testing.T) {
 	}
 }
 
-// (b) The source is committed history, never an unpinned working tree: StackTipWrapperDrift offers the
-// STACK TIP's committed checksum. A wrapper changed only in the working tree (not committed to the tip)
-// is never what the renewal is pinned to.
-func TestStackTipWrapperDriftReadsCommittedTip(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-	wt := t.TempDir()
-	gitInit(t, wt)
-
-	tip := []byte("#!/usr/bin/env bash\n# STACK-TIP devlab-exec\n")
-	writeRepoFile(t, wt, "deploy/devlab-exec", tip)
-	gitCommitAll(t, wt, "add tip wrapper")
-
-	// The working tree now diverges from the committed (tip) content — this is what a run could do.
-	writeRepoFile(t, wt, "deploy/devlab-exec", []byte("#!/usr/bin/env bash\n# WORKING-TREE tampering\n"))
-
-	// The installed copy differs from both, so a drift exists.
-	sbin := filepath.Join(t.TempDir(), "sbin")
-	if err := os.MkdirAll(sbin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sbin, "devlab-exec"), []byte("stale installed\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("DEVLAB_SBIN_DIR", sbin)
-	restore := wrapperInstallDir
-	wrapperInstallDir = sbin
-	t.Cleanup(func() { wrapperInstallDir = restore })
-
-	// The stack tip here is the default branch (no other open delivery); read its committed content.
-	drifts, err := StackTipWrapperDrift(wt, "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := driftNamed(drifts, "devlab-exec")
-	if got == nil {
-		t.Fatalf("devlab-exec drift not reported, got %+v", drifts)
-	}
-	if got.WantSHA != sha256of(tip) {
-		t.Fatalf("the offered content must be the committed STACK-TIP content, not the working tree's; got %s want %s", got.WantSHA, sha256of(tip))
-	}
-	if string(got.WantContent) != string(tip) {
-		t.Fatalf("WantContent must be the committed tip content byte-for-byte")
-	}
-}
 
 // DeliveringBranchWrapperDrift offers THIS run's own delivering-branch content — the second renewal
 // source, for when the run itself changed a root script that is not yet merged. It reports the drift

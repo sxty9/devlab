@@ -187,19 +187,14 @@ var ErrWrappersStale = errors.New("delivery incomplete: installed root wrappers 
 type DeployOps interface {
 	Detect(ctx context.Context, repo string) (Detection, error)
 	DeliverDev(ctx context.Context, repo string) (DeployOutcome, error)
-	// StackTipWrapperDrift reports which root wrappers' installed copies differ from the STACK TIP
-	// (deliver.NextPRBase — another open delivery's branch, else the standard branch), each carrying the
-	// sha256 of the tip content — the exact (file, checksum) set a wrapper-renewal question offers for
-	// the user's explicit approval. Empty means the installed wrappers already match the stack tip, so
-	// there is nothing on the tip to renew (a self delivery still blocked while this is empty is blocked
-	// by the run's OWN not-yet-merged wrapper change). Its reference is the stack tip, never main alone,
-	// so an open delivery's own wrapper change is not mistaken for drift to roll back.
-	StackTipWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error)
 	// WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own
-	// delivering branch — the content the run itself changed but has not yet merged. Each carries the
-	// sha256 of the delivering-branch content, the exact (file, checksum) set a wrapper-renewal question
-	// offers when the change is the run's OWN (empty means the run changed no root wrapper). This is the
-	// second source that turns the run-changed-a-root-script dead end into an answerable approval.
+	// delivering branch — the ONE stand the self-delivery gate proves the install against. Each carries
+	// the sha256 of the delivering-branch content, the exact (file, checksum) set a wrapper-renewal
+	// question offers (empty means the installed scripts already match what this run delivers). It is the
+	// SOLE reference for the renewal: installing this content is the one answer that makes the gate pass,
+	// so there is no second yardstick to contradict it (task point 2). It covers both a wrapper the run
+	// itself changed and one a stacked change carried in, because the delivering branch is cut from the
+	// stack tip and so already contains the latter.
 	WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error)
 	// RenewApprovedWrappers is the WRITE half: it installs the user-approved wrappers through the root
 	// tool. The approved question carries the (file, checksum) set, who approved and when; the daemon
@@ -436,6 +431,13 @@ const deliveryAlarmNotice = "delivery-alarm"
 
 // structureViolationNotice labels the REQ-028.4 code-structure violation notices.
 const structureViolationNotice = "code-structure-violation"
+
+// questionUnresolvableNotice labels a disturbance raised INSTEAD of a question, when no answer could
+// resolve the state (a contradiction between two checks, or an approval that was granted but proved
+// ineffective). It is a fault to be delivered, not routine noise, so IsDisturbance treats it as one by
+// default (unknown kinds are disturbances). Reusing the notice path keeps ONE way a fault reaches the
+// user (Kein stummes Ausbleiben), never a second channel.
+const questionUnresolvableNotice = "question-unresolvable"
 
 // Execute walks the chain over every target repo of the execution. Domain outcomes are fully
 // visible through the Sink; the returned error is the NAMED execution-level outcome:

@@ -986,9 +986,10 @@ func (c chainQuestions) OpenForRepo(ctx context.Context, repo, exceptRunID strin
 	if c.d.s.runQuestions == nil {
 		return nil, nil
 	}
-	// A question whose run no longer exists holds nothing: retire it BEFORE reading what still holds
-	// the repository, so a moot question never halts a new order (the deadlock this fixes).
-	c.d.s.closeMootQuestions()
+	// A question that can no longer take effect — its run is gone, or its order has finished — holds
+	// nothing: retire it BEFORE reading what still holds the repository, so a dead question never halts a
+	// new order (the deadlock this fixes).
+	c.d.s.sweepDeadQuestions()
 	return c.d.s.runQuestions.OpenForRepo(repo, exceptRunID)
 }
 
@@ -1314,31 +1315,13 @@ func prodConfigFromEnv(knownHosts string) (deploy.ProdConfig, error) {
 	return deploy.ProdConfig{RsyncTarget: target, Identity: id, Trigger: deploy.SSHTrigger(recv, id)}, nil
 }
 
-// StackTipWrapperDrift reports which root wrappers' installed copies differ from the STACK TIP
-// (deliver.NextPRBase — another open delivery's branch, else the standard branch), never main alone.
-// Only the self repo ships the root wrappers, so a foreign repo has none.
-func (c chainDeploy) StackTipWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
-	if repoShort(repo) != selfRepo() {
-		return nil, nil
-	}
-	_, wt, err := c.d.bench(ctx, repo)
-	if err != nil {
-		return nil, err
-	}
-	tip, err := c.d.Deliver().NextPRBase(ctx, repo, c.d.deliveringBranch(repo))
-	if err != nil {
-		return nil, fmt.Errorf("resolve the stack tip for the wrapper drift probe: %w", err)
-	}
-	return wrapperGrants(deploy.StackTipWrapperDrift(wt, tip))
-}
-
 // WorkingWrapperDrift reports which root wrappers' installed copies differ from THIS run's own
-// delivering branch — the content the run itself changed but has not yet merged. It is the second
-// renewal source (beside StackTipWrapperDrift): when the installed scripts already match the stack tip,
-// this is what lets a run that changed a root script ask for approval instead of halting for good. It
-// reads the delivering branch's committed ref (the same tree the gate measures), so a run's change is
-// seen even when the shared working tree sits on the standard branch. Only the self repo owns these
-// root wrappers, so a foreign repo has none.
+// delivering branch — the ONE stand the self-delivery gate (deploy.GuardWrappersCurrent) proves the
+// install against, and therefore the sole reference for a wrapper renewal (task point 2: no second
+// yardstick to contradict it). It reads the delivering branch's committed ref (the same tree the gate
+// measures), so a run's change is seen even when the shared working tree sits on the standard branch,
+// and the delivering branch — cut from the stack tip — also carries any stacked wrapper change. Only
+// the self repo owns these root wrappers, so a foreign repo has none.
 func (c chainDeploy) WorkingWrapperDrift(ctx context.Context, repo string) ([]runs.WrapperGrant, error) {
 	if repoShort(repo) != selfRepo() {
 		return nil, nil
@@ -1378,20 +1361,13 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	}
 	grantDir := c.d.s.paths.WrapperGrants()
 	renewer := deploy.SudoWrapperRenewer{}
-	// Bind the re-read to the SAME source the approval named. WrapperSourceWorking re-reads this run's
-	// own delivering branch; anything else (WrapperSourceStackTip, empty, or the retired "merged") the
-	// stack tip. Either way the daemon re-reads the bytes and RenewApprovedWrapper refuses any that no
-	// longer hash to the approved checksum, so a source that changed after the approval installs nothing.
-	var src deploy.WrapperContentAt
-	if q.WrapperSource == runs.WrapperSourceWorking {
-		src = deploy.DeliveringBranchContent(wt, c.d.deliveringBranch(repo))
-	} else {
-		tip, terr := c.d.Deliver().NextPRBase(ctx, repo, c.d.deliveringBranch(repo))
-		if terr != nil {
-			return fmt.Errorf("resolve the stack tip for the approved wrapper renewal: %w", terr)
-		}
-		src = deploy.StackTipContent(wt, tip)
-	}
+	// The approved content is always re-read from the branch this run delivers — the ONE reference the
+	// self-delivery gate proves against and the only stand whose installation clears it (the stack-tip
+	// yardstick that used to stand beside it drove the pendulum and is gone, task point 2). The daemon
+	// re-reads the bytes and RenewApprovedWrapper refuses any that no longer hash to the approved
+	// checksum, so a branch that changed after the approval — or an old question persisted with a
+	// different source — installs nothing and the delivery re-asks.
+	src := deploy.DeliveringBranchContent(wt, c.d.deliveringBranch(repo))
 	by := q.AnsweredBy.User
 	if by == "" {
 		by = q.AnsweredBy.OnBehalfOf
