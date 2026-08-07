@@ -170,6 +170,28 @@ UMask=0027
 #   /etc/systemd/system   the generated unit of a first-time setup
 #   /etc/caddy/conf.d     its generated route
 #   /var/lib              the state directory of a first-time setup (useradd creates /var/lib/<id>)
+#
+# DELIBERATELY OUT OF THIS LIST — reached OUTSIDE the cgroup, not by widening the sandbox. Some things
+# the chain must write are NOT here on purpose, because giving the service standing write to them would
+# let it do — unattended — the very thing a human is meant to approve. ProtectSystem=strict makes every
+# path outside this list read-only for the service AND every child it starts, so these are reached only
+# by handing the one approved operation OUT of the cgroup into a transient systemd unit (systemd-run),
+# exactly as the self-repo restart does (deploy/devlab-install --handover):
+#   /usr/local/sbin       the root wrappers themselves. Listed here, the service could rewrite its own
+#                         root scripts and so grant itself root without approval — the whole point of
+#                         keeping it out. An approved renewal writes it via the hand-out in
+#                         deploy/devlab-install (maybe_hand_out_renewal). Before that existed, an approved
+#                         renewal hit "mktemp: Read-only file system" and the same question came back in a
+#                         loop (measured 2026-08-06).
+# KNOWN, NOT YET CLOSED — the SAME class, named so nobody rediscovers it by running into it (task point
+# 5). First-time setup of a FOREIGN service writes three paths that are ALSO read-only here, so it would
+# fail the same way the wrapper renewal did, and the right fix is the same hand-out, never adding these to
+# the list (that would hand the service standing write over system identity and rights):
+#   /etc/passwd,/etc/shadow,/etc/group   useradd/groupadd for the new service account (setup_ensure_account)
+#   /etc/holistic/permissions.d          the service's rights manifest copied in at first-time setup
+# Two more paths must lie UNDER a writable root above (they are instance configuration, not literals
+# here): the holistic dashboard checkout and its serve root, which the confined ui rebuild/serve writes —
+# place them under /opt or /var/lib, or that step fails read-only the same way.
 ReadWritePaths=/var/lib /tmp /opt /usr/local/bin /etc/systemd/system /etc/caddy/conf.d
 NoNewPrivileges=false
 ProtectSystem=strict
