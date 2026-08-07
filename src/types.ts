@@ -722,10 +722,16 @@ export interface RunQuestion {
   ended?: boolean;
   /** Why the question closed without an effective answer (rejected, its run is gone, or its order finished). */
   closeNote?: string;
-  /** For a 'wrapper-renewal' question: the exact standard-branch (file, checksum) set the approval
-   *  covers. Approving installs only these named files with these checksums; detail renders the same
-   *  set for the reader. */
+  /** For a 'wrapper-renewal' question: the exact (file, checksum) set the approval covers — the version
+   *  this run delivers (its own branch, not yet merged). Approving installs only these named files with
+   *  these checksums; detail renders the same set for the reader. */
   wrappers?: { name: string; sha: string }[];
+  /** For a GUARDED question ('wrapper-renewal' | 'prod-host-key'): the exact sentence the user affirms
+   *  to approve, derived by the backend from the question's own subject (which version, which files and
+   *  checksums, or which host key). It is both the consent shown on the checkbox and — verbatim — the
+   *  answer recorded in the ledger, so the two can never describe different things. Absent for a plain
+   *  'decision'. */
+  approvalStatement?: string;
   /** For a 'prod-host-key' question: the production host whose key changed and the SHA256 fingerprint
    *  of the key now presented — the exact key the approval covers (the accept path re-verifies it). */
   hostKeyTarget?: string;

@@ -182,17 +182,15 @@ function QuestionRow({
   const [confirmed, setConfirmed] = useState(false);
   const waited = waitingSince(q.askedAt, Date.now());
 
-  const approveNote = wrapper
-    ? 'Approved renewing the root wrapper scripts to their standard-branch version.'
-    : 'Approved trusting the new production host key.';
-  const consent = wrapper
-    ? 'I approve installing the standard-branch (merged) version of these root scripts. This approval is single-use and covers only the files and checksums shown above; the run installs and re-verifies them.'
-    : 'I confirm this fingerprint matches the production host (verified out-of-band) and approve trusting its new ssh key. This approval is single-use and covers only this exact key; the chain re-reads and re-verifies it before trusting it.';
+  // The consent the user affirms is the ONE sentence the backend derived from THIS question's subject
+  // (which version, which files and checksums, or which host key) — never a text formulated here beside
+  // it. The backend records the same sentence as the ledger answer, so the note is only the user's
+  // optional addition; the affirmation itself is not typed here and cannot drift from what is booked.
+  const consent = q.approvalStatement ?? '';
   const canSend = guarded ? confirmed : text.trim().length > 0;
   const send = () => {
     if (!canSend) return;
-    const body = guarded ? text.trim() || approveNote : text.trim();
-    void onAnswer(q, body, guarded);
+    void onAnswer(q, text.trim(), guarded);
   };
 
   return (
@@ -229,7 +227,7 @@ function QuestionRow({
       {guarded && q.detail && (
         <details className="mt-2" open>
           <summary className="cursor-pointer text-caption text-danger">
-            {wrapper ? 'What would be installed (the standard-branch version)' : 'The new host key that would be trusted'}
+            {wrapper ? 'What would be installed (the version this delivery ships)' : 'The new host key that would be trusted'}
           </summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-fill/[0.04] px-2.5 py-1.5 text-caption text-text-secondary">
             {q.detail}

@@ -2,6 +2,7 @@ package runs
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"devlab/backend/internal/model"
@@ -274,4 +275,81 @@ func TestQuestionCloseEnded(t *testing.T) {
 		t.Fatalf("a second sweep closes nothing new, got %+v", again)
 	}
 	_ = going
+}
+
+// The wrong phrasing this task removes: the old consent claimed the MERGED (standard-branch) version
+// while a wrapper-renewal question always installs the run's own delivering branch. No derived consent
+// may ever contain it again (task test c).
+const retiredMergedConsent = "standard-branch (merged) version"
+
+// TASK TEST a — a question about THIS run's version: the derived consent (which is also the booked
+// answer) names exactly that version and the exact files+checksums, and never the retired merged
+// wording. There is ONE source for the consent shown and the answer booked — the question's own
+// subject — so they cannot describe different things.
+func TestWrapperApprovalStatementNamesRunVersionAndChecksums(t *testing.T) {
+	shaA := strings.Repeat("a", 64)
+	shaB := strings.Repeat("b", 64)
+	q := Question{
+		QKind:         QuestionWrapperRenewal,
+		WrapperSource: WrapperSourceWorking,
+		Wrappers: []WrapperGrant{
+			{Name: "devlab-install", SHA: shaA, Summary: "+7/-2 lines"},
+			{Name: "devlab-exec", SHA: shaB},
+		},
+	}
+	got := q.GuardedApprovalStatement()
+	// Names the run's own delivering branch, not yet merged — the version actually installed.
+	for _, want := range []string{"this run", "not yet merged"} {
+		if !strings.Contains(strings.ToLower(got), strings.ToLower(want)) {
+			t.Fatalf("consent must name the run's own not-yet-merged version (%q), got %q", want, got)
+		}
+	}
+	// Names each file bound to its exact checksum (task point 2).
+	for _, want := range []string{"devlab-install", shaA, "devlab-exec", shaB} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("consent must pin file %q to its checksum, got %q", want, got)
+		}
+	}
+	// Never the retired merged wording (task test c).
+	if strings.Contains(got, retiredMergedConsent) {
+		t.Fatalf("consent must not claim the merged version, got %q", got)
+	}
+}
+
+// TASK TEST b — the honest counterpart of "a question about the merged version": the merged/stack-tip
+// source is RETIRED, and the write half installs the delivering branch regardless of the label a
+// question was persisted with. So even a question carrying the retired source STILL derives the
+// delivering-branch consent — the text is bound to the version actually installed, never to a stale
+// recorded label that would misdescribe it (the very drift this task closes).
+func TestWrapperApprovalStatementIgnoresRetiredSourceLabel(t *testing.T) {
+	q := Question{
+		QKind:         QuestionWrapperRenewal,
+		WrapperSource: WrapperSourceStackTip, // a legacy label — must not change what the consent claims
+		Wrappers:      []WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("c", 64)}},
+	}
+	got := q.GuardedApprovalStatement()
+	if !strings.Contains(strings.ToLower(got), "not yet merged") || strings.Contains(got, retiredMergedConsent) {
+		t.Fatalf("even a retired-source question must derive the delivering-branch consent, got %q", got)
+	}
+}
+
+// TASK TEST c — the consent is DERIVED from the subject, never a fixed string beside it: a different
+// subject yields different text. A host-key question names its own host and fingerprint; a plain
+// decision has no fixed consent at all.
+func TestGuardedApprovalStatementTracksSubject(t *testing.T) {
+	host := Question{QKind: QuestionProdHostKey, HostKeyTarget: "prod.example", HostKeyFingerprint: "SHA256:ZZZ"}
+	hs := host.GuardedApprovalStatement()
+	if !strings.Contains(hs, "prod.example") || !strings.Contains(hs, "SHA256:ZZZ") {
+		t.Fatalf("host-key consent must name its own host and fingerprint, got %q", hs)
+	}
+	// Two wrapper questions with different checksums produce different consent — proof it is not fixed.
+	w1 := Question{QKind: QuestionWrapperRenewal, Wrappers: []WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("1", 64)}}}
+	w2 := Question{QKind: QuestionWrapperRenewal, Wrappers: []WrapperGrant{{Name: "devlab-install", SHA: strings.Repeat("2", 64)}}}
+	if w1.GuardedApprovalStatement() == w2.GuardedApprovalStatement() {
+		t.Fatal("consent must change with the subject's checksums — it must not be a fixed string")
+	}
+	// A plain decision carries no fixed consent.
+	if s := (Question{QKind: QuestionDecision}).GuardedApprovalStatement(); s != "" {
+		t.Fatalf("a decision has no guarded consent, got %q", s)
+	}
 }
