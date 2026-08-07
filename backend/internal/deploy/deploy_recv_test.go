@@ -31,7 +31,10 @@ func recvFixture(t *testing.T, repo, userLine string, withRoute, withRights bool
 	if err := os.WriteFile(filepath.Join(art, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The delivered unit mirrors setup_unit_text: it declares the shared JWT secret it reads, so the
+	// receiver's first-time setup derives and mints that instance secret from the unit itself.
 	unit := "[Unit]\nDescription=x\nAfter=network.target\n\n[Service]\n" + userLine +
+		"\nEnvironment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret" +
 		"\nExecStart=/opt/" + repo + "/bin/" + repo + "d --listen 127.0.0.1:8811\n\n[Install]\nWantedBy=multi-user.target\n"
 	if err := os.WriteFile(filepath.Join(setup, repo+".service"), []byte(unit), 0o644); err != nil {
 		t.Fatal(err)
@@ -67,7 +70,11 @@ func TestRecvCheckFirstTimeWhenUnitMissing(t *testing.T) {
 		t.Fatalf("a missing unit must dry-run a first-time setup (exit 0), got %d\n%s", res.exit, res.out)
 	}
 	for _, want := range []string{"Erstinstallation", "create nologin system account 'svc-a'",
-		"install delivered unit", "verified User=svc-a", "install delivered route", "groupadd", "start svc-a"} {
+		"install delivered unit", "verified User=svc-a", "install delivered route", "groupadd", "start svc-a",
+		// the instance secret the unit demands is planned to be minted on THIS host (BEFUND 1)
+		"mint instance secret 'jwt-secret'",
+		// the honest gate now proves the service STAYS up, holding its port (BEFUND 2)
+		"STAYS up"} {
 		if !strings.Contains(res.out, want) {
 			t.Errorf("first-time plan must mention %q:\n%s", want, res.out)
 		}
