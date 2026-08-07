@@ -193,7 +193,19 @@ case "$verb" in
         | ( cd "$art/ui" && tar -xf - )
       built=1
     fi
-    [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui)"
+    # ── a service may SHIP ITS OWN first-time setup product: a top-level setup/ dir carrying its systemd
+    # unit under its OWN name (setup/<unit>.service — e.g. a dashboard's <repo>-dashboard.service), and
+    # optionally its edge route / rights. It travels into the artifact verbatim so the installer READS the
+    # unit's real name from it instead of computing <repo>.service. Nothing here is trusted or executed —
+    # only carried; the root installer validates it (User=<repo>, foreign-unit refusal, reserved names)
+    # exactly as it validates the generated product. A repo WITHOUT a setup/ dir is untouched: emit-setup
+    # then generates the uniform product from the ONE template as before.
+    if [ -d setup ]; then
+      rm -rf -- "$art/setup"; mkdir -p -- "$art/setup"
+      ( cd setup && tar -cf - . ) | ( cd "$art/setup" && tar -xf - )
+      built=1
+    fi
+    [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui / setup)"
     ;;
 
   emit-setup)
@@ -215,7 +227,8 @@ case "$verb" in
     art="$wt/.mercury-artifact"
     [ -d "$art" ] || die "no artifact at $art — build before emitting setup"
     dst="$art/setup"
-    rm -rf -- "$dst"; mkdir -p -- "$dst"
+    # Do NOT wipe: artifact-build may have staged a service's OWN setup product here. mkdir is enough.
+    mkdir -p -- "$dst"
     if [ "$repo" = "${DEVLAB_SELF_REPO:-devlab}" ]; then
       # The self repo (devlab) is a LAYOUT special case: its unit is NOT the generated /opt/<repo>
       # template but the CHECKED-IN deploy/devlabd.service (User=devlab, /usr/local/bin/devlabd, its own
@@ -232,6 +245,10 @@ case "$verb" in
         cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
       fi
       echo "devlab-exec: emitted self setup product (devlabd.service + /api/* route on :$selfport) into $dst"
+    elif ls "$dst"/*.service >/dev/null 2>&1; then
+      # The service SHIPPED its own setup product (a *.service already staged by artifact-build): its unit
+      # carries its own name, so nothing is generated over it. The receiver reads that name on install.
+      echo "devlab-exec: setup product already present in $dst (repo-provided) — leaving it, generating nothing"
     else
       setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
       setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"

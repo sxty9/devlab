@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"devlab/backend/internal/atlas"
+	"devlab/backend/internal/model"
 )
 
 // installWrapper is the pinned root wrapper (uniform install path, like the devlab-exec pin in
@@ -198,17 +199,56 @@ func parseUILine(out string) InstallResult {
 
 // LivePorts is the production PortSource: the ledger is derived fresh from the host's routes and
 // bound sockets on every call — no stored port state (REQ-044.4).
-type LivePorts struct{}
+//
+// Unit is the service's OWN unit name as read from the delivered setup product (e.g. holistic-dashboard),
+// which may differ from the service id. It matters for the idempotency below: a service whose unit is
+// already running holds its port even when NO edge route names it (bound-but-unrouted), so that port is
+// the service's OWN, never a conflict — the very case that made `holistic`, running under its divergently
+// named unit, look like a foreign occupant of 8770 and blocked its own renewal. "" falls back to the
+// service id. Active reports whether that unit is running; the default asks systemd, and a test supplies
+// its own seam.
+type LivePorts struct {
+	Unit   string
+	Active func(ctx context.Context, unit string) bool
+}
 
-func (LivePorts) PortFor(ctx context.Context, service string, desired int) (int, bool, error) {
+func (lp LivePorts) PortFor(ctx context.Context, service string, desired int) (int, bool, error) {
 	allocs, err := atlas.AllocationsNow()
 	if err != nil {
 		return 0, false, err
 	}
 	if port, ok := atlas.RoutedPort(allocs, service); ok {
-		return port, false, nil // already provisioned — idempotent, its own port is never a conflict
+		return port, false, nil // already provisioned by route — idempotent, its own port is never a conflict
 	}
-	port, err := atlas.ProposeDesired(allocs, atlas.BandFromEnv(), desired)
+	unit := lp.Unit
+	if unit == "" {
+		unit = service
+	}
+	ownActive := desired != 0 && lp.isActive(ctx, unit)
+	return decidePort(allocs, atlas.BandFromEnv(), desired, ownActive)
+}
+
+func (lp LivePorts) isActive(ctx context.Context, unit string) bool {
+	if lp.Active != nil {
+		return lp.Active(ctx, unit)
+	}
+	return exec.CommandContext(ctx, "systemctl", "is-active", "--quiet", unit).Run() == nil
+}
+
+// decidePort is the pure port decision (testable without a host). A desired port that is bound but NOT
+// routed, while the service's OWN unit is active, is the own service's port — idempotent (firstTime=false),
+// never a conflict: the running own unit is what holds it. A port held by a ROUTED (thus named, foreign)
+// service stays a conflict, and so does a bound port when the own unit is NOT active — only the delivering
+// service's own running unit earns the bypass. Everything else follows ProposeDesired unchanged: a free
+// desired port is granted, an occupied one is the *OccupiedError that names the holder and proposes a free
+// port.
+func decidePort(allocs []model.PortAllocation, band atlas.Band, desired int, ownActive bool) (int, bool, error) {
+	if desired != 0 && ownActive {
+		if holder, taken := atlas.Occupied(allocs, desired); taken && holder == "" {
+			return desired, false, nil
+		}
+	}
+	port, err := atlas.ProposeDesired(allocs, band, desired)
 	if err != nil {
 		return 0, true, err
 	}

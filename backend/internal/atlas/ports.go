@@ -217,6 +217,14 @@ func occupied(allocs []model.PortAllocation, port int) (holder string, taken boo
 	return strings.Join(holders, ", "), taken
 }
 
+// Occupied reports whether a port is taken in the ledger and, when it is, names any ROUTED holder(s)
+// (comma-joined; "" means the port is bound but unrouted — a listener with no edge route to a named
+// service). It is the exported view of occupied(), so a caller outside atlas can distinguish "held by a
+// routed foreign service" (holder != "") from "bound but unrouted" (holder == "") without re-deriving it.
+func Occupied(allocs []model.PortAllocation, port int) (holder string, taken bool) {
+	return occupied(allocs, port)
+}
+
 // RoutedPort returns the routed port a service already holds, if any.
 func RoutedPort(allocs []model.PortAllocation, service string) (int, bool) {
 	for _, a := range allocs {

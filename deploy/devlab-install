@@ -390,7 +390,17 @@ fi
 #    (it is the most privileged one). The three that decide something only about a foreign SERVICE —
 #    whose unit is ours, whose account we are about to create, whose rights manifest we publish — run
 #    for foreign repositories only. All of them are read-only and happen before any effect.
-UNIT_FILE="$UNIT_DIR/${REPO}.service"
+# The UNIT NAME is READ FROM THE DELIVERED SETUP PRODUCT, not ERRECHNET from the repository name: a
+# service whose unit is legitimately named otherwise (a dashboard shipping <repo>-dashboard.service)
+# carries that unit in the artifact's setup/ dir, and the installer finds its real name there. A package
+# that ships no unit keeps the unchanged <repo> derivation (DELIVERED_SETUP=0 → the inline templates
+# below generate <repo>.service exactly as before). The self repo is decided in its own branch and never
+# reaches the foreign unit-name discovery, so its default here stays <repo>. The discovery for a foreign
+# repo runs in step 5d (after the setup lib and $real are in hand).
+SETUP_SRC="$real/setup"
+UNIT_NAME="$REPO"
+DELIVERED_SETUP=0
+UNIT_FILE="$UNIT_DIR/${UNIT_NAME}.service"
 FIRST_TIME=0
 MANIFEST=""
 
@@ -455,18 +465,36 @@ else
 fi
 
 if [ "$REPO" != "$SELF_REPO" ]; then
+  # 5c-bis) THE UNIT NAME comes from the delivered setup product. A package that carries setup/<name>.service
+  #     names its own unit; the installer reads that name rather than assuming <repo>.service. Ambiguous or
+  #     absent → the <repo> derivation stands (DELIVERED_SETUP=0). A divergent name is a systemctl argument
+  #     and a unit-file path, so it must pass the lexical gate; the deeper guards (foreign unit below,
+  #     User=<repo> at install) still bind the unit to this service's own account.
+  UNIT_NAME="$(setup_delivered_unit_name "$SETUP_SRC" "$REPO")"
+  if [ -n "$UNIT_NAME" ]; then
+    DELIVERED_SETUP=1
+    if [ "$UNIT_NAME" != "$REPO" ]; then
+      setup_valid_unit_name "$UNIT_NAME" || die "refusing delivered unit '$UNIT_NAME' for '$REPO' (name/namespace)" 2
+    fi
+  else
+    UNIT_NAME="$REPO"
+  fi
+  UNIT_FILE="$UNIT_DIR/${UNIT_NAME}.service"
+
   # 5d) unit existence is asked of SYSTEMD, not of a path: a vendor unit lives under /lib or
   #     /usr/lib and a path test in $UNIT_DIR does not see it, so "first time" would happily
   #     generate a second unit that SHADOWS a running system service (and `systemctl restart` would
   #     then start our artifact in its place). A fragment outside $UNIT_DIR — vendor, /run, or the
   #     /dev/null of a masked unit — is refused; only our own fragment counts as "already set up".
-  frag="$("$SYSTEMCTL" show -p FragmentPath --value "${REPO}.service" 2>/dev/null)" \
-    || die "could not ask systemd about ${REPO}.service" 4
+  #     The question is asked about the DELIVERED unit name — so a service already running under its
+  #     own (divergently-named) unit is recognised as ALREADY SET UP and RENEWED, never duplicated.
+  frag="$("$SYSTEMCTL" show -p FragmentPath --value "${UNIT_NAME}.service" 2>/dev/null)" \
+    || die "could not ask systemd about ${UNIT_NAME}.service" 4
   frag="$(printf '%s' "$frag" | tr -d '[:space:]')"
   case "$frag" in
     "$UNIT_FILE") FIRST_TIME=0 ;;
     "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
-    *) die "unit ${REPO}.service already exists outside this wrapper's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
+    *) die "unit ${UNIT_NAME}.service already exists outside this wrapper's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
   esac
 
   # 5e) the service account — judged WHERE IT IS DECIDED: at first-time setup, which runs `useradd`
@@ -529,13 +557,63 @@ fi
 BIN="$real/${REPO}d"    # go build ./cmd/... writes cmd/<repo>d into the artifact
 [ -f "$BIN" ] || die "staged binary missing: $BIN (expected <repo>d — prebuilt, never built here)" 5
 
-# UNIT_FILE / FIRST_TIME / MANIFEST were decided in the validation cascade (step 5) — systemd was
-# asked, the account was judged and the manifest was resolved before any effect could happen.
-if [ "$FIRST_TIME" = 1 ]; then
+# UNIT_FILE / UNIT_NAME / DELIVERED_SETUP / FIRST_TIME / MANIFEST were decided in the validation cascade
+# (step 5) — systemd was asked about the delivered unit name, the account was judged and the manifest was
+# resolved before any effect could happen.
+if [ "$FIRST_TIME" = 1 ] && [ "$DELIVERED_SETUP" = 1 ]; then
+  # First-time setup from the DELIVERED setup product — the SAME rule the production receiver applies, run
+  # here on the dev host: the package carries setup/<unit>.service (and optionally setup/<repo>.caddy), so
+  # the installer INSTALLS those bytes under the delivered unit name instead of GENERATING a <repo>.service.
+  # The delivered unit is not trusted blindly — it must run as its OWN account (exactly User=<repo>), and a
+  # foreign unit under this name was already refused in step 5d. No --port is demanded: the port lives in
+  # the delivered unit and the honest running gate proves it.
+  DELIV_UNIT="$SETUP_SRC/${UNIT_NAME}.service"
+  DELIV_ROUTE="$SETUP_SRC/${REPO}.caddy"
+  [ -f "$DELIV_UNIT" ] || die "first-time setup of '$REPO' has no delivered unit at $DELIV_UNIT" 5
+  setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
+    || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
+  log "first-time setup of '$REPO' from the delivered setup product (unit ${UNIT_NAME}.service)"
+
+  if [ "$CHECK" = 1 ]; then
+    echo "PLAN: create system user '$REPO' (nologin) if missing"
+    echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
+    if [ -f "$DELIV_ROUTE" ]; then
+      echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy ($CADDY_BIN validate --config $CADDY_MAIN + reload caddy; unwind on failure)"
+    else
+      echo "PLAN: no delivered route in the artifact — none installed"
+    fi
+    if [ -n "$MANIFEST" ]; then
+      echo "PLAN: install rights manifest $MANIFEST (validated copy) + groupadd its hp_* groups"
+    else
+      echo "PLAN: no rights manifest in the checkout — install without declared rights"
+    fi
+    echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $UNIT_NAME"
+  else
+    setup_ensure_account "$REPO"
+    install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
+    if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
+      # The route dir is SHARED (setup_install_route validates the ASSEMBLED edge and takes OUR route AND
+      # the freshly written delivered unit back out on failure, so a bad route never leaves a half setup a
+      # later run reads as an update). A delivered route is optional; its failure is NAMED, never swallowed.
+      rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/$REPO.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" 2>&1)" || rc=$?
+      [ "$rc" = 0 ] || die "$reason" "$rc"
+    elif [ -f "$DELIV_ROUTE" ]; then
+      log "no route dir at $CADDY_CONF — delivered route NOT installed"
+    fi
+    if [ -n "$MANIFEST" ]; then
+      setup_install_rights "$MANIFEST" "$PERMS_DIR" "$REPO"
+    else
+      log "no rights manifest in the checkout — service installs without declared rights (Uniformity gap, reported by detection)"
+    fi
+    "$SYSTEMCTL" daemon-reload
+    "$SYSTEMCTL" enable "$UNIT_NAME" >/dev/null 2>&1 || true
+  fi
+elif [ "$FIRST_TIME" = 1 ]; then
   # First-time setup from the root-owned SHARED templates (setup_unit_text / setup_route_text in
   # devlab-setup-lib.sh — the ONE source the production receiver installs from too): unit + route +
   # rights with VALIDATED values only. The port is the atlas proposal handed in by the service
-  # (--port); repo content is never executed, only validated files are copied.
+  # (--port); repo content is never executed, only validated files are copied. Reached when the package
+  # ships NO unit (DELIVERED_SETUP=0) — the unchanged <repo>.service derivation.
   [ "$PORT" != 0 ] || die "first-time setup of '$REPO' needs --port <n> (a free port from the atlas proposal)" 5
   log "first-time setup of '$REPO' (unit + route + rights from inline templates, port $PORT)"
 
@@ -606,15 +684,20 @@ fi
 # is NAMED, not swallowed. Derive from the unit that WILL be in place — the generated one (first-time)
 # or the installed one (update); in a first-time dry-run the unit is not on disk yet, so render it.
 secret_unit="$UNIT_FILE"; secret_tmp=0
-if [ ! -r "$secret_unit" ] && [ "$FIRST_TIME" = 1 ] && [ "$PORT" != 0 ]; then
-  secret_unit="$(mktemp)"; secret_tmp=1; setup_unit_text "$REPO" "$PORT" > "$secret_unit"
+if [ ! -r "$secret_unit" ] && [ "$FIRST_TIME" = 1 ]; then
+  if [ "$DELIVERED_SETUP" = 1 ]; then
+    # The delivered unit is right there in the artifact — read the secrets it demands from it, no render.
+    secret_unit="$SETUP_SRC/${UNIT_NAME}.service"
+  elif [ "$PORT" != 0 ]; then
+    secret_unit="$(mktemp)"; secret_tmp=1; setup_unit_text "$REPO" "$PORT" > "$secret_unit"
+  fi
 fi
 if [ "$CHECK" = 1 ]; then setup_plan_secrets "$secret_unit"; else setup_ensure_secrets "$REPO" "$UNIT_FILE"; fi
 [ "$secret_tmp" = 1 ] && rm -f -- "$secret_unit"
 
 run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
 run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
-run "$SYSTEMCTL" restart "$REPO"
+run "$SYSTEMCTL" restart "$UNIT_NAME"
 log "install-only deploy of '$REPO' program done (running-proof is the caller's honest gate, F10)"
 
 # ── the service UI: wire it in, rebuild the dashboard, and DELIVER it to where the browser reads ──
