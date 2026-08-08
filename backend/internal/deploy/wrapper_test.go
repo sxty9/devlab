@@ -57,6 +57,20 @@ func runWrapper(t *testing.T, script string, env map[string]string, args ...stri
 // (sudo's env_reset strips it in production).
 const testOwner = "example-org"
 
+// stampBuildKind writes the build.kind marker every real artifact now carries (devlab-exec artifact-build
+// stamps it). The installer reads it rather than guessing a Bauart from a filename, so a fixture that
+// stages a prebuilt program must also declare its kind — exactly as a real delivery would. Go fixtures
+// pass "go-daemon"; python fixtures pass "python-app".
+func stampBuildKind(t *testing.T, artifactDir, kind string) {
+	t.Helper()
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "build.kind"), []byte(kind+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // installEnv prepares a fake workspace root with a valid artifact and returns the env + paths. The
 // checkout carries an origin remote under testOwner, because the wrapper only installs repositories
 // of the configured organisation.
@@ -71,6 +85,7 @@ func installEnv(t *testing.T) (env map[string]string, workRoot, artifact string)
 	if err := os.WriteFile(filepath.Join(artifact, "svc-ad"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, artifact, "go-daemon")
 	writeOrigin(t, filepath.Dir(artifact), testOwner, "svc-a")
 	return map[string]string{"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner}, workRoot, artifact
 }
@@ -342,6 +357,7 @@ func TestInstallCheckUINeutralisesEditorTsconfig(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(artifact, repo+"d"), []byte("bin"), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			stampBuildKind(t, artifact, "go-daemon")
 			if err := os.WriteFile(filepath.Join(artifact, "ui", "tsconfig.json"), []byte(badTs), 0o644); err != nil {
 				t.Fatal(err)
 			}

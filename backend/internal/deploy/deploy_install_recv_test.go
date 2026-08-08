@@ -35,6 +35,7 @@ func installRecvEnv(t *testing.T, repo string, stageOK bool) (env map[string]str
 	if err := os.WriteFile(filepath.Join(art, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, art, "go-daemon")
 	if stageOK {
 		setup := filepath.Join(art, "setup")
 		if err := os.MkdirAll(setup, 0o755); err != nil {

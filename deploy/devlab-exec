@@ -104,6 +104,15 @@ case "$verb" in
     art="$wt/.mercury-artifact"
     rm -rf -- "$art"; mkdir -p -- "$art"
     built=0
+    # The service's DECLARED build kind — a single word in a checked-in build.kind at the repo root (see
+    # setup_valid_build_kind in devlab-setup-lib.sh: go-daemon | python-app). It is what makes a service
+    # SAY what it is instead of the installer guessing from a filename. A Go service needs no declaration:
+    # when the Go build below produces a binary and nothing was declared, the kind is recorded as
+    # go-daemon (the historical default, now written down). The declaration DRIVES the python-app payload
+    # build below and is stamped into the artifact so the installer reads it (never re-derives it).
+    declared_kind=""
+    [ -f build.kind ] && declared_kind="$(head -n1 build.kind | tr -d '[:space:]')"
+    repo_name="$(basename -- "$wt")"
     if [ -f package.json ]; then
       npm ci --no-audit --no-fund || npm install --no-audit --no-fund
       # Where the built web bundle lands is READ FROM THE BUILD'S OWN RESULT, never guessed from a
@@ -181,6 +190,38 @@ case "$verb" in
       ( cd -- "$gd" && if [ -d cmd ]; then go build ${tags:+-tags "$tags"} -o "$art/" ./cmd/...; else go build ${tags:+-tags "$tags"} -o "$art/" ./...; fi )
       built=1
     fi
+    # ── python-app: a prebuilt, relocatable payload the installer copies VERBATIM to /opt/<repo> ────────
+    # A service DECLARES `python-app` in build.kind; there is no go.mod to build and there never will be a
+    # <repo>d. The deployable program is a virtualenv (built HERE, as the unprivileged runner — prod never
+    # builds) plus whatever the app needs, laid out UNDER payload/ so it becomes /opt/<repo>/ on install.
+    # The venv is built with --copies (a real interpreter, no build-path dependency) and its console-script
+    # shebangs are relocated from this staging path to the FINAL /opt/<repo>/venv, so the install stays a
+    # pure copy of already-correct bytes. A python-app MUST ship setup/<unit>.service: only the unit knows
+    # how to start it (its ExecStart names the interpreter and module), so the unit — not a name convention
+    # — is the source of truth. The build fails LOUDLY rather than ship a half payload.
+    if [ "$declared_kind" = python-app ]; then
+      command -v python3 >/dev/null 2>&1 || die "build.kind declares python-app but python3 is not available to build the venv"
+      [ -d setup ] || die "a python-app must ship its own setup/<unit>.service — only the unit knows how to start it; none was found in the repo"
+      payload="$art/payload"; venv="$payload/venv"
+      rm -rf -- "$payload"; mkdir -p -- "$payload"
+      python3 -m venv --copies "$venv" || die "failed to create the virtualenv for the python-app payload"
+      "$venv/bin/python" -m pip install --disable-pip-version-check --no-input --upgrade pip >/dev/null 2>&1 || true
+      if [ -f requirements.txt ]; then
+        "$venv/bin/python" -m pip install --disable-pip-version-check --no-input -r requirements.txt \
+          || die "pip install -r requirements.txt failed for the python-app payload"
+      fi
+      if [ -f pyproject.toml ] || [ -f setup.py ] || [ -f setup.cfg ]; then
+        "$venv/bin/python" -m pip install --disable-pip-version-check --no-input . \
+          || die "pip install . failed for the python-app payload (the app package must be installable)"
+      fi
+      # Relocate the venv's shebangs from the staging path to the final install prefix (shared library).
+      SETUP_LIB_PY="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
+      [ -r "$SETUP_LIB_PY" ] || die "shared setup library not found: $SETUP_LIB_PY"
+      # shellcheck source=/dev/null
+      . "$SETUP_LIB_PY"
+      setup_relocate_venv "$venv" "/opt/$repo_name/venv"
+      built=1
+    fi
     # ── the service UI belongs INTO the artifact (a delivery ships all a service needs, not just its
     # program). A holistic service contributes its dashboard face through a ui/ directory; its SOURCE
     # is staged verbatim so the root installer can wire it into the shared dashboard and let THAT build
@@ -204,6 +245,18 @@ case "$verb" in
       rm -rf -- "$art/setup"; mkdir -p -- "$art/setup"
       ( cd setup && tar -cf - . ) | ( cd "$art/setup" && tar -xf - )
       built=1
+    fi
+    # ── STAMP the build kind into the artifact so the installer READS it, never guesses ─────────────────
+    # The kind is authoritative from the declaration when present (validated), else recorded as go-daemon
+    # when the Go build produced a binary. An artifact that produced no program (only ui/ or setup/) gets
+    # NO stamp — the installer then refuses it BY NAME rather than assume a Bauart.
+    if [ -n "$declared_kind" ]; then
+      case "$declared_kind" in
+        go-daemon | python-app) printf '%s\n' "$declared_kind" > "$art/build.kind" ;;
+        *) die "repo declares an unknown build kind '$declared_kind' in build.kind (known: go-daemon python-app)" ;;
+      esac
+    elif [ -n "${gd:-}" ]; then
+      printf 'go-daemon\n' > "$art/build.kind"
     fi
     [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui / setup)"
     ;;

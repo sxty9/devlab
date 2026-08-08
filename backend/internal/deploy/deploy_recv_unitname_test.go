@@ -26,6 +26,7 @@ func recvDivergentFixture(t *testing.T, repo, unitName string) (env map[string]s
 	if err := os.WriteFile(filepath.Join(art, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, art, "go-daemon")
 	unit := "[Unit]\nDescription=x\n\n[Service]\nUser=" + repo +
 		"\nEnvironment=HOLISTIC_SECRET_FILE=/etc/holistic/jwt-secret" +
 		"\nExecStart=/opt/" + repo + "/bin/" + repo + "d --listen 127.0.0.1:8811\n\n[Install]\nWantedBy=multi-user.target\n"

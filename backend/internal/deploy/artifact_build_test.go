@@ -146,6 +146,85 @@ func TestArtifactBuildBuiltButResultMissing(t *testing.T) {
 	}
 }
 
+// ── build.kind: the artifact SAYS what it is (so the installer never guesses a Bauart from a filename) ──
+
+func needTool(t *testing.T, tool string) {
+	t.Helper()
+	if _, err := exec.LookPath(tool); err != nil {
+		t.Skipf("%s not available: %v", tool, err)
+	}
+}
+
+// A Go service needs NO declaration: when the build produces a binary, artifact-build records the kind as
+// go-daemon in the artifact, so the installer reads it (a Go service is delivered exactly as before).
+func TestArtifactBuildStampsGoDaemon(t *testing.T) {
+	needTool(t, "go")
+	env, wt := artifactWorkspace(t, map[string]string{
+		"go.mod":  "module svc\n\ngo 1.21\n",
+		"main.go": "package main\n\nfunc main() {}\n",
+	})
+	res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt)
+	if res.exit != 0 {
+		t.Fatalf("a go build must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	got, err := os.ReadFile(filepath.Join(wt, ".mercury-artifact", "build.kind"))
+	if err != nil {
+		t.Fatalf("a go-daemon artifact must carry a build.kind stamp: %v\n%s", err, res.out)
+	}
+	if strings.TrimSpace(string(got)) != "go-daemon" {
+		t.Errorf("the stamp must record go-daemon, got %q", string(got))
+	}
+}
+
+// A python-app DECLARES python-app in build.kind; artifact-build then builds a relocatable venv payload and
+// stamps the kind — no go.mod, no <repo>d. The venv's console-script shebangs are relocated to the final
+// /opt/<repo>/venv so the installer's job stays a pure copy.
+func TestArtifactBuildBuildsPythonPayload(t *testing.T) {
+	needTool(t, "python3")
+	// A python-app must ship its own unit (the source of truth for how it starts).
+	unit := "[Unit]\n[Service]\nUser=svc\nExecStart=/opt/svc/venv/bin/uvicorn app.main:app\n"
+	env, wt := artifactWorkspace(t, map[string]string{
+		"build.kind":                  "python-app\n",
+		"setup/svc-dashboard.service": unit,
+	})
+	res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt)
+	if res.exit != 0 {
+		t.Fatalf("a declared python-app must build its payload (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	art := filepath.Join(wt, ".mercury-artifact")
+	if got, err := os.ReadFile(filepath.Join(art, "build.kind")); err != nil || strings.TrimSpace(string(got)) != "python-app" {
+		t.Fatalf("the artifact must be stamped python-app, got %q err %v", string(got), err)
+	}
+	py := filepath.Join(art, "payload", "venv", "bin", "python")
+	if _, err := os.Stat(py); err != nil {
+		t.Fatalf("the payload must carry a built venv interpreter at payload/venv/bin/python: %v\n%s", err, res.out)
+	}
+	// The venv's pip console script must have had its shebang relocated to the FINAL install path, so a
+	// plain copy to /opt/svc lands runnable — the whole point of building it here and not on the target.
+	if b, err := os.ReadFile(filepath.Join(art, "payload", "venv", "bin", "pip")); err == nil {
+		first := strings.SplitN(string(b), "\n", 2)[0]
+		if !strings.HasPrefix(first, "#!/opt/svc/venv/bin/python") {
+			t.Errorf("the venv console-script shebang must be relocated to /opt/svc/venv, got %q", first)
+		}
+	}
+}
+
+// A setup-only artifact (a service that ships neither a Go build nor a python declaration) carries NO
+// build.kind — so the installer refuses it by name rather than assume a Bauart. This pins the boundary
+// that makes task test c a real, named refusal rather than a silent go-daemon guess.
+func TestArtifactBuildSetupOnlyHasNoStamp(t *testing.T) {
+	env, wt := artifactWorkspace(t, map[string]string{
+		"setup/svc.service": "[Service]\nUser=svc\n",
+	})
+	res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt)
+	if res.exit != 0 {
+		t.Fatalf("a setup-only artifact still builds (the setup travels), got %d\n%s", res.exit, res.out)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".mercury-artifact", "build.kind")); !os.IsNotExist(err) {
+		t.Errorf("a setup-only artifact must carry NO build.kind stamp (the installer refuses it by name), err=%v", err)
+	}
+}
+
 // A build that writes the bundle at the repo ROOT (the classic single-app SPA, e.g. devlab's own vite
 // dist) must keep working — the result-reading detection subsumes the old root-only case, it does not
 // replace one narrow guess with another.

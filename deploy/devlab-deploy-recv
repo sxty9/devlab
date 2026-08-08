@@ -311,11 +311,48 @@ case "$REPO" in
     fi
     ;;
   *)
-    # Uniform Holistic Go service: the artifact holds <repo>d (go build ./cmd/... → cmd/<repo>d). Install
-    # to /opt/<repo>/bin/<repo>d. <repo> is already charset+traversal validated above, so the derived
-    # paths are bounded.
-    gbin="$real/${REPO}d"
-    [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
+    # Uniform Holistic service — ONE install path that carries every declared build kind, the SAME
+    # dispatch the dev installer uses (shared library, no second path on prod). The artifact SAYS what it
+    # is (build.kind) and the receiver installs what it CONTAINS and the unit DESCRIBES; it never guesses a
+    # Bauart from a filename. <repo> is already charset+traversal validated above, so the derived paths are
+    # bounded. An undeclared kind is refused BY NAME.
+    KIND="$(setup_read_build_kind "$real")"
+    [ -n "$KIND" ] || die "artifact for '$REPO' does not declare its build kind (no build.kind) — refusing to guess it from filenames; a service must declare its Bauart ($SETUP_BUILD_KINDS)" 2
+    setup_valid_build_kind "$KIND" || die "artifact declares an unknown build kind '$KIND' (known: $SETUP_BUILD_KINDS)" 2
+    case "$KIND" in
+      go-daemon)
+        gbin="$real/${REPO}d"
+        [[ -f "$gbin" ]] || die "staged binary missing: $gbin (build.kind=go-daemon expects a prebuilt <repo>d)" 10
+        ;;
+      python-app)
+        payload="$real/payload"
+        [[ -d "$payload" ]] || die "staged payload missing: $payload (build.kind=python-app expects a prebuilt payload/ tree)" 10
+        ;;
+    esac
+
+    # install_program / plan_program — install the prebuilt program per its declared kind (a pure copy;
+    # THIS HOST NEVER BUILDS). go-daemon: the single <repo>d binary. python-app: the payload/ tree copied
+    # verbatim to /opt/<repo> (venv shebangs relocated at build time), --safe-links dropping any escaping
+    # symlink, then a+rX so the service account (User=<repo>, not root) can read and run the interpreter.
+    install_program() {
+      case "$KIND" in
+        go-daemon)
+          install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+          install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+          ;;
+        python-app)
+          install -d -o root -g root -m 0755 "/opt/$REPO"
+          rsync -a --delete --safe-links "$payload/" "/opt/$REPO/"
+          chmod -R a+rX "/opt/$REPO"
+          ;;
+      esac
+    }
+    plan_program() {
+      case "$KIND" in
+        go-daemon)  echo "PLAN: install binary $gbin -> /opt/$REPO/bin/${REPO}d" ;;
+        python-app) echo "PLAN: copy prebuilt payload $payload/ -> /opt/$REPO/ (rsync --delete --safe-links + chmod a+rX; this host never builds)" ;;
+      esac
+    }
 
     # The UNIT NAME comes from the DELIVERED setup product, not from the repository name: a service whose
     # unit is legitimately named otherwise (a dashboard shipping <repo>-dashboard.service) carries that
@@ -387,7 +424,7 @@ case "$REPO" in
       if [ "$CHECK" = 1 ]; then
         echo "PLAN: Erstinstallation of '$REPO' (no unit ${UNIT_NAME}.service on this host)"
         echo "PLAN: create nologin system account '$REPO' (home /var/lib/$REPO) if missing"
-        echo "PLAN: install binary $gbin -> /opt/$REPO/bin/${REPO}d"
+        plan_program
         echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
         [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy (caddy validate + reload; unwind on failure)" \
                               || echo "PLAN: no delivered route in the artifact — none installed"
@@ -401,8 +438,7 @@ case "$REPO" in
       fi
 
       setup_ensure_account "$REPO"
-      install -d -o root -g root -m 0755 "/opt/$REPO/bin"
-      install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+      install_program
       install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
       # The route dir is SHARED by every service of the host (setup_install_route validates the ASSEMBLED
@@ -434,8 +470,7 @@ case "$REPO" in
     else
       # ── UPDATE — the unit already exists: replace the program and restart (today's behaviour) ──
       log "Aktualisierung of '$REPO' — unit '${UNIT_NAME}.service' already present; replacing the program and restarting"
-      run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
-      run install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
+      if [ "$CHECK" = 1 ]; then plan_program; else install_program; fi
       # Self-heal a host set up before secrets were minted: ensure them (idempotent) before restart, so
       # an update of a service that has been looping on a missing secret can finally stay up.
       ensure_secrets_for "$REPO" "$UNIT_FILE"
