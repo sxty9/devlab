@@ -134,6 +134,14 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 	// accept it now (verified against the pinned fingerprint) so the held sends below can succeed. This
 	// never trusts a key on its own — the gate re-reads it and refuses a key that changed again.
 	applyApprovedHostKey(ctx, questions, hostkey, n, pub)
+	// The identity of the host production actually is, read AFTER any approval was applied so a
+	// just-reinstalled host reads as itself. A production-state record naming a DIFFERENT host key is a
+	// claim about a machine that has been replaced — void, not stale (see recordProdCarries and
+	// validProdRecords). "" means the identity could not be read (production unarmed, or the host is
+	// unreachable this pass): the reading side then honours records as they stand rather than void a
+	// valid record on a transient read failure, the same "degrade to what can be read" stance the
+	// roster read takes.
+	currentHostKey := currentProdHostKey(ctx, hostkey)
 	var firstErr error
 	// The repositories this pass touched through a booked delivery — the reconciliation below leaves
 	// them alone, because the chain just handled them: re-measuring the same repository in the same
@@ -183,7 +191,7 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 				firstErr = orFirst(firstErr, err)
 				continue
 			}
-			recordProdCarries(prodState, d.Repo, out.Commit, now)
+			recordProdCarries(prodState, d.Repo, out.Commit, currentHostKey, now)
 			settleAfterProd(ledger, res, d)
 			publishDeliveries(pub)
 
@@ -231,8 +239,25 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 	// moved past on another path — stays silent. reconcileProd measures both against the roster and the
 	// recorded production state, names each ("Kein stummes Ausbleiben"), and brings production up over
 	// the SAME production path.
-	reconcileProd(ctx, prod, landscapeRoster(ctx, landscape), all, prodState, n, pub, handled, now)
+	reconcileProd(ctx, prod, landscapeRoster(ctx, landscape), all, prodState, currentHostKey, n, pub, handled, now)
 	return firstErr
+}
+
+// currentProdHostKey reads the identity of the production host as it is RIGHT NOW — the ssh host-key
+// fingerprint the target currently presents — used to tell a production-state record about the host
+// still there from one about a host that has been replaced. Reading a key is not trusting it (the
+// gate's own ScanFingerprint only reads); trust is a separate, approved step. It returns "" when
+// there is no gate (production unarmed) or the key cannot be read this pass, and the reading side then
+// makes no identity judgement rather than void a valid record on a transient failure.
+func currentProdHostKey(ctx context.Context, hostkey HostKeyGate) string {
+	if hostkey == nil {
+		return ""
+	}
+	fp, err := hostkey.ScanFingerprint(ctx)
+	if err != nil {
+		return ""
+	}
+	return fp
 }
 
 // landscapeRoster reads the landscape's service roster for this pass — the full repository names of
@@ -258,30 +283,31 @@ func landscapeRoster(ctx context.Context, landscape LandscapeSource) []string {
 //   - MATCH: production carries exactly the standard branch — nothing at all, no message, no send.
 //   - DRIFT: production runs the service but at an OLDER state than the standard branch (a change
 //     reached the standard branch on another path). Named as a drift and brought current.
-//   - MISSING: production does not run the service at all — no delivery ever put it there. Named as
-//     missing and delivered for the first time, over the SAME production path.
+//   - MISSING: production does not run the service at all — no valid record puts it there (never
+//     delivered, or delivered only to a host that has since been replaced). Named as missing and
+//     delivered for the first time to the host now there, over the SAME production path.
 //
 // Both DRIFT and MISSING are brought up to the standard branch over the existing production send; no
-// second path is built. Which of the two a service is in is decided by whether production is known to
-// have EVER run it — a recorded production commit, or a delivery that reached production before.
+// second path is built. Which of the two a service is in is decided by ONE reading — whether a VALID
+// production-state record (bound to the host currently there) names it. A delivery's ProdDeployedAt
+// is not consulted: it records the lifecycle of a send to whatever host existed then, so it must not
+// answer "does production run this now".
 //
 // It only considers a service that is quiescent — no open, failed, or production-owing delivery,
 // because those the chain itself is still driving. A read it cannot complete (the tip could not be
 // resolved) is left for the next pass rather than guessed at; a reconciliation read failure is never
 // the production pass's error, so it does not mask a real delivery failure.
-func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, n *runs.NoticeStore, pub live.Publisher, handled map[string]bool, now time.Time) {
+func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, currentHostKey string, n *runs.NoticeStore, pub live.Publisher, handled map[string]bool, now time.Time) {
 	if prodState == nil {
 		return // nowhere to record what production carries — the reconciliation has no reference
 	}
-	// Which services production is KNOWN to have run before — used only to tell an OLD-state drift from
-	// a never-delivered MISSING service, so each is reported by its own honest name.
-	ranBefore := map[string]bool{}
-	for _, d := range all {
-		if d.ProdDeployedAt != nil {
-			ranBefore[d.Repo] = true
-		}
-	}
-	for _, repo := range reconcileRepos(roster, all, prodState, handled) {
+	// The SINGLE source of truth for "what does production carry": the commit recorded for each service,
+	// read through the host-identity filter so a record about a REPLACED host counts as absent. Every
+	// judgement below — even, drift, missing, and the in-flight hold in reconcileRepos — reads THIS map,
+	// so no second path (a delivery's ProdDeployedAt, which records the OLD host's lifecycle) can claim
+	// "production ran this before" after the host was rebuilt.
+	carried := validProdRecords(prodState, currentHostKey)
+	for _, repo := range reconcileRepos(roster, all, carried, handled) {
 		if ctx.Err() != nil {
 			return
 		}
@@ -289,18 +315,16 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 		if err != nil || tip == "" {
 			continue // could not measure the standard branch — leave it for the next pass, never guess
 		}
-		rec, ok, err := prodState.Get(repo)
-		if err != nil {
-			continue
-		}
-		if ok && rec.Commit == tip {
+		commit, ranBefore := carried[repo]
+		if ranBefore && commit == tip {
 			continue // production carries the standard branch — no drift, no message, no send
 		}
 
-		// Name the gap by its true kind. A service production has run before but that now trails (or
-		// whose carried commit is unknown) is a DRIFT; a service production has never run is MISSING.
-		if ok || ranBefore[repo] {
-			notify(n, runs.NoticeProdDrift, repo, prodDriftText(tip, rec.Commit, ok))
+		// Name the gap by its true kind. A service production is recorded to run but that now trails is a
+		// DRIFT; a service with no valid record — never run, or run only by a host that has been replaced
+		// — is MISSING and delivered for the first time to the host now there.
+		if ranBefore {
+			notify(n, runs.NoticeProdDrift, repo, prodDriftText(tip, commit))
 		} else {
 			notify(n, runs.NoticeProdMissing, repo, prodMissingText(tip))
 		}
@@ -314,7 +338,7 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 		}
 		switch {
 		case derr == nil && out.Running:
-			recordProdCarries(prodState, repo, out.Commit, now)
+			recordProdCarries(prodState, repo, out.Commit, currentHostKey, now)
 			publishDeliveries(pub)
 		case derr == nil && out.NotApplicable:
 			// The roster listed this repository, yet the send proves it no service (a routed id whose
@@ -347,31 +371,26 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 // and a stuck delivery is not a delivery "in motion". A NeedsProd (merged, owing) delivery is
 // already shipped by the booked loop above (it is in `handled`), so it needs no separate hold here.
 //
-// "Production already runs it" is measured the SAME way reconcileProd tells DRIFT from MISSING: a
-// delivery that reached production before, OR a recorded production-state commit. The two passes
-// must agree on the case, or one would wait while the other delivers.
-func reconcileRepos(roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, handled map[string]bool) []string {
+// "Production already runs it" is measured the SAME way reconcileProd tells DRIFT from MISSING — a
+// VALID recorded production-state commit (carried) — and from no other source. The two passes read
+// the same map, so one never waits while the other delivers. A delivery's ProdDeployedAt is NOT
+// consulted here: it records the lifecycle of a send to whatever host was there when it ran, so after
+// a rebuild it would falsely claim "production runs this" for a machine that no longer exists — the
+// exact parallel path this consolidation removes.
+func reconcileRepos(roster []string, all []runs.Delivery, carried map[string]string, handled map[string]bool) []string {
 	expected := map[string]bool{}
 	for _, repo := range roster {
 		if repo != "" {
 			expected[repo] = true
 		}
 	}
-	// The set of repositories production is KNOWN to run — a recorded production commit, or a delivery
-	// that reached production before. Exactly the notion reconcileProd uses for DRIFT-vs-MISSING.
+	// The set of repositories production is KNOWN to run — a VALID recorded production commit for the
+	// host currently there. Exactly the notion reconcileProd uses for DRIFT-vs-MISSING. A service
+	// production runs is reconciled for drift even if the roster read happened to miss it this pass.
 	onProd := map[string]bool{}
-	if prodState != nil {
-		if recs, err := prodState.All(); err == nil {
-			for _, r := range recs {
-				onProd[r.Repo] = true
-			}
-		}
-	}
-	for _, d := range all {
-		if d.ProdDeployedAt != nil {
-			onProd[d.Repo] = true
-			expected[d.Repo] = true // production runs it — reconcile drift even if the roster read missed it
-		}
+	for repo := range carried {
+		onProd[repo] = true
+		expected[repo] = true
 	}
 	// A repository held back this pass: an open, in-flight (not failed) delivery, but ONLY where
 	// production already runs the service. Missing services fall through and are delivered.
@@ -392,28 +411,59 @@ func reconcileRepos(roster []string, all []runs.Delivery, prodState *runs.ProdSt
 	return out
 }
 
-// recordProdCarries records the standard-branch commit production now carries for a repository. An
-// empty commit is not recorded — an unproven state is worse than an absent one, since the
-// reconciliation reads an absent record as "measure afresh" and a wrong one as "even".
-func recordProdCarries(prodState *runs.ProdStateStore, repo, commit string, now time.Time) {
+// recordProdCarries records the standard-branch commit production now carries for a repository, BOUND
+// to the identity of the host it carries it on (hostKey, the fingerprint read this pass). Binding the
+// record to the host is what lets a later pass tell a live claim from a claim about a machine that has
+// since been replaced. An empty commit is not recorded — an unproven state is worse than an absent
+// one, since the reconciliation reads an absent record as "measure afresh" and a wrong one as "even".
+// hostKey may be "" when the identity could not be read this pass; the record is still written (the
+// commit is proven) and the reading side treats an unbound record as one it cannot vouch for.
+func recordProdCarries(prodState *runs.ProdStateStore, repo, commit, hostKey string, now time.Time) {
 	if prodState == nil || commit == "" {
 		return
 	}
-	_ = prodState.Put(runs.ProdRecord{Repo: repo, Commit: commit, DeployedAt: now})
+	_ = prodState.Put(runs.ProdRecord{Repo: repo, Commit: commit, HostKey: hostKey, DeployedAt: now})
+}
+
+// validProdRecords is the reading-side judgement the passive pool must not make: it returns, per
+// repository, the commit production is recorded to carry — but ONLY for records still bound to the
+// host currently there. A record naming a DIFFERENT host key describes a machine that has been
+// replaced (a rebuilt host presents a new key); that record is not stale but VOID, so it is dropped
+// and the repository reads as absent — "measure afresh", which the reconciliation then does. This is
+// the ONE place "what does production carry" is derived; every reader takes this map so no second
+// path can disagree with it.
+//
+// currentHostKey "" means the host identity could not be read this pass (production unarmed, or the
+// host unreachable). Identity cannot be judged then, so every record is honoured as it stands rather
+// than voided wholesale — voiding a valid record on a transient read failure would re-deliver the
+// whole landscape for nothing. A record with an empty HostKey (written before the binding existed, or
+// on a pass whose identity read failed) matches no non-empty currentHostKey and so reads as absent:
+// it is re-measured and re-recorded, this time bound to the host.
+func validProdRecords(prodState *runs.ProdStateStore, currentHostKey string) map[string]string {
+	out := map[string]string{}
+	if prodState == nil {
+		return out
+	}
+	recs, err := prodState.All()
+	if err != nil {
+		return out
+	}
+	for _, r := range recs {
+		if currentHostKey != "" && r.HostKey != currentHostKey {
+			continue // a claim about a host that has been replaced — void, measure afresh
+		}
+		out[r.Repo] = r.Commit
+	}
+	return out
 }
 
 // prodDriftText is the disturbance the user sees when the standard branch has advanced past what
 // production carries. It states the effect (production runs an older state than the standard branch)
 // and that the standard branch moved without a delivery — the governance finding — and that
-// production is being brought current over the existing path. carriedKnown false means production's
-// running commit was not on record at all, which is itself the gap being closed.
-func prodDriftText(tip, carried string, carriedKnown bool) string {
-	if !carriedKnown {
-		return fmt.Sprintf("the standard branch is at %s and production's running commit was not on "+
-			"record — production is being brought up to the standard branch over the existing production "+
-			"path so the two are provably equal. A change that reaches the standard branch belongs to a "+
-			"recorded delivery.", shortSHA(tip))
-	}
+// production is being brought current over the existing path. It is reached only with a KNOWN carried
+// commit: a service with no valid record is MISSING (prodMissingText), never a drift, so there is no
+// "unknown carried commit" drift case to word.
+func prodDriftText(tip, carried string) string {
 	return fmt.Sprintf("the standard branch advanced to %s but production carries %s — no recorded "+
 		"delivery accounts for the change, so production ran an older state while the ledger read "+
 		"'delivered'. Production is being brought up to the standard branch over the existing production "+

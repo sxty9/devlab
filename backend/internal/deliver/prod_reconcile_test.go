@@ -94,28 +94,38 @@ func TestReconcileProd_EvenIsSilent(t *testing.T) {
 	}
 }
 
-// TestReconcileProd_UnknownCarriedIsHealed is the bootstrap case: production ran this repository
-// before but the pool has NO record of which commit it carries (a stale host the mechanism has never
-// measured — exactly what existed on 2026-08-04). An unknown state is not assumed current: it is
-// named and brought up to the standard branch.
-func TestReconcileProd_UnknownCarriedIsHealed(t *testing.T) {
+// TestReconcileProd_ProdDeployedAtIsNotWhatProductionCarries pins the single-source rule: a delivery
+// that reached production before (ProdDeployedAt set) is the lifecycle of ONE send to the host that
+// was there then — it is NOT a claim about what production carries now. With no valid production-state
+// record, the reconciliation must NOT read that lifecycle stamp as "production runs this at an older
+// state" (a DRIFT); the service is MISSING and delivered for the first time to the host now there.
+// This is the exact regression the consolidation removes: after a rebuild, a first-ever delivery must
+// not be announced as a drift.
+func TestReconcileProd_ProdDeployedAtIsNotWhatProductionCarries(t *testing.T) {
 	ledger, res, n, ps := tempLedger(t), tempResults(t), tempNotices(t), tempProdState(t)
 
-	prodDeployedDelivery(t, ledger, "dlv_1", "o/x", "old000000") // no ps.Put — the pool is empty
+	prodDeployedDelivery(t, ledger, "dlv_1", "o/x", "old000000") // ran to prod before; no ps.Put record
+	roster := []string{"o/x"}
 
 	prod := &fakeProd{
 		tips: map[string]string{"o/x": "tip222222"},
 		out:  map[string]ProdOutcome{"o/x": {Running: true, Commit: "tip222222"}},
 	}
-	if err := MaintainProd(context.Background(), prod, nil, ledger, ps, res, n, nil, nil, nil); err != nil {
+	if err := MaintainProd(context.Background(), prod, fakeLandscape{svc: roster}, ledger, ps, res, n, nil, nil, nil); err != nil {
 		t.Fatalf("MaintainProd: %v", err)
 	}
 
-	if notes, _ := n.List(); len(notes) != 1 || notes[0].Kind != runs.NoticeProdDrift {
-		t.Fatalf("an unknown production state must be named as a prod-drift notice, got %+v", notes)
+	// Named MISSING, not DRIFT — the delivery's production-lifecycle stamp is not "what production carries".
+	kinds := noticeKinds(n)
+	if kinds[runs.NoticeProdMissing] != 1 || kinds[runs.NoticeProdDrift] != 0 {
+		t.Fatalf("a service with only a ProdDeployedAt delivery and no valid record must be MISSING, not DRIFT, got %v", kinds)
+	}
+	// It is delivered over the existing path and now recorded as what production carries.
+	if len(prod.calls) != 1 || prod.calls[0] != "o/x" {
+		t.Fatalf("the missing service must be delivered, got calls=%v", prod.calls)
 	}
 	if rec, ok, _ := ps.Get("o/x"); !ok || rec.Commit != "tip222222" {
-		t.Fatalf("the bootstrap heal must record the carried commit, got %+v ok=%v", rec, ok)
+		t.Fatalf("the heal must record the carried commit, got %+v ok=%v", rec, ok)
 	}
 }
 
