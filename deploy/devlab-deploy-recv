@@ -68,6 +68,12 @@ PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
 # systemd is the authority on which units exist — asked through this binary so the question is
 # answerable in a dry run (the seam is stripped by sshd in production).
 SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
+# The account and package databases the reserved-name gate reads to tell a genuine first install of a
+# reserved landscape name (nothing exists under it) from a name grab (an OS account or a distro package
+# already holds it). Seams for the direct-invocation dry run only — sshd hands the forced command no
+# environment, so a client cannot move them; in production these are the real tools.
+GETENT="${DEVLAB_GETENT:-getent}"
+DPKG="${DEVLAB_DPKG:-dpkg-query}"
 
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
@@ -379,20 +385,30 @@ case "$REPO" in
       *)          die "unexpected unit state '$state' for ${UNIT_NAME}.service" 2 ;;
     esac
 
-    # THE RESERVED-IDENTITY GATE — the SAME shared rule devlab-install applies (setup_owns_reserved_name),
-    # run HERE for both branches so the receiver and the dev installer never drift on it. A reserved <repo>
-    # (an OS account, a package, a landscape component such as the `holistic` dashboard) is refused UNLESS
-    # this is the service that already OWNS the identity: the host already carries our own unit under the
-    # delivered name (an update — a foreign unit was refused above) AND that unit runs as `User=<repo>`.
-    # Read from the host and the delivered package, never guessed from the name — so the landscape's own
-    # reserved-named dashboard renews itself while a stranger claiming the name stays refused (a first-time
-    # install of a reserved name owns nothing). The shape/namespace of the name is validated separately in
-    # the first-time branch below (setup_valid_repo_shape).
+    # THE RESERVED-IDENTITY GATE — the SAME shared rules devlab-install applies, run HERE for both branches
+    # so the receiver and the dev installer never drift on it. A reserved <repo> (an OS account, a package,
+    # a landscape component such as the `holistic` dashboard) is judged in THREE cases, all read from the
+    # host and the delivered package, never guessed from the name:
+    #   renew  — the host already carries our own unit under the delivered name (an update — a foreign unit
+    #            was refused above) AND that unit runs as `User=<repo>`: the identity's owner renewing
+    #            itself (setup_owns_reserved_name).
+    #   admit  — a FIRST-TIME setup on a bare host where NOTHING under the name exists: no foreign account,
+    #            no package, and no unit (first-time). This is the whole point of the fix — on a freshly
+    #            provisioned production host `holistic` owns nothing but also collides with nothing, so its
+    #            first install must be admitted; the reserved list protects against foreign PROPERTY, not
+    #            against ABSENCE (setup_reserved_name_free). Without this, holistic — the one landscape
+    #            service not yet on a new host — could never reach production at all.
+    #   refuse — anything else: a first-time name already held by a foreign account or package, or an
+    #            update whose unit runs as someone else. The list is NOT shortened.
+    # The shape/namespace of the name is validated separately in the first-time branch below
+    # (setup_valid_repo_shape).
     is_update=0; [ "$FIRST_TIME" = 0 ] && is_update=1
     for r in $SETUP_RESERVED_REPOS; do
       if [ "$REPO" = "$r" ]; then
         if setup_owns_reserved_name "$REPO" "$UNIT_FILE" "$is_update"; then
           log "repo '$REPO' is reserved, but its unit '${UNIT_NAME}.service' is already ours and runs as 'User=$REPO' — the identity's owner renewing itself; admitted"
+        elif [ "$is_update" = 0 ] && setup_reserved_name_free "$REPO" "$GETENT" "$DPKG"; then
+          log "repo '$REPO' is reserved, but nothing under this name exists on this host (no account, no package, no unit) — the identity is unclaimed; first-time install admitted"
         else
           die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — no unit under this name is yet ours to renew (name/namespace)" 2
         fi
@@ -409,8 +425,9 @@ case "$REPO" in
 
       # The delivered unit is NOT trusted blindly (the same three gates devlab-install applies):
       #  1) the service account NAME must pass the service grammar + namespace (setup_valid_repo_shape);
-      #     the reserved-identity list is judged by the shared ownership gate above (a first-time reserved
-      #     name owns nothing and was already refused there), so it is not re-checked here;
+      #     the reserved-identity list is judged by the shared gate above — which for a first-time setup
+      #     ADMITS a reserved name only when nothing under it exists on this host (setup_reserved_name_free)
+      #     and otherwise refuses it — so it is not re-checked here;
       #  2) the unit must run as its OWN account — exactly `User=<repo>`, never root, never something else;
       #  3) systemd must not already know a FOREIGN unit under this name (checked above — frag was empty).
       # The unit's own NAME may diverge from <repo> (validated lexically above); the account may not.
