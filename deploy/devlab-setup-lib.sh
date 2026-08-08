@@ -40,18 +40,32 @@ sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
 caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod
 docker containerd kubelet etcd snapd holistic"
 
-# setup_valid_repo_name <repo> — the SHAPE and NAMESPACE gate a name must pass before it reaches any
-# path: the grammar ^[a-z][a-z0-9-]{2,30}$, no doubled or trailing dash, not systemd's own prefix, and
-# not a reserved identity. Returns 0 when the name is admissible; otherwise it prints the reason to
-# stderr and returns 1. The caller turns that into its own die/exit with its own exit code, so both
-# wrappers keep their established exit-code contract while sharing the one rule-set.
-setup_valid_repo_name() {
-  local repo="$1" r
+# setup_valid_repo_shape <repo> — the pure SHAPE and NAMESPACE gate, WITHOUT the reserved-identity list:
+# the grammar ^[a-z][a-z0-9-]{2,30}$, no doubled or trailing dash, and not systemd's own prefix. This is
+# the check every use of a repo name in a path owes (path-safety), independent of whether the name is a
+# reserved identity. The reserved list is a SEPARATE judgement (setup_valid_repo_name / the ownership gate
+# below) because a reserved name is not always inadmissible: the service to which the identity already
+# belongs may renew itself. Prints the reason to stderr and returns 1 on a bad shape.
+setup_valid_repo_shape() {
+  local repo="$1"
   [[ "$repo" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || { echo "invalid repo name '$repo' (want ^[a-z][a-z0-9-]{2,30}\$)" >&2; return 1; }
   case "$repo" in
     *--* | *-) echo "invalid repo name '$repo' (no doubled and no trailing dash)" >&2; return 1 ;;
     systemd-*) echo "repo name '$repo' lies in systemd's own namespace" >&2; return 1 ;;
   esac
+  return 0
+}
+
+# setup_valid_repo_name <repo> — the SHAPE and NAMESPACE gate PLUS the reserved-identity list: a name that
+# is admissible for a FIRST-TIME setup, which owns nothing and therefore may never take a reserved
+# identity. Returns 0 when the name is admissible; otherwise it prints the reason to stderr and returns 1.
+# The caller turns that into its own die/exit with its own exit code, so both wrappers keep their
+# established exit-code contract while sharing the one rule-set. For a name that is reserved BUT already
+# belongs to the service being delivered (a renewal), the caller uses setup_owns_reserved_name to lift the
+# refusal — this function alone always refuses a reserved name, because on its own it cannot see the host.
+setup_valid_repo_name() {
+  local repo="$1" r
+  setup_valid_repo_shape "$repo" || return 1
   for r in $SETUP_RESERVED_REPOS; do
     if [ "$repo" = "$r" ]; then
       echo "repo name '$repo' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one" >&2
@@ -59,6 +73,32 @@ setup_valid_repo_name() {
     fi
   done
   return 0
+}
+
+# setup_owns_reserved_name <repo> <own-unit-file> <is-update> — decide whether the service being delivered
+# ALREADY OWNS the on-host identity that its (reserved) <repo> name would otherwise be refused for. The
+# reserved list forbids a service from CLAIMING an identity that is not its own — an operating-system
+# account, a third-party package, or a landscape component such as the `holistic` dashboard. But it must
+# NOT trap the ONE service to WHICH that identity already belongs: that service has to be able to renew
+# itself. The refusal and the admission are two different cases the SPELLING alone cannot tell apart.
+#
+# Ownership is NEVER guessed from the repository NAME — deriving a decision from the name instead of from
+# the delivered artifact and the host is the very fault this whole cascade is unwinding. It is read from
+# what the delivery package NAMES and what the HOST confirms, and BOTH must hold:
+#   * <is-update> is "1" when systemd already carries OUR OWN unit under the delivered unit name
+#     (setup_unit_state = update; a FOREIGN unit was refused by the caller before this). So the host itself
+#     confirms WE installed this unit — the name is already in our hands, not merely asked for.
+#   * the on-host unit at <own-unit-file> declares `User=<repo>` — so the service ACCOUNT the reserved
+#     name would collide with is the very account this, our, unit already runs as. Unit AND account.
+# Returns 0 (owns → the reserved name is admitted) only when both hold; 1 otherwise. A first-time setup
+# owns nothing (refused); an update whose unit runs as someone else does not own the account (refused).
+# SHARED so devlab-install (dev) and devlab-deploy-recv (prod) lift the reserved refusal for the identity's
+# rightful owner by ONE rule, and neither invents a second path.
+setup_owns_reserved_name() {
+  local repo="$1" own_file="$2" is_update="$3"
+  [ "$is_update" = 1 ] || return 1
+  [ -f "$own_file" ] || return 1
+  setup_unit_declares_user "$own_file" "$repo"
 }
 
 # setup_unit_text <repo> <port> — THE systemd unit template. Every value is derived from the two

@@ -342,6 +342,27 @@ case "$REPO" in
       *)          die "unexpected unit state '$state' for ${UNIT_NAME}.service" 2 ;;
     esac
 
+    # THE RESERVED-IDENTITY GATE — the SAME shared rule devlab-install applies (setup_owns_reserved_name),
+    # run HERE for both branches so the receiver and the dev installer never drift on it. A reserved <repo>
+    # (an OS account, a package, a landscape component such as the `holistic` dashboard) is refused UNLESS
+    # this is the service that already OWNS the identity: the host already carries our own unit under the
+    # delivered name (an update — a foreign unit was refused above) AND that unit runs as `User=<repo>`.
+    # Read from the host and the delivered package, never guessed from the name — so the landscape's own
+    # reserved-named dashboard renews itself while a stranger claiming the name stays refused (a first-time
+    # install of a reserved name owns nothing). The shape/namespace of the name is validated separately in
+    # the first-time branch below (setup_valid_repo_shape).
+    is_update=0; [ "$FIRST_TIME" = 0 ] && is_update=1
+    for r in $SETUP_RESERVED_REPOS; do
+      if [ "$REPO" = "$r" ]; then
+        if setup_owns_reserved_name "$REPO" "$UNIT_FILE" "$is_update"; then
+          log "repo '$REPO' is reserved, but its unit '${UNIT_NAME}.service' is already ours and runs as 'User=$REPO' — the identity's owner renewing itself; admitted"
+        else
+          die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — no unit under this name is yet ours to renew (name/namespace)" 2
+        fi
+        break
+      fi
+    done
+
     if [ "$FIRST_TIME" = 1 ]; then
       # ── FIRST-TIME SETUP — install the DELIVERED unit/route/rights (the receiver erzeugt nichts) ──
       log "Erstinstallation of '$REPO' — no unit '${UNIT_NAME}.service' on this host; installing the delivered setup product"
@@ -350,11 +371,13 @@ case "$REPO" in
       [ -f "$DELIV_UNIT" ] || die "first-time setup of '$REPO' has no delivered unit at $DELIV_UNIT" 10
 
       # The delivered unit is NOT trusted blindly (the same three gates devlab-install applies):
-      #  1) the service account NAME must pass the service grammar + reserved-identity list (shared rule);
+      #  1) the service account NAME must pass the service grammar + namespace (setup_valid_repo_shape);
+      #     the reserved-identity list is judged by the shared ownership gate above (a first-time reserved
+      #     name owns nothing and was already refused there), so it is not re-checked here;
       #  2) the unit must run as its OWN account — exactly `User=<repo>`, never root, never something else;
       #  3) systemd must not already know a FOREIGN unit under this name (checked above — frag was empty).
       # The unit's own NAME may diverge from <repo> (validated lexically above); the account may not.
-      setup_valid_repo_name "$REPO" || die "refusing first-time setup of '$REPO' (name/namespace)" 2
+      setup_valid_repo_shape "$REPO" || die "refusing first-time setup of '$REPO' (name/namespace)" 2
       setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
         || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
 

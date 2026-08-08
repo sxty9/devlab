@@ -89,3 +89,72 @@ func TestEmitSetupSelfShipsCheckedInUnit(t *testing.T) {
 		t.Errorf("the self setup must ship devlabd.service, not a generated devlab.service")
 	}
 }
+
+// emitSetupRepoWorkspace stages a per-user workspace for an arbitrary <repo> with an already-built
+// artifact. When shipsOwnSetup is set, the artifact carries the repo's OWN divergently-named unit under
+// setup/ (as artifact-build would stage it), so emit-setup leaves it and generates nothing.
+func emitSetupRepoWorkspace(t *testing.T, repo, unit string, shipsOwnSetup bool) (env map[string]string, wt string) {
+	t.Helper()
+	me, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	wt = filepath.Join(state, "workspaces", me.Username, repo)
+	art := filepath.Join(wt, ".mercury-artifact")
+	if err := os.MkdirAll(art, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if shipsOwnSetup {
+		setup := filepath.Join(art, "setup")
+		if err := os.MkdirAll(setup, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(setup, unit+".service"), []byte(deliveredUnit(repo, repo)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return map[string]string{
+		"DEVLAB_STATE_DIR": state,
+		"DEVLAB_SETUP_LIB": filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh"),
+	}, wt
+}
+
+// A RESERVED-named service that SHIPS ITS OWN setup product (holistic → holistic-dashboard.service) must
+// NOT be refused at emit-setup: the build only PACKAGES the repo-provided unit, which NAMES its own
+// identity; the root installer alone decides ownership on the host. Refusing here trapped the landscape's
+// own dashboard out of every production build (the defect this run removes).
+func TestEmitSetupReservedNameShippingOwnSetupIsPackaged(t *testing.T) {
+	env, wt := emitSetupRepoWorkspace(t, "holistic", "holistic-dashboard", true)
+	res := runWrapper(t, "deploy/devlab-exec", env, "emit-setup", wt, "holistic", "8811")
+	if res.exit != 0 {
+		t.Fatalf("emit-setup of a reserved name that ships its own setup must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	if strings.Contains(res.out, "refusing to emit setup") {
+		t.Errorf("the shipped setup product must be packaged, not refused as reserved:\n%s", res.out)
+	}
+	// The repo-provided unit is left exactly as staged; nothing is generated over it.
+	if _, err := os.Stat(filepath.Join(wt, ".mercury-artifact", "setup", "holistic-dashboard.service")); err != nil {
+		t.Errorf("the repo-provided unit must be left in place: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".mercury-artifact", "setup", "holistic.service")); err == nil {
+		t.Errorf("emit-setup must NOT generate a holistic.service over the shipped product")
+	}
+}
+
+// A RESERVED-named service that ships NO setup product would make emit-setup GENERATE holistic.service
+// (User=holistic) from the template — a colliding identity a freshly generated uniform unit can never own.
+// That is still refused, at the one place emit-setup coins a name into an identity.
+func TestEmitSetupReservedNameGeneratedIsRefused(t *testing.T) {
+	env, wt := emitSetupRepoWorkspace(t, "holistic", "holistic", false)
+	res := runWrapper(t, "deploy/devlab-exec", env, "emit-setup", wt, "holistic", "8811")
+	if res.exit == 0 {
+		t.Fatalf("emit-setup that would GENERATE a reserved identity must be refused, got exit 0\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "reserved") {
+		t.Errorf("the refusal must name the reservation:\n%s", res.out)
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".mercury-artifact", "setup", "holistic.service")); err == nil {
+		t.Errorf("no unit may be generated for the refused reserved name")
+	}
+}

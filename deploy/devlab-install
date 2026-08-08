@@ -104,8 +104,11 @@ ARTIFACT_DIR_NAME=".mercury-artifact"
 # systemd is the authority on which units exist — asked through this binary so the question is
 # answerable in a dry run without a bus (the seam is stripped by sudo's env_reset in production).
 SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
-# The unit directory this wrapper owns. A fragment ANYWHERE else belongs to somebody else.
-UNIT_DIR="/etc/systemd/system"
+# The unit directory this wrapper owns. A fragment ANYWHERE else belongs to somebody else. The env seam
+# only ever moves the directory in a direct-invocation test (it is stripped by sudo's env_reset in
+# production, like every other seam here), so it grants no privilege — it lets a test decide what unit
+# already exists, exactly as devlab-deploy-recv's DEVLAB_UNIT_DIR does.
+UNIT_DIR="${DEVLAB_UNIT_DIR:-/etc/systemd/system}"
 # The configured organisation whose repositories may be installed: an instance value, so it lives
 # in root-owned runtime configuration and never as a literal in this template.
 OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
@@ -473,12 +476,11 @@ UNIT_FILE="$UNIT_DIR/${UNIT_NAME}.service"
 FIRST_TIME=0
 MANIFEST=""
 
-# 5a) reserved identities: no repository may be named after an OS, package or landscape component.
-for r in $SETUP_RESERVED_REPOS; do
-  if [ "$REPO" = "$r" ]; then
-    die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one" 2
-  fi
-done
+# 5a) systemd's own namespace is refused on the SPELLING alone — no unit under `systemd-*` is ever ours,
+#     so no host state could make it admissible. The reserved-IDENTITY list (root, caddy, holistic, …) is
+#     judged LATER, in step 5g, once the delivered unit name (5c-bis) and the host's unit state (5d) are
+#     known: a reserved name must still be admitted for the ONE service to WHICH that identity already
+#     belongs (it renews itself), and that ownership is read from the host, never guessed from the name.
 case "$REPO" in
   systemd-*) die "repo name '$REPO' lies in systemd's own namespace" 2 ;;
 esac
@@ -565,6 +567,30 @@ if [ "$REPO" != "$SELF_REPO" ]; then
     "") if [ -e "$UNIT_FILE" ]; then FIRST_TIME=0; else FIRST_TIME=1; fi ;;
     *) die "unit ${UNIT_NAME}.service already exists outside this wrapper's control ($frag) — refusing to shadow or overwrite a foreign unit" 5 ;;
   esac
+
+  # 5g) THE RESERVED-IDENTITY GATE — judged HERE, after the delivered unit name (5c-bis) and the host's
+  #     unit state (5d) are known, so it can tell apart the two cases the SPELLING alone cannot:
+  #       forbid  — a service CLAIMS an identity (an OS account, a package unit, a landscape component)
+  #                 that is not its own;
+  #       admit   — the service to WHICH that identity already belongs renews itself.
+  #     Ownership is read from the HOST, never derived from the name (the same defect that produced the
+  #     three fixes before this one): systemd confirms the delivered unit is already OURS (FIRST_TIME=0 —
+  #     an update, not a first install, and a foreign fragment was already refused in 5d) AND that unit
+  #     runs as `User=<repo>`, so the account the reserved name would collide with is the very account this
+  #     unit already runs as. Only then is a reserved name admitted. The list is NOT shortened — `holistic`
+  #     stays on it; it is OWNERSHIP that lifts the refusal, and only for the owner. A first-time setup, or
+  #     an update whose unit runs as someone else, stays refused exactly as before.
+  is_update=0; [ "$FIRST_TIME" = 0 ] && is_update=1
+  for r in $SETUP_RESERVED_REPOS; do
+    if [ "$REPO" = "$r" ]; then
+      if setup_owns_reserved_name "$REPO" "$UNIT_FILE" "$is_update"; then
+        log "repo name '$REPO' is reserved, but its unit '${UNIT_NAME}.service' is already ours and runs as 'User=$REPO' — this is the service the identity belongs to, renewing itself; admitted"
+      else
+        die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one, and no unit under this name is yet ours to renew" 2
+      fi
+      break
+    fi
+  done
 
   # 5e) the service account — judged WHERE IT IS DECIDED: at first-time setup, which runs `useradd`
   #     and writes `User=<repo>` into a generated unit. An account that already exists must then be
