@@ -84,7 +84,13 @@ Type=simple
 # Dedicated unprivileged service user. Per-user git/file ops (and terminal/AI) run AS the
 # logged-in Linux user via the pinned devlab-exec sudo wrapper; the service itself only reads.
 User=devlab
-SupplementaryGroups=holistic
+# holistic: the shared landscape group (jwt-secret, revoked.json). systemd-journal: the honest
+# running gate (deploy.Gate) reads a just-delivered unit's OWN journal to name WHY a failed start
+# died; without this group journalctl answers "No journal files were opened due to insufficient
+# permissions", and that gate deficiency was mistaken for the service's failure reason (2026-08-08,
+# holistic-dashboard booked as failed although it was live). The group is read-only — it grants the
+# service nothing but the ability to READ the system journal.
+SupplementaryGroups=holistic systemd-journal
 ExecStart=/usr/local/bin/devlabd
 Restart=on-failure
 RestartSec=3

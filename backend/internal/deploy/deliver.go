@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -139,7 +140,21 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 
 	// The honest gate (F10): "installed and started" only when the unit is ACTIVE and the port
 	// is HELD — otherwise the setup FAILED, never green by default (REQ-044.3, K-4).
-	if err := gate.VerifyRunning(ctx, key, port); err != nil {
+	//
+	// The gate probes the unit that was actually INSTALLED. Its name is carried by the delivered
+	// setup product (setup/<name>.service) and may legitimately differ from the repository name — a
+	// dashboard whose unit is `<repo>-dashboard` is the standing case. The gate reads that name from
+	// the ONE place that determines it (DeliveredUnitName, the twin of the installer's
+	// setup_delivered_unit_name), instead of deriving it a second time from the repository name. The
+	// installer already made this correction (PR 106); deriving the name again here made the gate ask
+	// systemd for `holistic` while the installer had installed and started `holistic-dashboard`, so a
+	// LIVE delivery was booked as failed. Absent a delivered unit the name falls back to the service
+	// id, and the behaviour is unchanged.
+	unit := DeliveredUnitName(artifactDir, key)
+	if unit == "" {
+		unit = key
+	}
+	if err := gate.VerifyRunning(ctx, unit, port); err != nil {
 		return Outcome{Installed: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
 			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", key, err)
 	}
@@ -271,15 +286,25 @@ func ProdSetupPort(ctx context.Context, d Detection) (int, error) {
 
 // ─── the honest running gate (F10) ───────────────────────────────────────────
 
+// LogLookup is the result of reading a unit's journal for the cause of a failed start. It separates
+// two things a bare string conflated: the actual last log line (the service's OWN reason), and whether
+// the gate could read the journal AT ALL. When the gate lacks journal access, journalctl prints "No
+// journal files were opened due to insufficient permissions" — that is the gate's OWN missing right,
+// not the service's failure reason, and must never be reported as the cause (task point 2/3).
+type LogLookup struct {
+	Line     string // the unit's real last log line, or "" when the journal held none
+	Readable bool   // true only when the gate could actually read the journal; false = its own right is missing
+}
+
 // Gate proves a service is up AND STAYS up: unit active AND port held, held CONTINUOUSLY over a dwell.
 // The probes are seams so the gate is testable without a host; the defaults ask systemd, dial the
 // loopback port, and read the unit's own journal for the reason a failed start died.
 type Gate struct {
 	UnitActive func(ctx context.Context, unit string) error
 	PortHeld   func(ctx context.Context, port int) error
-	LogReason  func(ctx context.Context, unit string) string // the line from the unit's log that carries the cause
-	Wait       time.Duration                                 // how long the service gets to COME UP
-	Dwell      time.Duration                                 // how long it must then STAY up, continuously
+	LogReason  func(ctx context.Context, unit string) LogLookup // the unit's log line that carries the cause, or an unreadable verdict
+	Wait       time.Duration                                    // how long the service gets to COME UP
+	Dwell      time.Duration                                    // how long it must then STAY up, continuously
 	Poll       time.Duration
 }
 
@@ -301,15 +326,25 @@ func DefaultGate() Gate {
 			}
 			return conn.Close()
 		},
-		LogReason: func(ctx context.Context, unit string) string {
-			out, _ := exec.CommandContext(ctx, "journalctl", "-u", unit, "-n", "5", "--no-pager", "-o", "cat").CombinedOutput()
-			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		LogReason: func(ctx context.Context, unit string) LogLookup {
+			// stdout (the log itself) and stderr (journalctl's own complaints) are kept apart, so the
+			// gate never mistakes "I may not read this journal" for the service's last log line. The old
+			// CombinedOutput() folded the two, which is exactly how "No journal files were opened due to
+			// insufficient permissions" ended up reported as holistic's failure reason (2026-08-08).
+			cmd := exec.CommandContext(ctx, "journalctl", "-u", unit, "-n", "5", "--no-pager", "-o", "cat")
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err := cmd.Run()
+			if journalUnreadable(err, stderr.String()) {
+				return LogLookup{Readable: false}
+			}
+			lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
 			for i := len(lines) - 1; i >= 0; i-- {
 				if s := strings.TrimSpace(lines[i]); s != "" {
-					return s
+					return LogLookup{Line: s, Readable: true}
 				}
 			}
-			return ""
+			return LogLookup{Readable: true}
 		},
 		Wait:  15 * time.Second,
 		Dwell: 12 * time.Second,
@@ -371,15 +406,43 @@ func (g Gate) VerifyRunning(ctx context.Context, unit string, port int) error {
 }
 
 // withReason appends the unit's own log line to a gate failure, so a failed delivery names the cause
-// from the service's protocol rather than a bare probe error.
+// from the service's protocol rather than a bare probe error. When the journal could not be READ at
+// all, the failure says so explicitly ("reason unknown, log not readable") instead of dressing the
+// gate's own missing right up as the service's cause — a wrong cause that points elsewhere is worse
+// than an admitted unknown (task point 2/3).
 func (g Gate) withReason(ctx context.Context, unit string, err error) error {
 	if err == nil || g.LogReason == nil {
 		return err
 	}
-	if reason := strings.TrimSpace(g.LogReason(ctx, unit)); reason != "" {
+	look := g.LogReason(ctx, unit)
+	if !look.Readable {
+		return fmt.Errorf("%w — reason unknown, log not readable: the gate lacks journal access for unit %s (add it to the systemd-journal group)", err, unit)
+	}
+	if reason := strings.TrimSpace(look.Line); reason != "" {
 		return fmt.Errorf("%w — last log line: %s", err, reason)
 	}
 	return err
+}
+
+// journalUnreadable reports whether journalctl failed because the gate itself may not read the unit's
+// journal, as opposed to the journal simply being empty. The signature is journalctl's own on a host
+// where the service account is not in the systemd-journal group: it prints "No journal files were
+// opened due to insufficient permissions" (or a plain permission-denied) to STDERR. That message is
+// the gate's deficiency, never the delivered service's failure cause, so it is recognised here and
+// turned into an honest "unreadable" verdict rather than passed off as a log line.
+func journalUnreadable(runErr error, stderr string) bool {
+	s := strings.ToLower(stderr)
+	switch {
+	case strings.Contains(s, "insufficient permissions"),
+		strings.Contains(s, "no journal files were opened"),
+		strings.Contains(s, "permission denied"):
+		return true
+	}
+	// journalctl exited non-zero AND complained on stderr for some other reason (e.g. the journal is
+	// unavailable): the reason it would have carried cannot be trusted, so treat the log as unreadable
+	// rather than invent a cause. A clean non-zero exit with no stderr (an empty journal) stays
+	// readable — there is simply no line, which withReason reports as no appended cause.
+	return runErr != nil && strings.TrimSpace(stderr) != ""
 }
 
 func (g Gate) probeOnce(ctx context.Context, unit string, port int) error {
@@ -397,9 +460,4 @@ func (g Gate) probeOnce(ctx context.Context, unit string, port int) error {
 		return errors.New("gate has no probes — refusing to report running")
 	}
 	return nil
-}
-
-// VerifyRunning is the default-gate convenience over a Detection (unit name == service id).
-func VerifyRunning(ctx context.Context, d Detection, port int) error {
-	return DefaultGate().VerifyRunning(ctx, d.ID, port)
 }
