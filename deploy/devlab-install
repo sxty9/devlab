@@ -194,10 +194,12 @@ own_root() { [ "$(id -u)" -eq 0 ] && chown root:root -- "$@" || true; }
 # confined child (root via the sudoers pin, but inside the cgroup where /usr/local/sbin is read-only), so
 # the atomic write below fails; the fix is to run the SAME renewal in a transient unit outside the cgroup,
 # exactly as the self-repo restart hands its work out (see --handover). The handed-out unit runs
-# unconfined as root and RE-ENTERS this very tool with the SAME three arguments, so all four bindings —
-# the renewable name, the run-unwritable source, the approved checksum, and single-use — are re-checked
-# OUTSIDE the boundary; nothing the caller says is trusted across it. It returns here, to run the checks
-# and write in THIS context, when:
+# unconfined as root and RE-ENTERS this very tool with the SAME arguments (the whole approval: the grant
+# plus every name/content pair), so all four bindings — the renewable name, the run-unwritable source, the
+# approved checksum, and single-use — are re-checked OUTSIDE the boundary; nothing the caller says is
+# trusted across it. THE PATH IS DECIDED HERE, BEFORE ANY CONSUMPTION (task point 2): if the write cannot
+# happen in this cgroup, the whole set is handed out up front — a doomed in-cgroup attempt that would
+# touch the ledger is never made. It returns here, to run the checks and write in THIS context, when:
 #   * --check: a dry run writes nothing and needs no escape;
 #   * the recursion marker is set: we ARE the transient unit — do the work;
 #   * the target is already writable: there is no confinement to escape (an unconfined root install, or a
@@ -206,90 +208,127 @@ own_root() { [ "$(id -u)" -eq 0 ] && chown root:root -- "$@" || true; }
 # would fail again, which is the silent loop the user cannot win (task points 3/4). A failed hand-out
 # (systemd-run absent or the transient unit erroring) fails the renewal WITH the real reason, which the
 # daemon surfaces as one disturbance rather than re-asking.
-maybe_hand_out_renewal() {  # <name> <content-file> <grant-file>
+maybe_hand_out_renewal() {  # <grant-file> <name> <content-file> [<name> <content-file> ...]
   [ "$CHECK" = 1 ] && return 0
   [ "${DEVLAB_WRENEW_HANDED_OUT:-0}" = 1 ] && return 0
   [ -w "$SBIN_DIR" ] && return 0
   command -v "$SYSTEMD_RUN" >/dev/null 2>&1 \
-    || die "cannot write $SBIN_DIR — the devlab service confines it read-only (ProtectSystem=strict) and '$SYSTEMD_RUN' is not available to hand the renewal out of the service; the approved renewal of '$1' cannot be installed" 4
+    || die "cannot write $SBIN_DIR — the devlab service confines it read-only (ProtectSystem=strict) and '$SYSTEMD_RUN' is not available to hand the renewal out of the service; the approved renewal cannot be installed" 4
   local self
   self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "cannot resolve this wrapper's own path to hand the renewal out" 4
-  log "cannot write $SBIN_DIR from inside the service (ProtectSystem=strict) — handing the approved renewal of '$1' out to a transient unit outside the cgroup (like the self-repo restart)"
+  log "cannot write $SBIN_DIR from inside the service (ProtectSystem=strict) — handing the approved renewal out to a transient unit outside the cgroup (like the self-repo restart)"
   # --wait: block and adopt the unit's exit status · --pipe: forward the unit's output back to the daemon
   # that invoked us · --collect: reap the unit even on failure. --setenv carries the recursion marker and
-  # the already-resolved (pinned) paths so the transient unit measures the identical state. A non-zero
-  # exit propagates out of this wrapper: the renewal fails with the transient unit's real reason.
+  # the already-resolved (pinned) paths so the transient unit measures the identical state. The FULL
+  # argument list of this renewal follows `--`, so the transient unit renews the same set in one atomic
+  # pass. A non-zero exit propagates out of this wrapper: the renewal fails with the transient unit's
+  # real reason.
   "$SYSTEMD_RUN" --quiet --wait --pipe --collect \
     --unit="devlab-wrapper-renew-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
     --setenv=DEVLAB_WRENEW_HANDED_OUT=1 \
     --setenv="DEVLAB_STATE_DIR=$STATE_DIR" \
     --setenv="DEVLAB_SBIN_DIR=$SBIN_DIR" \
     --setenv="DEVLAB_WRAPPER_AUDIT_DIR=$WRENEW_AUDIT_DIR" \
-    -- "$self" --renew-wrapper "$1" "$2" "$3"
+    -- "$self" --renew-wrapper "$@"
   exit $?
 }
 
+# renew_wrapper installs ONE approval — which may cover SEVERAL wrapper files — as ONE UNIT: either every
+# named file lands, or none does (task point 4). One approval is one single-use, redeemed exactly once
+# (task point 3): the old per-file design called this tool once per file with the SAME approvalId, so the
+# first file's ledger entry made every later file of the same approval read as "already used" and the
+# renewal stopped half-done (the 2026-08-08 defect). The call now carries the whole set — one combined
+# grant (approvalId + who/when + one approved checksum per name) followed by <name> <content-file> pairs —
+# and the ledger is touched ONCE, after all files are committed. A dry run or an attempt that writes
+# nothing (a checksum mismatch, a read-only target that is handed out, a rolled-back commit) leaves the
+# approval UNCONSUMED (task point 1).
 renew_wrapper() {
-  [ "${#POSITIONAL[@]}" -eq 3 ] \
-    || die "usage: devlab-install --renew-wrapper <name> <content-file> <grant-file>" 2
-  local name="${POSITIONAL[0]}" contentf="${POSITIONAL[1]}" grantf="${POSITIONAL[2]}"
+  # <grant-file> then an EVEN number of <name> <content-file> pairs, at least one pair.
+  local argc="${#POSITIONAL[@]}"
+  { [ "$argc" -ge 3 ] && [ $(( (argc - 1) % 2 )) -eq 0 ]; } \
+    || die "usage: devlab-install --renew-wrapper <grant-file> <name> <content-file> [<name> <content-file> ...]" 2
+  local grantf="${POSITIONAL[0]}"
 
-  # 0) IF THE SERVICE CONFINES US OUT OF /usr/local/sbin, run this SAME renewal outside the cgroup and
-  #    exit with its result. This is what lets an approved renewal actually take effect; it returns here
-  #    only when the write can happen in this context (see maybe_hand_out_renewal). Every check below then
-  #    runs OUTSIDE the boundary too — root re-verifies, it does not trust the confined caller.
-  maybe_hand_out_renewal "$name" "$contentf" "$grantf"
+  # 0) IF THE SERVICE CONFINES US OUT OF /usr/local/sbin, run this SAME renewal (the WHOLE set) outside the
+  #    cgroup and exit with its result. The path is chosen BEFORE any consumption (task point 2): it returns
+  #    here only when the write can happen in this context. Every check below then runs OUTSIDE the boundary
+  #    too — root re-verifies, it does not trust the confined caller.
+  maybe_hand_out_renewal "${POSITIONAL[@]}"
 
-  # 1) THE NAME IS ON THE RENEWABLE LIST — the list lives here, not in the call (task point 4). No
-  #    path, no pattern, no extension beyond the list. The INSTALL MODE comes from the list too (0755
-  #    for the executable wrappers, 0644 for the sourced setup library), so a renewal never turns the
-  #    read-only library into an executable, nor a wrapper into a non-executable. The refusal names the
-  #    renewable set; it does not count it.
-  local ok=0 mode="" entry ename names=""
-  for entry in $RENEWABLE; do
-    ename="${entry%%:*}"
-    names="${names:+$names }$ename"
-    if [ "$name" = "$ename" ]; then ok=1; mode="${entry##*:}"; fi
-  done
-  [ "$ok" = 1 ] || die "refusing '$name': not a renewable root wrapper (renewable: $names)" 2
-
-  # 2) THE SOURCE MUST BE RUN-UNWRITABLE (task point 1: no file a run produced is ever a source). The
-  #    grant + content must resolve under the daemon-owned state root and NOT under the run-writable
-  #    workspaces subtree (the only place an agent run can write). realpath collapses '..' and every
-  #    symlink, so a link out of the workspace cannot smuggle a run-authored file past this.
-  local troot wroot p greal creal
+  # 1) THE GRANT MUST BE RUN-UNWRITABLE (task point 1: no file a run produced is ever a source). It must
+  #    resolve under the daemon-owned state root and NOT under the run-writable workspaces subtree (the
+  #    only place an agent run can write). realpath collapses '..' and every symlink.
+  local troot wroot greal
   troot="$(realpath -e -- "$STATE_DIR" 2>/dev/null)" || die "state root missing: $STATE_DIR" 5
   wroot="$troot/workspaces"
-  greal="$(realpath -e -- "$grantf" 2>/dev/null)"   || die "grant file does not resolve: $grantf" 2
-  creal="$(realpath -e -- "$contentf" 2>/dev/null)" || die "content file does not resolve: $contentf" 2
-  for p in "$greal" "$creal"; do
-    case "$p/" in "$troot"/*) : ;; *) die "source '$p' is outside the state root $troot — refusing" 2 ;; esac
-    case "$p/" in "$wroot"/*) die "source '$p' is under the run-writable workspaces tree — a run must not supply the content" 2 ;; esac
-    [ -f "$p" ] || die "source '$p' is not a regular file" 2
+  greal="$(realpath -e -- "$grantf" 2>/dev/null)" || die "grant file does not resolve: $grantf" 2
+  case "$greal/" in "$troot"/*) : ;; *) die "grant '$greal' is outside the state root $troot — refusing" 2 ;; esac
+  case "$greal/" in "$wroot"/*) die "grant '$greal' is under the run-writable workspaces tree — a run must not supply the approval" 2 ;; esac
+  [ -f "$greal" ] || die "grant '$greal' is not a regular file" 2
+
+  # 2) READ THE APPROVAL HEADER — the daemon rendered it from the user's explicit approval; a run cannot
+  #    write here. One approval, one approvalId, one who/when. The per-name approved checksums follow as
+  #    `sha256 <name> <sha>` lines and are looked up per file below.
+  local g_id g_by g_at
+  g_id="$(sed -n 's/^approvalId=//p' "$greal" | head -n1)"
+  g_by="$(sed -n 's/^approvedBy=//p' "$greal" | head -n1)"
+  g_at="$(sed -n 's/^approvedAt=//p' "$greal" | head -n1)"
+  [ -n "$g_id" ] || die "grant is incomplete (need approvalId)" 2
+  [[ "$g_id" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]] || die "grant approvalId has an unexpected shape: $g_id" 2
+
+  # 3) VALIDATE THE WHOLE SET FIRST — every name, source and checksum — before ANYTHING is written. Any
+  #    single failure refuses the entire approval and installs nothing (task point 4, the validation half
+  #    of all-or-none). The parallel arrays carry the vetted plan into the commit stage.
+  local -a v_name=() v_mode=() v_sha=() v_creal=() v_dest=() v_old=() v_backup=()
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local i n contentf ok mode entry ename names want creal actual dest oldsha backup
+  i=1
+  while [ "$i" -lt "$argc" ]; do
+    n="${POSITIONAL[$i]}"; contentf="${POSITIONAL[$((i + 1))]}"; i=$((i + 2))
+
+    # 3a) THE NAME IS ON THE RENEWABLE LIST — the list lives here, not in the call (task point 4). The
+    #     INSTALL MODE comes from the list too (0755 for the executable wrappers, 0644 for the sourced
+    #     setup library), so a renewal never turns the read-only library into an executable.
+    ok=0; mode=""; names=""
+    for entry in $RENEWABLE; do
+      ename="${entry%%:*}"
+      names="${names:+$names }$ename"
+      if [ "$n" = "$ename" ]; then ok=1; mode="${entry##*:}"; fi
+    done
+    [ "$ok" = 1 ] || die "refusing '$n': not a renewable root wrapper (renewable: $names)" 2
+
+    # 3b) THE APPROVED CHECKSUM FOR THIS NAME comes from the grant, never the call — that is what makes
+    #     "approve content A, then hand content B" install nothing (task points 2/3).
+    want="$(awk -v want="$n" '$1 == "sha256" && $2 == want { print $3; exit }' "$greal")"
+    [ -n "$want" ] || die "grant carries no approved checksum for '$n' — refusing" 2
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "grant checksum for '$n' is not a sha256: $want" 2
+
+    # 3c) THE CONTENT MUST BE RUN-UNWRITABLE under the state root, not under workspaces (task point 1).
+    creal="$(realpath -e -- "$contentf" 2>/dev/null)" || die "content file for '$n' does not resolve: $contentf" 2
+    case "$creal/" in "$troot"/*) : ;; *) die "source '$creal' is outside the state root $troot — refusing" 2 ;; esac
+    case "$creal/" in "$wroot"/*) die "source '$creal' is under the run-writable workspaces tree — a run must not supply the content" 2 ;; esac
+    [ -f "$creal" ] || die "source '$creal' is not a regular file" 2
+
+    # 3d) THE CONTENT HASHES TO THE APPROVED CHECKSUM (task points 2/3).
+    actual="$(sha256sum -- "$creal" | awk '{print $1}')"
+    [ "$actual" = "$want" ] \
+      || die "content checksum $actual for '$n' does not match the approved $want — refusing (the approval is for exactly one content)" 2
+
+    # Record what is there now, so the rollback (below) and the audit ledger can name the previous stand.
+    dest="$SBIN_DIR/$n"; oldsha="(absent)"; backup="none"
+    if [ -f "$dest" ]; then
+      oldsha="$(sha256sum -- "$dest" | awk '{print $1}')"
+      backup="$WRENEW_AUDIT_DIR/backups/${n}.${ts}.${oldsha}"
+    fi
+    v_name+=("$n"); v_mode+=("$mode"); v_sha+=("$want"); v_creal+=("$creal")
+    v_dest+=("$dest"); v_old+=("$oldsha"); v_backup+=("$backup")
   done
+  [ "${#v_name[@]}" -ge 1 ] || die "no wrappers to renew" 2
 
-  # 3) READ THE APPROVAL GRANT — the daemon rendered it from the user's explicit approval; a run
-  #    cannot write here. It names the file and the checksum the approval covers.
-  local g_name g_sha g_id g_by g_at
-  g_name="$(sed -n 's/^name=//p'       "$greal" | head -n1)"
-  g_sha="$( sed -n 's/^sha256=//p'     "$greal" | head -n1)"
-  g_id="$(  sed -n 's/^approvalId=//p' "$greal" | head -n1)"
-  g_by="$(  sed -n 's/^approvedBy=//p' "$greal" | head -n1)"
-  g_at="$(  sed -n 's/^approvedAt=//p' "$greal" | head -n1)"
-  [ -n "$g_name" ] && [ -n "$g_sha" ] && [ -n "$g_id" ] || die "grant is incomplete (need name, sha256, approvalId)" 2
-  [ "$g_name" = "$name" ] || die "grant is for '$g_name', not '$name' — refusing" 2
-  [[ "$g_sha" =~ ^[0-9a-f]{64}$ ]]            || die "grant checksum is not a sha256: $g_sha" 2
-  [[ "$g_id"  =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]  || die "grant approvalId has an unexpected shape: $g_id" 2
-
-  # 4) THE CONTENT IS EXACTLY THE APPROVED CHECKSUM (task points 2/3). This is what makes "approve
-  #    content A, then hand content B" install nothing.
-  local actual
-  actual="$(sha256sum -- "$creal" | awk '{print $1}')"
-  [ "$actual" = "$g_sha" ] \
-    || die "content checksum $actual does not match the approved $g_sha — refusing (the approval is for exactly one content)" 2
-
-  # 5) SINGLE-USE. The root-owned ledger records every consumed approval; a second use installs
-  #    nothing (task point 2). We create the audit tree here (root-owned) before reading it.
+  # 4) SINGLE-USE, ONCE FOR THE WHOLE APPROVAL. The root-owned ledger records the approvalId of a consumed
+  #    approval; a second use of the SAME approval installs nothing (task point 3). Because the whole set
+  #    is one invocation now, the ledger is read here once and written once (step 7) — the approvalId of
+  #    the first file no longer poisons the rest of its own approval.
   install -d -m 0700 -- "$WRENEW_AUDIT_DIR"          || die "cannot create audit dir $WRENEW_AUDIT_DIR" 4
   install -d -m 0700 -- "$WRENEW_AUDIT_DIR/backups"  || die "cannot create backups dir" 4
   own_root "$WRENEW_AUDIT_DIR" "$WRENEW_AUDIT_DIR/backups"
@@ -298,37 +337,67 @@ renew_wrapper() {
     die "approval $g_id was already used — refusing to install it a second time (single-use)" 5
   fi
 
-  # 6) RECORD WHAT WAS THERE BEFORE, so a return to the previous stand is possible (task point 5).
-  local dest="$SBIN_DIR/$name" oldsha="(absent)" ts backup="none"
-  ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  if [ -f "$dest" ]; then
-    oldsha="$(sha256sum -- "$dest" | awk '{print $1}')"
-    backup="$WRENEW_AUDIT_DIR/backups/${name}.${ts}.${oldsha}"
-  fi
-
   if [ "$CHECK" = 1 ]; then
-    echo "PLAN: renew $name (mode $mode) -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha) from $creal"
+    for i in "${!v_name[@]}"; do
+      echo "PLAN: renew ${v_name[$i]} (mode ${v_mode[$i]}) -> ${v_sha[$i]} (approved by ${g_by:-unknown}; previous ${v_old[$i]}) from ${v_creal[$i]}"
+    done
     return 0
   fi
 
-  [ "$backup" = none ] || { cp -p -- "$dest" "$backup" || die "cannot back up the current $name" 4; own_root "$backup"; }
+  # 5) BACK UP every file being replaced, then STAGE a temp copy of every new file. Nothing is moved into
+  #    place while any file could still fail: staging every file first is what makes the commit all-or-none
+  #    (task point 4). A staging failure removes the temp files staged so far and installs nothing.
+  local -a staged=()
+  local tmp t
+  for i in "${!v_name[@]}"; do
+    if [ "${v_backup[$i]}" != none ]; then
+      cp -p -- "${v_dest[$i]}" "${v_backup[$i]}" \
+        || { for t in "${staged[@]}"; do rm -f -- "$t"; done; die "cannot back up the current ${v_name[$i]}" 4; }
+      own_root "${v_backup[$i]}"
+    fi
+    tmp="$(mktemp "$SBIN_DIR/.${v_name[$i]}.XXXXXX")" \
+      || { for t in "${staged[@]}"; do rm -f -- "$t"; done; die "cannot stage a temp file in $SBIN_DIR" 4; }
+    cp -- "${v_creal[$i]}" "$tmp" \
+      || { rm -f -- "$tmp"; for t in "${staged[@]}"; do rm -f -- "$t"; done; die "cannot write staged wrapper ${v_name[$i]}" 4; }
+    chmod "${v_mode[$i]}" "$tmp"; own_root "$tmp"
+    staged+=("$tmp")
+  done
 
-  # 7) INSTALL ATOMICALLY — stage a copy in the destination dir, set mode + owner, then rename over
-  #    the target. rename replaces the directory entry, not the inode a running process holds open, so
-  #    renewing devlab-install while THIS very invocation runs is safe.
-  local tmp
-  tmp="$(mktemp "$SBIN_DIR/.${name}.XXXXXX")" || die "cannot stage a temp file in $SBIN_DIR" 4
-  cp -- "$creal" "$tmp" || { rm -f -- "$tmp"; die "cannot write staged wrapper" 4; }
-  chmod "$mode" "$tmp"; own_root "$tmp"
-  mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; die "cannot move the new $name into place" 4; }
+  # 6) COMMIT — rename each staged file over its target. rename replaces the directory entry, not the inode
+  #    a running process holds open, so renewing devlab-install while THIS very invocation runs is safe. If
+  #    a rename fails partway, restore the already-committed targets from their backups so the set stays
+  #    all-or-none, and install nothing further (task point 4).
+  local -a committed=()
+  local j
+  for i in "${!v_name[@]}"; do
+    if mv -f -- "${staged[$i]}" "${v_dest[$i]}"; then
+      committed+=("$i")
+    else
+      for j in "${committed[@]}"; do
+        if [ "${v_backup[$j]}" != none ]; then
+          cp -p -- "${v_backup[$j]}" "${v_dest[$j]}" 2>/dev/null && own_root "${v_dest[$j]}"
+        else
+          rm -f -- "${v_dest[$j]}"
+        fi
+      done
+      for t in "${staged[@]}"; do rm -f -- "$t"; done
+      die "cannot move the new ${v_name[$i]} into place — rolled back the whole renewal (all-or-none)" 4
+    fi
+  done
 
-  # 8) APPEND THE TAMPER-EVIDENT RECORD: who approved what, what was installed, what was there before,
-  #    and where the rollback copy sits (task point 5).
-  printf 'installedAt=%s approvalId=%s name=%s newSha=%s oldSha=%s approvedBy=%s approvedAt=%s backup=%s\n' \
-    "$ts" "$g_id" "$name" "$g_sha" "$oldsha" "${g_by:-unknown}" "${g_at:-unknown}" "$backup" >> "$ledger"
+  # 7) APPEND THE TAMPER-EVIDENT RECORD, once for the whole approval: one line per installed file, all
+  #    under the same approvalId (the single-use key, step 4). Only reached after EVERY file committed, so
+  #    an approval that wrote nothing is never marked consumed (task point 1).
+  local rn=""
+  for i in "${!v_name[@]}"; do
+    printf 'installedAt=%s approvalId=%s name=%s newSha=%s oldSha=%s approvedBy=%s approvedAt=%s backup=%s\n' \
+      "$ts" "$g_id" "${v_name[$i]}" "${v_sha[$i]}" "${v_old[$i]}" "${g_by:-unknown}" "${g_at:-unknown}" "${v_backup[$i]}" \
+      >> "$ledger"
+    rn="${rn:+$rn }${v_name[$i]}"
+  done
   chmod 0600 "$ledger"; own_root "$ledger"
-  log "renewed root wrapper $name -> $g_sha (approved by ${g_by:-unknown}; previous $oldsha; backup $backup)"
-  echo "RENEWED: name=$name newSha=$g_sha oldSha=$oldsha approvalId=$g_id"
+  log "renewed root wrapper scripts ($rn) under approval $g_id (approved by ${g_by:-unknown})"
+  echo "RENEWED: approvalId=$g_id names=$rn"
 }
 
 if [ "$RENEW" = 1 ]; then

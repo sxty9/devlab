@@ -59,27 +59,46 @@ func newRenewFixture(t *testing.T) renewFixture {
 	}
 }
 
-// writeGrant stages a content file and a matching grant, returning their paths. sha lets a test pin a
-// checksum that deliberately disagrees with the content (test a).
-func (f renewFixture) writeGrant(t *testing.T, id, name string, content []byte, sha, by string) (contentPath, grantPath string) {
-	t.Helper()
-	contentPath = filepath.Join(f.grantsDir, id+"."+name+".content")
-	grantPath = filepath.Join(f.grantsDir, id+"."+name+".grant")
-	if err := os.WriteFile(contentPath, content, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	grant := strings.Join([]string{
-		"name=" + name, "sha256=" + sha, "approvalId=" + id,
-		"approvedBy=" + by, "approvedAt=2026-08-02T12:00:00Z", "",
-	}, "\n")
-	if err := os.WriteFile(grantPath, []byte(grant), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	return contentPath, grantPath
+// grantFile is ONE file of an approval, as a test states it: the wrapper name, its content, and the
+// sha the grant pins for it. pinSHA lets a test pin a checksum that deliberately disagrees with the
+// content (test a); when empty, the sha of content is used.
+type grantFile struct {
+	name    string
+	content []byte
+	pinSHA  string
 }
 
-func (f renewFixture) renew(t *testing.T, name, contentPath, grantPath string) wrapperResult {
-	return runWrapper(t, "deploy/devlab-install", f.env, "--renew-wrapper", name, contentPath, grantPath)
+func gf(name string, content []byte) grantFile { return grantFile{name: name, content: content} }
+
+// writeApproval stages the content of every file plus ONE combined grant covering the whole approval,
+// and returns the grant path and the ordered <name> <content-path> argument list — exactly the shape
+// the root tool now takes (`--renew-wrapper <grant> <name> <content> …`). This mirrors the daemon's
+// stageWrapperGrantSet: one approval, one grant, its files spent as one unit.
+func (f renewFixture) writeApproval(t *testing.T, id, by string, files ...grantFile) (grantPath string, args []string) {
+	t.Helper()
+	lines := []string{"approvalId=" + id, "approvedBy=" + by, "approvedAt=2026-08-02T12:00:00Z"}
+	for _, w := range files {
+		sha := w.pinSHA
+		if sha == "" {
+			sha = sha256of(w.content)
+		}
+		contentPath := filepath.Join(f.grantsDir, id+"."+w.name+".content")
+		if err := os.WriteFile(contentPath, w.content, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, "sha256 "+w.name+" "+sha)
+		args = append(args, w.name, contentPath)
+	}
+	lines = append(lines, "")
+	grantPath = filepath.Join(f.grantsDir, id+".grant")
+	if err := os.WriteFile(grantPath, []byte(strings.Join(lines, "\n")), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	return grantPath, args
+}
+
+func (f renewFixture) renew(t *testing.T, grantPath string, args ...string) wrapperResult {
+	return runWrapper(t, "deploy/devlab-install", f.env, append([]string{"--renew-wrapper", grantPath}, args...)...)
 }
 
 // (a) A confirmation for content A installs content B NOT.
@@ -87,8 +106,9 @@ func TestRenewRefusesContentThatMismatchesTheApprovedChecksum(t *testing.T) {
 	f := newRenewFixture(t)
 	approvedSHA := sha256of([]byte("APPROVED CONTENT A\n"))
 	// The staged content is B, but the grant carries the checksum of A.
-	c, g := f.writeGrant(t, "qst_a1", "devlab-exec", []byte("DIFFERENT CONTENT B\n"), approvedSHA, "operator")
-	res := f.renew(t, "devlab-exec", c, g)
+	g, args := f.writeApproval(t, "qst_a1", "operator",
+		grantFile{name: "devlab-exec", content: []byte("DIFFERENT CONTENT B\n"), pinSHA: approvedSHA})
+	res := f.renew(t, g, args...)
 	if res.exit == 0 {
 		t.Fatalf("expected a refusal, got exit 0\n%s", res.out)
 	}
@@ -104,17 +124,16 @@ func TestRenewRefusesContentThatMismatchesTheApprovedChecksum(t *testing.T) {
 func TestRenewIsSingleUse(t *testing.T) {
 	f := newRenewFixture(t)
 	content := []byte("#!/usr/bin/env bash\necho merged devlab-exec\n")
-	sha := sha256of(content)
-	c, g := f.writeGrant(t, "qst_c1", "devlab-exec", content, sha, "operator")
+	g, args := f.writeApproval(t, "qst_c1", "operator", gf("devlab-exec", content))
 
-	if res := f.renew(t, "devlab-exec", c, g); res.exit != 0 {
+	if res := f.renew(t, g, args...); res.exit != 0 {
 		t.Fatalf("first renewal should succeed, got exit %d\n%s", res.exit, res.out)
 	}
 	if got, _ := os.ReadFile(filepath.Join(f.sbinDir, "devlab-exec")); string(got) != string(content) {
 		t.Fatalf("first renewal did not install the approved content")
 	}
 	// The same grant/approval a second time installs nothing.
-	res := f.renew(t, "devlab-exec", c, g)
+	res := f.renew(t, g, args...)
 	if res.exit == 0 || !strings.Contains(res.out, "already used") {
 		t.Fatalf("expected a single-use refusal, got exit %d\n%s", res.exit, res.out)
 	}
@@ -124,13 +143,14 @@ func TestRenewIsSingleUse(t *testing.T) {
 func TestRenewRefusesUnknownName(t *testing.T) {
 	f := newRenewFixture(t)
 	content := []byte("malicious\n")
-	c, g := f.writeGrant(t, "qst_d1", "evil-tool", content, sha256of(content), "operator")
-	res := f.renew(t, "evil-tool", c, g)
+	g, args := f.writeApproval(t, "qst_d1", "operator", gf("evil-tool", content))
+	res := f.renew(t, g, args...)
 	if res.exit == 0 || !strings.Contains(res.out, "not a renewable root wrapper") {
 		t.Fatalf("expected refusal of an unknown wrapper name, got exit %d\n%s", res.exit, res.out)
 	}
 	// And a real wrapper name whose content is fine still cannot be installed from a run-writable
 	// place: a source under the workspaces subtree is refused (defense for task point 1).
+	g2, _ := f.writeApproval(t, "qst_d2", "operator", gf("devlab-exec", content))
 	ws := filepath.Join(f.stateDir, "workspaces", "runner")
 	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Fatal(err)
@@ -139,9 +159,72 @@ func TestRenewRefusesUnknownName(t *testing.T) {
 	if err := os.WriteFile(wc, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res2 := f.renew(t, "devlab-exec", wc, g)
+	res2 := f.renew(t, g2, "devlab-exec", wc)
 	if res2.exit == 0 || !strings.Contains(res2.out, "workspaces") {
 		t.Fatalf("expected refusal of a run-writable source, got exit %d\n%s", res2.exit, res2.out)
+	}
+}
+
+// (b) MULTI-FILE ATOMIC — the decisive regression. ONE approval covers THREE wrapper files. Before this
+// fix each file was a separate root call under the same approvalId, so the first file's ledger entry
+// made the second read as "already used" and the renewal stopped half-done. Now the whole set installs
+// in one call: all three land, the approval is spent exactly ONCE, and a second use of the same approval
+// installs nothing.
+func TestRenewInstallsAMultiFileApprovalAtomically(t *testing.T) {
+	f := newRenewFixture(t)
+	exec := []byte("#!/usr/bin/env bash\n# merged devlab-exec\n")
+	inst := []byte("#!/usr/bin/env bash\n# merged devlab-install\n")
+	lib := []byte("# shellcheck shell=bash\n# merged devlab-setup-lib.sh\n")
+	g, args := f.writeApproval(t, "qst_multi", "operator",
+		gf("devlab-exec", exec), gf("devlab-install", inst), gf("devlab-setup-lib.sh", lib))
+
+	if res := f.renew(t, g, args...); res.exit != 0 {
+		t.Fatalf("a multi-file approval must install every file in one pass, got exit %d\n%s", res.exit, res.out)
+	}
+	for name, want := range map[string][]byte{"devlab-exec": exec, "devlab-install": inst, "devlab-setup-lib.sh": lib} {
+		got, err := os.ReadFile(filepath.Join(f.sbinDir, name))
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("%s was not installed from the multi-file approval (the half-renewal defect); err=%v", name, err)
+		}
+	}
+	// The ledger records ONE approval consumed across all three files.
+	ledger, err := os.ReadFile(filepath.Join(f.auditDir, "installed.log"))
+	if err != nil {
+		t.Fatalf("no audit ledger: %v", err)
+	}
+	if n := strings.Count(string(ledger), "approvalId=qst_multi "); n != 3 {
+		t.Fatalf("expected one ledger line per installed file under the one approval, got %d:\n%s", n, ledger)
+	}
+	// The whole approval is single-use: a second full use of the SAME approval installs nothing.
+	res := f.renew(t, g, args...)
+	if res.exit == 0 || !strings.Contains(res.out, "already used") {
+		t.Fatalf("the whole approval must be single-use, got exit %d\n%s", res.exit, res.out)
+	}
+}
+
+// (b, the refusal half) ALL-OR-NONE ON A BAD FILE: if ONE file of a multi-file approval fails validation
+// (its content no longer matches the approved checksum), NONE of the set is installed — not even the
+// files that would have passed. The approval is left unconsumed so a corrected delivery can still redeem
+// it (task points 1/4).
+func TestRenewMultiFileIsAllOrNoneWhenOneFileMismatches(t *testing.T) {
+	f := newRenewFixture(t)
+	good := []byte("#!/usr/bin/env bash\n# good devlab-exec\n")
+	// devlab-install's grant pins the checksum of one content but the staged content is another.
+	g, args := f.writeApproval(t, "qst_partial", "operator",
+		gf("devlab-exec", good),
+		grantFile{name: "devlab-install", content: []byte("STAGED B\n"), pinSHA: sha256of([]byte("APPROVED A\n"))})
+
+	res := f.renew(t, g, args...)
+	if res.exit == 0 || !strings.Contains(res.out, "does not match the approved") {
+		t.Fatalf("a set with one bad file must be refused whole, got exit %d\n%s", res.exit, res.out)
+	}
+	// The GOOD file must NOT have been installed — validation happens for the whole set before any write.
+	if _, err := os.Stat(filepath.Join(f.sbinDir, "devlab-exec")); !os.IsNotExist(err) {
+		t.Fatalf("no file of the set may be installed when another file is bad (all-or-none)")
+	}
+	// And the approval is unconsumed: the ledger holds nothing for it.
+	if ledger, _ := os.ReadFile(filepath.Join(f.auditDir, "installed.log")); strings.Contains(string(ledger), "qst_partial") {
+		t.Fatalf("a renewal that wrote nothing must not consume the approval:\n%s", ledger)
 	}
 }
 
@@ -152,10 +235,9 @@ func TestRenewRefusesUnknownName(t *testing.T) {
 func TestRenewInstallsSetupLibraryReadOnly(t *testing.T) {
 	f := newRenewFixture(t)
 	content := []byte("# shellcheck shell=bash\n# merged devlab-setup-lib.sh\n")
-	sha := sha256of(content)
-	c, g := f.writeGrant(t, "qst_lib1", "devlab-setup-lib.sh", content, sha, "operator")
+	g, args := f.writeApproval(t, "qst_lib1", "operator", gf("devlab-setup-lib.sh", content))
 
-	if res := f.renew(t, "devlab-setup-lib.sh", c, g); res.exit != 0 {
+	if res := f.renew(t, g, args...); res.exit != 0 {
 		t.Fatalf("renewing the setup library must succeed (defect #1), got exit %d\n%s", res.exit, res.out)
 	}
 	dest := filepath.Join(f.sbinDir, "devlab-setup-lib.sh")
@@ -187,9 +269,9 @@ func TestRenewIsAuditableAndReversible(t *testing.T) {
 
 	newContent := []byte("#!/usr/bin/env bash\n# NEW merged devlab-install\n")
 	newSHA := sha256of(newContent)
-	c, g := f.writeGrant(t, "qst_e1", "devlab-install", newContent, newSHA, "alice")
+	g, args := f.writeApproval(t, "qst_e1", "alice", gf("devlab-install", newContent))
 
-	if res := f.renew(t, "devlab-install", c, g); res.exit != 0 {
+	if res := f.renew(t, g, args...); res.exit != 0 {
 		t.Fatalf("renewal should succeed, got exit %d\n%s", res.exit, res.out)
 	}
 	if got, _ := os.ReadFile(dest); string(got) != string(newContent) {
@@ -277,9 +359,9 @@ func TestRenewHandsWriteOutWhenTargetIsReadOnly(t *testing.T) {
 
 	content := []byte("#!/usr/bin/env bash\necho merged devlab-install\n")
 	sha := sha256of(content)
-	c, g := f.writeGrant(t, "qst_h1", "devlab-install", content, sha, "operator")
+	g, args := f.writeApproval(t, "qst_h1", "operator", gf("devlab-install", content))
 
-	res := f.renew(t, "devlab-install", c, g)
+	res := f.renew(t, g, args...)
 	if res.exit != 0 {
 		t.Fatalf("a confined renewal must be handed out and succeed, got exit %d\n%s", res.exit, res.out)
 	}
@@ -306,9 +388,9 @@ func TestRenewFailsByNameWhenConfinedAndNoEscape(t *testing.T) {
 	confine(t, f)
 
 	content := []byte("#!/usr/bin/env bash\necho merged\n")
-	c, g := f.writeGrant(t, "qst_h2", "devlab-install", content, sha256of(content), "operator")
+	g, args := f.writeApproval(t, "qst_h2", "operator", gf("devlab-install", content))
 
-	res := f.renew(t, "devlab-install", c, g)
+	res := f.renew(t, g, args...)
 	if res.exit == 0 {
 		t.Fatalf("a confined renewal with no escape must fail, got exit 0\n%s", res.out)
 	}
@@ -333,9 +415,10 @@ func TestHandoutStillEnforcesTheApprovedChecksum(t *testing.T) {
 	approvedSHA := sha256of([]byte("APPROVED CONTENT A\n"))
 	// Staged content is B; the grant pins the checksum of A. The escape runs, but the re-check outside
 	// refuses before any write.
-	c, g := f.writeGrant(t, "qst_h3", "devlab-exec", []byte("DIFFERENT CONTENT B\n"), approvedSHA, "operator")
+	g, args := f.writeApproval(t, "qst_h3", "operator",
+		grantFile{name: "devlab-exec", content: []byte("DIFFERENT CONTENT B\n"), pinSHA: approvedSHA})
 
-	res := f.renew(t, "devlab-exec", c, g)
+	res := f.renew(t, g, args...)
 	if res.exit == 0 || !strings.Contains(res.out, "does not match the approved") {
 		t.Fatalf("a handed-out renewal must still refuse content that mismatches the approved checksum, got exit %d\n%s", res.exit, res.out)
 	}
@@ -407,50 +490,66 @@ func driftNamed(drifts []WrapperDrift, name string) *WrapperDrift {
 }
 
 // fakeRenewer records whether the root write step was reached at all — a refusal before the write
-// (source no longer matches the approval) must never call it.
-type fakeRenewer struct{ calls []string }
+// (a source no longer matches the approval) must never call it — and which files one call carried, so a
+// test can prove the whole approval reached root as ONE invocation.
+type fakeRenewer struct{ calls [][]string }
 
-func (f *fakeRenewer) Renew(_ context.Context, name, _, _ string) error {
-	f.calls = append(f.calls, name)
+func (f *fakeRenewer) Renew(_ context.Context, _ string, files []WrapperFile) error {
+	names := make([]string, len(files))
+	for i, fl := range files {
+		names[i] = fl.Name
+	}
+	f.calls = append(f.calls, names)
 	return nil
 }
 
-// A working-source approval with a matching checksum reaches the root write step and stages the run's
-// own content; but if the run's branch CHANGES after the approval, the re-read no longer hashes to the
-// approved checksum and RenewApprovedWrapper refuses BEFORE the write — nothing is installed (task
-// point 3, the working-source half of "the branch changed after approval installs nothing").
-func TestRenewApprovedWrapperBindsWorkingSourceToTheApprovedChecksum(t *testing.T) {
+// A working-source approval whose files all match reaches the root write step as ONE call carrying the
+// whole set; but if the run's branch CHANGES one file after the approval, the re-read no longer hashes to
+// the approved checksum and RenewApprovedWrapperSet refuses the WHOLE set BEFORE the write — nothing is
+// installed (task points 3/4, the working-source half of "the branch changed after approval installs
+// nothing", now all-or-none across the set).
+func TestRenewApprovedWrapperSetBindsWorkingSourceToTheApprovedChecksum(t *testing.T) {
 	wt := t.TempDir()
 	grantDir := filepath.Join(t.TempDir(), "grants")
 
-	approved := []byte("#!/usr/bin/env bash\n# approved run content\n")
-	writeRepoFile(t, wt, "deploy/devlab-install", approved)
-	approvedSHA := sha256of(approved)
+	approvedInstall := []byte("#!/usr/bin/env bash\n# approved run content\n")
+	approvedExec := []byte("#!/usr/bin/env bash\n# approved exec content\n")
+	writeRepoFile(t, wt, "deploy/devlab-install", approvedInstall)
+	writeRepoFile(t, wt, "deploy/devlab-exec", approvedExec)
+	set := []ApprovedWrapper{
+		{Name: "devlab-install", SHA: sha256of(approvedInstall)},
+		{Name: "devlab-exec", SHA: sha256of(approvedExec)},
+	}
 
-	// Matching content → the write step is reached and the grant is staged.
+	// Matching content → the write step is reached ONCE with the whole set, and each grant is staged.
 	r := &fakeRenewer{}
-	if err := RenewApprovedWrapper(context.Background(), r, DeliveringBranchContent(wt, "fix/x"), grantDir,
-		"devlab-install", approvedSHA, "qst_w1", "operator", "2026-08-04T00:00:00Z"); err != nil {
+	if err := RenewApprovedWrapperSet(context.Background(), r, DeliveringBranchContent(wt, "fix/x"), grantDir,
+		"qst_w1", "operator", "2026-08-04T00:00:00Z", set); err != nil {
 		t.Fatalf("a matching working-source approval should reach the write step, got %v", err)
 	}
-	if len(r.calls) != 1 || r.calls[0] != "devlab-install" {
-		t.Fatalf("the root write step should have been called once, got %+v", r.calls)
+	if len(r.calls) != 1 || len(r.calls[0]) != 2 {
+		t.Fatalf("the whole approval should reach the root write step in ONE call, got %+v", r.calls)
 	}
-	if _, err := os.Stat(filepath.Join(grantDir, "qst_w1.devlab-install.content")); err != nil {
-		t.Fatalf("the approved content should have been staged for the root tool: %v", err)
+	for _, name := range []string{"devlab-install", "devlab-exec"} {
+		if _, err := os.Stat(filepath.Join(grantDir, "qst_w1."+name+".content")); err != nil {
+			t.Fatalf("the approved content for %s should have been staged for the root tool: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(grantDir, "qst_w1.grant")); err != nil {
+		t.Fatalf("the combined grant should have been staged: %v", err)
 	}
 
-	// The run's branch changes AFTER the approval (a later commit rewrote the script). The re-read now
-	// differs from the approved checksum, so the renewal refuses and never reaches the write step.
+	// ONE file's branch content changes AFTER the approval (a later commit rewrote devlab-install). The
+	// re-read now differs from the approved checksum, so the WHOLE set is refused and nothing reaches root.
 	writeRepoFile(t, wt, "deploy/devlab-install", []byte("#!/usr/bin/env bash\n# changed after approval\n"))
 	r2 := &fakeRenewer{}
-	err := RenewApprovedWrapper(context.Background(), r2, DeliveringBranchContent(wt, "fix/x"), grantDir,
-		"devlab-install", approvedSHA, "qst_w2", "operator", "2026-08-04T00:00:00Z")
+	err := RenewApprovedWrapperSet(context.Background(), r2, DeliveringBranchContent(wt, "fix/x"), grantDir,
+		"qst_w2", "operator", "2026-08-04T00:00:00Z", set)
 	if err == nil || !strings.Contains(err.Error(), "not the approved") {
-		t.Fatalf("a source that changed after the approval must be refused, got %v", err)
+		t.Fatalf("a source that changed after the approval must refuse the whole set, got %v", err)
 	}
 	if len(r2.calls) != 0 {
-		t.Fatalf("nothing must reach the root write step when the source no longer matches, got %+v", r2.calls)
+		t.Fatalf("nothing must reach the root write step when one file no longer matches, got %+v", r2.calls)
 	}
 }
 
