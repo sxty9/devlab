@@ -33,6 +33,7 @@ func foreignFixture(t *testing.T, repo string) (env map[string]string, artifact 
 	if err := os.WriteFile(filepath.Join(artifact, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, artifact, "go-daemon")
 	writeOrigin(t, checkout, testOwner, repo)
 	return map[string]string{"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner}, artifact
 }

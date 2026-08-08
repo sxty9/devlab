@@ -40,6 +40,81 @@ sshd ssh cron atd chrony ntp named dnsmasq exim postfix dovecot sudo
 caddy nginx apache apache2 httpd postgres postgresql mysql mariadb redis mongod
 docker containerd kubelet etcd snapd holistic"
 
+# ── the build KIND: how a service is built, DECLARED not guessed ─────────────────────────────────────
+# The unified install path once assumed EVERY service is a Go daemon — it demanded a prebuilt <repo>d
+# binary and refused anything else, even when the delivery package fully described what to start. That
+# trapped `holistic`, a Python (uvicorn) service, out of production. The landscape now carries EXACTLY
+# TWO named build kinds, and no silent third: a service DECLARES which it is, and the installer installs
+# what the artifact CONTAINS and the unit DESCRIBES — it never infers the build kind from a filename.
+#
+#   go-daemon   — a single prebuilt Go binary <repo>d. Installed to /opt/<repo>/bin/<repo>d; its unit's
+#                 ExecStart runs that binary. This is the historical uniform shape; a Go service needs
+#                 no declaration (artifact-build stamps `go-daemon` when it produced the binary), so it
+#                 is delivered exactly as before.
+#   python-app  — a prebuilt, relocatable payload tree (a --copies virtualenv plus the app) that the
+#                 installer copies VERBATIM to /opt/<repo>; its unit's ExecStart runs an interpreter out
+#                 of that tree (…/venv/bin/…). It carries no <repo>d and never will. Because only the
+#                 unit knows how to start it, a python-app MUST ship its own setup/<unit>.service — the
+#                 unit is the source of truth, not a name convention.
+#
+# This is a DELIBERATE, bounded pair, not an open plugin surface: extending it is a named change to this
+# one list, reviewed like any other. Uniformity ("Code-Struktur") is preserved where it actually binds —
+# every service, whatever its kind, ships ONE artifact through the ONE chain, declares its unit in setup/,
+# passes the identical name/path/identity hardening, and is proven by the identical honest running gate.
+# The build kind changes only WHICH prebuilt bytes are copied and where — one path that carries two kinds,
+# never a second installer and never a per-service branch.
+SETUP_BUILD_KINDS="go-daemon python-app"
+
+# setup_valid_build_kind <kind> — 0 when <kind> is one of the two named build kinds, 1 otherwise. The set
+# lives HERE and nowhere else, so the dev installer, the production receiver and the artifact builder can
+# never drift on what a valid Bauart is.
+setup_valid_build_kind() {
+  local kind="$1" k
+  for k in $SETUP_BUILD_KINDS; do [ "$kind" = "$k" ] && return 0; done
+  return 1
+}
+
+# setup_read_build_kind <artifact-dir> — echo the build kind an artifact DECLARES (the trimmed first line
+# of <artifact-dir>/build.kind), or nothing when the file is absent or unreadable. The caller REFUSES an
+# empty result BY NAME — it never falls back to a filename guess. The value is not validated here (a caller
+# that reads it also runs setup_valid_build_kind, so an unknown value and an absent one get distinct,
+# named refusals).
+setup_read_build_kind() {
+  local dir="$1"
+  [ -r "$dir/build.kind" ] || return 0
+  head -n1 -- "$dir/build.kind" | tr -d '[:space:]'
+}
+
+# setup_relocate_venv <venv-dir> <final-venv-path> — make a virtualenv built at one path runnable from
+# another WITHOUT rebuilding it on the target (prod never builds). `python -m venv` bakes the venv's own
+# absolute path into the shebang of every script under bin/ (e.g. `#!<venv-dir>/bin/python`), so a venv
+# built at the artifact staging path would, once copied to /opt/<repo>/venv, have every console script
+# point back at a path that does not exist there. This rewrites those shebangs from the build path to the
+# FINAL install path, at BUILD time (as the unprivileged runner) — so the installer's job stays a pure
+# copy of already-correct bytes. The interpreter itself is a real binary under `--copies` (no shebang),
+# and site-packages resolve relative to it, so after the shebang rewrite the tree is fully relocatable.
+# Only the FIRST-LINE shebang of regular files directly under bin/ is touched, and only when it names the
+# build path — nothing else in the tree is rewritten.
+setup_relocate_venv() {
+  local venv="$1" final="$2" f first mode newfirst
+  [ -d "$venv/bin" ] || return 0
+  for f in "$venv"/bin/*; do
+    [ -f "$f" ] || continue
+    IFS= read -r first < "$f" || continue
+    case "$first" in
+      "#!$venv/"*) : ;;
+      *) continue ;;
+    esac
+    # Rewrite ONLY the first line (the shebang), leaving every following byte untouched, and keep the
+    # file's mode (console scripts are executable). Done in bash so no sed delimiter can collide with a
+    # path that contains '#'.
+    newfirst="#!$final/${first#"#!$venv/"}"
+    mode="$(stat -c %a -- "$f" 2>/dev/null || echo 755)"
+    { printf '%s\n' "$newfirst"; tail -n +2 -- "$f"; } > "$f.reloc" || { rm -f -- "$f.reloc"; continue; }
+    chmod "$mode" "$f.reloc"; mv -f -- "$f.reloc" "$f"
+  done
+}
+
 # setup_valid_repo_shape <repo> — the pure SHAPE and NAMESPACE gate, WITHOUT the reserved-identity list:
 # the grammar ^[a-z][a-z0-9-]{2,30}$, no doubled or trailing dash, and not systemd's own prefix. This is
 # the check every use of a repo name in a path owes (path-safety), independent of whether the name is a

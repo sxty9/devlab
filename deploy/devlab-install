@@ -648,9 +648,36 @@ if [ "$REPO" = "$SELF_REPO" ]; then
   exit 0
 fi
 
-# ── foreign repo: ONE generic install path for every uniform service ─────────────────────────────
-BIN="$real/${REPO}d"    # go build ./cmd/... writes cmd/<repo>d into the artifact
-[ -f "$BIN" ] || die "staged binary missing: $BIN (expected <repo>d — prebuilt, never built here)" 5
+# ── foreign repo: ONE generic install path that carries every declared build kind ────────────────
+# The old path assumed EVERY service is a Go daemon: it demanded a prebuilt <repo>d and refused anything
+# else — even when the delivery package fully described what to start. That trapped `holistic`, a Python
+# (uvicorn) service, out of production. The installer now installs what the artifact CONTAINS and the unit
+# DESCRIBES: the artifact SAYS what it is (build.kind, read via the shared library), and the kind — one of
+# exactly two named ones — drives ONLY which prebuilt bytes are copied and where. One path, two kinds, no
+# second installer and no per-service branch. An artifact that does not declare its kind is REFUSED BY
+# NAME; the installer never guesses a Bauart from a filename.
+KIND="$(setup_read_build_kind "$real")"
+[ -n "$KIND" ] || die "artifact '$real' does not declare its build kind (no build.kind) — refusing to guess it from filenames; a service must declare its Bauart ($SETUP_BUILD_KINDS)" 2
+setup_valid_build_kind "$KIND" || die "artifact declares an unknown build kind '$KIND' (known: $SETUP_BUILD_KINDS)" 2
+
+# The prebuilt program bytes, per kind — validated to EXIST before any effect, and NEVER built here.
+case "$KIND" in
+  go-daemon)
+    BIN="$real/${REPO}d"    # go build ./cmd/... writes cmd/<repo>d into the artifact
+    [ -f "$BIN" ] || die "staged binary missing: $BIN (build.kind=go-daemon expects a prebuilt <repo>d, never built here)" 5
+    ;;
+  python-app)
+    # A prebuilt, relocatable payload tree (a --copies virtualenv + the app), copied verbatim to /opt/<repo>.
+    PAYLOAD="$real/payload"
+    [ -d "$PAYLOAD" ] || die "staged payload missing: $PAYLOAD (build.kind=python-app expects a prebuilt payload/ tree, never built here)" 5
+    # A python-app carries no <repo>d template: only its unit knows how to start it (ExecStart names the
+    # interpreter and module). So a FIRST-TIME setup MUST ship setup/<unit>.service — the generated
+    # <repo>.service template below is a go-daemon shape and does not apply here.
+    if [ "$FIRST_TIME" = 1 ] && [ "$DELIVERED_SETUP" != 1 ]; then
+      die "first-time setup of python-app '$REPO' needs a delivered setup/<unit>.service in the artifact — only the unit knows how to start it; there is no <repo>d template for a python-app" 5
+    fi
+    ;;
+esac
 
 # UNIT_FILE / UNIT_NAME / DELIVERED_SETUP / FIRST_TIME / MANIFEST were decided in the validation cascade
 # (step 5) — systemd was asked about the delivered unit name, the account was judged and the manifest was
@@ -790,10 +817,28 @@ fi
 if [ "$CHECK" = 1 ]; then setup_plan_secrets "$secret_unit"; else setup_ensure_secrets "$REPO" "$UNIT_FILE"; fi
 [ "$secret_tmp" = 1 ] && rm -f -- "$secret_unit"
 
-run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
-run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
+# Install the prebuilt program per its DECLARED kind — a pure copy of already-built bytes; root never
+# builds (E §7.4). The unit installed above (delivered or generated) already names how to start it.
+case "$KIND" in
+  go-daemon)
+    run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
+    run install -o root -g root -m 0755 "$BIN" "/opt/$REPO/bin/${REPO}d"
+    ;;
+  python-app)
+    # Copy the prebuilt payload VERBATIM to /opt/<repo> (the venv's console-script shebangs already point
+    # here — relocated at build time — so this is a plain copy, not a build). --safe-links drops any
+    # symlink that would escape the payload, so a crafted link cannot make root expose a foreign file under
+    # the service tree; --delete keeps /opt/<repo> exactly what was delivered. The program files land
+    # root-owned, then a+rX makes the tree readable and traversable for the unit's own service account
+    # (User=<repo>, not root) — the same public-by-role rule the dashboard serve root uses, so the build
+    # user's umask cannot leave the interpreter unreadable to the account that must run it.
+    run install -d -o root -g root -m 0755 "/opt/$REPO"
+    run rsync -a --delete --safe-links "$PAYLOAD/" "/opt/$REPO/"
+    run chmod -R a+rX "/opt/$REPO"
+    ;;
+esac
 run "$SYSTEMCTL" restart "$UNIT_NAME"
-log "install-only deploy of '$REPO' program done (running-proof is the caller's honest gate, F10)"
+log "install-only deploy of '$REPO' program ($KIND) done (running-proof is the caller's honest gate, F10)"
 
 # ── the service UI: wire it in, rebuild the dashboard, and DELIVER it to where the browser reads ──
 # "Delivered" means the user SEES it — the browser fetches the NEW bundle. A service that ships a ui/

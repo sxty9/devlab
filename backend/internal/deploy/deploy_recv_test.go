@@ -31,6 +31,7 @@ func recvFixture(t *testing.T, repo, userLine string, withRoute, withRights bool
 	if err := os.WriteFile(filepath.Join(art, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, art, "go-daemon")
 	// The delivered unit mirrors setup_unit_text: it declares the shared JWT secret it reads, so the
 	// receiver's first-time setup derives and mints that instance secret from the unit itself.
 	unit := "[Unit]\nDescription=x\nAfter=network.target\n\n[Service]\n" + userLine +

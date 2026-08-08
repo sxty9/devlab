@@ -48,6 +48,7 @@ func reservedInstallFixture(t *testing.T, repo, unit, onHostUser string) (env ma
 	if err := os.WriteFile(filepath.Join(artifact, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, artifact, "go-daemon")
 	// The delivered setup names the unit — a divergent name, so UNIT_NAME is read from it, not from <repo>.
 	if err := os.WriteFile(filepath.Join(setup, unit+".service"), []byte(deliveredUnit(repo, repo)), 0o644); err != nil {
 		t.Fatal(err)
@@ -141,6 +142,7 @@ func recvReservedFixture(t *testing.T, repo, unit, onHostUser string) (env map[s
 	if err := os.WriteFile(filepath.Join(art, repo+"d"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampBuildKind(t, art, "go-daemon")
 	if err := os.WriteFile(filepath.Join(setup, unit+".service"), []byte(deliveredUnit(repo, repo)), 0o644); err != nil {
 		t.Fatal(err)
 	}
