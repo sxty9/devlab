@@ -68,7 +68,7 @@ type WrapperContentAt struct {
 //
 // SAFETY — why a run-authored source is admissible here (task point 3): unlike the stack-tip source, a
 // run CAN choose these bytes, so the human — never a merge — is the gate. That gate holds because the
-// approval is bound to EXACTLY this content by its sha256 (RenewApprovedWrapper re-reads and refuses
+// approval is bound to EXACTLY this content by its sha256 (RenewApprovedWrapperSet re-reads and refuses
 // any other bytes), it is SINGLE-USE and lives in a daemon-owned place a run cannot write (the
 // question pool and the staged grant dir), the root tool RE-VERIFIES name, sha, provenance and
 // single-use itself before it writes, and a branch that changes AFTER the approval no longer hashes to
@@ -220,71 +220,101 @@ func InstalledWrapperMatches(name, sha string) bool {
 	return sha256hex(got) == sha
 }
 
-// WrapperRenewer is the seam over the root write half — `sudo -n devlab-install --renew-wrapper
-// <name> <content-file> <grant-file>`. The production implementation is SudoWrapperRenewer; tests
-// substitute a fake that records the call.
-type WrapperRenewer interface {
-	Renew(ctx context.Context, name, contentPath, grantPath string) error
+// ApprovedWrapper is ONE file of an approval: the renewable wrapper name and the sha256 the user
+// approved for it. A single approval carries a SET of these, and the whole set is renewed as one unit.
+type ApprovedWrapper struct {
+	Name string
+	SHA  string
 }
 
-// RenewApprovedWrapper is the daemon side of ONE approved renewal. It re-reads the wrapper from the
-// SAME source the approval was built from (src — the stack tip or the delivering branch), refuses if
-// that content no longer matches the sha the user approved (the approval is for exactly one content),
-// stages the content and a run-unwritable grant under grantDir, and calls the root tool. grantDir MUST
-// be a daemon-owned, run-unwritable directory (the caller passes <state>/mercury/wrapper-grants); the
-// bytes a run could reach are never a source of what root writes.
+// WrapperFile is ONE staged (name, content-path) pair the root tool installs — the name it validates
+// against its own renewable list and the run-unwritable file holding the approved bytes.
+type WrapperFile struct {
+	Name        string
+	ContentPath string
+}
+
+// WrapperRenewer is the seam over the root write half — `sudo -n devlab-install --renew-wrapper
+// <grant-file> <name> <content-file> [<name> <content-file> ...]`. ONE call carries the WHOLE approval
+// (all its files), so the root tool installs them atomically and spends the single-use approval exactly
+// once; the old per-file seam let the first file's ledger entry poison the rest of its own approval
+// (the 2026-08-08 half-renewal). The production implementation is SudoWrapperRenewer; tests substitute
+// a fake that records the call.
+type WrapperRenewer interface {
+	Renew(ctx context.Context, grantPath string, files []WrapperFile) error
+}
+
+// RenewApprovedWrapperSet is the daemon side of ONE approved renewal that may cover SEVERAL files. It
+// re-reads every wrapper from the SAME source the approval was built from (src — the delivering branch),
+// refuses the WHOLE set if ANY file's content no longer matches the sha the user approved (the approval
+// is for exactly one content per file, and it is all-or-none — task points 3/4), stages every content
+// file plus one combined run-unwritable grant under grantDir, and calls the root tool ONCE. grantDir
+// MUST be a daemon-owned, run-unwritable directory (the caller passes <state>/mercury/wrapper-grants);
+// the bytes a run could reach are never a source of what root writes.
 //
-// The re-read against src is what makes "a branch that changed after the approval installs nothing"
-// hold for BOTH sources: whether the approved content came from the stack tip or the run's own
-// delivering branch, a later change to that source no longer hashes to approvedSHA and is refused here —
-// so a run can never swap the approved bytes for others after the human said yes (task point 3).
-func RenewApprovedWrapper(ctx context.Context, r WrapperRenewer, src WrapperContentAt, grantDir, name, approvedSHA, approvalID, approvedBy, approvedAt string) error {
-	want, ok := src.read(name)
-	if !ok {
-		return fmt.Errorf("renew %s: %s no longer carries deploy/%s — nothing to install", name, src.label, name)
+// The re-read against src is what makes "a branch that changed after the approval installs nothing" hold:
+// a later change to the source no longer hashes to the approved sha and is refused here BEFORE any write,
+// so a run can never swap the approved bytes for others after the human said yes (task point 3). Because
+// the refusal is checked for every file before staging, a single changed file installs none of the set.
+func RenewApprovedWrapperSet(ctx context.Context, r WrapperRenewer, src WrapperContentAt, grantDir, approvalID, approvedBy, approvedAt string, wrappers []ApprovedWrapper) error {
+	if len(wrappers) == 0 {
+		return nil // nothing approved to install
 	}
-	if got := sha256hex(want); got != approvedSHA {
-		// The source content moved since the user approved a specific checksum — the approval is no
-		// longer for THIS content, so it installs nothing (task point 3). The next delivery re-asks.
-		return fmt.Errorf("renew %s: %s content is now %s, not the approved %s — refusing (approval is for one content)", name, src.label, got, approvedSHA)
+	// Re-read and re-verify EVERY file first — any one that moved refuses the whole set (all-or-none).
+	contents := make([][]byte, len(wrappers))
+	for i, w := range wrappers {
+		want, ok := src.read(w.Name)
+		if !ok {
+			return fmt.Errorf("renew %s: %s no longer carries deploy/%s — nothing to install (whole approval refused)", w.Name, src.label, w.Name)
+		}
+		if got := sha256hex(want); got != w.SHA {
+			return fmt.Errorf("renew %s: %s content is now %s, not the approved %s — refusing the whole approval (approval is for one content)", w.Name, src.label, got, w.SHA)
+		}
+		contents[i] = want
 	}
-	contentPath, grantPath, err := writeWrapperGrant(grantDir, name, approvedSHA, approvalID, approvedBy, approvedAt, want)
+	files, grantPath, err := stageWrapperGrantSet(grantDir, approvalID, approvedBy, approvedAt, wrappers, contents)
 	if err != nil {
-		return fmt.Errorf("renew %s: stage grant: %w", name, err)
+		return fmt.Errorf("renew approval %s: stage grant: %w", approvalID, err)
 	}
-	if err := r.Renew(ctx, name, contentPath, grantPath); err != nil {
-		return fmt.Errorf("renew %s: root install refused: %w", name, err)
+	if err := r.Renew(ctx, grantPath, files); err != nil {
+		return fmt.Errorf("renew approval %s: root install refused: %w", approvalID, err)
 	}
 	return nil
 }
 
-// writeWrapperGrant stages the merged content and a minimal key=value grant the root tool reads. The
-// grant is deliberately NOT the question JSON: the root tool must parse it without a JSON reader, and
-// it must carry only what root verifies (the approved name + checksum + who/when). Both files are
-// written 0640 under grantDir (daemon-owned, run-unwritable), each with a per-approval name so a
-// second, concurrent renewal never overwrites another's staged content.
-func writeWrapperGrant(dir, name, sha, approvalID, approvedBy, approvedAt string, content []byte) (contentPath, grantPath string, err error) {
+// stageWrapperGrantSet stages the approved content of every file plus ONE combined key=value grant the
+// root tool reads. The grant is deliberately NOT the question JSON: the root tool must parse it without a
+// JSON reader, and it carries only what root verifies (the approvalId + who/when header, then one
+// `sha256 <name> <sha>` line per file). Content files are written 0640 under grantDir (daemon-owned,
+// run-unwritable), each named per (approval, wrapper) so a second, concurrent renewal never overwrites
+// another's staged content; the grant is named per approval.
+func stageWrapperGrantSet(dir, approvalID, approvedBy, approvedAt string, wrappers []ApprovedWrapper, contents [][]byte) (files []WrapperFile, grantPath string, err error) {
 	if err = os.MkdirAll(dir, 0o750); err != nil {
-		return "", "", err
+		return nil, "", err
 	}
-	base := approvalID + "." + name
-	contentPath = filepath.Join(dir, base+".content")
-	grantPath = filepath.Join(dir, base+".grant")
-	if err = os.WriteFile(contentPath, content, 0o640); err != nil {
-		return "", "", err
-	}
-	grant := strings.Join([]string{
-		"name=" + name,
-		"sha256=" + sha,
+	lines := []string{
 		"approvalId=" + approvalID,
 		"approvedBy=" + sanitizeGrantValue(approvedBy),
 		"approvedAt=" + sanitizeGrantValue(approvedAt),
-		"",
-	}, "\n")
-	if err = os.WriteFile(grantPath, []byte(grant), 0o640); err != nil {
-		return "", "", err
 	}
-	return contentPath, grantPath, nil
+	files = make([]WrapperFile, len(wrappers))
+	for i, w := range wrappers {
+		contentPath := filepath.Join(dir, approvalID+"."+w.Name+".content")
+		if err = os.WriteFile(contentPath, contents[i], 0o640); err != nil {
+			return nil, "", err
+		}
+		// name and sha are constrained tokens (no spaces), so a space-separated line parses safely in the
+		// root tool's awk lookup. The content path is passed as a positional argument, never inside the
+		// grant, so a path with spaces never reaches this line.
+		lines = append(lines, "sha256 "+w.Name+" "+w.SHA)
+		files[i] = WrapperFile{Name: w.Name, ContentPath: contentPath}
+	}
+	lines = append(lines, "")
+	grantPath = filepath.Join(dir, approvalID+".grant")
+	if err = os.WriteFile(grantPath, []byte(strings.Join(lines, "\n")), 0o640); err != nil {
+		return nil, "", err
+	}
+	return files, grantPath, nil
 }
 
 // sanitizeGrantValue keeps a grant value on ONE line (the root tool reads line by line). Newlines
@@ -298,8 +328,11 @@ func sanitizeGrantValue(s string) string {
 // daemon — never the agent's run shell — is what invokes it.
 type SudoWrapperRenewer struct{}
 
-func (SudoWrapperRenewer) Renew(ctx context.Context, name, contentPath, grantPath string) error {
-	args := []string{"-n", installWrapper, "--renew-wrapper", name, contentPath, grantPath}
+func (SudoWrapperRenewer) Renew(ctx context.Context, grantPath string, files []WrapperFile) error {
+	args := []string{"-n", installWrapper, "--renew-wrapper", grantPath}
+	for _, f := range files {
+		args = append(args, f.Name, f.ContentPath)
+	}
 	out, err := exec.CommandContext(ctx, "sudo", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))

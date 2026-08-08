@@ -1370,8 +1370,8 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	// The approved content is always re-read from the branch this run delivers — the ONE reference the
 	// self-delivery gate proves against and the only stand whose installation clears it (the stack-tip
 	// yardstick that used to stand beside it drove the pendulum and is gone, task point 2). The daemon
-	// re-reads the bytes and RenewApprovedWrapper refuses any that no longer hash to the approved
-	// checksum, so a branch that changed after the approval — or an old question persisted with a
+	// re-reads the bytes and RenewApprovedWrapperSet refuses the whole set if any no longer hash to the
+	// approved checksum, so a branch that changed after the approval — or an old question persisted with a
 	// different source — installs nothing and the delivery re-asks.
 	src := deploy.DeliveringBranchContent(wt, c.d.deliveringBranch(repo))
 	by := q.AnsweredBy.User
@@ -1382,15 +1382,21 @@ func (c chainDeploy) RenewApprovedWrappers(ctx context.Context, repo string, q r
 	if q.AnsweredAt != nil {
 		at = q.AnsweredAt.UTC().Format(time.RFC3339)
 	}
+	// One approval covers a SET of wrappers; renew them in ONE atomic root call so the whole approval is
+	// spent exactly once (task points 3/4). A file already at the approved checksum is dropped from the
+	// set — an idempotent retry does not re-install content already in place — but every file that still
+	// differs is renewed together, all-or-none. If nothing differs, nothing is spent.
+	var todo []deploy.ApprovedWrapper
 	for _, g := range q.Wrappers {
 		if deploy.InstalledWrapperMatches(g.Name, g.SHA) {
-			continue // already renewed to this exact content — do not spend the single-use approval again
+			continue
 		}
-		if err := deploy.RenewApprovedWrapper(ctx, renewer, src, grantDir, g.Name, g.SHA, q.ID, by, at); err != nil {
-			return err
-		}
+		todo = append(todo, deploy.ApprovedWrapper{Name: g.Name, SHA: g.SHA})
 	}
-	return nil
+	if len(todo) == 0 {
+		return nil // every approved wrapper is already the approved content
+	}
+	return deploy.RenewApprovedWrapperSet(ctx, renewer, src, grantDir, q.ID, by, at, todo)
 }
 
 // ── the agent stream ─────────────────────────────────────────────────────────────────────
