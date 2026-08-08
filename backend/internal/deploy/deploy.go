@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"devlab/backend/internal/model"
@@ -212,6 +214,41 @@ func DeliveredUnitName(artifactDir, service string) string {
 		return ""
 	}
 	return only
+}
+
+// unitListenPortRe and unitFlagPortRe read the loopback port a delivered unit's ExecStart binds, in the
+// two forms that occur across the build kinds. The go-daemon template writes `--listen 127.0.0.1:<port>`
+// (a colon, matched first because a loopback bind is unambiguous); a python-app names the port the
+// interpreter's way, `--port <port>` or `--port=<port>` (uvicorn). Both are read for exactly the reason
+// setup_unit_listen_port reads them in the shell — the honest gate must dial the port the UNIT binds.
+var (
+	unitListenPortRe = regexp.MustCompile(`127\.0\.0\.1:(\d{1,5})`)
+	unitFlagPortRe   = regexp.MustCompile(`--port[=\s]+(\d{1,5})`)
+)
+
+// DeliveredUnitPort reads the loopback port the delivered unit's ExecStart binds, the Go twin of the
+// shell setup_unit_listen_port the production receiver already dials. It is consulted BESIDE
+// DeliveredUnitName, from the same delivered setup product (setup/<unit>.service), so the dev gate proves
+// the port the DELIVERED unit binds rather than one the chain's port allocation computed — the third
+// place a value the package NAMES was being RECHNET instead (unit name PR 106, probed unit PR 110). It
+// returns 0 when the package ships no such unit, the unit names no port, or the value is out of range —
+// the caller then falls back to the allocation, exactly as before, for a service that fixes no port.
+func DeliveredUnitPort(artifactDir, unit string) int {
+	if unit == "" {
+		return 0
+	}
+	raw, err := os.ReadFile(filepath.Join(artifactDir, "setup", unit+".service"))
+	if err != nil {
+		return 0
+	}
+	for _, re := range []*regexp.Regexp{unitListenPortRe, unitFlagPortRe} {
+		if m := re.FindSubmatch(raw); m != nil {
+			if p, err := strconv.Atoi(string(m[1])); err == nil && p > 0 && p <= 65535 {
+				return p
+			}
+		}
+	}
+	return 0
 }
 
 // Gap names a repo whose delivery is possible but not yet set up — "delivery not yet set up"

@@ -528,11 +528,16 @@ $(setup_unit_secret_files "$unit")
 EOF
 }
 
-# setup_unit_listen_port <unit-file> — the loopback port the unit's ExecStart binds
-# (--listen 127.0.0.1:<port>), or empty. The honest running gate dials this port to prove the service
-# STAYS up; a unit whose port cannot be read is proven by unit-activity alone.
+# setup_unit_listen_port <unit-file> — the loopback port the unit's ExecStart binds, or empty. Two forms
+# occur across the build kinds: the go-daemon template's `--listen 127.0.0.1:<port>` (a colon, read first
+# because a loopback bind is unambiguous) and a python-app's `--port <port>` / `--port=<port>` (uvicorn).
+# The honest running gate dials this port to prove the service STAYS up; a unit whose port cannot be read
+# is proven by unit-activity alone. Keep in step with the Go twin deploy.DeliveredUnitPort — a dev gate
+# that dialed a computed port while the delivered unit bound another booked a live service as failed.
 setup_unit_listen_port() {
-  local file="$1"
+  local file="$1" port
   [ -r "$file" ] || return 0
-  grep -oE '127\.0\.0\.1:[0-9]+' -- "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true
+  port="$(grep -oE '127\.0\.0\.1:[0-9]+' -- "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true)"
+  [ -n "$port" ] || port="$(grep -oE -e '--port[=[:space:]]+[0-9]+' -- "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true)"
+  printf '%s' "$port"
 }

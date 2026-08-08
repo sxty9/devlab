@@ -635,6 +635,38 @@ if [ "$REPO" = "$SELF_REPO" ]; then
   run rsync -a --delete "$WEB/" "$STATE_DIR/www/"
   log "self install done (binary + web); running process keeps its loaded image"
 
+  # Keep devlabd's OWN unit current from the delivered, checked-in copy, so a SECURITY directive the unit
+  # template gained reaches a devlabd that was installed before it. A self UPDATE otherwise replaces only
+  # the binary and never rewrites the unit — which is why `SupplementaryGroups=… systemd-journal`, the
+  # right the honest running gate needs to READ a just-delivered unit's journal and name WHY a failed start
+  # died, sat in the repo and never took effect: the gate kept reporting "the gate lacks journal access"
+  # (2026-08-08). The unit lives in $UNIT_DIR, which IS writable inside the service cgroup (it is a
+  # ReadWritePaths entry), so this needs no hand-out; instance values live in the drop-in
+  # ($UNIT_DIR/${SELF_UNIT}.service.d), which this does NOT touch. The group takes effect on the handover
+  # restart below. A FOREIGN unit under this name is refused (never overwritten); an older artifact that
+  # ships no setup/ unit leaves the installed one unchanged. The delivered unit is trusted only if it runs
+  # as its own account (User=$SELF_REPO), the same gate the production receiver applies.
+  SELF_DELIV_UNIT="$SETUP_SRC/${SELF_UNIT}.service"
+  SELF_UNIT_FILE="$UNIT_DIR/${SELF_UNIT}.service"
+  if [ -f "$SELF_DELIV_UNIT" ]; then
+    setup_unit_declares_user "$SELF_DELIV_UNIT" "$SELF_REPO" \
+      || die "delivered self unit $SELF_DELIV_UNIT does not run as 'User=$SELF_REPO' — refusing to install it" 2
+    self_state="$(setup_unit_state "$SELF_UNIT" "$SELF_UNIT_FILE" "$SYSTEMCTL")" \
+      || die "could not ask systemd about ${SELF_UNIT}.service" 4
+    case "$self_state" in
+      foreign:*) die "unit ${SELF_UNIT}.service already exists outside this wrapper's control (${self_state#foreign:}) — refusing to overwrite a foreign unit" 5 ;;
+    esac
+    if ! cmp -s "$SELF_DELIV_UNIT" "$SELF_UNIT_FILE" 2>/dev/null; then
+      run install -o root -g root -m 0644 "$SELF_DELIV_UNIT" "$SELF_UNIT_FILE"
+      run "$SYSTEMCTL" daemon-reload
+      log "refreshed ${SELF_UNIT}.service from the delivered unit — its security directives (systemd-journal group) reach the running service on the restart"
+    else
+      log "installed ${SELF_UNIT}.service already matches the delivered unit — left unchanged"
+    fi
+  else
+    log "no delivered ${SELF_UNIT}.service in the artifact — installed unit left unchanged"
+  fi
+
   if [ "$HANDOVER" = 1 ]; then
     # The ONE restart path: a transient unit OUTSIDE the devlabd cgroup waits for the free
     # signal, then restarts. If systemd-run fails, THIS wrapper fails (exit 4) and the caller's

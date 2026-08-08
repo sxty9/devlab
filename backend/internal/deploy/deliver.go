@@ -115,15 +115,45 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 	}
 	key := d.ID
 
-	desired := 0
-	if d.Decl != nil {
+	// The unit the gate proves — AND the port that unit BINDS — both come from the ONE place that
+	// determines them: the delivered setup product. DeliveredUnitName reads the unit's name (the twin of
+	// the installer's setup_delivered_unit_name); DeliveredUnitPort reads the port from that unit's
+	// ExecStart (the twin of setup_unit_listen_port, which the production receiver already dials). A
+	// service whose unit is legitimately named otherwise — a dashboard shipping <repo>-dashboard.service —
+	// carries both its name and its port in the artifact's setup/ dir; absent a delivered unit the name
+	// falls back to the service id and the port to the allocation, unchanged.
+	//
+	// This is the THIRD instance of a single pattern, and the pattern is the point: the chain must
+	// ENTNEHMEN a value the delivered package NAMES, not RECHNEN it from the repository name or its own
+	// allocation. Deriving the unit NAME a second time booked a live delivery as failed (PR 106); deriving
+	// the probed UNIT again did the same (PR 110); deriving the PORT from the allocation made the gate dial
+	// 8785 while the delivered holistic-dashboard unit bound 8770 and the service was live (2026-08-08).
+	unit := DeliveredUnitName(artifactDir, key)
+	if unit == "" {
+		unit = key
+	}
+	fixedPort := DeliveredUnitPort(artifactDir, unit)
+
+	// The port ALLOCATION keeps its single purpose (task point 2): propose a free port to a service that
+	// has NONE yet (a generated <repo>.service). When the delivered unit already fixes a port, that port
+	// is the desired one, so the allocation recognises the service's OWN running unit as holding it —
+	// expected, not a conflict (task point 3) — and a FOREIGN holder still as a conflict; it never
+	// proposes a different port over what the unit binds.
+	desired := fixedPort
+	if desired == 0 && d.Decl != nil {
 		desired = d.Decl.Port
 	}
 	port, _, err := ports.PortFor(ctx, key, desired)
 	if err != nil {
-		// An occupied desired port is REJECTED before any install: the error names the holder
-		// and proposes a free port (REQ-044.2). No wrapper call happens.
+		// An occupied desired port is REJECTED before any install: the error names the holder and, for a
+		// service with no fixed port, proposes a free one (REQ-044.2). No wrapper call happens.
 		return Outcome{Detail: err.Error()}, err
+	}
+	// A delivered unit's fixed port is authoritative for what is proven: the allocation above may only
+	// CONFIRM it (free, or the service's own running unit) or reject a FOREIGN holder — it never MOVES a
+	// port the unit binds. Absent a fixed port the proposed one stands unchanged.
+	if fixedPort != 0 {
+		port = fixedPort
 	}
 
 	res, err := ri.Install(ctx, key, artifactDir, "dev", port, false)
@@ -138,22 +168,9 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 		return o, fmt.Errorf("deploy: install of %s failed: %w", key, err)
 	}
 
-	// The honest gate (F10): "installed and started" only when the unit is ACTIVE and the port
-	// is HELD — otherwise the setup FAILED, never green by default (REQ-044.3, K-4).
-	//
-	// The gate probes the unit that was actually INSTALLED. Its name is carried by the delivered
-	// setup product (setup/<name>.service) and may legitimately differ from the repository name — a
-	// dashboard whose unit is `<repo>-dashboard` is the standing case. The gate reads that name from
-	// the ONE place that determines it (DeliveredUnitName, the twin of the installer's
-	// setup_delivered_unit_name), instead of deriving it a second time from the repository name. The
-	// installer already made this correction (PR 106); deriving the name again here made the gate ask
-	// systemd for `holistic` while the installer had installed and started `holistic-dashboard`, so a
-	// LIVE delivery was booked as failed. Absent a delivered unit the name falls back to the service
-	// id, and the behaviour is unchanged.
-	unit := DeliveredUnitName(artifactDir, key)
-	if unit == "" {
-		unit = key
-	}
+	// The honest gate (F10): "installed and started" only when the unit is ACTIVE and the port is HELD —
+	// otherwise the setup FAILED, never green by default (REQ-044.3, K-4). It probes the unit that was
+	// actually INSTALLED and the port that unit BINDS, both read above from the delivered setup product.
 	if err := gate.VerifyRunning(ctx, unit, port); err != nil {
 		return Outcome{Installed: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
 			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", key, err)
