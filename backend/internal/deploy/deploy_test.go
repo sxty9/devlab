@@ -459,8 +459,8 @@ func TestGateFailsServiceThatDoesNotStay(t *testing.T) {
 			}
 			return errors.New("connection refused")
 		},
-		LogReason: func(context.Context, string) string {
-			return "prizmd: no JWT secret: set HOLISTIC_SECRET_FILE or HOLISTIC_SECRET"
+		LogReason: func(context.Context, string) LogLookup {
+			return LogLookup{Line: "prizmd: no JWT secret: set HOLISTIC_SECRET_FILE or HOLISTIC_SECRET", Readable: true}
 		},
 		Wait: time.Second, Dwell: 500 * time.Millisecond, Poll: time.Millisecond,
 	}
@@ -493,11 +493,138 @@ func TestGateComeUpFailureCarriesLogReason(t *testing.T) {
 	g := Gate{
 		UnitActive: func(context.Context, string) error { return errors.New("inactive") },
 		PortHeld:   func(context.Context, int) error { return nil },
-		LogReason:  func(context.Context, string) string { return "presentrd: no JWT secret" },
-		Wait:       5 * time.Millisecond, Dwell: 5 * time.Millisecond, Poll: time.Millisecond,
+		LogReason: func(context.Context, string) LogLookup {
+			return LogLookup{Line: "presentrd: no JWT secret", Readable: true}
+		},
+		Wait: 5 * time.Millisecond, Dwell: 5 * time.Millisecond, Poll: time.Millisecond,
 	}
 	err := g.VerifyRunning(context.Background(), "presentr", 8812)
 	if err == nil || !strings.Contains(err.Error(), "no JWT secret") {
 		t.Fatalf("a never-active service must fail with its log reason, got %v", err)
+	}
+}
+
+// artifactWithUnit builds a minimal artifact dir whose delivered setup product carries the given unit
+// name — the shape DeliveredUnitName reads to recover a divergently named unit (e.g. holistic-dashboard
+// for the holistic repository).
+func artifactWithUnit(t *testing.T, unit string) string {
+	t.Helper()
+	art := t.TempDir()
+	setup := filepath.Join(art, "setup")
+	if err := os.MkdirAll(setup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(setup, unit+".service"), []byte("[Unit]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return art
+}
+
+// DECISIVE (task test a): a service whose unit is named otherwise than its repository is delivered, and
+// the gate probes the DELIVERED unit — not the repository name. holistic ships setup/holistic-dashboard.service,
+// so the gate must ask systemd about holistic-dashboard (which is live), not holistic (which never existed).
+// Deriving the name from the repository is exactly what booked the live 2026-08-08 delivery as failed.
+func TestDeliverDevGateProbesDeliveredUnitNotRepo(t *testing.T) {
+	art := artifactWithUnit(t, "holistic-dashboard")
+
+	var probed string
+	gate := Gate{
+		// Active ONLY for the delivered unit; the repository name would fail the way systemd does for a
+		// unit that does not exist. So a green outcome PROVES the gate probed the delivered unit.
+		UnitActive: func(_ context.Context, unit string) error {
+			probed = unit
+			if unit != "holistic-dashboard" {
+				return fmt.Errorf("unit %s is not active", unit)
+			}
+			return nil
+		},
+		PortHeld: func(context.Context, int) error { return nil },
+		Wait:     10 * time.Millisecond, Poll: time.Millisecond,
+	}
+
+	out, err := DeliverDev(context.Background(), &fakeInstaller{}, fakePorts{port: 8770}, gate,
+		Detection{Kind: KindService, ID: "holistic", Evidence: "./service"}, "holistic", art)
+	if err != nil {
+		t.Fatalf("a live service under its delivered unit must deliver green, got %v", err)
+	}
+	if probed != "holistic-dashboard" {
+		t.Errorf("the gate probed %q, want the DELIVERED unit holistic-dashboard (never the repo name)", probed)
+	}
+	if !out.Installed || !out.Running {
+		t.Errorf("outcome = %+v, want installed+running", out)
+	}
+}
+
+// task test b: the service genuinely does not come up ⇒ the failure carries the REAL last log line from
+// the unit's own journal, named against the DELIVERED unit.
+func TestDeliverDevFailureNamesRealLogLine(t *testing.T) {
+	art := artifactWithUnit(t, "holistic-dashboard")
+	var reasoned string
+	gate := Gate{
+		UnitActive: func(context.Context, string) error { return errors.New("inactive") },
+		PortHeld:   func(context.Context, int) error { return nil },
+		LogReason: func(_ context.Context, unit string) LogLookup {
+			reasoned = unit
+			return LogLookup{Line: "holistic-dashboard: ModuleNotFoundError: no module named 'uvicorn'", Readable: true}
+		},
+		Wait: 5 * time.Millisecond, Poll: time.Millisecond,
+	}
+	_, err := DeliverDev(context.Background(), &fakeInstaller{}, fakePorts{port: 8770}, gate,
+		Detection{Kind: KindService, ID: "holistic", Evidence: "./service"}, "holistic", art)
+	if err == nil {
+		t.Fatal("a service that does not come up must fail the delivery")
+	}
+	if !strings.Contains(err.Error(), "uvicorn") {
+		t.Errorf("the failure must carry the REAL last log line: %v", err)
+	}
+	if reasoned != "holistic-dashboard" {
+		t.Errorf("the reason was read for %q, want the delivered unit holistic-dashboard", reasoned)
+	}
+}
+
+// task test c: the journal is not readable ⇒ the message says so explicitly and gives NO false reason.
+// The gate's own missing right ("insufficient permissions") must never be dressed up as the service's cause.
+func TestDeliverDevFailureUnreadableLogSaysSo(t *testing.T) {
+	art := artifactWithUnit(t, "holistic-dashboard")
+	gate := Gate{
+		UnitActive: func(context.Context, string) error { return errors.New("inactive") },
+		PortHeld:   func(context.Context, int) error { return nil },
+		LogReason:  func(context.Context, string) LogLookup { return LogLookup{Readable: false} },
+		Wait:       5 * time.Millisecond, Poll: time.Millisecond,
+	}
+	_, err := DeliverDev(context.Background(), &fakeInstaller{}, fakePorts{port: 8770}, gate,
+		Detection{Kind: KindService, ID: "holistic", Evidence: "./service"}, "holistic", art)
+	if err == nil {
+		t.Fatal("a not-running service must fail the delivery")
+	}
+	if !strings.Contains(err.Error(), "log not readable") {
+		t.Errorf("an unreadable journal must be named as such, not passed off as a cause: %v", err)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "insufficient permissions") {
+		t.Errorf("the gate's OWN permission problem must never appear as the failure reason: %v", err)
+	}
+}
+
+// journalUnreadable recognises journalctl's own permission complaint (on STDERR) as the gate's deficiency,
+// distinct from an empty-but-readable journal. It is the guard that keeps "No journal files were opened due
+// to insufficient permissions" out of the failure reason.
+func TestJournalUnreadable(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		stderr string
+		want   bool
+	}{
+		{"the measured message", errors.New("exit status 1"), "No journal files were opened due to insufficient permissions.", true},
+		{"plain permission denied", errors.New("exit status 1"), "journalctl: Permission denied", true},
+		{"lowercased insufficient", nil, "insufficient permissions to read", true},
+		{"clean empty journal", nil, "", false},
+		{"non-zero but silent (e.g. no such unit)", errors.New("exit status 1"), "", false},
+		{"a genuine reason on stdout leaves stderr clean", nil, "", false},
+	}
+	for _, c := range cases {
+		if got := journalUnreadable(c.err, c.stderr); got != c.want {
+			t.Errorf("%s: journalUnreadable(%v, %q) = %v, want %v", c.name, c.err, c.stderr, got, c.want)
+		}
 	}
 }
