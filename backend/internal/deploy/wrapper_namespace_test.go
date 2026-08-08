@@ -51,6 +51,47 @@ func fakeSystemctl(t *testing.T, fragment string) string {
 	return p
 }
 
+// fakeGetent is the account seam the reserved-name gate reads: it answers `getent passwd <name>` with a
+// passwd line the test supplies (an absent name exits 2, as real getent does) and `getent group <name>`
+// with success for named groups. It lets a test decide what identity a host carries under a name — a
+// foreign account, our own account, or nothing — so the reserved gate's first-time decision does not
+// depend on the machine the test runs on. Names not in either map are reported absent.
+func fakeGetent(t *testing.T, passwd map[string]string, groups ...string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\ncase \"$1\" in\n  passwd)\n    case \"$2\" in\n")
+	for name, line := range passwd {
+		b.WriteString("      " + name + ") printf '%s\\n' '" + line + "'; exit 0 ;;\n")
+	}
+	b.WriteString("    esac ;;\n  group)\n    case \"$2\" in\n")
+	for _, g := range groups {
+		b.WriteString("      " + g + ") exit 0 ;;\n")
+	}
+	b.WriteString("    esac ;;\nesac\nexit 2\n")
+	p := filepath.Join(t.TempDir(), "getent")
+	if err := os.WriteFile(p, []byte(b.String()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// foreignAccount is a passwd line for a name held by SOMEONE ELSE — a system account whose home is not
+// /var/lib/<repo>, so the reserved gate reads it as foreign and keeps refusing the name.
+func foreignAccount(name string) string { return name + ":x:1:1::/nonexistent:/usr/sbin/nologin" }
+
+// ownShapeAccount is a passwd line in the shape THIS setup would create (system, nologin, home
+// /var/lib/<repo>) — a prior partial install of ours, not a foreign identity.
+func ownShapeAccount(name string) string {
+	return name + ":x:900:900::/var/lib/" + name + ":/usr/sbin/nologin"
+}
+
+// noPackages points DEVLAB_DPKG at a path that does not exist, so the reserved gate's `command -v` finds
+// no dpkg and the package check is skipped — the host carries no package under the name.
+func noPackages(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "no-dpkg-present")
+}
+
 // refused runs the wrapper in --check mode and asserts it died with the expected code, named the
 // reason, and planned NOTHING — a refusal after a PLAN line would mean effects had already begun.
 func refused(t *testing.T, env map[string]string, wantExit int, wantMsg string, args ...string) {
@@ -73,6 +114,11 @@ func TestInstallCheckRefusesReservedSystemNames(t *testing.T) {
 	for _, repo := range []string{"root", "caddy", "sshd", "postgres", "www-data", "nobody", "systemd-foo"} {
 		env, artifact := foreignFixture(t, repo)
 		env["DEVLAB_SYSTEMCTL"] = fakeSystemctl(t, "")
+		// Each of these names IS held by a foreign account on a real host — the whole reason they are
+		// reserved. Simulate that so the refusal does not depend on which of them the CI host happens to
+		// carry; a foreign account keeps the reserved name claimed and the first install refused.
+		env["DEVLAB_GETENT"] = fakeGetent(t, map[string]string{repo: foreignAccount(repo)})
+		env["DEVLAB_DPKG"] = noPackages(t)
 		res := runWrapper(t, "deploy/devlab-install", env, repo, artifact, "dev", "--check", "--port", "8772")
 		if res.exit != 2 {
 			t.Errorf("repo %q must die with exit 2, got %d\n%s", repo, res.exit, res.out)

@@ -109,6 +109,13 @@ SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
 # production, like every other seam here), so it grants no privilege — it lets a test decide what unit
 # already exists, exactly as devlab-deploy-recv's DEVLAB_UNIT_DIR does.
 UNIT_DIR="${DEVLAB_UNIT_DIR:-/etc/systemd/system}"
+# The host's account and package databases are asked through these binaries so the reserved-name gate can
+# tell a genuine first install of a reserved landscape name (nothing exists under it) apart from a name
+# grab (an OS account or a distro package already holds it). Seams for direct-invocation tests only —
+# stripped by sudo's env_reset in production, exactly like SYSTEMCTL and UNIT_DIR — so they grant no
+# privilege; they let a test decide what account/package the host carries.
+GETENT="${DEVLAB_GETENT:-getent}"
+DPKG="${DEVLAB_DPKG:-dpkg-query}"
 # The configured organisation whose repositories may be installed: an instance value, so it lives
 # in root-owned runtime configuration and never as a literal in this template.
 OWNER_FILE="${DEVLAB_GH_OWNER_FILE:-/etc/devlab/gh-owner}"
@@ -569,22 +576,33 @@ if [ "$REPO" != "$SELF_REPO" ]; then
   esac
 
   # 5g) THE RESERVED-IDENTITY GATE — judged HERE, after the delivered unit name (5c-bis) and the host's
-  #     unit state (5d) are known, so it can tell apart the two cases the SPELLING alone cannot:
+  #     unit state (5d) are known, so it can tell apart the THREE cases the SPELLING alone cannot:
   #       forbid  — a service CLAIMS an identity (an OS account, a package unit, a landscape component)
   #                 that is not its own;
-  #       admit   — the service to WHICH that identity already belongs renews itself.
-  #     Ownership is read from the HOST, never derived from the name (the same defect that produced the
-  #     three fixes before this one): systemd confirms the delivered unit is already OURS (FIRST_TIME=0 —
-  #     an update, not a first install, and a foreign fragment was already refused in 5d) AND that unit
-  #     runs as `User=<repo>`, so the account the reserved name would collide with is the very account this
-  #     unit already runs as. Only then is a reserved name admitted. The list is NOT shortened — `holistic`
-  #     stays on it; it is OWNERSHIP that lifts the refusal, and only for the owner. A first-time setup, or
-  #     an update whose unit runs as someone else, stays refused exactly as before.
+  #       renew   — the service to WHICH that identity already belongs renews itself;
+  #       admit   — the identity DOES NOT EXIST YET, so a genuine first install may take it.
+  #     Every judgement is read from the HOST, never derived from the name (the same defect the whole
+  #     cascade before this fix was unwinding).
+  #       * renew  — systemd confirms the delivered unit is already OURS (FIRST_TIME=0, an update, and a
+  #                  foreign fragment was already refused in 5d) AND that unit runs as `User=<repo>`; the
+  #                  account the reserved name would collide with is the very account our unit already
+  #                  runs as (setup_owns_reserved_name).
+  #       * admit  — a FIRST-TIME setup owns nothing, but on a bare host a reserved landscape name (like
+  #                  `holistic` on a freshly provisioned production host) also COLLIDES with nothing: no
+  #                  foreign account, no package, and — because this is first-time — no unit. The reserved
+  #                  list guards against taking a name that belongs to someone else, not against a name
+  #                  that belongs to no one; refusing here trapped the one landscape service that isn't yet
+  #                  on a new host out of ever reaching it (setup_reserved_name_free).
+  #     The list is NOT shortened — `holistic` stays on it. What changed is only that NON-EXISTENCE is no
+  #     longer mistaken for foreign ownership. A first-time setup whose name IS already held by a foreign
+  #     account or package, and an update whose unit runs as someone else, stay refused exactly as before.
   is_update=0; [ "$FIRST_TIME" = 0 ] && is_update=1
   for r in $SETUP_RESERVED_REPOS; do
     if [ "$REPO" = "$r" ]; then
       if setup_owns_reserved_name "$REPO" "$UNIT_FILE" "$is_update"; then
         log "repo name '$REPO' is reserved, but its unit '${UNIT_NAME}.service' is already ours and runs as 'User=$REPO' — this is the service the identity belongs to, renewing itself; admitted"
+      elif [ "$is_update" = 0 ] && setup_reserved_name_free "$REPO" "$GETENT" "$DPKG"; then
+        log "repo name '$REPO' is reserved, but nothing under this name exists on this host (no account, no package, no unit) — the identity is unclaimed; first-time install admitted"
       else
         die "repo name '$REPO' is reserved (operating-system, package or landscape identity) — a unit and a service account under this name would collide with an existing one, and no unit under this name is yet ours to renew" 2
       fi
@@ -599,8 +617,8 @@ if [ "$REPO" != "$SELF_REPO" ]; then
   #     On an UPDATE the unit already exists, is root-owned, and its `User=` was settled when it was
   #     written — nothing is adopted here, so a service whose account legitimately predates DevLab
   #     stays deliverable instead of being refused for the spelling of its name.
-  if [ "$FIRST_TIME" = 1 ] && getent passwd "$REPO" >/dev/null 2>&1; then
-    IFS=: read -r _pname _ppw puid _pgid _pgecos phome pshell <<<"$(getent passwd "$REPO")"
+  if [ "$FIRST_TIME" = 1 ] && "$GETENT" passwd "$REPO" >/dev/null 2>&1; then
+    IFS=: read -r _pname _ppw puid _pgid _pgecos phome pshell <<<"$("$GETENT" passwd "$REPO")"
     [ "${puid:-0}" -gt 0 ] 2>/dev/null || die "account '$REPO' is uid 0 — refusing to install a service under it" 2
     [ "${phome:-}" = "/var/lib/$REPO" ] || die "account '$REPO' already exists with home '${phome:-}' (expected /var/lib/$REPO) — refusing to adopt a foreign account" 2
     case "${pshell:-}" in

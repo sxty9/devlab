@@ -135,9 +135,12 @@ setup_valid_repo_shape() {
 # is admissible for a FIRST-TIME setup, which owns nothing and therefore may never take a reserved
 # identity. Returns 0 when the name is admissible; otherwise it prints the reason to stderr and returns 1.
 # The caller turns that into its own die/exit with its own exit code, so both wrappers keep their
-# established exit-code contract while sharing the one rule-set. For a name that is reserved BUT already
-# belongs to the service being delivered (a renewal), the caller uses setup_owns_reserved_name to lift the
-# refusal — this function alone always refuses a reserved name, because on its own it cannot see the host.
+# established exit-code contract while sharing the one rule-set. This function alone ALWAYS refuses a
+# reserved name, because on its own it cannot see the host. The caller lifts that refusal in the two cases
+# the host reveals: the identity already belongs to the delivered service (a renewal — setup_owns_reserved_name),
+# or nothing under the name exists on this host at all (a genuine first install on a bare host —
+# setup_reserved_name_free). The reserved list itself is never shortened; only host-visible ownership or
+# host-visible absence admits a reserved name.
 setup_valid_repo_name() {
   local repo="$1" r
   setup_valid_repo_shape "$repo" || return 1
@@ -174,6 +177,55 @@ setup_owns_reserved_name() {
   [ "$is_update" = 1 ] || return 1
   [ -f "$own_file" ] || return 1
   setup_unit_declares_user "$own_file" "$repo"
+}
+
+# setup_reserved_name_free <repo> [<getent>] [<dpkg>] — the THIRD case the reserved list must tell apart,
+# the one setup_owns_reserved_name cannot: the identity DOES NOT EXIST YET. The list guards against a
+# service CLAIMING an identity that is not its own — but non-existence is not foreign ownership. On a bare
+# host `holistic` (a reserved landscape name) owns nothing AND collides with nothing, so the FIRST install
+# must be admitted; the protection is against foreign PROPERTY, not against absence. Refusing here is the
+# fault that traps the one landscape service that isn't yet on a freshly provisioned host out of ever
+# reaching it — the service could only exist where it already exists.
+#
+# The distinction is EXISTENCE of a foreign identity on the host, read from the host, never guessed from
+# the name — the same rule the whole reserved list already stands on ("would collide with an EXISTING
+# one"). This function is called by the caller ONLY for a first-time setup (is_update=0): a foreign UNIT
+# was already refused before this (setup_unit_state = foreign → die), and our own unit means an update
+# (setup_owns_reserved_name decides that case), so the unit is settled and only the ACCOUNT and the
+# PACKAGE remain to check. Returns 0 (free → the first install may proceed) only when BOTH hold:
+#   * no FOREIGN account under the name. An account is foreign when its shape is not the one THIS setup
+#     would create — a system account (uid>0), nologin/false shell, home /var/lib/<repo>. root (uid 0),
+#     an interactive login, or a foreign home (www-data → /var/www, daemon → /usr/sbin) is a foreign
+#     identity and keeps the name claimed; the SAME shape rule the account guard already applies when it
+#     decides whether an existing account may be adopted, so the two never diverge. An account already in
+#     our own shape is a prior partial install of ours, not a foreign claim, and does not disqualify.
+#   * no PACKAGE installed under the name (dpkg-query "install ok installed"). Every distro package that
+#     owns a reserved name also creates its account, so this is belt to the account check — but the list
+#     names a package as its own kind of identity, so it is checked in its own right where dpkg exists.
+# Returns 1 (claimed → the caller keeps refusing) otherwise. The getent/dpkg seams default to the real
+# tools; they exist only so a direct-invocation test can decide what the host carries, exactly as the
+# systemctl seam lets a test decide what unit exists. SHARED so the dev installer and the prod receiver
+# admit a genuine first-time install of a reserved landscape name by ONE rule, with no second path.
+setup_reserved_name_free() {
+  local repo="$1" getent_cmd="${2:-getent}" dpkg_cmd="${3:-dpkg-query}" line puid phome pshell
+  # a FOREIGN account keeps the name claimed
+  if line="$("$getent_cmd" passwd "$repo" 2>/dev/null)" && [ -n "$line" ]; then
+    IFS=: read -r _ _ puid _ _ phome pshell <<<"$line"
+    [ "${puid:-0}" -gt 0 ] 2>/dev/null || return 1
+    [ "${phome:-}" = "/var/lib/$repo" ] || return 1
+    case "${pshell:-}" in
+      */nologin | */false) : ;;
+      *) return 1 ;;
+    esac
+    # account exists in OUR shape — a prior partial install of ours, not a foreign identity; not disqualifying
+  fi
+  # a PACKAGE under the name keeps it claimed (checked only where dpkg is present)
+  if command -v "$dpkg_cmd" >/dev/null 2>&1; then
+    if "$dpkg_cmd" -W -f='${Status}' "$repo" 2>/dev/null | grep -q 'install ok installed'; then
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # setup_unit_text <repo> <port> — THE systemd unit template. Every value is derived from the two
@@ -267,10 +319,23 @@ EDGE
 # setup_ensure_account <repo> — the service's own identity: a nologin SYSTEM account whose home is
 # /var/lib/<repo>, created only when absent (idempotent). This is what `User=<repo>` in the unit runs
 # as; devlab-install and devlab-deploy-recv create it identically at first-time setup.
+#
+# On a BARE host a same-named GROUP may already exist without the matching user — the landscape's own
+# prerequisites create a `holistic` group before any service is installed. `useradd` defaults (Debian
+# USERGROUPS_ENAB) to creating a per-user group of the same name, which then FAILS ("group holistic
+# exists") and aborts the whole first-time setup. So when a group under the name is already present, the
+# account is created bound to THAT group (-g <repo>) instead of trying to mint a second one; when no such
+# group exists the default per-user group is created as before. This is another check that silently
+# assumed nothing was there yet — it only ever fired once a bare host actually had the group.
 setup_ensure_account() {
   local repo="$1"
-  getent passwd "$repo" >/dev/null 2>&1 \
-    || useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" "$repo"
+  if ! getent passwd "$repo" >/dev/null 2>&1; then
+    if getent group "$repo" >/dev/null 2>&1; then
+      useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" -g "$repo" "$repo"
+    else
+      useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" "$repo"
+    fi
+  fi
   install -d -o "$repo" -g "$repo" -m 0755 "/var/lib/$repo"
 }
 

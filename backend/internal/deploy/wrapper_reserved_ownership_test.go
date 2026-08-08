@@ -68,6 +68,10 @@ func reservedInstallFixture(t *testing.T, repo, unit, onHostUser string) (env ma
 		"DEVLAB_GH_OWNER":  testOwner,
 		"DEVLAB_UNIT_DIR":  unitDir,
 		"DEVLAB_SYSTEMCTL": fakeSystemctl(t, fragment),
+		// By default the host carries NO account and NO package under the name — a bare host. A test that
+		// needs a foreign or an own-shape account overrides DEVLAB_GETENT.
+		"DEVLAB_GETENT": fakeGetent(t, nil),
+		"DEVLAB_DPKG":   noPackages(t),
 	}
 	return env, artifact
 }
@@ -109,19 +113,57 @@ func TestInstallReservedNameRefusedWhenAccountIsAnothers(t *testing.T) {
 	}
 }
 
-// TEST c) A reserved name that owns NOTHING — no unit on the host, a first-time setup — is refused, exactly
-// as before: a first install may never take a foreign identity.
-func TestInstallReservedNameRefusedOnFirstTime(t *testing.T) {
+// TEST c) DECISIVE: a reserved name that owns nothing YET — no unit on the host, no account, no package,
+// a first-time setup on a bare host — is now ADMITTED. This is the fix: on a freshly provisioned host the
+// reserved landscape name `holistic` collides with nothing, so its first install must proceed; the reserved
+// list protects against foreign PROPERTY, not against ABSENCE. Before this, holistic could exist only where
+// it already existed, and never reached a new production host at all.
+func TestInstallReservedNameAdmittedOnBareFirstTime(t *testing.T) {
 	env, artifact := reservedInstallFixture(t, "holistic", "holistic-dashboard", "")
 	res := runWrapper(t, "deploy/devlab-install", env, "holistic", artifact, "dev", "--check")
+	if res.exit != 0 {
+		t.Fatalf("a first-time install of a reserved name on a bare host must be admitted (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	if strings.Contains(res.out, "is reserved (operating-system") {
+		t.Errorf("a bare host owns nothing under the name — the first install must NOT be refused as reserved:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "the identity is unclaimed; first-time install admitted") {
+		t.Errorf("the admission must be named (non-existence is not foreign ownership):\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "PLAN:") {
+		t.Errorf("an admitted first-time install must plan its effects:\n%s", res.out)
+	}
+}
+
+// TEST c') A reserved name whose account is held by SOMEONE ELSE on a first-time host stays refused: the
+// protection is in full force against foreign ownership. A foreign account (home not /var/lib/<repo>) keeps
+// the name claimed even with no unit present.
+func TestInstallReservedNameRefusedWhenForeignAccountHoldsIt(t *testing.T) {
+	env, artifact := reservedInstallFixture(t, "holistic", "holistic-dashboard", "")
+	env["DEVLAB_GETENT"] = fakeGetent(t, map[string]string{"holistic": foreignAccount("holistic")})
+	res := runWrapper(t, "deploy/devlab-install", env, "holistic", artifact, "dev", "--check")
 	if res.exit != 2 {
-		t.Fatalf("a first-time install of a reserved name must be refused (exit 2), got %d\n%s", res.exit, res.out)
+		t.Fatalf("a first-time reserved name a foreign account holds must be refused (exit 2), got %d\n%s", res.exit, res.out)
 	}
 	if !strings.Contains(res.out, "is reserved") {
 		t.Errorf("the refusal must name the reservation:\n%s", res.out)
 	}
 	if strings.Contains(res.out, "PLAN:") {
 		t.Errorf("a refused first-time install must plan nothing:\n%s", res.out)
+	}
+}
+
+// TEST c”) A first-time host whose account under the name is in OUR OWN shape (a prior partial install of
+// ours — system, nologin, home /var/lib/<repo>) is NOT a foreign identity, so the first install proceeds.
+func TestInstallReservedNameAdmittedWhenOwnShapeAccountExists(t *testing.T) {
+	env, artifact := reservedInstallFixture(t, "holistic", "holistic-dashboard", "")
+	env["DEVLAB_GETENT"] = fakeGetent(t, map[string]string{"holistic": ownShapeAccount("holistic")})
+	res := runWrapper(t, "deploy/devlab-install", env, "holistic", artifact, "dev", "--check")
+	if res.exit != 0 {
+		t.Fatalf("a first-time install whose account is our own shape must be admitted (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "the identity is unclaimed; first-time install admitted") {
+		t.Errorf("an own-shape account is not foreign — the admission must be named:\n%s", res.out)
 	}
 }
 
@@ -153,7 +195,14 @@ func recvReservedFixture(t *testing.T, repo, unit, onHostUser string) (env map[s
 		}
 		fragment = onHost
 	}
-	return map[string]string{"DEVLAB_STAGING": staging, "DEVLAB_UNIT_DIR": unitDir}, fragment
+	return map[string]string{
+		"DEVLAB_STAGING":  staging,
+		"DEVLAB_UNIT_DIR": unitDir,
+		// A bare host by default: no account, no package under the name. A test that needs a foreign or an
+		// own-shape account overrides DEVLAB_GETENT.
+		"DEVLAB_GETENT": fakeGetent(t, nil),
+		"DEVLAB_DPKG":   noPackages(t),
+	}, fragment
 }
 
 // TEST d-precondition: the receiver RENEWS a reserved-named service that already owns its unit+account,
@@ -184,6 +233,45 @@ func TestRecvReservedNameRefusedWhenAccountIsAnothers(t *testing.T) {
 	}
 	if !strings.Contains(res.out, "is reserved") || !strings.Contains(res.out, "no unit under this name is yet ours") {
 		t.Errorf("the refusal must name the reservation and the missing ownership:\n%s", res.out)
+	}
+	if strings.Contains(res.out, "PLAN:") {
+		t.Errorf("a refused install must plan nothing:\n%s", res.out)
+	}
+}
+
+// TEST a) DECISIVE — the measured failure: the receiver on a BARE production host (no unit, no account, no
+// package under the name) now ADMITS the first-time install of the reserved landscape name `holistic`,
+// instead of dying on "no unit under this name is yet ours". This is what let holistic reach a freshly
+// provisioned production host at all — the 13-of-15 gap the task names.
+func TestRecvReservedNameAdmittedOnBareFirstTime(t *testing.T) {
+	env, fragment := recvReservedFixture(t, "holistic", "holistic-dashboard", "")
+	res := runRecv(t, env, fragment, "holistic")
+	if res.exit != 0 {
+		t.Fatalf("the receiver must admit a first-time reserved name on a bare host (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	if strings.Contains(res.out, "no unit under this name is yet ours") {
+		t.Errorf("a bare host owns nothing under the name — the first install must NOT be refused as reserved:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "the identity is unclaimed; first-time install admitted") {
+		t.Errorf("the admission must be named:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "Erstinstallation") || !strings.Contains(res.out, "PLAN:") {
+		t.Errorf("an admitted first-time install must be named and plan its effects:\n%s", res.out)
+	}
+}
+
+// TEST c/d) A reserved name a FOREIGN account holds on the receiver's host stays refused, even first-time —
+// nobody may take an existing system identity. This covers both "a foreign account holds the name" and "a
+// bare reserved name whose account exists but is not ours".
+func TestRecvReservedNameRefusedWhenForeignAccountHoldsIt(t *testing.T) {
+	env, fragment := recvReservedFixture(t, "holistic", "holistic-dashboard", "")
+	env["DEVLAB_GETENT"] = fakeGetent(t, map[string]string{"holistic": foreignAccount("holistic")})
+	res := runRecv(t, env, fragment, "holistic")
+	if res.exit != 2 {
+		t.Fatalf("a first-time reserved name a foreign account holds must be refused (exit 2), got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "is reserved") {
+		t.Errorf("the refusal must name the reservation:\n%s", res.out)
 	}
 	if strings.Contains(res.out, "PLAN:") {
 		t.Errorf("a refused install must plan nothing:\n%s", res.out)
