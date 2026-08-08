@@ -223,7 +223,16 @@ case "$verb" in
     [ -r "$SETUP_LIB" ] || die "shared setup library not found: $SETUP_LIB"
     # shellcheck source=/dev/null
     . "$SETUP_LIB"
-    setup_valid_repo_name "$repo" || die "refusing to emit setup for '$repo'"
+    # The repo name must be path-safe (it becomes $dst/<repo>.*): validate its SHAPE for every branch. The
+    # reserved-IDENTITY refusal is NOT applied here, though — it is applied only in the GENERATE branch
+    # below, where emit-setup itself fabricates <repo>.service/<repo>.caddy with `User=<repo>`. A service
+    # that SHIPS ITS OWN setup product (a divergently-named unit like <repo>-dashboard.service) or the self
+    # repo NAMES its own identity in the delivered unit; emit-setup generates nothing over it, and only the
+    # root installer — which alone can see the host — decides ownership there (a reserved name is admitted
+    # for the service the identity already belongs to). Refusing a reserved <repo> HERE would trap exactly
+    # that owner (holistic: the landscape's own dashboard, whose repo name is on the reserved list), which
+    # is the defect being removed. Shape now; reserved only when generating.
+    setup_valid_repo_shape "$repo" || die "refusing to emit setup for '$repo'"
     art="$wt/.mercury-artifact"
     [ -d "$art" ] || die "no artifact at $art — build before emitting setup"
     dst="$art/setup"
@@ -250,6 +259,13 @@ case "$verb" in
       # carries its own name, so nothing is generated over it. The receiver reads that name on install.
       echo "devlab-exec: setup product already present in $dst (repo-provided) — leaving it, generating nothing"
     else
+      # THE GENERATE BRANCH — emit-setup fabricates the uniform identity <repo>.service (User=<repo>) and
+      # <repo>.caddy. A reserved <repo> would fabricate a colliding OS/package/landscape identity, and a
+      # freshly generated uniform unit can never be the OWNER of a reserved identity (the owner ships its
+      # own setup product and took a branch above, never this one). So the reserved list is enforced HERE,
+      # the one place emit-setup coins a name into an identity. The root installer refuses it again at
+      # install; this is the early, same-rule refusal.
+      setup_valid_repo_name "$repo" || die "refusing to generate a setup product for the reserved name '$repo'"
       setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
       setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
       # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
