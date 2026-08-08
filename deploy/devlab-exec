@@ -190,15 +190,20 @@ case "$verb" in
       ( cd -- "$gd" && if [ -d cmd ]; then go build ${tags:+-tags "$tags"} -o "$art/" ./cmd/...; else go build ${tags:+-tags "$tags"} -o "$art/" ./...; fi )
       built=1
     fi
-    # ── python-app: a prebuilt, relocatable payload the installer copies VERBATIM to /opt/<repo> ────────
+    # ── python-app: a prebuilt, SELF-CONTAINED payload the installer copies VERBATIM to /opt/<repo> ──────
     # A service DECLARES `python-app` in build.kind; there is no go.mod to build and there never will be a
     # <repo>d. The deployable program is a virtualenv (built HERE, as the unprivileged runner — prod never
     # builds) plus whatever the app needs, laid out UNDER payload/ so it becomes /opt/<repo>/ on install.
-    # The venv is built with --copies (a real interpreter, no build-path dependency) and its console-script
-    # shebangs are relocated from this staging path to the FINAL /opt/<repo>/venv, so the install stays a
-    # pure copy of already-correct bytes. A python-app MUST ship setup/<unit>.service: only the unit knows
-    # how to start it (its ExecStart names the interpreter and module), so the unit — not a name convention
-    # — is the source of truth. The build fails LOUDLY rather than ship a half payload.
+    # The venv is built with --copies, but that copies only the INTERPRETER, not its standard library — the
+    # interpreter would still fetch the stdlib from the BUILD host's python (…/usr/lib/pythonX.Y), which a
+    # target with a different python version does not have, so the service would die before its first line.
+    # So we BUNDLE the interpreter and its full stdlib into the payload (setup_bundle_python) and re-point
+    # the venv at them: the payload is truly relocatable across python versions, depending on nothing the
+    # target's own python provides. Console-script shebangs are relocated to the FINAL /opt/<repo>/venv, and
+    # the bundle's runnability is PROVEN here before it can ship (setup_python_payload_selftest — the same
+    # proof the receiver re-runs on the target before copying). A python-app MUST ship setup/<unit>.service:
+    # only the unit knows how to start it (its ExecStart names the interpreter and module), so the unit — not
+    # a name convention — is the source of truth. The build fails LOUDLY rather than ship a half payload.
     if [ "$declared_kind" = python-app ]; then
       command -v python3 >/dev/null 2>&1 || die "build.kind declares python-app but python3 is not available to build the venv"
       [ -d setup ] || die "a python-app must ship its own setup/<unit>.service — only the unit knows how to start it; none was found in the repo"
@@ -214,12 +219,20 @@ case "$verb" in
         "$venv/bin/python" -m pip install --disable-pip-version-check --no-input . \
           || die "pip install . failed for the python-app payload (the app package must be installable)"
       fi
-      # Relocate the venv's shebangs from the staging path to the final install prefix (shared library).
       SETUP_LIB_PY="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
       [ -r "$SETUP_LIB_PY" ] || die "shared setup library not found: $SETUP_LIB_PY"
       # shellcheck source=/dev/null
       . "$SETUP_LIB_PY"
+      # Bundle the interpreter + stdlib so the venv is version-portable, then relocate its shebangs to the
+      # final install prefix. Both come from the ONE shared library the installer and receiver also source.
+      pyver="$(setup_bundle_python "$venv" "/opt/$repo_name/venv")" \
+        || die "failed to bundle a relocatable python into the python-app payload"
       setup_relocate_venv "$venv" "/opt/$repo_name/venv"
+      # Prove the bundle actually runs and is self-contained BEFORE it ships (the build host trivially passes;
+      # the value is that the identical proof runs at receive, where a differing target is caught pre-copy).
+      setup_python_payload_selftest "$payload" >/dev/null \
+        || die "the bundled python payload failed its self-test on the build host — refusing to ship a payload that cannot even run here"
+      printf '%s\n' "$pyver" > "$art/build.python"
       built=1
     fi
     # ── the service UI belongs INTO the artifact (a delivery ships all a service needs, not just its

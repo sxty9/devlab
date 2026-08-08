@@ -717,7 +717,8 @@ case "$KIND" in
     [ -f "$BIN" ] || die "staged binary missing: $BIN (build.kind=go-daemon expects a prebuilt <repo>d, never built here)" 5
     ;;
   python-app)
-    # A prebuilt, relocatable payload tree (a --copies virtualenv + the app), copied verbatim to /opt/<repo>.
+    # A prebuilt, SELF-CONTAINED payload tree (a --copies virtualenv + the interpreter + stdlib + the app),
+    # copied verbatim to /opt/<repo>.
     PAYLOAD="$real/payload"
     [ -d "$PAYLOAD" ] || die "staged payload missing: $PAYLOAD (build.kind=python-app expects a prebuilt payload/ tree, never built here)" 5
     # A python-app carries no <repo>d template: only its unit knows how to start it (ExecStart names the
@@ -726,6 +727,13 @@ case "$KIND" in
     if [ "$FIRST_TIME" = 1 ] && [ "$DELIVERED_SETUP" != 1 ]; then
       die "first-time setup of python-app '$REPO' needs a delivered setup/<unit>.service in the artifact — only the unit knows how to start it; there is no <repo>d template for a python-app" 5
     fi
+    # PRE-COPY COMPATIBILITY GATE — prove the bundled interpreter runs on THIS host and imports its bundled
+    # standard library BEFORE the payload is copied, so a python mismatch is NAMED here (never a restart loop
+    # in the unit log). Side-effect-free, so it runs in --check too. On the dev host build==run so it always
+    # passes; it is the SAME proof the production receiver applies, kept here so both paths share one gate.
+    PYSELF="$(setup_python_payload_selftest "$PAYLOAD")" \
+      || die "python-app '$REPO': the bundled interpreter cannot run on this host — refusing BEFORE copy so the incompatibility is named here, not as a restart loop in the unit log (see the reason above)" 5
+    if [ "$CHECK" = 1 ]; then echo "PLAN: pre-copy gate — bundled python $PYSELF verified runnable on this host"; else log "python-app '$REPO': bundled python $PYSELF verified runnable on this host"; fi
     ;;
 esac
 
