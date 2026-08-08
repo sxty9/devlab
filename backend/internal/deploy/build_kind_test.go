@@ -17,6 +17,42 @@ import (
 	"testing"
 )
 
+// stageBundledPython lays a FAKE self-contained interpreter into a python-app payload so the off-host tests
+// exercise the pre-copy compatibility gate (setup_python_payload_selftest) without building a real venv. A
+// real payload carries payload/pybase/bin/python3.<minor> (the bundled interpreter) + its stdlib; here that
+// interpreter is a tiny shell script the gate runs with `env -i … -c '…'`. When ok it prints a version and
+// exits 0 (a runnable host); when not it writes a C-library error and exits 1 (an incompatible host — the
+// mismatch this whole change turns from a target-side restart loop into a named pre-copy refusal). A
+// matching venv/bin/python is staged too, since the gate also probes the venv interpreter when present.
+func stageBundledPython(t *testing.T, payload string, ok bool) {
+	t.Helper()
+	bin := filepath.Join(payload, "pybase", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(payload, "pybase", "lib", "python3.14"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "#!/bin/sh\nprintf 3.14.4\n"
+	if !ok {
+		body = "#!/bin/sh\necho 'python3.14: /lib/x86_64-linux-gnu/libc.so.6: version GLIBC_2.41 not found' >&2\nexit 1\n"
+	}
+	if err := os.WriteFile(filepath.Join(bin, "python3.14"), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	venvPy := filepath.Join(payload, "venv", "bin", "python")
+	if err := os.MkdirAll(filepath.Dir(venvPy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	vbody := "#!/bin/sh\nprintf ok\n"
+	if !ok {
+		vbody = "#!/bin/sh\nexit 1\n"
+	}
+	if err := os.WriteFile(venvPy, []byte(vbody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // pythonInstallFixture stages a well-formed python-app delivery for the DEV installer: the checkout under
 // the workspace root, a build.kind declaring python-app, a prebuilt payload/ tree (a venv the installer
 // copies verbatim — its mere presence is what --check checks), the delivered setup/<unit>.service that
@@ -37,6 +73,7 @@ func pythonInstallFixture(t *testing.T, repo, unit, onHostFrag string) (env map[
 	if err := os.WriteFile(filepath.Join(venvBin, "uvicorn"), []byte("#!/opt/"+repo+"/venv/bin/python\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stageBundledPython(t, filepath.Join(artifact, "payload"), true)
 	stampBuildKind(t, artifact, "python-app")
 	// The delivered unit — the source of truth for how a python-app starts (an interpreter out of the venv).
 	setup := filepath.Join(artifact, "setup")
@@ -102,6 +139,43 @@ func TestInstallPythonAppUpdateCopiesPayload(t *testing.T) {
 	}
 	if strings.Contains(res.out, "install delivered unit") {
 		t.Errorf("an update must not re-install the delivered unit (it is already ours): %s", res.out)
+	}
+}
+
+// TASK TEST c (the version-portability half): a python-app whose bundled interpreter cannot run on THIS
+// host is refused BEFORE the payload is copied — the incompatibility is named at the gate, never left to
+// surface as a restart loop in the target's unit log. This is the dev installer's half of the gate.
+func TestInstallPythonAppIncompatibleRefusedBeforeCopy(t *testing.T) {
+	env, artifact := pythonInstallFixture(t, "svc-a", "svc-a", "")
+	// Replace the bundled interpreter with one that fails to load (an older C library than the build host).
+	stageBundledPython(t, filepath.Join(artifact, "payload"), false)
+	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check")
+	if res.exit == 0 {
+		t.Fatalf("an unrunnable bundled interpreter must be refused, got exit 0\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "cannot run on this host") || !strings.Contains(res.out, "BEFORE copy") {
+		t.Errorf("the refusal must name the incompatibility and that it is caught before the copy: %s", res.out)
+	}
+	if strings.Contains(res.out, "rsync") && strings.Contains(res.out, "/opt/svc-a/") {
+		t.Errorf("a refused python-app must plan no copy into /opt: %s", res.out)
+	}
+}
+
+// TASK TEST c (production half): the receiver applies the IDENTICAL pre-copy gate — an interpreter that
+// cannot run on the production host is refused before the copy, through the same shared proof.
+func TestRecvPythonAppIncompatibleRefusedBeforeCopy(t *testing.T) {
+	env, fragment := pythonRecvFixture(t, "svc-a", "svc-a", "")
+	payload := filepath.Join(env["DEVLAB_STAGING"], "svc-a", "payload")
+	stageBundledPython(t, payload, false)
+	res := runRecv(t, env, fragment, "svc-a")
+	if res.exit == 0 {
+		t.Fatalf("the receiver must refuse an unrunnable bundled interpreter, got exit 0\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "cannot run on this production host") || !strings.Contains(res.out, "BEFORE copy") {
+		t.Errorf("the receiver's refusal must name the incompatibility and the pre-copy point: %s", res.out)
+	}
+	if strings.Contains(res.out, "copy prebuilt payload") {
+		t.Errorf("a refused python-app must plan no payload copy: %s", res.out)
 	}
 }
 
@@ -186,6 +260,7 @@ func pythonRecvFixture(t *testing.T, repo, unit, onHostUser string) (env map[str
 	if err := os.WriteFile(filepath.Join(venvBin, "uvicorn"), []byte("#!/opt/"+repo+"/venv/bin/python\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stageBundledPython(t, filepath.Join(art, "payload"), true)
 	stampBuildKind(t, art, "python-app")
 	setup := filepath.Join(art, "setup")
 	if err := os.MkdirAll(setup, 0o755); err != nil {

@@ -333,6 +333,15 @@ case "$REPO" in
       python-app)
         payload="$real/payload"
         [[ -d "$payload" ]] || die "staged payload missing: $payload (build.kind=python-app expects a prebuilt payload/ tree)" 10
+        # PRE-COPY COMPATIBILITY GATE — a python-app carries its own interpreter + stdlib, so it no longer
+        # depends on THIS host's python VERSION; but the interpreter is a native binary and an older system
+        # C library here than on the build host would still stop it. PROVE it runs and imports its bundled
+        # stdlib BEFORE the copy, so the incompatibility is NAMED here and now (Kein stummes Ausbleiben) and
+        # never left to surface as a restart loop in the unit log. The proof is side-effect-free, so it runs
+        # in --check too — a plan that could not be carried out must not read as clean.
+        pyself="$(setup_python_payload_selftest "$payload")" \
+          || die "python-app '$REPO': the delivered interpreter cannot run on this production host — refusing BEFORE copy so the incompatibility is named here, not as a restart loop in the unit log (see the reason above)" 10
+        if [[ "$CHECK" == 1 ]]; then echo "PLAN: pre-copy gate — bundled python $pyself verified runnable on this host"; else log "python-app '$REPO': bundled python $pyself verified runnable on this host — proceeding to copy"; fi
         ;;
     esac
 

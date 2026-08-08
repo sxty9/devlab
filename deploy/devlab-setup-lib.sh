@@ -51,11 +51,18 @@ docker containerd kubelet etcd snapd holistic"
 #                 ExecStart runs that binary. This is the historical uniform shape; a Go service needs
 #                 no declaration (artifact-build stamps `go-daemon` when it produced the binary), so it
 #                 is delivered exactly as before.
-#   python-app  — a prebuilt, relocatable payload tree (a --copies virtualenv plus the app) that the
-#                 installer copies VERBATIM to /opt/<repo>; its unit's ExecStart runs an interpreter out
-#                 of that tree (…/venv/bin/…). It carries no <repo>d and never will. Because only the
-#                 unit knows how to start it, a python-app MUST ship its own setup/<unit>.service — the
-#                 unit is the source of truth, not a name convention.
+#   python-app  — a prebuilt, SELF-CONTAINED payload tree (a --copies virtualenv, the app, AND the
+#                 interpreter + full standard library it needs) that the installer copies VERBATIM to
+#                 /opt/<repo>; its unit's ExecStart runs an interpreter out of that tree (…/venv/bin/…).
+#                 It carries no <repo>d and never will. Because only the unit knows how to start it, a
+#                 python-app MUST ship its own setup/<unit>.service — the unit is the source of truth,
+#                 not a name convention. `python -m venv --copies` copies the interpreter but NOT the
+#                 standard library: the interpreter fetches that from its build-host `home` (…/usr/bin →
+#                 …/usr/lib/pythonX.Y). A target with a DIFFERENT python has no such directory, so the
+#                 service dies before its first line ("No module named 'encodings'"). So the payload
+#                 BUNDLES the interpreter and its stdlib (setup_bundle_python) and re-points the venv at
+#                 them — the venv depends on nothing the target's own python provides — and the
+#                 interpreter's runnability on the target is PROVEN before the copy (setup_python_payload_selftest).
 #
 # This is a DELIBERATE, bounded pair, not an open plugin surface: extending it is a named change to this
 # one list, reviewed like any other. Uniformity ("Code-Struktur") is preserved where it actually binds —
@@ -113,6 +120,105 @@ setup_relocate_venv() {
     { printf '%s\n' "$newfirst"; tail -n +2 -- "$f"; } > "$f.reloc" || { rm -f -- "$f.reloc"; continue; }
     chmod "$mode" "$f.reloc"; mv -f -- "$f.reloc" "$f"
   done
+}
+
+# setup_bundle_python <staging-venv-dir> <final-venv-path> — make a --copies venv TRULY portable across
+# python VERSIONS by shipping the interpreter and its standard library WITH the payload, instead of leaving
+# the venv to fetch its stdlib from whatever python the target happens to have.
+#
+# THE BUG THIS CLOSES: `python -m venv --copies` copies the interpreter binary but not the standard
+# library. The copied interpreter still finds its stdlib through the `home` recorded in pyvenv.cfg — the
+# build host's /usr/bin, whose sibling /usr/lib/pythonX.Y holds the stdlib. Copy that venv to a target
+# whose python differs (build host 3.14, target 3.12) and that directory does not exist there: the
+# interpreter cannot even import `encodings` and the unit dies in a restart loop before its first line.
+# The shebang relocation (setup_relocate_venv) does NOT help — it fixes paths INSIDE the venv, not the
+# venv's binding to a python version that lives OUTSIDE it.
+#
+# WHAT THIS DOES: it copies the base interpreter and its FULL standard library into <payload>/pybase (the
+# payload being the venv's parent, which becomes the final install prefix), then rewrites the venv's
+# pyvenv.cfg so `home`/`executable` point at that BUNDLED base at its FINAL location. After this the venv
+# resolves its standard library from <final-prefix>/pybase — a path the payload itself carries — and needs
+# NOTHING from the target's own python. The interpreter binary is self-contained (it links only the C
+# runtime, not a separate libpython), so the bundle is a plain tree the installer copies verbatim; no build
+# ever runs on the target. Values are READ from the venv's own interpreter (version, stdlib location), never
+# guessed, so it stays correct across python minor versions. Echoes the bundled X.Y version for the caller's
+# log/stamp; returns non-zero (with a named reason) if the interpreter cannot be introspected or bundled.
+setup_bundle_python() {
+  local venv="$1" final_venv="$2" payload final_prefix pybase ver full stdlib base_bin
+  [ -x "$venv/bin/python" ] || { echo "setup_bundle_python: no venv interpreter at $venv/bin/python" >&2; return 1; }
+  payload="$(dirname -- "$venv")"
+  final_prefix="$(dirname -- "$final_venv")"
+  pybase="$payload/pybase"
+  # Read the interpreter's own account of itself — the ONLY reliable source of its version and where its
+  # standard library actually lives (distros differ; guessing /usr/lib is how this class of bug is born).
+  ver="$("$venv/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" || ver=""
+  full="$("$venv/bin/python" -c 'import sys;print(sys.version.split()[0])' 2>/dev/null)" || full="$ver"
+  stdlib="$("$venv/bin/python" -c 'import sysconfig;print(sysconfig.get_path("stdlib"))' 2>/dev/null)" || stdlib=""
+  base_bin="$("$venv/bin/python" -c 'import sys;print(sys._base_executable or sys.executable)' 2>/dev/null)" || base_bin=""
+  base_bin="$(readlink -f -- "$base_bin" 2>/dev/null || printf '%s' "$base_bin")"
+  { [ -n "$ver" ] && [ -d "$stdlib" ] && [ -x "$base_bin" ]; } \
+    || { echo "setup_bundle_python: could not resolve the interpreter to bundle (version='$ver' stdlib='$stdlib' base='$base_bin')" >&2; return 1; }
+  # Lay down <payload>/pybase/{bin/pythonX.Y, lib/pythonX.Y/<stdlib>}. __pycache__ is excluded — the
+  # compiled caches are regenerated on first import and only carry stale absolute paths otherwise.
+  rm -rf -- "$pybase"; mkdir -p -- "$pybase/bin" "$pybase/lib" || return 1
+  cp -a -- "$base_bin" "$pybase/bin/python$ver" || { echo "setup_bundle_python: failed to copy the interpreter" >&2; return 1; }
+  ln -sf "python$ver" "$pybase/bin/python3"
+  ln -sf "python$ver" "$pybase/bin/python"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude='__pycache__' "$stdlib/" "$pybase/lib/python$ver/" || { echo "setup_bundle_python: failed to copy the standard library" >&2; return 1; }
+  else
+    cp -a -- "$stdlib" "$pybase/lib/python$ver" || { echo "setup_bundle_python: failed to copy the standard library" >&2; return 1; }
+    find "$pybase/lib/python$ver" -depth -type d -name __pycache__ -exec rm -rf -- {} + 2>/dev/null || true
+  fi
+  # Re-point the venv at the BUNDLED base at its FINAL install location. `home` is the base bin dir; the
+  # interpreter derives its prefix (and thus the stdlib at <prefix>/lib/pythonX.Y) from it. site-packages
+  # under the venv are unchanged; only the base the venv sits ON is now the shipped one, not the target's.
+  {
+    printf 'home = %s\n' "$final_prefix/pybase/bin"
+    printf 'include-system-site-packages = false\n'
+    printf 'version = %s\n' "$full"
+    printf 'executable = %s\n' "$final_prefix/pybase/bin/python$ver"
+  } > "$venv/pyvenv.cfg" || return 1
+  printf '%s\n' "$ver"
+}
+
+# setup_python_payload_selftest <payload-dir> — PROVE, before a python-app payload is copied anywhere, that
+# its bundled interpreter RUNS on THIS host and imports its bundled standard library. This is the pre-copy
+# compatibility gate demanded by "Kein stummes Ausbleiben": a python-app carries its own interpreter + stdlib
+# (setup_bundle_python), so it no longer depends on the target's python VERSION — but the interpreter is
+# still a native binary, and a host whose C runtime is OLDER than the build host's could fail to load it or
+# its compiled stdlib extensions. That incompatibility is caught HERE — at build AND at receive — named, and
+# refused BEFORE the copy, never left to surface as a restart loop in the target's unit log.
+#
+# It runs the bundled BASE interpreter standalone (it resolves its stdlib relative to its own location, so no
+# baked final path and no environment are needed — that self-location is exactly the portability this proves)
+# and, when a venv is present, the VENV interpreter that ExecStart actually runs, pointed at the STAGED bundle
+# via PYTHONHOME (the venv's baked `home` names the not-yet-existing final /opt path). The import set is kept
+# to the standard library the reported failure was about (encodings) plus a compiled extension that links
+# only the C runtime (math) — never libssl/libsqlite3, whose absence would be a separate, app-level fact, not
+# an interpreter incompatibility. Echoes the proven X.Y version on success; prints a named reason and returns
+# non-zero on a missing bundle or an incompatible host.
+setup_python_payload_selftest() {
+  local payload="$1" base venv ver out matches
+  matches=("$payload"/pybase/bin/python3.[0-9]*)
+  base="${matches[0]}"
+  if [ ! -x "$base" ]; then
+    echo "python-app payload at '$payload' carries no bundled interpreter (payload/pybase/bin/python3.*) — this is a non-relocatable payload that would depend on the target's own python; refusing before any copy" >&2
+    return 1
+  fi
+  if ! out="$(env -i "$base" -c 'import sys, encodings, json, math, binascii; sys.stdout.write(sys.version.split()[0])' 2>&1)"; then
+    echo "the bundled python interpreter cannot run on this host and import its own standard library — refusing to copy an unrunnable payload. This host is incompatible with the environment the payload was built on (most often an OLDER system C library than the build host). Detail: $(printf '%s' "$out" | tail -n 3)" >&2
+    return 1
+  fi
+  ver="$out"
+  venv="$payload/venv/bin/python"
+  if [ -x "$venv" ]; then
+    if ! out="$(env -i PYTHONHOME="$payload/pybase" "$venv" -c 'import encodings, sys; sys.stdout.write("ok")' 2>&1)"; then
+      echo "the venv interpreter cannot find the bundled standard library — the payload is not self-contained. Detail: $(printf '%s' "$out" | tail -n 3)" >&2
+      return 1
+    fi
+  fi
+  printf '%s\n' "$ver"
 }
 
 # setup_valid_repo_shape <repo> — the pure SHAPE and NAMESPACE gate, WITHOUT the reserved-identity list:

@@ -207,6 +207,33 @@ func TestArtifactBuildBuildsPythonPayload(t *testing.T) {
 			t.Errorf("the venv console-script shebang must be relocated to /opt/svc/venv, got %q", first)
 		}
 	}
+
+	// The payload must be SELF-CONTAINED: it bundles the interpreter and its standard library, so it runs
+	// on a target whose python differs from the build host's. artifact-build stamps the bundled X.Y version.
+	pv, err := os.ReadFile(filepath.Join(art, "build.python"))
+	if err != nil {
+		t.Fatalf("a python-app artifact must stamp its bundled python version (build.python): %v\n%s", err, res.out)
+	}
+	minor := strings.TrimSpace(string(pv))
+	base := filepath.Join(art, "payload", "pybase", "bin", "python"+minor)
+	if _, err := os.Stat(base); err != nil {
+		t.Fatalf("the payload must bundle the interpreter at pybase/bin/python%s: %v", minor, err)
+	}
+	if _, err := os.Stat(filepath.Join(art, "payload", "pybase", "lib", "python"+minor, "encodings")); err != nil {
+		t.Fatalf("the payload must bundle the standard library (encodings) under pybase/lib/python%s: %v", minor, err)
+	}
+	// pyvenv.cfg must point the venv at the BUNDLED base at its final /opt path, not the build host's /usr —
+	// that re-binding is what makes the venv independent of the target's own python version.
+	cfg, err := os.ReadFile(filepath.Join(art, "payload", "venv", "pyvenv.cfg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cfg), "home = /opt/svc/pybase/bin") {
+		t.Errorf("the venv must be re-pointed at the bundled base (home = /opt/svc/pybase/bin), got:\n%s", cfg)
+	}
+	if strings.Contains(string(cfg), "home = /usr") {
+		t.Errorf("the venv must NOT still point at the build host's /usr — that is the version-binding bug:\n%s", cfg)
+	}
 }
 
 // A setup-only artifact (a service that ships neither a Go build nor a python declaration) carries NO
