@@ -81,6 +81,33 @@ func TestArtifactBuildFindsMonorepoBundle(t *testing.T) {
 	}
 }
 
+// A service that SHIPS its own first-time setup product (a top-level setup/ dir carrying its unit under
+// its own name) has that product staged verbatim into the artifact — so the installer reads the unit's
+// real name from it rather than computing <repo>.service. No npm/go is needed: the setup/ dir alone is a
+// deliverable the build carries.
+func TestArtifactBuildStagesRepoProvidedSetup(t *testing.T) {
+	unit := "[Unit]\n[Service]\nUser=svc\nExecStart=/opt/svc/bin/svcd --listen 127.0.0.1:8770\n"
+	env, wt := artifactWorkspace(t, map[string]string{
+		"setup/svc-dashboard.service": unit,
+		"setup/svc.caddy":             "handle /api/services/svc/* {\n}\n",
+	})
+	res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt)
+	if res.exit != 0 {
+		t.Fatalf("a repo-provided setup/ must be staged (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	staged := filepath.Join(wt, ".mercury-artifact", "setup", "svc-dashboard.service")
+	got, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatalf("the repo-provided unit must be staged into the artifact setup/: %v\n%s", err, res.out)
+	}
+	if string(got) != unit {
+		t.Errorf("the staged unit must be the repo's own bytes verbatim, got:\n%s", string(got))
+	}
+	if _, err := os.Stat(filepath.Join(wt, ".mercury-artifact", "setup", "svc.caddy")); err != nil {
+		t.Errorf("the whole setup product must travel (route included): %v", err)
+	}
+}
+
 // Task test b: a repository with no package.json and no go.mod (and no ui) is genuinely 'nothing to
 // build' — the message stays, and it must NOT be confused with the built-but-not-found fault below.
 func TestArtifactBuildNothingToBuild(t *testing.T) {

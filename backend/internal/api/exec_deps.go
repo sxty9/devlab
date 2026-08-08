@@ -1164,7 +1164,13 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 			Detail: "artifact installed; the restart is handed over to the root wrapper and fires once the slots are free",
 		}, nil
 	}
-	out, err := deploy.DeliverDev(ctx, deploy.SudoInstaller{}, deploy.LivePorts{}, deploy.DefaultGate(), det, repoShort(repo), artifact)
+	// The port decision keys on the service's OWN unit, whose name is READ FROM THE DELIVERED SETUP
+	// PRODUCT (setup/<name>.service), not computed from the repo name. A service already running under a
+	// divergently named unit thus holds its own port even when no edge route names it (bound-but-unrouted)
+	// — so its port is recognised as its own, not a foreign conflict. Absent a delivered unit the name
+	// falls back to the service id and the behaviour is unchanged.
+	ports := deploy.LivePorts{Unit: deploy.DeliveredUnitName(artifact, det.ID)}
+	out, err := deploy.DeliverDev(ctx, deploy.SudoInstaller{}, ports, deploy.DefaultGate(), det, repoShort(repo), artifact)
 	return executor.DeployOutcome{
 		Installed: out.Installed, Running: out.Running, Port: out.Port, Detail: out.Detail,
 		UI: string(out.UI), UIDetail: out.UIDetail,

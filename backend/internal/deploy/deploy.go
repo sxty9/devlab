@@ -177,6 +177,43 @@ func hasNonconformingCmd(repoDir string) bool {
 	return false
 }
 
+// DeliveredUnitName reads the unit name the delivered setup product carries, mirroring the shell rule
+// in devlab-setup-lib.sh (setup_delivered_unit_name): a service whose unit is legitimately named
+// otherwise ships setup/<name>.service, and the installer reads that name rather than assuming
+// <service>.service. It returns the bare unit name (no ".service"), or "" when the package ships no
+// unit or is ambiguous — in which case the caller falls back to the service id. The precedence:
+// setup/<service>.service (the conventional generated name) wins; else a lone *.service is taken; more
+// than one and none conventional is ambiguous and yields "" (never a guess). This is the Go twin the
+// port source consults so it can recognise the service's OWN unit when deciding a conflict.
+func DeliveredUnitName(artifactDir, service string) string {
+	setup := filepath.Join(artifactDir, "setup")
+	if fi, err := os.Stat(setup); err != nil || !fi.IsDir() {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(setup, service+".service")); err == nil {
+		return service
+	}
+	entries, err := os.ReadDir(setup)
+	if err != nil {
+		return ""
+	}
+	var only string
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if name, ok := strings.CutSuffix(e.Name(), ".service"); ok {
+			count++
+			only = name
+		}
+	}
+	if count != 1 {
+		return ""
+	}
+	return only
+}
+
 // Gap names a repo whose delivery is possible but not yet set up — "delivery not yet set up"
 // is DISTINCT from "no service" and never green (REQ-029). Template repos do not count;
 // excluded never triggers an attempt.

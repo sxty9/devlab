@@ -178,6 +178,56 @@ setup_unit_declares_user() {
   grep -Eq "^[[:space:]]*User[[:space:]]*=[[:space:]]*${repo}[[:space:]]*$" -- "$file"
 }
 
+# setup_delivered_unit_name <setup-dir> <repo> — the unit name the DELIVERED setup product carries, so
+# the installer READS the unit's name from the package instead of ERRECHNET-ing it from the repository
+# name. A service whose unit legitimately differs from its repository (a dashboard whose unit is
+# `<repo>-dashboard.service`) ships that unit in setup/, and this is where its real name is recovered.
+# The rule, in order:
+#   * no setup/ dir, or no *.service in it        → echo nothing → the caller falls back to <repo> (the
+#                                                    unchanged derivation for a package that ships no unit);
+#   * setup/<repo>.service present                → <repo> (the conventional name a uniform service's
+#                                                    generated product carries — unambiguous, wins outright);
+#   * exactly one other *.service                 → that file's stem (the divergent, delivered name);
+#   * more than one and none named <repo>.service → nothing (ambiguous: not a guess, the caller falls back).
+# It echoes the bare unit NAME (no `.service` suffix, the form systemctl and the unit-file path both take).
+setup_delivered_unit_name() {
+  local dir="$1" repo="$2" f count=0 only="" base
+  [ -d "$dir" ] || return 0
+  if [ -f "$dir/$repo.service" ]; then printf '%s' "$repo"; return 0; fi
+  for f in "$dir"/*.service; do
+    [ -e "$f" ] || continue
+    count=$((count + 1)); only="$f"
+  done
+  [ "$count" -eq 1 ] || return 0
+  base="$(basename -- "$only")"
+  printf '%s' "${base%.service}"
+}
+
+# setup_valid_unit_name <unit-name> — the SHAPE gate a DELIVERED unit name must pass before it reaches a
+# systemctl argument or a unit-file path. A unit name may legitimately differ from the repository name
+# (it need not equal it), but it is still a name the installer will hand to systemd and interpolate into
+# /etc/systemd/system/<name>.service, so it must be a safe token: the holistic service grammar widened
+# only to admit the longer, dashed compound names a delivered unit carries (<repo>-dashboard), never a
+# path separator, a traversal, or a systemd-reserved prefix. The deeper safety — that the unit is OURS
+# and runs as our own account — stays with the foreign-unit refusal (setup_unit_state) and the User=
+# check (setup_unit_declares_user); this is only the lexical gate. Prints the reason and returns 1 on a
+# bad name, like setup_valid_repo_name, so each caller keeps its own exit-code contract.
+setup_valid_unit_name() {
+  local name="$1" r
+  [[ "$name" =~ ^[a-z][a-z0-9-]{2,60}$ ]] || { echo "invalid delivered unit name '$name' (want ^[a-z][a-z0-9-]{2,60}\$)" >&2; return 1; }
+  case "$name" in
+    *--* | *-) echo "invalid delivered unit name '$name' (no doubled and no trailing dash)" >&2; return 1 ;;
+    systemd-*) echo "delivered unit name '$name' lies in systemd's own namespace" >&2; return 1 ;;
+  esac
+  for r in $SETUP_RESERVED_REPOS; do
+    if [ "$name" = "$r" ]; then
+      echo "delivered unit name '$name' is reserved (operating-system, package or landscape identity)" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
 # setup_unit_state <unit-name> <own-unit-file> [<systemctl>] — the SHARED first-time-vs-update-vs-foreign
 # decision, asked of SYSTEMD (setup_fragment_path), not of a directory, so a vendor unit under /lib or
 # /usr/lib is visible and refused rather than silently shadowed. It echoes exactly one of:

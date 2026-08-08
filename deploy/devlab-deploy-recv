@@ -317,31 +317,43 @@ case "$REPO" in
     gbin="$real/${REPO}d"
     [[ -f "$gbin" ]] || die "staged binary missing: $gbin (expected <repo>d)" 10
 
+    # The UNIT NAME comes from the DELIVERED setup product, not from the repository name: a service whose
+    # unit is legitimately named otherwise (a dashboard shipping <repo>-dashboard.service) carries that
+    # unit in setup/, and the receiver installs it under THAT name. When the package ships no unit — or the
+    # conventional <repo>.service — the name is <repo> exactly as before. The name is a systemctl argument
+    # and a unit-file path, so a divergent one passes the lexical gate; the deeper guards (foreign unit,
+    # User=<repo>) are unchanged and still bind the unit to this service's own account.
+    SETUP="$real/setup"
+    UNIT_NAME="$(setup_delivered_unit_name "$SETUP" "$REPO")"; [ -n "$UNIT_NAME" ] || UNIT_NAME="$REPO"
+    if [ "$UNIT_NAME" != "$REPO" ]; then
+      setup_valid_unit_name "$UNIT_NAME" || die "refusing delivered unit '$UNIT_NAME' for '$REPO' (name/namespace)" 2
+    fi
+
     # FIRST-TIME vs UPDATE vs FOREIGN is decided by systemd, not by a path (setup_unit_state): the shared
     # decision the self branch below makes too. Our own unit (or one we already installed) → UPDATE. No
     # unit at all → FIRST-TIME. A FOREIGN unit → refuse: we neither shadow nor overwrite a unit that is
-    # not ours (the same refusal devlab-install makes).
-    UNIT_FILE="$UNIT_DIR/${REPO}.service"
-    state="$(setup_unit_state "$REPO" "$UNIT_FILE" "$SYSTEMCTL")" || die "could not ask systemd about ${REPO}.service" 4
+    # not ours (the same refusal devlab-install makes). It asks systemd about the DELIVERED unit name.
+    UNIT_FILE="$UNIT_DIR/${UNIT_NAME}.service"
+    state="$(setup_unit_state "$UNIT_NAME" "$UNIT_FILE" "$SYSTEMCTL")" || die "could not ask systemd about ${UNIT_NAME}.service" 4
     case "$state" in
       first-time) FIRST_TIME=1 ;;
       update)     FIRST_TIME=0 ;;
-      foreign:*)  die "unit ${REPO}.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
-      *)          die "unexpected unit state '$state' for ${REPO}.service" 2 ;;
+      foreign:*)  die "unit ${UNIT_NAME}.service already exists outside this receiver's control (${state#foreign:}) — refusing to shadow or overwrite a foreign unit" 5 ;;
+      *)          die "unexpected unit state '$state' for ${UNIT_NAME}.service" 2 ;;
     esac
 
     if [ "$FIRST_TIME" = 1 ]; then
       # ── FIRST-TIME SETUP — install the DELIVERED unit/route/rights (the receiver erzeugt nichts) ──
-      log "Erstinstallation of '$REPO' — no unit on this host; installing the delivered setup product"
-      SETUP="$real/setup"
-      DELIV_UNIT="$SETUP/${REPO}.service"
+      log "Erstinstallation of '$REPO' — no unit '${UNIT_NAME}.service' on this host; installing the delivered setup product"
+      DELIV_UNIT="$SETUP/${UNIT_NAME}.service"
       [ -d "$SETUP" ] || die "first-time setup of '$REPO' needs a delivered setup/ in the artifact, but none was shipped — the build did not attach the unit (a change without its delivery is a failure)" 10
       [ -f "$DELIV_UNIT" ] || die "first-time setup of '$REPO' has no delivered unit at $DELIV_UNIT" 10
 
       # The delivered unit is NOT trusted blindly (the same three gates devlab-install applies):
-      #  1) the NAME must pass the service grammar + reserved-identity list (shared rule);
+      #  1) the service account NAME must pass the service grammar + reserved-identity list (shared rule);
       #  2) the unit must run as its OWN account — exactly `User=<repo>`, never root, never something else;
       #  3) systemd must not already know a FOREIGN unit under this name (checked above — frag was empty).
+      # The unit's own NAME may diverge from <repo> (validated lexically above); the account may not.
       setup_valid_repo_name "$REPO" || die "refusing first-time setup of '$REPO' (name/namespace)" 2
       setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
         || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
@@ -350,7 +362,7 @@ case "$REPO" in
       DELIV_RIGHTS="$SETUP/${REPO}.json"
 
       if [ "$CHECK" = 1 ]; then
-        echo "PLAN: Erstinstallation of '$REPO' (no unit on this host)"
+        echo "PLAN: Erstinstallation of '$REPO' (no unit ${UNIT_NAME}.service on this host)"
         echo "PLAN: create nologin system account '$REPO' (home /var/lib/$REPO) if missing"
         echo "PLAN: install binary $gbin -> /opt/$REPO/bin/${REPO}d"
         echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
@@ -359,8 +371,8 @@ case "$REPO" in
         [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/$REPO.json + groupadd its hp_* groups" \
                                || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
         setup_plan_secrets "$DELIV_UNIT"
-        echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $REPO && $SYSTEMCTL start $REPO"
-        prove_running "$REPO" "$(setup_unit_listen_port "$DELIV_UNIT")"
+        echo "PLAN: $SYSTEMCTL daemon-reload && $SYSTEMCTL enable $UNIT_NAME && $SYSTEMCTL start $UNIT_NAME"
+        prove_running "$UNIT_NAME" "$(setup_unit_listen_port "$DELIV_UNIT")"
         echo "PLAN: prod deploy of '$REPO' done (first-time setup)"
         exit 0
       fi
@@ -393,19 +405,19 @@ case "$REPO" in
       ensure_secrets_for "$REPO" "$UNIT_FILE"
 
       "$SYSTEMCTL" daemon-reload
-      "$SYSTEMCTL" enable "$REPO" >/dev/null 2>&1 || true
-      "$SYSTEMCTL" start "$REPO"
-      prove_running "$REPO" "$(setup_unit_listen_port "$UNIT_FILE")"
+      "$SYSTEMCTL" enable "$UNIT_NAME" >/dev/null 2>&1 || true
+      "$SYSTEMCTL" start "$UNIT_NAME"
+      prove_running "$UNIT_NAME" "$(setup_unit_listen_port "$UNIT_FILE")"
     else
       # ── UPDATE — the unit already exists: replace the program and restart (today's behaviour) ──
-      log "Aktualisierung of '$REPO' — unit already present; replacing the program and restarting"
+      log "Aktualisierung of '$REPO' — unit '${UNIT_NAME}.service' already present; replacing the program and restarting"
       run install -d -o root -g root -m 0755 "/opt/$REPO/bin"
       run install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
       # Self-heal a host set up before secrets were minted: ensure them (idempotent) before restart, so
       # an update of a service that has been looping on a missing secret can finally stay up.
       ensure_secrets_for "$REPO" "$UNIT_FILE"
-      run "$SYSTEMCTL" restart "$REPO"
-      prove_running "$REPO" "$(setup_unit_listen_port "$UNIT_FILE")"
+      run "$SYSTEMCTL" restart "$UNIT_NAME"
+      prove_running "$UNIT_NAME" "$(setup_unit_listen_port "$UNIT_FILE")"
     fi
     ;;
 esac
