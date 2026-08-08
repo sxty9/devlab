@@ -26,10 +26,21 @@ import (
 // ProdRecord is the standard-branch commit production carries for ONE repository, and when the send
 // that put it there completed. Repo is the ledger's full "owner/repo" name (the same value a
 // Delivery carries), Commit is the full standard-branch SHA that was built and shipped.
+//
+// HostKey is the identity of the production host this record DESCRIBES: the ssh host-key fingerprint
+// the target presented when the send that wrote this record proved it running. A production-state
+// record is a CLAIM about one specific machine, and a machine's ssh host key is its identity — a
+// rebuilt host presents a new key. So a record whose HostKey no longer matches the host currently
+// there is not stale but VOID: a claim about a machine that has been replaced. The pool only HOLDS
+// this identity; whether a record is void is judged on the reading side (the reconciliation that
+// compares it against the host currently there), never here — the pool stays a passive store
+// (Passive Speicher). It is omitempty so a record written before the binding existed carries an empty
+// identity, which the reading side treats as "cannot vouch for this host — measure afresh".
 type ProdRecord struct {
 	Repo       string    `json:"repo"`
 	Commit     string    `json:"commit"`
 	DeployedAt time.Time `json:"deployedAt"`
+	HostKey    string    `json:"hostKey,omitempty"`
 }
 
 // ProdStateStore persists the production-state pool — one record per repository, matched by Repo.
