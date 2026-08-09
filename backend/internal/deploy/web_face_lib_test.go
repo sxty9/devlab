@@ -12,6 +12,7 @@ package deploy
 // packages it refuses BY NAME rather than pass over.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,15 @@ func facePackage(t *testing.T, declare string, withBundle bool) string {
 	return art
 }
 
+// libRun is ONE run of the face half as a wrapper performs it: install the face, then — at the END of
+// the run — state its outcome (setup_install_web + setup_confirm_web). The verdict line belongs to the
+// second call, because what a run installs and then loses again was not installed; the tests therefore
+// read the outcome the way a delivery does, off the end of the run.
+func libRun(art, repo string, plan int) string {
+	arg := fmt.Sprintf("%s %s %d", art, repo, plan)
+	return "setup_install_web " + arg + " && setup_confirm_web " + arg
+}
+
 // DECISIVE: a delivered face IS installed — at the serve root the package declares, not at one derived
 // from the repository name — and it arrives readable by the webserver's role. This is the half whose
 // absence left the landscape dashboard's bundle in the staging directory.
@@ -54,8 +64,7 @@ func TestLibInstallWebInstallsWhereThePackageDeclares(t *testing.T) {
 	root := filepath.Join(host, "holistic", "www")
 	art := facePackage(t, root, true)
 
-	res := sourceLib(t, map[string]string{"DEVLAB_SERVICE_ROOT": host},
-		"setup_install_web "+art+" holistic")
+	res := sourceLib(t, map[string]string{"DEVLAB_SERVICE_ROOT": host}, libRun(art, "holistic", 0))
 	if res.exit != 0 {
 		t.Fatalf("a declared face must install (exit 0), got %d\n%s", res.exit, res.out)
 	}
@@ -146,7 +155,7 @@ func TestLibInstallWebRefusesADeclarationOutsideTheServiceTerritory(t *testing.T
 // "ships no interface" apart from "its interface never arrived".
 func TestLibInstallWebStatesTheAbsentHalf(t *testing.T) {
 	art := facePackage(t, "", false)
-	res := sourceLib(t, nil, "setup_install_web "+art+" prizm")
+	res := sourceLib(t, nil, libRun(art, "prizm", 0))
 	if res.exit != 0 {
 		t.Fatalf("a package without a face is not a fault, got exit %d\n%s", res.exit, res.out)
 	}
@@ -162,8 +171,7 @@ func TestLibInstallWebPlanOnlyJudgesWithoutCopying(t *testing.T) {
 	root := filepath.Join(host, "holistic", "www")
 	art := facePackage(t, root, true)
 
-	res := sourceLib(t, map[string]string{"DEVLAB_SERVICE_ROOT": host},
-		"setup_install_web "+art+" holistic 1")
+	res := sourceLib(t, map[string]string{"DEVLAB_SERVICE_ROOT": host}, libRun(art, "holistic", 1))
 	if res.exit != 0 {
 		t.Fatalf("the plan must judge cleanly, got %d\n%s", res.exit, res.out)
 	}
@@ -176,7 +184,7 @@ func TestLibInstallWebPlanOnlyJudgesWithoutCopying(t *testing.T) {
 
 	// A package the real run would refuse is refused in the plan too, at the same place.
 	bad := facePackage(t, "/etc/caddy", true)
-	if res := sourceLib(t, nil, "setup_install_web "+bad+" holistic 1"); res.exit == 0 {
+	if res := sourceLib(t, nil, libRun(bad, "holistic", 1)); res.exit == 0 {
 		t.Errorf("a plan over an inadmissible declaration must fail like the real run:\n%s", res.out)
 	}
 }

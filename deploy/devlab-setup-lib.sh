@@ -670,6 +670,16 @@ setup_account_retry() {
 # through setup_account_cmd, so a momentarily-locked account database makes it WAIT, not fail.
 setup_ensure_account() {
   local repo="$1"
+  # DIRECT-INVOCATION TEST SEAM (the same one setup_ensure_secrets carries; sudo's env_reset and sshd's
+  # forced command both strip it, so it can never be set in operation): creating an operating-system
+  # account is the one step of an install that no unprivileged process can perform even against a
+  # fixture host, so under the seam the identity step is skipped and SAID to be skipped. It lets a whole
+  # delivery be driven end to end off a production host — which is how "the face survives the run" is
+  # measured on a host rather than read off a report.
+  if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then
+    echo "devlab: (test seam) service account '$repo' not created — unprivileged run against a fixture host" >&2
+    return 0
+  fi
   setup_account_cmd "$repo" setup_ensure_account_locked "$repo" || return 1
   install -d -o "$repo" -g "$repo" -m 0755 "/var/lib/$repo"
 }
@@ -1053,22 +1063,22 @@ setup_valid_web_root() {  # <root> <repo>
   return 1
 }
 
-# setup_install_web <artifact-dir> <repo> [<plan-only>] — install the delivered face, and STATE the
-# outcome. THE ONE path both the dev installer and the production receiver take, so a face arrives on a
-# workbench and on a production host by the identical rule and neither can grow a second one.
+# setup_install_web <artifact-dir> <repo> [<plan-only>] — install the delivered face. THE ONE path both
+# the dev installer and the production receiver take, so a face arrives on a workbench and on a
+# production host by the identical rule and neither can grow a second one.
 #
-# It reports on a single machine-readable line, the twin of the `MERCURY-UI:` line the dashboard half
-# reports on, so a delivery names BOTH halves of a service's interface instead of inferring one from the
-# other's silence:
-#   MERCURY-WEB: none                  the package ships no face and declares none
-#   MERCURY-WEB: installed | <root>    the face is on this host, proven readable by the webserver
-#   MERCURY-WEB: planned   | <root>    <plan-only>=1: everything judged, nothing copied
+# IT DOES NOT STATE SUCCESS. The verdict belongs to the END of the run and is spoken there
+# (setup_confirm_web): a face that is copied here and gone by the time the run finishes was not
+# installed, whatever this step saw. What this step does state is a REFUSAL, at the point it refuses:
 #   MERCURY-WEB: failed                with the named reason on stderr; the function returns 1 and the
 #                                      caller fails the install with ITS OWN exit code
 # The three faults it refuses are all incomplete packages, never silent skips: a face without a
 # declaration, a declaration without a face, and a declaration outside the service's own territory. A
 # service that ships a face which never reaches its host is an INCOMPLETE DELIVERY — the very state this
-# reporting exists to end — so it is never a warning beside a green result.
+# reporting exists to end — so it is never a warning beside a green result. It refuses BEFORE it copies,
+# and it is called BEFORE the program half, so an incomplete package changes as little as possible on the
+# host before it fails. That ordering is about failing early — it is NOT what keeps the face alive; that
+# is the program copy's own boundary (setup_install_program), which holds whenever and wherever it runs.
 #
 # After the copy the tree is made readable BY ITS PUBLIC ROLE and that readability is PROVEN
 # (setup_serve_root_readable / setup_serve_root_check): a face the webserver cannot read is a 404 over a
@@ -1079,7 +1089,7 @@ setup_install_web() {  # <artifact-dir> <repo> [<plan-only>]
   [ -d "$art/web" ] && have_web=1
   root="$(setup_read_web_root "$art")"
   if [ "$have_web" = 0 ] && [ -z "$root" ]; then
-    echo "MERCURY-WEB: none"; return 0
+    return 0
   fi
   if [ -z "$root" ]; then
     echo "MERCURY-WEB: failed"
@@ -1096,7 +1106,6 @@ setup_install_web() {  # <artifact-dir> <repo> [<plan-only>]
   fi
   if [ "$plan" = 1 ]; then
     echo "PLAN: install the delivered face $art/web -> the serve root the package declares ($root), make it readable by its public role, and PROVE the webserver can read its start page — else fail the delivery BENANNT"
-    echo "MERCURY-WEB: planned | $root"
     return 0
   fi
   if ! mkdir -p -- "$root"; then
@@ -1119,5 +1128,139 @@ setup_install_web() {  # <artifact-dir> <repo> [<plan-only>]
     echo "the delivered face of '$repo' did not become servable at '$root': $reason" >&2
     return 1
   fi
+}
+
+# setup_confirm_web <artifact-dir> <repo> [<plan-only>] — THE VERDICT ON THE FACE, spoken at the END of
+# the run. This is the ONE line a reader (and the delivery chain) takes the outcome from:
+#   MERCURY-WEB: none                  the package ships no face and declares none
+#   MERCURY-WEB: installed | <root>    the face is on this host AT THE END of the run, proven readable
+#   MERCURY-WEB: planned   | <root>    <plan-only>=1: everything judged, nothing copied
+#   MERCURY-WEB: failed                (from setup_install_web, at the point it refuses the package)
+# Exactly one such line is written per run: either the refusal where the package was refused, or this
+# verdict at the end.
+#
+# WHY IT IS SPOKEN HERE AND NOT AT THE COPY. "Installed" used to be reported the moment the bytes were
+# copied — and the very next step of the same run deleted them again: the program half of a python-app
+# copied its payload over the whole service directory with `rsync --delete`, which removed the face that
+# had just been laid beside it. The host then had no start page, the instance root answered 503, and the
+# delivery was booked as a success (measured on production 2026-08-09: `MERCURY-WEB: installed |
+# /opt/holistic/www` while /opt/holistic held nothing but pybase and venv). A verdict about a moment is
+# not a verdict about the delivery. What is not there when the run ends was not installed — so the same
+# proof the copy already ran (setup_serve_root_check: the start page exists AND an unprivileged reader
+# can read it) is REPEATED here, over the END state, and only that repetition may say "installed".
+#
+# It re-reads the package's own declaration rather than being handed a path, so it judges the same fact
+# by the same rule as the copy did and cannot be told a different serve root than the one that was used.
+setup_confirm_web() {  # <artifact-dir> <repo> [<plan-only>]
+  local art="$1" repo="$2" plan="${3:-0}" root have_web=0 reason
+  [ -d "$art/web" ] && have_web=1
+  root="$(setup_read_web_root "$art")"
+  if [ "$have_web" = 0 ] && [ -z "$root" ]; then
+    echo "MERCURY-WEB: none"; return 0
+  fi
+  if [ "$plan" = 1 ]; then
+    echo "MERCURY-WEB: planned | $root"; return 0
+  fi
+  if ! reason="$(setup_serve_root_check "$root" 2>&1)"; then
+    echo "MERCURY-WEB: failed"
+    echo "the delivered face of '$repo' is NOT at its serve root '$root' now that the run has finished: $reason" >&2
+    echo "it was installed earlier in this run and did not survive it — something else in the same run removed it. A face that is gone when the run ends was not installed, so this delivery is incomplete and fails." >&2
+    return 1
+  fi
   echo "MERCURY-WEB: installed | $root"
+}
+
+# ── THE PROGRAM: A COPY THAT CLEANS UP AFTER ITSELF, AND AFTER NOBODY ELSE ────────────────────────
+# A service directory (/opt/<repo>) is not the program's private property: the program lives in it, and
+# so does the service's own face, at the serve root the package declares (/opt/<repo>/www by the serve
+# convention). The python-app program install copied its payload there with `rsync -a --delete`, which
+# removes everything on the receiving side that the payload does not carry — and the payload carries no
+# face. So the delivery installed the interface and deleted it again in the same run, and reported
+# success both times (measured on production 2026-08-09).
+#
+# THE RULE, and it is ONE rule for every build kind: the program's copy touches only what belongs to the
+# PROGRAM. What another half of the same service owns inside that directory is kept out of the copy
+# entirely — not deleted from and not written into — by name, derived from that half's own declaration
+# and never from a fixed list of directory names. The delete itself is NOT weakened: everything the
+# previous payload left and the new one no longer carries still goes, so a shrinking program still
+# cleans up after itself.
+#
+# The alternative — installing the program first and the face after it — was rejected: it leaves the
+# boundary violated and merely arranges for the damage to be repaired afterwards, so any run, any host
+# and any future caller that installs only the program destroys the face again. A boundary that must be
+# remembered at every call site is a boundary that will be crossed again.
+
+# setup_program_keepouts <artifact-dir> <repo> <dest> — the paths INSIDE the program's destination that
+# belong to ANOTHER half of the same service, one per line, relative to <dest>. Today exactly one half
+# can live there: the service's own face, at the serve root its package declares. A declaration that is
+# not admissible is not honoured here either — the face half refuses the package by name before the
+# program is ever copied (setup_install_web), and a keepout derived from a rejected declaration would
+# quietly let a package name a directory it may not own.
+setup_program_keepouts() {  # <artifact-dir> <repo> <dest>
+  local art="$1" repo="$2" dest="$3" root rel
+  root="$(setup_read_web_root "$art")"
+  [ -n "$root" ] || return 0
+  setup_valid_web_root "$root" "$repo" >/dev/null 2>&1 || return 0
+  case "$root/" in
+    "$dest"/*) rel="${root#"$dest"/}"; [ -n "$rel" ] && printf '%s\n' "$rel" ;;
+  esac
+  return 0
+}
+
+# setup_install_program <artifact-dir> <repo> <kind> [<plan-only>] — install the prebuilt program per its
+# DECLARED build kind. THE ONE program install both the dev installer and the production receiver take,
+# so the two hosts cannot drift on what a program install may remove. It is a pure copy of already-built
+# bytes; neither host ever builds. <plan-only>=1 states the plan and copies nothing.
+#
+#   go-daemon   the single prebuilt <repo>d, installed into the program's own directory /opt/<repo>/bin.
+#   python-app  the prebuilt payload tree (a --copies virtualenv + the bundled interpreter + the app),
+#               copied verbatim to /opt/<repo> — the prefix the venv's shebangs and the delivered unit's
+#               ExecStart were built against, which is why the payload is not moved into a subdirectory
+#               of its own: that path is named in the SERVICE's repository, not in this one.
+#               --safe-links drops any symlink escaping the payload, so a crafted link cannot make root
+#               expose a foreign file under the service tree; --delete removes what a previous payload
+#               left behind, BOUNDED by the keepouts above; a+rX then makes the tree readable and
+#               traversable for the unit's own service account (User=<repo>, not root), which did not
+#               build it — the same public-by-role rule the serve root follows.
+setup_install_program() {  # <artifact-dir> <repo> <kind> [<plan-only>]
+  local art="$1" repo="$2" kind="$3" plan="${4:-0}" dest bin payload rel keep=() kept=""
+  dest="$SETUP_SERVICE_ROOT/$repo"
+  # Ownership: root owns what it installs. The DIRECT-INVOCATION test seam drops the flags so a whole
+  # install can be driven unprivileged against a fixture host (sudo's env_reset and sshd's forced
+  # command both strip it, so it can never be set in operation).
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    # The program's copy LEAVES THAT DIRECTORY ALONE, in both directions: rsync neither deletes what
+    # stands there (an excluded path is exempt from --delete — that is what saves the face) nor writes
+    # anything of its own into it (a payload that happened to carry files at that path would otherwise
+    # overwrite the face right after it was installed, which is the same fault from the other side).
+    keep+=("--filter=- /$rel/***")
+    kept="${kept:+$kept, }$dest/$rel"
+  done < <(setup_program_keepouts "$art" "$repo" "$dest")
+  case "$kind" in
+    go-daemon)
+      bin="$art/${repo}d"
+      if [ "$plan" = 1 ]; then
+        echo "PLAN: install binary $bin -> $dest/bin/${repo}d (the program's own directory; nothing outside it is removed)"
+        return 0
+      fi
+      install -d "${own[@]}" -m 0755 "$dest/bin"
+      install "${own[@]}" -m 0755 "$bin" "$dest/bin/${repo}d"
+      ;;
+    python-app)
+      payload="$art/payload"
+      if [ "$plan" = 1 ]; then
+        echo "PLAN: copy prebuilt payload $payload/ -> $dest/ (rsync --delete --safe-links + chmod a+rX; this host never builds)${kept:+ — the delete stops at what another half of '$repo' owns: $kept}"
+        return 0
+      fi
+      install -d "${own[@]}" -m 0755 "$dest"
+      rsync -a --delete --safe-links ${keep[@]+"${keep[@]}"} "$payload/" "$dest/" || return 1
+      chmod -R a+rX "$dest"
+      ;;
+    *)
+      echo "setup_install_program: unknown build kind '$kind' (known: $SETUP_BUILD_KINDS)" >&2
+      return 1
+      ;;
+  esac
 }
