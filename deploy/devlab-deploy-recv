@@ -244,6 +244,19 @@ case "$REPO" in
     run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
     run mkdir -p "$WWW_DIR"
     run rsync -a --delete "$WEB"/ "$WWW_DIR"/
+    # THE SERVED FACE IS READABLE BY THE EDGE, NOT BY THE BUILD ACCOUNT. `rsync -a` above carries the
+    # SOURCE's owner and mode, and the source is the artifact built on the workbench under the
+    # unprivileged build account — so on a freshly provisioned host the web root arrived drwxr-x--- /
+    # uid 1001 and the edge (a different account) answered 404 over a present page. The serving side sets
+    # the public-by-role readability (a+rX), symmetric to the a+rX the program install gives /opt/<repo>,
+    # never the account that happened to build (setup_serve_root_readable) — then PROVE the edge can read
+    # the start page, so a served tree it cannot read is a FAILED delivery named here, not a silent 404.
+    if [ "$CHECK" = 1 ]; then
+      echo "PLAN: make the served web root $WWW_DIR readable by the edge's role (a+rX; symmetric to /opt/<repo>), then PROVE the edge account can read $WWW_DIR/index.html — else fail the delivery BENANNT"
+    else
+      setup_serve_root_readable "$WWW_DIR"
+      serve_reason="$(setup_serve_root_check "$WWW_DIR" 2>&1)" || die "prod web delivery of 'devlab' failed: $serve_reason" 11
+    fi
 
     if [ "$SELF_FIRST" = 1 ]; then
       # ── FIRST-TIME SETUP of devlab — install the DELIVERED unit/route/rights (the receiver erzeugt

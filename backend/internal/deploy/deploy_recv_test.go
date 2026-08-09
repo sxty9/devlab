@@ -123,7 +123,10 @@ func TestRecvSelfFirstTimeWhenUnitMissing(t *testing.T) {
 		// the instance secret the delivered unit demands is minted on THIS host
 		"mint instance secret 'jwt-secret'",
 		// restarted through the EXISTING self restart, and proven to STAY up holding its fixed port
-		"restart devlabd", "STAYS up", "(:8781)"} {
+		"restart devlabd", "STAYS up", "(:8781)",
+		// the served web root is made readable by the EDGE's role (a+rX) and PROVEN readable — else the
+		// edge answers 404 over a present page on a freshly built host (the build account's group-only mode)
+		"readable by the edge's role", "PROVE the edge account can read"} {
 		if !strings.Contains(res.out, want) {
 			t.Errorf("first-time self setup plan must mention %q:\n%s", want, res.out)
 		}
@@ -145,6 +148,11 @@ func TestRecvSelfUpdateWhenUnitPresent(t *testing.T) {
 	}
 	if !strings.Contains(res.out, "Aktualisierung of 'devlab'") || !strings.Contains(res.out, "restart devlabd") {
 		t.Errorf("a renewal must be named and plan the restart:\n%s", res.out)
+	}
+	// A renewal replaces the web too, so it also makes the served root readable by the edge's role and
+	// proves it — the fix must not be limited to the first-time branch.
+	if !strings.Contains(res.out, "readable by the edge's role") || !strings.Contains(res.out, "PROVE the edge account can read") {
+		t.Errorf("a renewal must also make the served web root readable by the edge and prove it:\n%s", res.out)
 	}
 	if strings.Contains(res.out, "Erstinstallation") || strings.Contains(res.out, "install delivered unit") {
 		t.Errorf("a renewal must NOT set up a unit:\n%s", res.out)

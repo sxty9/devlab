@@ -651,7 +651,13 @@ if [ "$REPO" = "$SELF_REPO" ]; then
   run install -o root -g root -m 0755 "$BIN" "/usr/local/bin/${SELF_UNIT}"
   run install -d -m 0755 "$STATE_DIR/www"
   run rsync -a --delete "$WEB/" "$STATE_DIR/www/"
-  log "self install done (binary + web); running process keeps its loaded image"
+  # The self web is a SERVE ROOT like the dashboard's: `rsync -a` above carries the artifact's owner and
+  # mode (built under the unprivileged runner's umask), so the served tree is made readable by its PUBLIC
+  # ROLE — never by the account that built it — exactly as the production receiver and serve_dashboard do
+  # (the ONE shared rule, setup_serve_root_readable). Without this the edge answers 404 over a present
+  # start page on a host whose www root never carried serving permissions from an earlier era.
+  run setup_serve_root_readable "$STATE_DIR/www"
+  log "self install done (binary + web, served readable by role); running process keeps its loaded image"
 
   # Keep devlabd's OWN unit current from the delivered, checked-in copy, so a SECURITY directive the unit
   # template gained reaches a devlabd that was installed before it. A self UPDATE otherwise replaces only
@@ -982,39 +988,27 @@ wire_ui_copy() {  # <src> <dst>
 # page that was present. A serve root is not a private directory: it is public by role, because the
 # browser fetches every byte of it. So after the copy the permissions are DERIVED FROM THAT ROLE —
 # directories betretbar, files lesbar for every reader (`a+rX`) — regardless of who built or under which
-# umask. World-read (rather than adding the webserver to a group) needs no knowledge of the webserver's
-# account, which is instance configuration this template does not and should not carry; it makes the
-# tree reachable for ANY webserver identity.
+# umask. The role rule itself lives once in the shared library (setup_serve_root_readable), used by every
+# serve-root copy — this dashboard serve, the self web above, and the production receiver's web root — so
+# none can drift.
 serve_dashboard() {  # <built-bundle-dir> <serve-root>
   install -d -m 0755 "$2"
   rsync -a --delete "$1/" "$2/"
-  chmod -R a+rX "$2"
+  setup_serve_root_readable "$2"
 }
 
 # serve_readable proves the delivered serve root is actually reachable by the webserver — point (2):
 # a delivery whose result the webserver cannot read is NOT complete and must say so, never a silent
 # green (F10 — proven, not assumed; the honesty rule the caller already enforces on the program half).
-# The webserver's account is INSTANCE configuration this template does not carry, so we prove the ROLE
-# property that makes the page readable for every possible account: an unprivileged reader with no
-# special rights can read the start page. Running as root (production, via sudo) we DROP to `nobody` —
-# the nologin account present on every host — and read index.html: if `nobody` can read it, the
-# webserver can too, whatever its account. Without root (the direct-invocation test seam, id != 0, where
-# no privilege drop is possible) we check the same property on the mode bits: the other-read bit must be
-# set. Either way a serve root the webserver could not read fails BENANNT.
-# It echoes the named reason to stderr and RETURNS non-zero (it does not die), so each caller decides
-# what to report first — the real path prints `MERCURY-UI: failed` before failing, the --check
-# simulation only records the outcome.
+# The proof itself is the shared setup_serve_root_check (the ONE place that role check lives, used by the
+# production receiver too); this wrapper only prefixes the reason with this tool's name so a failure that
+# surfaces in the caller's log names where it came from. It RETURNS non-zero (does not die), so each
+# caller decides what to report first — the real path prints `MERCURY-UI: failed` before failing, the
+# --check simulation only records the outcome.
 serve_readable() {  # <serve-root>  → 0 if the webserver can read the start page, else 1 (reason on stderr)
-  local index="$1/index.html"
-  [ -f "$index" ] || { echo "devlab-install: error: serve root $1 has no index.html after delivery — the browser has no start page to fetch (delivery incomplete)" >&2; return 1; }
-  if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null 2>&1 && getent passwd nobody >/dev/null 2>&1; then
-    runuser -u nobody -- test -r "$index" && return 0
-    echo "devlab-install: error: the delivered start page $index is NOT readable by an unprivileged reader ('nobody') — the webserver would answer 404 over a present page; the serve root's permissions do not match its public role (delivery incomplete)" >&2
-    return 1
-  fi
-  local mode; mode="$(stat -c %a "$index" 2>/dev/null || echo 0)"
-  [ "$(( 8#${mode:-0} & 4 ))" = 4 ] && return 0
-  echo "devlab-install: error: the delivered start page $index lacks other-read (mode $mode) — the webserver could not read it (delivery incomplete)" >&2
+  local reason
+  reason="$(setup_serve_root_check "$1" 2>&1)" && return 0
+  echo "devlab-install: error: $reason" >&2
   return 1
 }
 
