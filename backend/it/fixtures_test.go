@@ -193,6 +193,12 @@ func seedGitRepo(r *gitRepo, shape string) error {
 	if shape != "library" {
 		files["service"] = "#!/usr/bin/env bash\n# the uniform service CLI\nexit 0\n"
 	}
+	// The one shape that PROVES it delivers nothing. Detection judges the declaration before it looks
+	// for a daemon, so this repository is excluded by right — evidenced, and therefore legitimately
+	// silent. It is what the "library" shape is NOT: that one merely says nothing at all.
+	if shape == "excluded" {
+		files["holistic-service.json"] = "{\"deliver\": false}\n"
+	}
 	for rel, body := range files {
 		p := filepath.Join(seed, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -354,8 +360,17 @@ func (d *fixtureDeps) repoLocked(name string) *fixtureRepo {
 
 // libraryRepo registers a repository whose LAYOUT is a library — no deliverable daemon. The
 // detection then attests that from the repository itself (K-4).
+// libraryRepo seeds a repository that says NOTHING: no service CLI, no daemon, no declaration. Detection
+// calls this UNDECLARED — a deficiency, not a property — so it buys no skip.
 func (d *fixtureDeps) libraryRepo(name string) *fixtureRepo {
 	d.world.shape(name, "library")
+	return d.repo(name)
+}
+
+// excludedRepo seeds a repository that DECLARES deliver:false. That declaration is the proof an absence
+// cannot supply, so its stages are legitimately not-applicable.
+func (d *fixtureDeps) excludedRepo(name string) *fixtureRepo {
+	d.world.shape(name, "excluded")
 	return d.repo(name)
 }
 

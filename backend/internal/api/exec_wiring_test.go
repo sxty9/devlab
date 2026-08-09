@@ -434,7 +434,7 @@ func TestRedeliverOutcomeIsHonest(t *testing.T) {
 		err  error
 		want string // "" = nil, otherwise a substring the error must name
 	}{
-		{"a library has nothing to re-deliver", executor.DeployOutcome{}, deploy.ErrNotAService, ""},
+		{"an undeclared repository is NOT quietly nothing-to-do", executor.DeployOutcome{}, deploy.ErrUndeclared, "neither delivers nor declares itself"},
 		{"an excluded repository is not delivered", executor.DeployOutcome{}, deploy.ErrExcluded, ""},
 		{"the pristine template is never delivered", executor.DeployOutcome{}, deploy.ErrTemplateRepo, ""},
 		{"a build failure surfaces", executor.DeployOutcome{}, errors.New("artifact build failed"), "artifact build failed"},

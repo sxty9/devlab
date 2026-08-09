@@ -68,9 +68,13 @@ type Outcome struct {
 // Honest no-attempt reasons: these repos are never installed, and the caller can prove WHY
 // (not-applicable only with evidence, REQ-031.3).
 var (
-	ErrExcluded      = errors.New("deploy: excluded by declaration (deliver:false) — no delivery attempt")
-	ErrNotAService   = errors.New("deploy: not a service — nothing to deliver")
-	ErrTemplateRepo  = errors.New("deploy: the pristine service template is never delivered")
+	ErrExcluded     = errors.New("deploy: excluded by declaration (deliver:false) — no delivery attempt")
+	ErrTemplateRepo = errors.New("deploy: the pristine service template is never delivered")
+	// ErrUndeclared is NOT an honest no-attempt reason and deliberately does not sit with the ones above:
+	// it is a DEFICIENCY. The repository neither delivers nor declares that it delivers nothing, so
+	// "nothing to deliver" would be a claim about it that nobody has proven. It is named and failed
+	// instead of passed over — the silence that let a whole service stay out of production unnoticed.
+	ErrUndeclared    = errors.New("deploy: the repository neither delivers nor declares itself — declare deliver:false in " + DeclarationFileName + " to exclude it, or give it the ./service CLI or cmd/<id>d daemon the shared structure expects")
 	ErrNonconforming = errors.New("deploy: repo does not conform to the shared service structure (Code-Struktur violation) — no special path exists")
 
 	// ErrIDMismatch names the split the install wrapper itself cannot see. The wrapper derives the
@@ -93,8 +97,8 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 	switch d.Kind {
 	case KindExcluded:
 		return Outcome{Detail: d.Evidence}, ErrExcluded
-	case KindLibrary:
-		return Outcome{Detail: d.Evidence}, ErrNotAService
+	case KindUndeclared:
+		return Outcome{Detail: d.Evidence}, fmt.Errorf("%w: %s", ErrUndeclared, d.Evidence)
 	case KindTemplate:
 		return Outcome{Detail: d.Evidence}, ErrTemplateRepo
 	case KindNonconforming:

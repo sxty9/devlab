@@ -276,11 +276,12 @@ func TestEvidenceFreeSkipIsRefusedAndAttestedSkipIsAccepted(t *testing.T) {
 	// detection has.
 	mute := e.deps.repo("mute")
 	mute.detection = &executor.Detection{Kind: "excluded", Evidence: ""}
-	// A repository whose LAYOUT attests it: no deliverable daemon anywhere.
-	e.deps.libraryRepo("libonly")
+	// A repository whose DECLARATION attests it: holistic-service.json says deliver:false. A layout with
+	// no daemon would NOT do — that is an absence, and an absence proves nothing (see the test below).
+	e.deps.excludedRepo("declared")
 
 	e.addTodo("run_mute", "skip without evidence", "mute")
-	e.addTodo("run_lib", "skip with evidence", "libonly")
+	e.addTodo("run_lib", "skip with evidence", "declared")
 	e.boot(ctx)
 
 	code, body := e.post("/api/mercury/runs/run_mute/run", map[string]any{})
@@ -323,18 +324,53 @@ func TestEvidenceFreeSkipIsRefusedAndAttestedSkipIsAccepted(t *testing.T) {
 	mustJSON(t, body, &libOut)
 	e.waitPhase(libOut.ExecutionID, model.PhaseCompleted)
 
-	libStages := e.stagesOf(libOut.ExecutionID, "libonly")
-	assertAllTerminal(t, "libonly", libStages)
+	libStages := e.stagesOf(libOut.ExecutionID, "declared")
+	assertAllTerminal(t, "declared", libStages)
 	libDev := stageNamed(t, libStages, model.StageDeliverDev)
 	if libDev.State != model.StepNotApplicable {
-		t.Errorf("the library repository's deliver-dev is %s, want not-applicable (%s)", libDev.State, libDev.Reason)
+		t.Errorf("the declared repository's deliver-dev is %s, want not-applicable (%s)", libDev.State, libDev.Reason)
 	}
-	if libDev.Evidence == "" || !strings.Contains(libDev.Evidence, "library") {
-		t.Errorf("the skip is not attested by the repository: %q", libDev.Evidence)
+	if libDev.Evidence == "" || !strings.Contains(libDev.Evidence, "deliver:false") {
+		t.Errorf("the skip is not attested by the repository's own declaration: %q", libDev.Evidence)
 	}
 	// not-applicable lets the chain run on (REQ-030.4): the delivery still happens.
 	if pr := stageNamed(t, libStages, model.StagePullRequest); pr.State != model.StepExecuted {
 		t.Errorf("a not-applicable stage stopped the chain: pull-request is %s (%s)", pr.State, pr.Reason)
+	}
+}
+
+// The third state, and the one that cost seven days: a repository that neither delivers nor declares
+// itself buys NO skip. It used to be classified a "library" purely because nothing was found in it, and
+// every stage then passed over it with that as its attested reason — so a service whose implementation
+// simply had not landed yet was indistinguishable from one that was never meant to run, and its absence
+// from production went unnoticed.
+//
+// "Nicht anwendbar" may only follow from a PROVEN property of the thing; the lack of an installation is
+// not such a property but a deficiency. So the stage must APPLY here — whatever it then reports, it may
+// not report that the repository was legitimately passed over.
+func TestUndeclaredRepositoryBuysNoSkip(t *testing.T) {
+	e := newEnv(t, sched.Config{Tick: 20 * time.Millisecond})
+	ctx := e.ctx
+
+	// No service CLI, no daemon, and no declaration either way: the repository has said nothing.
+	e.deps.libraryRepo("silent")
+	e.addTodo("run_silent", "a repository that never said what it is", "silent")
+	e.boot(ctx)
+
+	code, body := e.post("/api/mercury/runs/run_silent/run", map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("POST silent: %d %s", code, body)
+	}
+	var out model.StartOutcome
+	mustJSON(t, body, &out)
+	e.waitEnded(out.ExecutionID)
+
+	stages := e.stagesOf(out.ExecutionID, "silent")
+	assertAllTerminal(t, "silent", stages)
+	dev := stageNamed(t, stages, model.StageDeliverDev)
+	if dev.State == model.StepNotApplicable {
+		t.Errorf("an undeclared repository was passed over as not-applicable (%q) — silence is not a proven "+
+			"property, and treating it as one is what kept a missing service off the books", dev.Evidence)
 	}
 }
 

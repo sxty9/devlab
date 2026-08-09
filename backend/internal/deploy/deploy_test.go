@@ -75,14 +75,40 @@ func TestDetectServiceByDaemonLayout(t *testing.T) {
 	}
 }
 
-func TestDetectLibrary(t *testing.T) {
+// A repository that says NOTHING is UNDECLARED, not a library. Calling it a library reads a property
+// off an absence, and that is the silence a whole missing service hid behind for seven days. The
+// evidence must name what is missing AND the one line that ends it.
+func TestDetectUndeclared(t *testing.T) {
 	dir := mkRepo(t, map[string]string{"go.mod": "module example.invalid/lib\n", "lib.go": "package lib\n"})
 	d, err := Detect(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Kind != KindLibrary || d.Evidence == "" {
-		t.Fatalf("got %+v, want an evidenced library", d)
+	if d.Kind != KindUndeclared {
+		t.Fatalf("got %+v, want undeclared — a repository that neither delivers nor declares itself", d)
+	}
+	if !strings.Contains(d.Evidence, "neither delivers nor declares itself") {
+		t.Errorf("the evidence must name the absence itself: %q", d.Evidence)
+	}
+	if !strings.Contains(d.Evidence, "deliver:false") {
+		t.Errorf("the evidence must name the remedy that buys silence by right: %q", d.Evidence)
+	}
+}
+
+// The counterpart, and the whole point of the distinction: the SAME repository that says deliver:false
+// IS proven to deliver nothing, and is excluded — evidenced, and silent by right.
+func TestDetectUndeclaredBecomesExcludedByOneDeclaration(t *testing.T) {
+	dir := mkRepo(t, map[string]string{
+		"go.mod":                "module example.invalid/lib\n",
+		"lib.go":                "package lib\n",
+		"holistic-service.json": `{"deliver": false}`,
+	})
+	d, err := Detect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Kind != KindExcluded {
+		t.Fatalf("got %+v, want excluded — the declaration is the proof an absence cannot supply", d)
 	}
 }
 
@@ -149,7 +175,7 @@ func TestFindGapsDistinguishesStates(t *testing.T) {
 	dets := map[string]Detection{
 		"svc-new":   {Kind: KindService, ID: "svc-new", Evidence: "./service CLI (template convention)"},
 		"svc-live":  {Kind: KindService, ID: "svc-live", Evidence: "./service CLI (template convention)"},
-		"lib":       {Kind: KindLibrary, Evidence: "no ./service CLI and no cmd/<id>d daemon — nothing to deliver"},
+		"lib":       {Kind: KindUndeclared, Evidence: "neither delivers nor declares itself"},
 		"template":  {Kind: KindTemplate, Evidence: "pristine service template"},
 		"opted-out": {Kind: KindExcluded, Evidence: "declares deliver:false"},
 		"weird":     {Kind: KindNonconforming, Evidence: "declaration present, but nothing conforms"},
@@ -175,7 +201,15 @@ func TestFindGapsDistinguishesStates(t *testing.T) {
 	if _, ok := byRepo["weird"]; !ok {
 		t.Errorf("a nonconforming repo is reported as a violation: %+v", gaps)
 	}
-	for _, repo := range []string{"svc-live", "lib", "template", "opted-out"} {
+	// An undeclared repository IS a gap: nothing about it has been proven, and only proof buys silence.
+	if g, ok := byRepo["lib"]; !ok {
+		t.Errorf("an undeclared repo must be reported, never passed over: %+v", gaps)
+	} else if !strings.Contains(g.Detail, "nothing is proven") {
+		t.Errorf("the gap must say what is missing — proof, not a daemon: %q", g.Detail)
+	}
+	// These three rest on evidence (routed and live; the pristine template; a declared deliver:false),
+	// and evidence is exactly what makes silence legitimate.
+	for _, repo := range []string{"svc-live", "template", "opted-out"} {
 		if _, ok := byRepo[repo]; ok {
 			t.Errorf("%s must not be a gap: %+v", repo, byRepo[repo])
 		}
@@ -237,10 +271,11 @@ func TestDeliverDevExcludedNeverAttempts(t *testing.T) {
 	}
 }
 
-// Libraries and the template are refused with their evidence — no attempt either.
+// The template is refused with its evidence, and an undeclared repository FAILS BY NAME — no attempt
+// in either case, but only one of the two is a proven property.
 func TestDeliverDevNonServicesRefused(t *testing.T) {
 	for kind, want := range map[Kind]error{
-		KindLibrary:       ErrNotAService,
+		KindUndeclared:    ErrUndeclared,
 		KindTemplate:      ErrTemplateRepo,
 		KindNonconforming: ErrNonconforming,
 	} {

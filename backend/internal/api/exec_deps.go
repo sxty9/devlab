@@ -1256,9 +1256,18 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 				"state from the holistic checkout and ship its built bundle over this send once the receiver installs it", repo)
 	}
 	switch det.Kind {
-	case deploy.KindLibrary, deploy.KindExcluded, deploy.KindTemplate:
+	case deploy.KindExcluded, deploy.KindTemplate:
+		// NotApplicable states a PROVEN property, and these two carry one: the repository DECLARES
+		// deliver:false, or it is the pristine template. The evidence attests it, so production genuinely
+		// does not apply and the delivery settles.
 		return deliver.ProdOutcome{NotApplicable: true, Evidence: det.Evidence, Commit: shipped,
 			Detail: "not a service — nothing to run in production"}, nil
+	case deploy.KindUndeclared:
+		// Deliberately NOT settled as not-applicable. Nothing has been proven about this repository, and
+		// "nothing to run in production" would be a property claimed from an absence — precisely the
+		// silence that kept a missing service off the books. It is reported as the deficiency it is.
+		return deliver.ProdOutcome{Detail: det.Evidence},
+			fmt.Errorf("%w: %s", deploy.ErrUndeclared, det.Evidence)
 	case deploy.KindNonconforming:
 		return deliver.ProdOutcome{Detail: det.Evidence},
 			fmt.Errorf("%w: %s", deploy.ErrNonconforming, det.Evidence)
