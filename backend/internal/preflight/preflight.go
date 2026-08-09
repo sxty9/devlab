@@ -142,8 +142,19 @@ func Derive(ctx context.Context, src Sources, repo string, run runs.Run) (Findin
 		f.Evidence = append(f.Evidence,
 			fmt.Sprintf("this task's branch is ahead of the default branch @%s; no delivery of it is recorded", short(head)))
 	case merged != nil:
+		// "Already delivered?" is a question about the WORK, not the run id. The merged delivery met
+		// the todo AS IT STOOD then; if the todo's text has since grown or changed to demand new work,
+		// that added demand is not delivered and the todo is not delivered either (REQ-020 D-e). The
+		// stand delivered is recorded on the delivery, so the comparison reads the content, not a flag.
+		if grown, why := runs.RequirementDemandsNewWork(merged.Requirement, run.Title, run.Task); grown {
+			f.State = model.TaskNotImplemented
+			f.Evidence = append(f.Evidence, fmt.Sprintf(
+				"an earlier stand was delivered (delivery %s merged at %s), but %s — the added demand is not delivered",
+				merged.ID, merged.MergedAt.UTC().Format(time.RFC3339), why))
+			break
+		}
 		f.State = model.TaskDelivered
-		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s",
+		f.Evidence = append(f.Evidence, fmt.Sprintf("delivery %s merged at %s; the todo text still asks for exactly this work (editorial edits aside)",
 			merged.ID, merged.MergedAt.UTC().Format(time.RFC3339)))
 	default:
 		f.State = model.TaskNotImplemented

@@ -1014,6 +1014,7 @@ func pullRequestRun(ctx context.Context, rc *RepoCtx) error {
 		ExecutionID: rc.Doc.ID,
 		FromCommit:  rc.deliveryBase,
 		ToCommit:    rc.head,
+		Requirement: runs.RequirementDigest(rc.Run.Title, rc.Run.Task),
 	}
 	var pr model.PRRef
 	var adopted bool

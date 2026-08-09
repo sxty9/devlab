@@ -303,9 +303,12 @@ type StartOutcome struct {
 	Resumed     bool   `json:"resumed,omitempty"`
 	Fresh       bool   `json:"fresh,omitempty"`
 	// NotStarted is the named reason nothing was started (e.g. "already delivered"), with the
-	// per-target evidence in TaskStates (B-4).
+	// per-target state in TaskStates and the observation it rests on in TaskEvidence (B-4). A
+	// rejection is nachpruefbar only WITH the evidence: "already delivered" must name which stand
+	// counts as delivered, so a caller can check it against the todo's current text.
 	NotStarted     string               `json:"notStarted,omitempty"`
 	TaskStates     map[string]TaskState `json:"taskStates,omitempty"`
+	TaskEvidence   map[string][]string  `json:"taskEvidence,omitempty"`
 	Suggestion     *DeferSuggestion     `json:"suggestion,omitempty"`
 	RestartPending bool                 `json:"restartPending,omitempty"`
 }
