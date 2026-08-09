@@ -132,6 +132,71 @@ exit 3
 	}
 }
 
+// TASK TEST c: an unprivileged `useradd` prints BOTH "Permission denied." and the busy "cannot lock …
+// try again later." — the second matches the momentary-lock signature, the first is the real cause. The
+// create must fail IMMEDIATELY with the rights refusal, NOT wait out the lock deadline and then report
+// "the database stayed locked". A counter proves the create was attempted exactly once (no retry), and
+// the message names the abort-carrying line, not the busy line printed after it.
+func TestAccountRightsRefusalFailsImmediately(t *testing.T) {
+	count := filepath.Join(t.TempDir(), "count")
+	fake := fakeBin(t, "useradd", `#!/bin/bash
+echo x >> "`+count+`"
+echo "useradd: Permission denied." >&2
+echo "useradd: cannot lock /etc/passwd; try again later." >&2
+exit 1
+`)
+	// A generous wait so that, were the rights refusal (wrongly) read as a momentary lock, the create
+	// would retry many times before the deadline — the counter would then be > 1.
+	env := accountEnv(t, fake, map[string]string{"SETUP_ACCOUNT_LOCK_WAIT": "5", "SETUP_ACCOUNT_LOCK_STEP": "0"})
+	res := sourceLib(t, env, `setup_account_cmd sxgate useradd --system sxgate; echo "exit=$?"`)
+	if strings.Contains(res.out, "exit=0") {
+		t.Fatalf("a rights refusal must fail the create, got:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "Permission denied") {
+		t.Errorf("the abort-carrying line (Permission denied) must be surfaced, got:\n%s", res.out)
+	}
+	if strings.Contains(res.out, "stayed locked") {
+		t.Errorf("a rights refusal must NOT be reported as a momentary lock that stayed locked, got:\n%s", res.out)
+	}
+	c, err := os.ReadFile(count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(strings.TrimSpace(string(c)), "x"); n != 1 {
+		t.Errorf("a rights refusal must be attempted exactly once (no retry), got %d attempts", n)
+	}
+}
+
+// TASK TEST d: a genuine, MOMENTARY lock — the busy signal WITHOUT any rights refusal in the output — is
+// still retried and, once the lock clears, the create succeeds. The fake reports the database locked on
+// its first attempt and creates the account on its second.
+func TestAccountMomentaryLockRetriedThenSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	count := filepath.Join(dir, "count")
+	db := filepath.Join(dir, "passwd")
+	fake := fakeBin(t, "useradd", `#!/bin/bash
+n=$(cat "`+count+`" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "`+count+`"
+if [ "$n" -lt 2 ]; then
+  echo "useradd: cannot lock /etc/passwd; try again later." >&2
+  exit 10
+fi
+printf '%s\n' "${@: -1}" >> "`+db+`"
+exit 0
+`)
+	env := accountEnv(t, fake, map[string]string{"SETUP_ACCOUNT_LOCK_WAIT": "5", "SETUP_ACCOUNT_LOCK_STEP": "0"})
+	res := sourceLib(t, env, `setup_account_cmd sxgate useradd --system sxgate; echo "exit=$?"`)
+	if !strings.Contains(res.out, "exit=0") {
+		t.Fatalf("a momentary lock must be retried until it clears and then succeed, got:\n%s", res.out)
+	}
+	got, err := os.ReadFile(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "sxgate") {
+		t.Errorf("the account must have been created on the retry, database holds:\n%s", got)
+	}
+}
+
 // The create is idempotent and reads the database under the lock: an account that already exists is left
 // as is and `useradd` is never invoked. `root` always exists, so it stands in for a present account.
 func TestAccountLockedCreateIdempotent(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"devlab/backend/internal/workspace"
 )
@@ -19,6 +20,12 @@ const ArtifactDirName = ".mercury-artifact"
 func Build(ctx context.Context, ex workspace.Executor, wt string) (string, error) {
 	out, err := ex.ArtifactBuild(ctx, wt)
 	if err != nil {
+		// The failed step's output IS the reason. When the toolchain said nothing, name exactly that —
+		// which step, which status, no output — rather than folding an empty string that reads as a
+		// blank protocol (task point 2, "Kein stummes Ausbleiben").
+		if strings.TrimSpace(out) == "" {
+			return "", fmt.Errorf("deploy: artifact build failed with no output: %w", err)
+		}
 		return "", fmt.Errorf("deploy: artifact build failed: %w\n%s", err, tail(out, 4000))
 	}
 	art := filepath.Join(wt, ArtifactDirName)

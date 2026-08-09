@@ -503,6 +503,14 @@ EDGE
 # and `usermod` all name a busy database with these two phrases and nothing else does: "cannot lock" is
 # emitted only when acquiring the lock fails, and "try again later" is the tool's own advice to retry.
 SETUP_ACCOUNT_LOCK_SIGNATURE='cannot lock|try again later'
+# A refusal repetition CANNOT cure, judged over the WHOLE output and BEFORE the lock signature. An
+# unprivileged `useradd` prints TWO lines — "useradd: Permission denied." AND "useradd: cannot lock
+# /etc/passwd; try again later." — and only the first is the real cause; the second merely matches the
+# momentary-lock signature above. Reading that second line as a busy database would wait out the whole
+# deadline for a right that can never appear, then report "the database stayed locked" — a false cause
+# hiding the true one printed one line above. So whenever the output carries a rights refusal ANYWHERE,
+# the create fails AT ONCE, and its message names the line that carries the abort, not the last line.
+SETUP_ACCOUNT_DENIED_SIGNATURE='permission denied|operation not permitted|must be (root|superuser)'
 # Tunables (overridable for tests; the defaults bound a real host's momentary contention):
 : "${SETUP_ACCOUNT_LOCK:=/run/lock/holistic-account.lock}"  # the host-wide account-creation lock file
 : "${SETUP_ACCOUNT_LOCK_WAIT:=30}"                          # seconds a momentary lock may persist
@@ -537,11 +545,19 @@ setup_account_cmd() {
 # command's stderr is captured so the signature can be judged and, on a factual failure, surfaced intact.
 setup_account_retry() {
   local describe="$1"; shift
-  local elapsed=0 step="$SETUP_ACCOUNT_LOCK_STEP" err rc
+  local elapsed=0 step="$SETUP_ACCOUNT_LOCK_STEP" err rc denied
   [ "$step" -ge 1 ] 2>/dev/null || step=1
   while :; do
     err="$("$@" 2>&1 1>/dev/null)"; rc=$?
     [ "$rc" -eq 0 ] && return 0
+    # Judge the WHOLE output for an unrecoverable rights refusal FIRST — before the lock signature — and
+    # fail immediately with the very line that carries it, never after waiting out the lock deadline for
+    # a right that cannot appear. This is the line "one above" the busy message that was being overlooked.
+    denied="$(printf '%s\n' "$err" | grep -Ei "$SETUP_ACCOUNT_DENIED_SIGNATURE" | head -n1)"
+    if [ -n "$denied" ]; then
+      echo "devlab: creating the account for '$describe' was refused for lack of rights — ${denied}" >&2
+      return "$rc"
+    fi
     if printf '%s' "$err" | grep -Eqi "$SETUP_ACCOUNT_LOCK_SIGNATURE"; then
       if [ "$elapsed" -ge "$SETUP_ACCOUNT_LOCK_WAIT" ]; then
         echo "devlab: the account database stayed locked for more than ${SETUP_ACCOUNT_LOCK_WAIT}s while creating the account for '$describe' — last message: ${err}" >&2
