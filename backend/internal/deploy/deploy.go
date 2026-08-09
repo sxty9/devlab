@@ -23,8 +23,16 @@ import (
 type Kind string
 
 const (
-	KindService       Kind = "service"
-	KindLibrary       Kind = "library"
+	KindService Kind = "service"
+	// KindUndeclared is the repository that says NOTHING: no ./service CLI, no cmd/<id>d daemon, and no
+	// declaration either way. It used to be called a "library" — a PROPERTY read off an ABSENCE, and the
+	// axiom forbids exactly that: "nicht anwendbar" may only follow from a proven property of the thing,
+	// and the lack of an installation is not such a property but a deficiency. The difference is not
+	// academic. A repository whose service had not been built yet was classified a library, every stage
+	// skipped it with that as its attested reason, and its absence from production went unnoticed for
+	// seven days (sxgate, measured 2026-08-09). A repository that genuinely delivers nothing SAYS so in
+	// holistic-service.json (deliver:false) and is KindExcluded — proven, evidenced, and silent by right.
+	KindUndeclared    Kind = "undeclared"
 	KindExcluded      Kind = "excluded"
 	KindNonconforming Kind = "nonconforming"
 	KindTemplate      Kind = "template"
@@ -116,8 +124,14 @@ func Detect(repoDir string) (Detection, error) {
 			Evidence: "has a cmd/ tree, but neither a ./service CLI nor a cmd/<id>d daemon conforms to the shared structure"}, nil
 	}
 
-	// 6) Everything else holds code without a deliverable daemon: a library.
-	return Detection{Kind: KindLibrary, Evidence: "no ./service CLI and no cmd/<id>d daemon — nothing to deliver"}, nil
+	// 6) Everything else has said NOTHING — and silence is not a property. The repository carries no
+	// deliverable daemon AND no declaration that it is not supposed to carry one, so what is true of it
+	// is unknown, not "no service". It is reported as the deficiency it is; one line of
+	// holistic-service.json (deliver:false) turns it into a proven, evidenced, silent exclusion.
+	return Detection{Kind: KindUndeclared,
+		Evidence: "neither delivers nor declares itself: no ./service CLI, no cmd/<id>d daemon, and no " +
+			DeclarationFileName + " saying it delivers nothing — an absence is not a proven property, so this " +
+			"is reported rather than passed over; declare deliver:false to exclude it by right"}, nil
 }
 
 func readDeclaration(repoDir string) (*DeclarationFile, error) {
@@ -262,8 +276,9 @@ type Gap struct {
 
 // FindGaps derives the delivery gaps from detections and observed ports: a detected service
 // with no routed port has no delivery path yet (REQ-029.1); a nonconforming repo is reported as
-// the "Code-Struktur" violation it is (REQ-028.4). Libraries, the template and excluded repos
-// produce no gap.
+// the "Code-Struktur" violation it is (REQ-028.4); an undeclared repo is reported because nothing
+// about it has been proven. The template and repos that DECLARE deliver:false produce no gap —
+// those two rest on evidence, which is what buys silence.
 func FindGaps(dets map[string]Detection, allocs []model.PortAllocation) []Gap {
 	repos := make([]string, 0, len(dets))
 	for r := range dets {
@@ -283,6 +298,9 @@ func FindGaps(dets map[string]Detection, allocs []model.PortAllocation) []Gap {
 		case KindNonconforming:
 			gaps = append(gaps, Gap{Repo: repo, Kind: KindNonconforming,
 				Detail: "violates the Code-Struktur axiom: " + d.Evidence})
+		case KindUndeclared:
+			gaps = append(gaps, Gap{Repo: repo, Kind: KindUndeclared,
+				Detail: "nothing is proven about this repository: " + d.Evidence})
 		}
 	}
 	return gaps

@@ -152,7 +152,7 @@ type DeliverPRIn struct {
 	Requirement string
 }
 
-// Detection is the deploy detection across the seam (kinds: "service" | "library" |
+// Detection is the deploy detection across the seam (kinds: "service" | "undeclared" |
 // "excluded" | "nonconforming" | "template"), always with its evidence.
 type Detection struct {
 	Kind     string

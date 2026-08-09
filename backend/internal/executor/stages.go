@@ -817,8 +817,10 @@ func deliverDevApplies(ctx context.Context, rc *RepoCtx) (bool, string) {
 		// A skip must rest on ATTESTED repo evidence (REQ-031.3): a detection that carries
 		// none returns "" here — and the motor REFUSES the skip (recorded as failed).
 		switch det.Kind {
-		case "library":
-			return false, attested("library repository (no service to run)", det.Evidence)
+		// NOTE: "undeclared" is deliberately NOT here. A repository that neither delivers nor declares
+		// that it delivers nothing has proven no property, so it cannot buy a skip: the stage APPLIES and
+		// fails by name in deliverDevRun (deploy.ErrUndeclared). It used to skip as a "library repository",
+		// which is how a service that simply had not been built yet stayed invisible for seven days.
 		case "excluded":
 			return false, attested("excluded from delivery by declaration", det.Evidence)
 		case "template":

@@ -523,13 +523,17 @@ func (g runnerGitSide) RedeliverDev(ctx context.Context, repo string) error {
 	return redeliverOutcome(deps.Deploy().DeliverDev(ctx, repoShort(repo)))
 }
 
-// redeliverOutcome reads one re-delivery honestly: a repository that is not a service (excluded,
-// library, template) has NOTHING to re-deliver and says so by succeeding; an install that did not
-// come up is a named failure, never a quiet success. The self repo is the one exception to the port
-// probe — its proof is the handover plus the next boot (B-2).
+// redeliverOutcome reads one re-delivery honestly: a repository PROVEN to be no service (it declares
+// deliver:false, or it is the pristine template) has NOTHING to re-deliver and says so by succeeding;
+// an install that did not come up is a named failure, never a quiet success. The self repo is the one
+// exception to the port probe — its proof is the handover plus the next boot (B-2).
+//
+// A repository that merely never said anything about itself is NOT in that first group: it falls
+// through to the failure branch below, because reporting "nothing to re-deliver" about it would state
+// as fact something nobody has established (deploy.ErrUndeclared).
 func redeliverOutcome(out executor.DeployOutcome, err error) error {
 	switch {
-	case errors.Is(err, deploy.ErrNotAService), errors.Is(err, deploy.ErrExcluded), errors.Is(err, deploy.ErrTemplateRepo):
+	case errors.Is(err, deploy.ErrExcluded), errors.Is(err, deploy.ErrTemplateRepo):
 		return nil
 	case err != nil:
 		return err

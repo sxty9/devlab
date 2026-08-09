@@ -237,7 +237,7 @@ func TestFailedStageLogNeverEmpty(t *testing.T) {
 func TestSkipWithoutEvidenceRefused(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/lib")
-	deps.deploy.det = Detection{Kind: "library", Evidence: ""} // a claim with NO evidence
+	deps.deploy.det = Detection{Kind: "excluded", Evidence: ""} // a claim with NO evidence
 	sink := newFakeSink()
 
 	err := Execute(context.Background(), deps, mkRequest(model.KindTodo, "org/lib"), sink)
@@ -256,7 +256,7 @@ func TestSkipWithoutEvidenceRefused(t *testing.T) {
 func TestNotApplicableWithEvidenceContinues(t *testing.T) {
 	stubConstitution(t, nil)
 	deps := newFakeDeps("org/lib")
-	deps.deploy.det = Detection{Kind: "library", Evidence: "no service entrypoint (cmd/<id>d) and no service CLI"}
+	deps.deploy.det = Detection{Kind: "excluded", Evidence: "holistic-service.json declares deliver:false"}
 	sink := newFakeSink()
 
 	if err := Execute(context.Background(), deps, mkRequest(model.KindTodo, "org/lib"), sink); err != nil {
