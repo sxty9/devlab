@@ -1,0 +1,6 @@
+{
+  "edge": {
+    "role": "application",
+    "serveRoot": "/var/lib/devlab/www"
+  }
+}

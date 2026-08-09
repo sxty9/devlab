@@ -1134,7 +1134,18 @@ func (c chainDeploy) Detect(ctx context.Context, repo string) (executor.Detectio
 	if err != nil {
 		return executor.Detection{}, err
 	}
-	return executor.Detection{Kind: string(det.Kind), Evidence: det.Evidence}, nil
+	// A repository that declares itself a ROOT APPLICATION is reached under a hostname, and the hostname is
+	// THIS host's to declare. Asking here — where the host is visible — is what turns "delivered but
+	// unreachable" from something a user discovers through a 404 into something the run says out loud
+	// before it even tries. The delivery refuses the same state again at the route step; this is the
+	// earlier, legible half of one refusal, not a second rule.
+	gap := ""
+	if det.Edge.IsRootApplication() && !deploy.EdgeHostDeclared(det.ID) {
+		gap = "'" + det.ID + "' declares itself a root application (" + deploy.DeclarationFileName +
+			", edge.role=" + string(det.Edge) + "), and a root application is reached under a hostname of its own — " +
+			"this host declares none for it in " + filepath.Join(deploy.EdgeHostsDir(), det.ID)
+	}
+	return executor.Detection{Kind: string(det.Kind), Evidence: det.Evidence, EdgeGap: gap}, nil
 }
 
 // DeliverDev builds the artifact AS THE RUNNER, installs it through the pinned root wrapper, and

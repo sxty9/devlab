@@ -113,30 +113,59 @@ func AllocationsNow() ([]model.PortAllocation, error) {
 	return Allocations(caddyDir(), tcp, tcp6)
 }
 
-// routedFrom reads port -> holder ids off the route drop-ins in dir.
+// routedFrom reads port -> holder ids off the route drop-ins under dir — the flat directory AND the two
+// shelves a delivered route is now filed on (services/ for a uniform service's fragment, apps/ for a root
+// application's whole site block).
+//
+// Reading only the flat directory would make this ledger blind on a migrated host, and this ledger is what
+// answers "is that port already spoken for?". A blind ledger does not merely lose information: it hands a
+// NEW service a port an existing service is already routed to, and the two then fight over one socket. The
+// flat directory is still read because a grown, hand-built edge keeps its routes there — the ledger
+// reports what is deployed, never what ought to be. Only the BASE directory must be readable; an absent
+// shelf is a host not yet migrated, which is a state, not a fault.
 func routedFrom(dir string) (map[int][]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("atlas: reading routes %s: %w", dir, err)
 	}
 	byPort := map[int][]string{}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	seen := map[string]bool{} // "<port>/<id>" — a half-migrated host may carry both copies for a moment
+	scan := func(d string, es []os.DirEntry) {
+		for _, e := range es {
+			if e.IsDir() {
+				continue
+			}
+			id, ok := stem(e.Name(), ".caddy")
+			if !ok {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(d, e.Name()))
+			if err != nil {
+				continue
+			}
+			m := portRe.FindSubmatch(raw)
+			if m == nil {
+				continue
+			}
+			p, err := strconv.Atoi(string(m[1]))
+			if err != nil || p <= 0 {
+				continue
+			}
+			key := strconv.Itoa(p) + "/" + id
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			byPort[p] = append(byPort[p], id)
 		}
-		id, ok := stem(e.Name(), ".caddy")
-		if !ok {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+	}
+	scan(dir, entries)
+	for _, shelf := range []string{"services", "apps"} {
+		shelfEntries, err := os.ReadDir(filepath.Join(dir, shelf))
 		if err != nil {
 			continue
 		}
-		if m := portRe.FindSubmatch(raw); m != nil {
-			if p, err := strconv.Atoi(string(m[1])); err == nil && p > 0 {
-				byPort[p] = append(byPort[p], id)
-			}
-		}
+		scan(filepath.Join(dir, shelf), shelfEntries)
 	}
 	for p := range byPort {
 		sort.Strings(byPort[p])

@@ -202,3 +202,68 @@ func TestBandFromEnv(t *testing.T) {
 		t.Errorf("unset band should be the default, got %+v", b)
 	}
 }
+
+// THE LEDGER FOLLOWS THE ROUTES ONTO THEIR SHELVES. A delivered route is no longer one file flat in the
+// route directory: a uniform service's fragment goes on `services/`, a root application's whole site block
+// on `apps/`. This ledger answers "is that port already spoken for?", so reading only the flat directory
+// after that move would not merely lose information — it would hand a NEW service a port an existing
+// service is already routed to, and the two would fight over one socket. The flat directory keeps being
+// read because a grown, hand-built edge still keeps its routes there.
+func TestAllocationsReadBothShelvesAndTheFlatDirectory(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, id string, port int, app bool) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, rel), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := "handle /api/services/" + id + "/* {\n\treverse_proxy 127.0.0.1:" + strconv.Itoa(port) + "\n}\n"
+		if app {
+			body = "http://" + id + ".example.test:8080 {\n\thandle /api/* {\n\t\treverse_proxy 127.0.0.1:" +
+				strconv.Itoa(port) + "\n\t}\n}\n"
+		}
+		if err := os.WriteFile(filepath.Join(dir, rel, id+".caddy"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("services", "prizm", 18811, false) // a migrated uniform service
+	write("apps", "holistic", 8770, true)    // a root application's site block
+	write("apps", "devlab", 8781, true)      // a second root application
+	write(".", "legacy", 18899, false)       // a grown edge's flat route, still valid
+
+	tcp := writeProcNetTCP(t, "tcp", []int{18811, 8770})
+	got, err := Allocations(dir, tcp, "")
+	if err != nil {
+		t.Fatalf("Allocations: %v", err)
+	}
+	byPort := map[int]model.PortAllocation{}
+	for _, a := range got {
+		byPort[a.Port] = a
+	}
+	for _, want := range []struct {
+		port int
+		id   string
+	}{{18811, "prizm"}, {8770, "holistic"}, {8781, "devlab"}, {18899, "legacy"}} {
+		a, ok := byPort[want.port]
+		if !ok {
+			t.Fatalf("port %d must be in the ledger — a port nobody sees is a port that gets handed out twice: %+v", want.port, got)
+		}
+		if !a.Routed {
+			t.Errorf("port %d (%s) must be reported as routed: %+v", want.port, want.id, a)
+		}
+		if a.Service != want.id {
+			t.Errorf("port %d must be held by %q, got %q", want.port, want.id, a.Service)
+		}
+	}
+	// A half-migrated host carries the same route on the shelf AND flat for a moment. That is one holder,
+	// not two, and it must never read as a conflict.
+	write(".", "prizm", 18811, false)
+	got2, err := Allocations(dir, tcp, "")
+	if err != nil {
+		t.Fatalf("Allocations: %v", err)
+	}
+	for _, a := range got2 {
+		if a.Port == 18811 && a.Conflict {
+			t.Errorf("one route present on two shelves during a migration is ONE holder, not a conflict: %+v", a)
+		}
+	}
+}

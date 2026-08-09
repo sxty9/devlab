@@ -57,6 +57,39 @@ type Detection struct {
 	ID string
 	// Decl is the parsed declaration file, when present.
 	Decl *DeclarationFile
+	// Edge is HOW this delivery is reached from outside, read off the declaration (never off the
+	// repository's name). Empty for a repo that is not a service at all.
+	Edge EdgeRole
+}
+
+// EdgeRole is how a delivery is reached from OUTSIDE the host — a closed list of three, and the Go twin
+// of the shell's SETUP_EDGE_ROLES.
+//
+// It exists because that property used to be derived from the repository NAME: `if [ "$repo" = devlab ]`
+// decided, in two places in devlab-exec, whether a delivery got the uniform `/api/services/<id>/*` route
+// or the whole `/api/*` prefix. A name comparison can only ever hold for ONE member, so when a second one
+// legitimately grew into the same role (holistic, the landscape dashboard) the two collided in a single
+// site block and the alphabet decided which one's API existed at all (measured on production 2026-08-09).
+// The property therefore belongs to the PACKAGE and is declared, not computed.
+type EdgeRole string
+
+const (
+	// EdgeRoleService is the uniform shape and the DEFAULT for every package that says nothing: reached at
+	// /api/services/<id>/* under the dashboard's hostname. The default is deliberately the unprivileged
+	// one — silence must never buy a whole hostname.
+	EdgeRoleService EdgeRole = "service"
+	// EdgeRoleApplication owns a hostname of its own and the whole /api/* space beneath it, and serves its
+	// own face at the root of that name. It does NOT carry the landscape's services.
+	EdgeRoleApplication EdgeRole = "application"
+	// EdgeRoleDashboard is an application that additionally carries the landscape's uniform services —
+	// they are reached under ITS hostname. There is exactly one per instance.
+	EdgeRoleDashboard EdgeRole = "dashboard"
+)
+
+// IsRootApplication reports whether this role answers under a hostname of its own — the property both
+// installers branch on, asked once here rather than spelled out as a two-value comparison at each site.
+func (r EdgeRole) IsRootApplication() bool {
+	return r == EdgeRoleApplication || r == EdgeRoleDashboard
 }
 
 // DeclarationFile is the optional per-repo declaration (REQ-028.2 — named values instead of
@@ -69,6 +102,35 @@ type DeclarationFile struct {
 		Binary string `json:"binary,omitempty"`
 		Web    string `json:"web,omitempty"`
 	} `json:"artifact,omitempty"`
+	// Edge states how the delivery is reached from outside. It belongs HERE, in the one file a repo
+	// states delivery deviations in, and not in a second file of its own: a parallel declaration file
+	// beside this one would be an ähnliches Geschwister to it (Keine Redundanz / Reuse before Build).
+	// Neither field names a hostname or a zone — WHICH name a root application answers to is the HOST's
+	// to declare, in runtime configuration, and a package can never state it.
+	Edge *struct {
+		Role string `json:"role,omitempty"`
+		// ServeRoot is the absolute directory this package's own face is served from on the target host.
+		// Absent means the landscape's convention (/opt/<id>/www); it is stated only by a package whose
+		// face genuinely lives elsewhere. The installer re-validates it against the service's own
+		// territory either way — the declaration says WHERE, it does not grant where.
+		ServeRoot string `json:"serveRoot,omitempty"`
+	} `json:"edge,omitempty"`
+}
+
+// edgeRoleOf reads the declared edge role, defaulting to the unprivileged EdgeRoleService when the
+// declaration is absent or says nothing. An unknown word is NOT defaulted: it is returned as an error so
+// the caller reports a nonconforming repository rather than guessing what its author meant.
+func edgeRoleOf(decl *DeclarationFile) (EdgeRole, error) {
+	if decl == nil || decl.Edge == nil || decl.Edge.Role == "" {
+		return EdgeRoleService, nil
+	}
+	switch r := EdgeRole(decl.Edge.Role); r {
+	case EdgeRoleService, EdgeRoleApplication, EdgeRoleDashboard:
+		return r, nil
+	default:
+		return "", fmt.Errorf("edge.role is %q, which is not one of %q, %q or %q",
+			decl.Edge.Role, EdgeRoleService, EdgeRoleApplication, EdgeRoleDashboard)
+	}
 }
 
 // Detect classifies one repo directory with evidence. Order of judgement: the pristine template,
@@ -99,17 +161,27 @@ func Detect(repoDir string) (Detection, error) {
 			Evidence: DeclarationFileName + " declares deliver:false"}, nil
 	}
 
+	// 3a) A declared edge role we do not know is a violation, not a guess. It is judged AFTER the
+	// exclusion above, because a repository that delivers nothing is never reached from outside and its
+	// edge role would be a field about nothing.
+	role, roleErr := edgeRoleOf(decl)
+	if roleErr != nil {
+		return Detection{Kind: KindNonconforming, Decl: decl,
+			Evidence: DeclarationFileName + ": " + roleErr.Error() +
+				" — how a delivery is reached from outside is stated, never inferred"}, nil
+	}
+
 	// 4) A conforming service: the uniform ./service CLI, or the template daemon layout.
 	id := manifestID(repoDir)
 	if fi, err := os.Stat(filepath.Join(repoDir, "service")); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
 		if id == "" {
 			id = filepath.Base(repoDir)
 		}
-		return Detection{Kind: KindService, ID: id, Decl: decl,
+		return Detection{Kind: KindService, ID: id, Decl: decl, Edge: role,
 			Evidence: "./service CLI (template convention)"}, nil
 	}
 	if cmdID, dir := daemonCmdID(repoDir); cmdID != "" {
-		return Detection{Kind: KindService, ID: cmdID, Decl: decl,
+		return Detection{Kind: KindService, ID: cmdID, Decl: decl, Edge: role,
 			Evidence: dir + "/" + cmdID + "d (template daemon layout)"}, nil
 	}
 
@@ -274,12 +346,56 @@ type Gap struct {
 	Detail string
 }
 
-// FindGaps derives the delivery gaps from detections and observed ports: a detected service
-// with no routed port has no delivery path yet (REQ-029.1); a nonconforming repo is reported as
-// the "Code-Struktur" violation it is (REQ-028.4); an undeclared repo is reported because nothing
-// about it has been proven. The template and repos that DECLARE deliver:false produce no gap —
-// those two rest on evidence, which is what buys silence.
-func FindGaps(dets map[string]Detection, allocs []model.PortAllocation) []Gap {
+// EdgeHostsDir is where a host declares WHICH hostname each root application answers to — one file per
+// application, named after it. The Go twin of the shell's SETUP_EDGE_HOSTS_DIR, resolved the same way:
+// an instance-neutral default under the shared holistic config dir, with the same env seam the shell
+// carries so a test can point both halves at one fixture directory.
+func EdgeHostsDir() string {
+	if d := os.Getenv("DEVLAB_EDGE_HOSTS_DIR"); d != "" {
+		return d
+	}
+	base := os.Getenv("DEVLAB_HOLISTIC_DIR")
+	if base == "" {
+		base = "/etc/holistic"
+	}
+	return filepath.Join(base, "edge", "hosts")
+}
+
+// EdgeHostDeclared reports whether THIS host names a hostname for the root application <id>. It only
+// asks whether the declaration is there and non-empty; the shell reader (setup_edge_host) remains the
+// one that judges its shape and hands it to the edge. Reading it here is what lets the deficiency be
+// NAMED before a delivery is attempted, instead of only when the delivery dies on it.
+func EdgeHostDeclared(id string) bool {
+	if id == "" {
+		return false
+	}
+	raw, err := os.ReadFile(filepath.Join(EdgeHostsDir(), id))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			return true
+		}
+	}
+	return false
+}
+
+// FindGaps derives the delivery gaps from detections, observed ports and the hostnames THIS host
+// declares: a detected service with no routed port has no delivery path yet (REQ-029.1); a nonconforming
+// repo is reported as the "Code-Struktur" violation it is (REQ-028.4); an undeclared repo is reported
+// because nothing about it has been proven; and a ROOT APPLICATION for which this host names no hostname
+// is reported as delivered-but-unreachable. The template and repos that DECLARE deliver:false produce no
+// gap — those two rest on evidence, which is what buys silence.
+//
+// declaredHost answers "does this host name a hostname for <id>?" — EdgeHostDeclared in operation, a
+// fixture in a test. It is a parameter rather than a direct read so the judgement can be measured
+// without a host, exactly like allocs.
+func FindGaps(dets map[string]Detection, allocs []model.PortAllocation, declaredHost func(id string) bool) []Gap {
+	if declaredHost == nil {
+		declaredHost = EdgeHostDeclared
+	}
 	repos := make([]string, 0, len(dets))
 	for r := range dets {
 		repos = append(repos, r)
@@ -291,6 +407,18 @@ func FindGaps(dets map[string]Detection, allocs []model.PortAllocation) []Gap {
 		d := dets[repo]
 		switch d.Kind {
 		case KindService:
+			// A ROOT APPLICATION is reached under a name of its own, so a host that names none for it
+			// serves it to nobody — and it would otherwise be the quietest possible failure: the program
+			// runs, the port answers, every stage is green, and the application is simply not on the
+			// internet. It is reported BEFORE the routed-port gap because it is the more specific fact
+			// about the same repository.
+			if d.Edge.IsRootApplication() && !declaredHost(d.ID) {
+				gaps = append(gaps, Gap{Repo: repo, Kind: KindService,
+					Detail: "delivered, but unreachable: '" + repo + "' declares itself a root application (edge.role=" +
+						string(d.Edge) + "), and a root application is reached under a hostname — this host declares none for it in " +
+						filepath.Join(EdgeHostsDir(), d.ID) + " (declare it with devlab-install-recv --edge-host " + d.ID + "=<name>)"})
+				continue
+			}
 			if _, routed := routedPortOf(allocs, d.ID); !routed {
 				gaps = append(gaps, Gap{Repo: repo, Kind: KindService,
 					Detail: "delivery not yet set up: service detected (" + d.Evidence + ") but no route/port is provisioned"})

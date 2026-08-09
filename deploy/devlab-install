@@ -78,6 +78,12 @@ WORKSPACES_ROOT="${DEVLAB_WORKSPACES:-$STATE_DIR/workspaces}"
 SELF_REPO="${DEVLAB_SELF_REPO:-devlab}"
 SELF_UNIT="${DEVLAB_UNIT:-devlabd}"
 CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
+# The two SHELVES under it: whole site blocks for root applications, naked fragments for uniform
+# services. Their names are decided ONCE, in the shared library beside the edge shell that imports them
+# (setup_edge_apps_dir / setup_edge_services_dir), so this wrapper and that shell cannot disagree about
+# where a route goes. Resolved once the library is sourced, below — instance-neutral, no domain, no zone.
+CADDY_APPS=""
+CADDY_SERVICES=""
 # The edge's assembled configuration, validated before a route of ours is adopted (see the route
 # step). Instance-neutral defaults of this template, like every value above.
 CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
@@ -545,6 +551,45 @@ SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}
 # shellcheck source=/dev/null
 . "$SETUP_LIB"
 
+# The two shelves, from the ONE place their names are decided (beside the edge shell that imports them).
+CADDY_APPS="$(setup_edge_apps_dir "$CADDY_CONF")"
+CADDY_SERVICES="$(setup_edge_services_dir "$CADDY_CONF")"
+
+# route_half <artifact> <repo> <port> <delivered-route> [<also-remove>...] — THE route step, one call for
+# every branch of this installer. It asks the SHARED switch (setup_prepare_route) how this delivery is
+# reached — a uniform service fragment on the services shelf, or a whole site block on the apps shelf
+# under the hostname this host declares for it — and then installs the answer through the SHARED install
+# (setup_install_route), which validates the ASSEMBLED edge and unwinds on failure exactly as before.
+#
+# Genau EIN Weg: the decision is not written here and not written in the production receiver, which calls
+# the same two functions for the same reason. What this wrapper adds is only its own exit code and its own
+# --check wording.
+route_half() {  # <artifact> <repo> <port> <delivered-route> [<also-remove>...]
+  local art="$1" repo="$2" port="$3" deliv="$4"; shift 4
+  local extra=("$@") staged rc=0 out dest
+  if [ ! -d "$CADDY_CONF" ]; then
+    log "no route dir at $CADDY_CONF — route for '$repo' NOT installed"
+    return 0
+  fi
+  staged="$(mktemp)" || die "cannot stage the route for '$repo'" 1
+  rc=0; out="$(setup_prepare_route "$art" "$repo" "$port" "$CADDY_CONF" "$deliv" "$staged" 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    rm -f -- "$staged"
+    [ "$CHECK" = 1 ] || rm -f ${extra[@]+"${extra[@]}"}
+    die "the route for '$repo' could not be prepared, so nothing was written to the edge: $out" 5
+  fi
+  dest="$out"
+  if [ "$CHECK" = 1 ]; then
+    rm -f -- "$staged"
+    echo "PLAN: write the route of '$repo' to $dest ($CADDY_BIN validate --config $CADDY_MAIN over the ASSEMBLED edge + reload caddy; on failure the file is taken back out and the edge keeps its last good configuration)"
+    return 0
+  fi
+  rc=0; out="$(setup_install_route "$staged" "$dest" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" ${extra[@]+"${extra[@]}"} 2>&1)" || rc=$?
+  rm -f -- "$staged"
+  [ "$rc" = 0 ] || die "$out" "$rc"
+  log "route of '$repo' installed at $dest"
+}
+
 # install_web_half <artifact> <repo> — THE service's OWN face: install the web bundle the package
 # carries at the serve root the package DECLARES. The work, the judgement and the wording all live in
 # the shared library (setup_install_web — the same call the production receiver makes, so a face arrives
@@ -925,16 +970,16 @@ if [ "$FIRST_TIME" = 1 ] && [ "$DELIVERED_SETUP" = 1 ]; then
   [ -f "$DELIV_UNIT" ] || die "first-time setup of '$REPO' has no delivered unit at $DELIV_UNIT" 5
   setup_unit_declares_user "$DELIV_UNIT" "$REPO" \
     || die "delivered unit $DELIV_UNIT does not run as 'User=$REPO' — refusing (a unit that starts something else or runs as root is not installed)" 2
-  log "first-time setup of '$REPO' from the delivered setup product (unit ${UNIT_NAME}.service)"
+  # The route must reach the daemon that is actually there, so the port comes from the DELIVERED UNIT —
+  # the same source the honest running gate dials — and only falls back to the atlas proposal when the
+  # unit fixes none.
+  ROUTE_PORT="$(setup_unit_listen_port "$DELIV_UNIT")"; [ -n "$ROUTE_PORT" ] || ROUTE_PORT="$PORT"
+  log "first-time setup of '$REPO' from the delivered setup product (unit ${UNIT_NAME}.service, route port $ROUTE_PORT)"
 
   if [ "$CHECK" = 1 ]; then
     echo "PLAN: create system user '$REPO' (nologin) if missing"
     echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
-    if [ -f "$DELIV_ROUTE" ]; then
-      echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy ($CADDY_BIN validate --config $CADDY_MAIN + reload caddy; unwind on failure)"
-    else
-      echo "PLAN: no delivered route in the artifact — none installed"
-    fi
+    route_half "$real" "$REPO" "$ROUTE_PORT" "$DELIV_ROUTE"
     if [ -n "$MANIFEST" ]; then
       echo "PLAN: install rights manifest $MANIFEST (validated copy) + groupadd its hp_* groups"
     else
@@ -944,15 +989,11 @@ if [ "$FIRST_TIME" = 1 ] && [ "$DELIVERED_SETUP" = 1 ]; then
   else
     setup_ensure_account "$REPO"
     install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
-    if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
-      # The route dir is SHARED (setup_install_route validates the ASSEMBLED edge and takes OUR route AND
-      # the freshly written delivered unit back out on failure, so a bad route never leaves a half setup a
-      # later run reads as an update). A delivered route is optional; its failure is NAMED, never swallowed.
-      rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/$REPO.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" 2>&1)" || rc=$?
-      [ "$rc" = 0 ] || die "$reason" "$rc"
-    elif [ -f "$DELIV_ROUTE" ]; then
-      log "no route dir at $CADDY_CONF — delivered route NOT installed"
-    fi
+    # The shelves are SHARED with every other service of the host, so the route step validates the
+    # ASSEMBLED edge and takes OUR file — plus the freshly written unit — back out on failure, leaving no
+    # half setup a later run would read as an update. Which shelf, and what the file says, is the shared
+    # switch's answer (route_half → setup_prepare_route), never this wrapper's.
+    route_half "$real" "$REPO" "$ROUTE_PORT" "$DELIV_ROUTE" "$UNIT_FILE"
     if [ -n "$MANIFEST" ]; then
       setup_install_rights "$MANIFEST" "$PERMS_DIR" "$REPO"
     else
@@ -973,9 +1014,7 @@ elif [ "$FIRST_TIME" = 1 ]; then
   if [ "$CHECK" = 1 ]; then
     echo "PLAN: create system user '$REPO' (nologin) if missing"
     echo "PLAN: write $UNIT_FILE from the inline template (ExecStart /opt/$REPO/bin/${REPO}d --listen 127.0.0.1:$PORT)"
-    echo "PLAN: write $CADDY_CONF/$REPO.caddy (route /api/services/$REPO/* -> 127.0.0.1:$PORT)"
-    echo "PLAN: $CADDY_BIN validate --config $CADDY_MAIN before adopting the route; on failure remove $CADDY_CONF/$REPO.caddy and fail (the route dir is shared with every other service)"
-    echo "PLAN: $SYSTEMCTL reload caddy (a failed reload fails this install — the route is taken back out)"
+    route_half "$real" "$REPO" "$PORT" ""
     if [ -n "$MANIFEST" ]; then
       echo "PLAN: install rights manifest $MANIFEST (validated copy) + groupadd its hp_* groups"
     else
@@ -985,36 +1024,13 @@ elif [ "$FIRST_TIME" = 1 ]; then
   else
     setup_ensure_account "$REPO"
     setup_unit_text "$REPO" "$PORT" > "$UNIT_FILE"
-    if [ -d "$CADDY_CONF" ]; then
-      # This directory is SHARED: the edge serves every other service of the host out of it, so an
-      # unparseable file of ours does not break "our" route — it breaks the whole edge at the next
-      # reload. So the ASSEMBLED configuration is validated first and OUR file is taken back out when
-      # it does not hold, and the reload's failure is NAMED instead of swallowed: the caller must not
-      # read "installed" over a service that has no route.
-      ROUTE_FILE="$CADDY_CONF/$REPO.caddy"
-      setup_route_text "$REPO" "$PORT" > "$ROUTE_FILE"
-      # unwind_first_time removes what THIS first-time branch has created so far — the route and the
-      # generated unit, both of which did not exist before this run (FIRST_TIME=1 was decided by
-      # systemd). Without it a failed route step would leave a unit behind, the next attempt would read
-      # as an UPDATE, skip the route step altogether, and report success over a service with no route.
-      # The system account and /var/lib/<repo> stay: creating them is idempotent and harmless.
-      unwind_first_time() { rm -f "$ROUTE_FILE" "$UNIT_FILE"; }
-      if command -v "$CADDY_BIN" >/dev/null 2>&1 && [ -f "$CADDY_MAIN" ]; then
-        if ! validate_out="$("$CADDY_BIN" validate --config "$CADDY_MAIN" 2>&1)"; then
-          unwind_first_time
-          die "the edge configuration does not validate with the new route — route and generated unit removed, edge untouched: $(printf '%s' "$validate_out" | tail -n 3)" 4
-        fi
-      else
-        unwind_first_time
-        die "cannot validate the shared edge configuration ($CADDY_BIN / $CADDY_MAIN) — refusing to write into a config directory serving every other service; provision the route by hand" 5
-      fi
-      "$SYSTEMCTL" reload caddy || {
-        unwind_first_time
-        die "caddy reload failed — route and generated unit removed so the edge keeps its last good configuration and the next attempt is a clean first-time setup" 4
-      }
-    else
-      log "no route dir at $CADDY_CONF — route NOT written"
-    fi
+    # The route step is the SAME one every other branch takes: the shared switch decides which shelf the
+    # route belongs on and what it says, and the shared install validates the ASSEMBLED edge and takes our
+    # file back out when it does not hold. $UNIT_FILE goes with it — without that, a failed route step
+    # would leave the generated unit behind, the next attempt would read as an UPDATE, skip the route
+    # altogether, and report success over a service with no route. The account and /var/lib/<repo> stay:
+    # creating them is idempotent and harmless.
+    route_half "$real" "$REPO" "$PORT" "" "$UNIT_FILE"
     # Rights manifest: the FILE COPY validated in step 5f (resolved inside the checkout, a regular
     # file, never a symlink out of it). Never executed.
     if [ -n "$MANIFEST" ]; then
@@ -1027,6 +1043,26 @@ elif [ "$FIRST_TIME" = 1 ]; then
     fi
     "$SYSTEMCTL" daemon-reload
     "$SYSTEMCTL" enable "$REPO" >/dev/null 2>&1 || true
+  fi
+else
+  # ── UPDATE — the unit is already on this host, and THE ROUTE IS RENEWED WITH IT ───────────────────
+  # The route used to be written on a first-time setup only. That was tolerable while a route was a
+  # single fragment whose content never changed, and it stopped being tolerable the moment HOW a
+  # delivery is reached became something the package declares and the host names: a service that is
+  # already installed is never a first-time setup again, so a corrected shape, a new shelf or a newly
+  # declared hostname would sit in the repository forever while the host kept answering the old way —
+  # and the only way to collect it would be to uninstall a live service. So the route is (re)derived on
+  # every install: it is idempotent, it invents nothing (the package says the shape, the host says the
+  # name), and a host converges on the current shape with the next delivery of each service.
+  #
+  # NOTHING is passed as <also-remove> here: on an update the unit belongs to a RUNNING service and a
+  # failed route step must never take it away. The route step still unwinds ITS OWN file and leaves the
+  # edge on its last good configuration.
+  ROUTE_PORT="$(setup_unit_listen_port "$UNIT_FILE")"; [ -n "$ROUTE_PORT" ] || ROUTE_PORT="$PORT"
+  if [ "$ROUTE_PORT" = 0 ]; then
+    log "update of '$REPO': its unit names no listen port and none was given (--port) — the route is left exactly as it stands"
+  else
+    route_half "$real" "$REPO" "$ROUTE_PORT" "$SETUP_SRC/${REPO}.caddy"
   fi
 fi
 

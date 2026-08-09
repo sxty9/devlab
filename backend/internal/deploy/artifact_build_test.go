@@ -274,11 +274,17 @@ func TestArtifactBuildFindsRootBundle(t *testing.T) {
 	}
 }
 
-// The package SAYS where its face belongs: a build that stages a web bundle stamps `web.root` beside
-// it, and the installer reads that stamp instead of deriving a destination from the repository name.
-// The value follows the landscape's serve convention (/opt/<repo>/www), with the self repo as the one
-// named layout exception it already is elsewhere — devlabd serves its own start page out of its state
-// directory, so that is what its package declares.
+// The package SAYS where its face belongs and HOW it is reached: a build stamps `web.root` and
+// `edge.role` into the artifact, and the installer reads those stamps instead of deriving anything from
+// the repository name. Both values come from the repository's OWN declaration (holistic-service.json),
+// with the landscape's serve convention /opt/<repo>/www and the unprivileged role `service` as the
+// defaults for a package that declares nothing.
+//
+// THE DECISIVE PART is the second case. Where a face belongs used to be decided by comparing the
+// repository's NAME against the self repo — `if [ "$repo_name" = devlab ]` — which is the edge-route
+// defect in its second guise: a property of the PACKAGE derived from its spelling, and therefore holdable
+// by exactly one member of the landscape. So the test names the fixture repo the self repo and proves
+// that this changes NOTHING.
 func TestArtifactBuildStampsWhereTheFaceBelongs(t *testing.T) {
 	needNPM(t)
 	files := map[string]string{
@@ -295,21 +301,63 @@ func TestArtifactBuildStampsWhereTheFaceBelongs(t *testing.T) {
 		t.Fatalf("a staged face must travel with the declaration of where it belongs: %v", err)
 	}
 	if strings.TrimSpace(string(got)) != "/opt/svc/www" {
-		t.Errorf("a uniform service's face belongs at its own serve root, got %q", strings.TrimSpace(string(got)))
+		t.Errorf("a package that declares no serve root follows the landscape convention, got %q", strings.TrimSpace(string(got)))
+	}
+	role, err := os.ReadFile(filepath.Join(wt, ".mercury-artifact", "edge.role"))
+	if err != nil {
+		t.Fatalf("every artifact must say how it is reached from outside: %v", err)
+	}
+	if strings.TrimSpace(string(role)) != "service" {
+		t.Errorf("silence must mean the unprivileged role, got %q", strings.TrimSpace(string(role)))
 	}
 
-	// The self repo's layout exception: its own daemon serves its face out of the state directory.
-	env2, wt2 := artifactWorkspace(t, files)
+	// A package that DECLARES both gets both — and the repository is ALSO named the self repo here, which
+	// is where a surviving name comparison would show itself. It must change nothing.
+	declared := map[string]string{}
+	for k, v := range files {
+		declared[k] = v
+	}
+	declared["holistic-service.json"] = `{"edge":{"role":"application","serveRoot":"/var/lib/svc/www"}}`
+	env2, wt2 := artifactWorkspace(t, declared)
 	env2["DEVLAB_SELF_REPO"] = "svc"
 	if res := runWrapper(t, "deploy/devlab-exec", env2, "artifact-build", wt2); res.exit != 0 {
-		t.Fatalf("the self build must succeed (exit 0), got %d\n%s", res.exit, res.out)
+		t.Fatalf("the build of a declaring package must succeed (exit 0), got %d\n%s", res.exit, res.out)
 	}
 	got, err = os.ReadFile(filepath.Join(wt2, ".mercury-artifact", "web.root"))
 	if err != nil {
-		t.Fatalf("the self package must declare its face's place too: %v", err)
+		t.Fatalf("a declaring package must stamp its face's place too: %v", err)
 	}
-	if want := filepath.Join(env2["DEVLAB_STATE_DIR"], "www"); strings.TrimSpace(string(got)) != want {
-		t.Errorf("the self face belongs in the state directory its daemon serves from: got %q, want %q",
-			strings.TrimSpace(string(got)), want)
+	if strings.TrimSpace(string(got)) != "/var/lib/svc/www" {
+		t.Errorf("the declared serve root must be stamped verbatim, got %q", strings.TrimSpace(string(got)))
+	}
+	role, err = os.ReadFile(filepath.Join(wt2, ".mercury-artifact", "edge.role"))
+	if err != nil {
+		t.Fatalf("the declared edge role must travel with the artifact: %v", err)
+	}
+	if strings.TrimSpace(string(role)) != "application" {
+		t.Errorf("the declared edge role must be stamped verbatim, got %q", strings.TrimSpace(string(role)))
+	}
+	// And NO hostname travels with the package: which name it answers to is the target host's to declare.
+	// A dot in the stamp would mean a name had crept into the artifact.
+	if strings.Contains(strings.TrimSpace(string(role)), ".") {
+		t.Errorf("a package must never carry a hostname, got %q", strings.TrimSpace(string(role)))
+	}
+}
+
+// A declaration nobody can read is never guessed past: an edge role outside the closed list fails the
+// build BY NAME rather than quietly becoming a uniform service.
+func TestArtifactBuildRefusesAnUnknownEdgeRole(t *testing.T) {
+	needNPM(t)
+	env, wt := artifactWorkspace(t, map[string]string{
+		"package.json": `{"name":"svc","private":true,"version":"0.0.0","scripts":{` +
+			`"build":"mkdir -p dist && printf '<!doctype html><title>ok</title>' > dist/index.html"}}`,
+		"holistic-service.json": `{"edge":{"role":"gateway"}}`,
+	})
+	res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt)
+	if res.exit == 0 {
+		t.Fatalf("an unknown edge role must fail the build, got exit 0\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "gateway") || !strings.Contains(res.out, "service application dashboard") {
+		t.Errorf("the refusal must name the bad value and the closed list:\n%s", res.out)
 	}
 }

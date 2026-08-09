@@ -97,14 +97,52 @@ func recvSelfFixture(t *testing.T, userLine string) (env map[string]string, unit
 	if err := os.WriteFile(filepath.Join(setup, "devlabd.service"), []byte(unit), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(setup, "devlab.caddy"), []byte("handle /api/* {\n\treverse_proxy 127.0.0.1:8781\n}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(filepath.Join(setup, "devlab.json"), []byte(`{"group":"hp_devlab_access"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return map[string]string{"DEVLAB_STAGING": staging, "DEVLAB_UNIT_DIR": unitDir},
-		filepath.Join(unitDir, "devlabd.service")
+	// HOW devlab is reached, carried by the package: a ROOT APPLICATION on a hostname of its own. NO route
+	// file travels with it — a root application's site block needs the TARGET host's hostname, which the
+	// build cannot know, so it is rendered at install. That is why this fixture stages a role and not a
+	// route: the naked `handle /api/*` fragment it used to ship is exactly what collided with the landscape
+	// dashboard's identical claim inside one site block (measured on production 2026-08-09).
+	if err := os.WriteFile(filepath.Join(art, "edge.role"), []byte("application\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{
+		"DEVLAB_STAGING":  staging,
+		"DEVLAB_UNIT_DIR": unitDir,
+		// The host's OWN runtime configuration: where its edge answers, and which name reaches devlab.
+		// Both at fixture paths — a test never reads or writes the real /etc/holistic.
+		"DEVLAB_EDGE_ADDRESS_FILE": edgeAddressFixture(t),
+		"DEVLAB_EDGE_HOSTS_DIR":    edgeHostsFixture(t, map[string]string{"devlab": "devlab.example.test"}),
+	}, filepath.Join(unitDir, "devlabd.service")
+}
+
+// edgeAddressFixture writes the ONE declaration of where a fixture host's edge answers and returns its
+// path — the same file setup_edge_address reads in operation.
+func edgeAddressFixture(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "edge-address")
+	if err := os.WriteFile(p, []byte("10.10.0.1:8080\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// edgeHostsFixture writes the hostnames a fixture host declares for its root applications (one file per
+// application, as --edge-host writes them) and returns the directory.
+func edgeHostsFixture(t *testing.T, hosts map[string]string) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "edge", "hosts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for id, name := range hosts {
+		if err := os.WriteFile(filepath.Join(dir, id), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
 }
 
 // TEST a) DECISIVE: a host with NO devlabd.service — the regular delivery of the SELF repo sets devlab up
@@ -121,9 +159,12 @@ func TestRecvSelfFirstTimeWhenUnitMissing(t *testing.T) {
 		"Erstinstallation of 'devlab'",
 		"create nologin system account 'devlab'",
 		"install delivered unit", "verified User=devlab",
-		// the web anteil AND the route belong to the setup (task point 4)
+		// the web anteil AND the route belong to the setup (task point 4). devlab declares itself a ROOT
+		// APPLICATION in this fixture's artifact, so its route is a whole site block on the apps shelf under
+		// the hostname the host declares — not the naked `handle /api/*` fragment that used to collide with
+		// the landscape dashboard's identical claim.
 		"/usr/local/bin/devlabd", "/var/lib/devlab/www",
-		"install delivered route", "devlab.caddy",
+		"write the route of 'devlab' to", "/conf.d/apps/devlab.caddy",
 		"groupadd",
 		// the instance secret the delivered unit demands is minted on THIS host
 		"mint instance secret 'jwt-secret'",
@@ -222,7 +263,10 @@ func TestRecvCheckFirstTimeWhenUnitMissing(t *testing.T) {
 		t.Fatalf("a missing unit must dry-run a first-time setup (exit 0), got %d\n%s", res.exit, res.out)
 	}
 	for _, want := range []string{"Erstinstallation", "create nologin system account 'svc-a'",
-		"install delivered unit", "verified User=svc-a", "install delivered route", "groupadd", "start svc-a",
+		"install delivered unit", "verified User=svc-a",
+		// a uniform service's route is a fragment on the services shelf, reached under the dashboard's name
+		"write the route of 'svc-a' to", "/conf.d/services/svc-a.caddy",
+		"groupadd", "start svc-a",
 		// the instance secret the unit demands is planned to be minted on THIS host (BEFUND 1)
 		"mint instance secret 'jwt-secret'",
 		// the honest gate now proves the service STAYS up, holding its port (BEFUND 2)

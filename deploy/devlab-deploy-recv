@@ -249,6 +249,53 @@ install_web() {  # <artifact> <repo>
     || die "prod delivery of '$2' is incomplete: the delivered face was not installed (see the reason above)" 11
 }
 
+# install_route <artifact> <repo> <port> <delivered-route> [<also-remove>...] — HOW this delivery is
+# reached from outside, decided by the SHARED switch and installed by the SHARED install. Both halves
+# live in devlab-setup-lib.sh and are called identically by the dev installer (devlab-install), because
+# two receivers with two edge paths are two edges: the property that decides a route's shape would be
+# judged twice and could be judged differently. That is the whole class of fault this closes, so it is
+# not restated here.
+#
+# The self repo has no route branch of its own any more. Its LAYOUT is still special (devlabd.service
+# instead of <repo>.service, and the handover) — but the edge knows nothing of repository names.
+
+# route_port <delivered-unit> <installed-unit> — the loopback port the route must reach: the port of the
+# unit that WILL be in place once this delivery is done. The DELIVERED unit is asked first, because it is
+# the one this run installs and because on a first-time host (and in every dry run) nothing is installed
+# yet, so it is the only readable source. On a renewal both name the same port.
+route_port() {  # <delivered-unit> <installed-unit>
+  local p=""
+  [ -r "$1" ] && p="$(setup_unit_listen_port "$1")"
+  if [ -z "$p" ] && [ -r "$2" ]; then p="$(setup_unit_listen_port "$2")"; fi
+  printf '%s' "$p"
+}
+
+install_route() {  # <artifact> <repo> <port> <delivered-route> [<also-remove>...]
+  local art="$1" repo="$2" port="$3" deliv="$4"; shift 4
+  local extra=("$@") staged rc=0 out dest
+  if [ ! -d "$CADDY_CONF" ]; then
+    log "no route dir at $CADDY_CONF — route for '$repo' NOT installed"
+    return 0
+  fi
+  staged="$(mktemp)" || die "cannot stage the route for '$repo'" 1
+  rc=0; out="$(setup_prepare_route "$art" "$repo" "$port" "$CADDY_CONF" "$deliv" "$staged" 2>&1)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    rm -f -- "$staged"
+    [ "$CHECK" = 1 ] || rm -f ${extra[@]+"${extra[@]}"}
+    die "the route for '$repo' could not be prepared, so nothing was written to the edge: $out" 5
+  fi
+  dest="$out"
+  if [ "$CHECK" = 1 ]; then
+    rm -f -- "$staged"
+    echo "PLAN: write the route of '$repo' to $dest ($CADDY_BIN validate --config $CADDY_MAIN over the ASSEMBLED edge + reload caddy; unwind on failure)"
+    return 0
+  fi
+  rc=0; out="$(setup_install_route "$staged" "$dest" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" ${extra[@]+"${extra[@]}"} 2>&1)" || rc=$?
+  rm -f -- "$staged"
+  [ "$rc" = 0 ] || die "$out" "$rc"
+  log "route of '$repo' installed at $dest"
+}
+
 # ── THE FACE'S END STATE — the ONE place this receiver states the outcome of the web half ────────────
 # The success mark belongs to the state at the END of the run, never to the moment of copying: this
 # receiver installed the delivered face and then, in the same run, deleted it again with the program
@@ -336,13 +383,14 @@ case "$REPO" in
 
       DELIV_ROUTE="$SETUP/devlab.caddy"
       DELIV_RIGHTS="$SETUP/devlab.json"
+      # The route reaches the daemon that is actually there: the port comes from the delivered unit.
+      DEVLAB_ROUTE_PORT="$(route_port "$DELIV_UNIT" "$DEVLABD_UNIT_FILE")"
 
       if [ "$CHECK" = 1 ]; then
         echo "PLAN: Erstinstallation of 'devlab' (no devlabd.service on this host)"
         echo "PLAN: create nologin system account 'devlab' (home /var/lib/devlab) if missing"
         echo "PLAN: install delivered unit $DELIV_UNIT -> $DEVLABD_UNIT_FILE (verified User=devlab)"
-        [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/devlab.caddy (caddy validate + reload; unwind on failure)" \
-                              || echo "PLAN: no delivered route in the artifact — none installed"
+        install_route "$real" devlab "$DEVLAB_ROUTE_PORT" "$DELIV_ROUTE"
         [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/devlab.json + groupadd its hp_* groups" \
                                || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
         setup_plan_secrets "$DELIV_UNIT"
@@ -356,12 +404,7 @@ case "$REPO" in
       setup_ensure_account devlab
       install "${RECV_OWN[@]}" -m 0644 "$DELIV_UNIT" "$DEVLABD_UNIT_FILE"
 
-      if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
-        rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/devlab.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$DEVLABD_UNIT_FILE" 2>&1)" || rc=$?
-        [ "$rc" = 0 ] || die "$reason" "$rc"
-      elif [ -f "$DELIV_ROUTE" ]; then
-        log "no route dir at $CADDY_CONF — delivered route NOT installed"
-      fi
+      install_route "$real" devlab "$DEVLAB_ROUTE_PORT" "$DELIV_ROUTE" "$DEVLABD_UNIT_FILE"
 
       if [ -f "$DELIV_RIGHTS" ]; then
         setup_install_rights "$DELIV_RIGHTS" "$PERMS_DIR" devlab
@@ -385,6 +428,12 @@ case "$REPO" in
       # ── RENEWAL — devlabd.service already present: replace the program + web (done above) and restart,
       # minting any secret a host set up before secrets existed still lacks (idempotent self-heal). ──
       log "Aktualisierung of 'devlab' — devlabd.service already present; replacing the program and restarting"
+      # The route is renewed WITH the program, not only at first-time setup: how a delivery is reached is
+      # now something the package declares and the host names, so a corrected shape or a newly declared
+      # hostname must be collectable without uninstalling a live service. Nothing is passed as
+      # <also-remove> — on a renewal the unit belongs to a RUNNING service and a failed route step must
+      # never take it away; the route step still unwinds its own file.
+      install_route "$real" devlab "$(route_port "$real/setup/devlabd.service" "$DEVLABD_UNIT_FILE")" "$real/setup/devlab.caddy"
       ensure_secrets_for devlab "$DEVLABD_UNIT_FILE"
       run "$SYSTEMCTL" restart devlabd
       prove_running devlabd "$(setup_unit_listen_port "$DEVLABD_UNIT_FILE")"
@@ -511,8 +560,7 @@ case "$REPO" in
         install_web "$real" "$REPO"
         plan_program
         echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
-        [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy (caddy validate + reload; unwind on failure)" \
-                              || echo "PLAN: no delivered route in the artifact — none installed"
+        install_route "$real" "$REPO" "$(route_port "$DELIV_UNIT" "$UNIT_FILE")" "$DELIV_ROUTE"
         [ -f "$DELIV_RIGHTS" ] && echo "PLAN: install delivered rights $DELIV_RIGHTS -> $PERMS_DIR/$REPO.json + groupadd its hp_* groups" \
                                || echo "PLAN: no delivered rights in the artifact — installed without declared rights"
         setup_plan_secrets "$DELIV_UNIT"
@@ -531,15 +579,10 @@ case "$REPO" in
       install_program
       install "${RECV_OWN[@]}" -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
-      # The route dir is SHARED by every service of the host (setup_install_route validates the ASSEMBLED
-      # config and takes OUR file — plus the freshly written unit — back out on failure). A delivered
-      # route is optional; its failure is NAMED, never swallowed.
-      if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
-        rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/$REPO.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$UNIT_FILE" 2>&1)" || rc=$?
-        [ "$rc" = 0 ] || die "$reason" "$rc"
-      elif [ -f "$DELIV_ROUTE" ]; then
-        log "no route dir at $CADDY_CONF — delivered route NOT installed"
-      fi
+      # The shelves are SHARED by every service of the host (setup_install_route validates the ASSEMBLED
+      # config and takes OUR file — plus the freshly written unit — back out on failure). Which shelf, and
+      # what the file says, is the shared switch's answer.
+      install_route "$real" "$REPO" "$(route_port "$DELIV_UNIT" "$UNIT_FILE")" "$DELIV_ROUTE" "$UNIT_FILE"
 
       # Rights manifest: a validated FILE COPY of the delivered manifest (never executed).
       if [ -f "$DELIV_RIGHTS" ]; then
@@ -562,6 +605,11 @@ case "$REPO" in
       log "Aktualisierung of '$REPO' — unit '${UNIT_NAME}.service' already present; replacing the program and restarting"
       install_web "$real" "$REPO"
       if [ "$CHECK" = 1 ]; then plan_program; else install_program; fi
+      # The route is renewed WITH the program (see the self renewal above for why): a service that is
+      # already installed is never a first-time setup again, so without this a corrected route shape or a
+      # newly declared hostname could never reach a live host. No <also-remove>: the unit belongs to a
+      # RUNNING service.
+      install_route "$real" "$REPO" "$(route_port "$real/setup/${UNIT_NAME}.service" "$UNIT_FILE")" "$real/setup/${REPO}.caddy"
       # Self-heal a host set up before secrets were minted: ensure them (idempotent) before restart, so
       # an update of a service that has been looping on a missing secret can finally stay up.
       ensure_secrets_for "$REPO" "$UNIT_FILE"
