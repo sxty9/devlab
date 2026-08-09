@@ -55,7 +55,16 @@ type ResultRecorder struct {
 	s   *Server
 	mu  sync.Mutex
 	res runs.Result
+	// tmu guards the session tick alone, so the coalescing of a fast agent's journal lines never
+	// waits behind a document flush.
+	tmu      sync.Mutex
+	lastTick time.Time
 }
+
+// sessionTickEvery coalesces the live tick of a speaking session. Every line is journalled; the
+// followers are told at most this often, because a session grows many times per second and each
+// tick costs every follower a read.
+const sessionTickEvery = 400 * time.Millisecond
 
 // NewResultRecorder opens the result document of one execution (id = the execution id, so the
 // document, the transcript journal and the state document share one name) and returns the recorder.
@@ -83,6 +92,12 @@ func (s *Server) NewResultRecorder(doc execstate.Doc, run runs.Run) *ResultRecor
 		}
 	}
 	r.flush()
+	// From now on this execution's agent conversation is addressable: it can be followed, and —
+	// with the right to do so — written into. The register lives exactly as long as the recorder,
+	// so there is never an entry pointing at an execution nobody is recording.
+	if s.sessions != nil {
+		s.sessions.open(doc.ID, r)
+	}
 	return r
 }
 
@@ -138,7 +153,34 @@ func (r *ResultRecorder) Transcript(_ string, line []byte) {
 	}
 	if err := r.s.results.AppendTranscript(r.res.ID, line); err != nil {
 		log.Printf("devlabd: transcript of execution %s: %v", r.res.ID, err)
+		return
 	}
+	r.tickSession()
+}
+
+// tickSession tells the followers that the session has spoken — coalesced, so a fast agent does
+// not make every open pane refetch per line. A dropped tick is harmless: the next one carries
+// everything since, because a follower reads forward from where it stopped.
+func (r *ResultRecorder) tickSession() {
+	now := time.Now()
+	r.tmu.Lock()
+	if now.Sub(r.lastTick) < sessionTickEvery {
+		r.tmu.Unlock()
+		return
+	}
+	r.lastTick = now
+	r.tmu.Unlock()
+	r.s.publish(live.TopicSession)
+}
+
+// Intervened records that a PERSON wrote into this running execution. It goes through the recorder
+// because the recorder is the ONE writer of the result document — a second writer would have its
+// entry overwritten by the next flush of this one.
+func (r *ResultRecorder) Intervened(in model.Intervention) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.res.Interventions = append(r.res.Interventions, in)
+	r.flush()
 }
 
 // Usage records the execution-cumulative consumption — climbing while the agent works (F7).
@@ -179,6 +221,16 @@ func (r *ResultRecorder) Notice(n executor.NoticeEvent) {
 // Finish stamps the end of the execution and its honest report. A pause or an interruption is NOT
 // an end: the document stays open so the resume continues in the same record (REQ-019.1).
 func (r *ResultRecorder) Finish(execErr error) {
+	// Whatever brought the execution to a stop, its conversation is no longer running HERE: the
+	// register entry goes and every desk still standing is shut. A pause or an interruption ends
+	// the open session just as an end does — a resume opens a new one.
+	if r.s.sessions != nil {
+		r.s.sessions.close(r.res.ID)
+	}
+	// The coalesced tick may have swallowed the last lines; one final tick makes the followers
+	// read them.
+	r.s.publish(live.TopicSession)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if execErr != nil && !executionEnded(execErr) {

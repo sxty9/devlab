@@ -61,6 +61,12 @@ type Server struct {
 	usage        *telemetry.UsageLedger
 	assigner     *autoAssigner
 
+	// sessions is the register of the agent conversations open in THIS process — what makes a
+	// running execution followable and speakable-to. It holds nothing that outlives the process:
+	// an execution that was running when the daemon stopped is simply no longer open, and its
+	// journal says what it managed to say.
+	sessions *openSessions
+
 	// Wired in cmd/devlabd once their packages are filled (Welle 1/2); nil-safe until then.
 	docs      *execstate.Store
 	scheduler *sched.Scheduler
@@ -112,6 +118,7 @@ func New(v *auth.Verifier, paths *statepath.Paths) *Server {
 		axiomAuthors: axiomauthors.NewStore(paths),
 		reportLedger: report.NewLedger(paths),
 		usage:        telemetry.OpenUsage(paths),
+		sessions:     newOpenSessions(),
 		staticDir:    staticDir,
 	}
 	// The constitution lives in its own repository. Pushing uses the runner's linked account —
@@ -285,6 +292,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/mercury/runs/{id}/prompt", s.guard(s.runPromptPreview))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results", s.guard(s.runResultsList))
 	mux.HandleFunc("GET /api/mercury/runs/{id}/results/{rid}", s.guard(s.runResultGet))
+	// The session an execution works in — read and written on ONE path, behind the TWO rights it
+	// takes: following it is not steering it.
+	mux.HandleFunc("GET /api/mercury/runs/{id}/results/{rid}/session", s.guardSessionWatch(s.runSessionRead))
+	mux.HandleFunc("POST /api/mercury/runs/{id}/results/{rid}/session", s.guardSessionSpeak(s.runSessionSpeak))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/run", s.guardCSRF(s.runNow))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/cancel", s.guardCSRF(s.runCancel))
 	mux.HandleFunc("POST /api/mercury/runs/{id}/defer", s.guardCSRF(s.runDefer))
@@ -401,6 +412,29 @@ func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 	})
 }
 
+// guardSessionWatch gates READING the session a run works in; guardSessionSpeak gates WRITING
+// into it (and carries the CSRF check every mutating request carries). They are two guards
+// because they are two rights: the first one alone never opens the second.
+func (s *Server) guardSessionWatch(h http.HandlerFunc) http.HandlerFunc {
+	return s.guard(func(w http.ResponseWriter, r *http.Request) {
+		if u := userFrom(r); u == nil || !u.CanWatchSession() {
+			writeErr(w, http.StatusForbidden, "Following a run's session requires the hp_devlab_session_watch right")
+			return
+		}
+		h(w, r)
+	})
+}
+
+func (s *Server) guardSessionSpeak(h http.HandlerFunc) http.HandlerFunc {
+	return s.guardCSRF(func(w http.ResponseWriter, r *http.Request) {
+		if u := userFrom(r); u == nil || !u.CanSpeakInSession() {
+			writeErr(w, http.StatusForbidden, "Writing into a run's session requires the hp_devlab_session_speak right")
+			return
+		}
+		h(w, r)
+	})
+}
+
 // checkCSRF applies the double-submit check on the cookie path. On a bearer request the check is
 // waived — a bearer header cannot be sent cross-site by a browser form (D 34).
 func (s *Server) checkCSRF(r *http.Request) bool {
@@ -487,8 +521,12 @@ func (s *Server) user(w http.ResponseWriter, r *http.Request) {
 		DisplayName:  auth.DisplayName(u.Username),
 		IsAdmin:      u.IsAdmin,
 		CanUseDevlab: u.CanUseDevlab(),
-		GithubLinked: s.githubLinked(u),
-		GithubLogin:  ghLogin,
+		// The surface must know both session rights up front: a viewer without the write right is
+		// shown the session WITHOUT an input, instead of an input that is refused when used.
+		CanWatchSession: u.CanWatchSession(),
+		CanSpeakSession: u.CanSpeakInSession(),
+		GithubLinked:    s.githubLinked(u),
+		GithubLogin:     ghLogin,
 	})
 }
 

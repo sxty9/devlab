@@ -7,13 +7,14 @@ import (
 	"time"
 )
 
-// TestTopicsClosedSet pins the EXACTLY NINE topics (REQ-034): the set is closed, distinct,
-// and matches the frontend vocabulary verbatim.
+// TestTopicsClosedSet pins the topic set (REQ-034): it is CLOSED, distinct, and matches the
+// frontend vocabulary verbatim. Growing it is a deliberate act — this test is what makes a new
+// topic a decision rather than a slip, and it is why every tick still rides on the ONE stream.
 func TestTopicsClosedSet(t *testing.T) {
-	want := []Topic{"axioms", "runs", "active", "progress", "deliveries", "notices", "slots", "restart", "questions"}
+	want := []Topic{"axioms", "runs", "active", "progress", "deliveries", "notices", "slots", "restart", "questions", "session"}
 	got := Topics()
-	if len(got) != 9 {
-		t.Fatalf("Topics() has %d entries, want exactly 9", len(got))
+	if len(got) != len(want) {
+		t.Fatalf("Topics() has %d entries, want exactly %d", len(got), len(want))
 	}
 	seen := map[Topic]bool{}
 	for i, tp := range got {

@@ -44,7 +44,7 @@ func TestTheFreshCallOpensTheConversationTheResumeAsksFor(t *testing.T) {
 	}
 	sess := executor.AgentSession{Key: "exec_1"}
 
-	fresh := chainAgentArgs("holistic", "mercury-dev", "do it", runs.ResolvedTuning{}, sess)
+	fresh := chainAgentArgs("holistic", "mercury-dev", runs.ResolvedTuning{}, sess)
 	opened, ok := flag(fresh, "--session-id")
 	if !ok {
 		t.Fatalf("the fresh call opens no named conversation: %v", fresh)
@@ -54,7 +54,7 @@ func TestTheFreshCallOpensTheConversationTheResumeAsksFor(t *testing.T) {
 	}
 
 	sess.Resume = true
-	again := chainAgentArgs("holistic", "mercury-dev", "do it", runs.ResolvedTuning{}, sess)
+	again := chainAgentArgs("holistic", "mercury-dev", runs.ResolvedTuning{}, sess)
 	asked, ok := flag(again, "--resume")
 	if !ok {
 		t.Fatalf("the continuation resumes nothing: %v", again)

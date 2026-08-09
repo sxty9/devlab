@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// Topic is one of the EXACTLY NINE topics (the closed set; REQ-034).
+// Topic is one of the topics of the CLOSED set below (REQ-034).
 type Topic string
 
 const (
@@ -23,11 +23,16 @@ const (
 	// TopicQuestions ticks when a blocking question is raised, answered or resolved — so the Blocked
 	// surface refreshes without polling.
 	TopicQuestions Topic = "questions"
+	// TopicSession ticks while an execution's agent session speaks, and when a person writes into
+	// it — coalesced, so a fast agent does not tick per line. It rides on the SAME stream as every
+	// other topic (there is no second channel), but stays its own topic: a session grows far more
+	// often than a stage changes, and only the pane that follows a session should refetch that often.
+	TopicSession Topic = "session"
 )
 
 // Topics returns the closed topic set (for guards and tests).
 func Topics() []Topic {
-	return []Topic{TopicAxioms, TopicRuns, TopicActive, TopicProgress, TopicDeliveries, TopicNotices, TopicSlots, TopicRestart, TopicQuestions}
+	return []Topic{TopicAxioms, TopicRuns, TopicActive, TopicProgress, TopicDeliveries, TopicNotices, TopicSlots, TopicRestart, TopicQuestions, TopicSession}
 }
 
 // Publisher is the injection seam the writers (handlers, sched, recorder, deliver) publish

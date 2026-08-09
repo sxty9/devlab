@@ -179,7 +179,10 @@ func (r route) concrete() string { return placeholderRe.ReplaceAllString(r.patte
 
 var (
 	placeholderRe = regexp.MustCompile(`\{[a-zA-Z]+\}`)
-	routeRe       = regexp.MustCompile(`mux\.HandleFunc\("([A-Z]+) ([^"]+)",\s*(?:s\.(guardAuthed|guardWrite|guardCSRF|guard)\()?s\.([A-Za-z0-9_]+)\)?\)`)
+	// LONGEST-FIRST alternation: Go's regexp is leftmost-first, so a shorter guard name that is a
+	// prefix of a longer one would swallow it — and the route would then be read as carrying a
+	// laxer guard than it does, or (with the nested call) not be read at all.
+	routeRe = regexp.MustCompile(`mux\.HandleFunc\("([A-Z]+) ([^"]+)",\s*(?:s\.(guardSessionWatch|guardSessionSpeak|guardAuthed|guardWrite|guardCSRF|guard)\()?s\.([A-Za-z0-9_]+)\)?\)`)
 )
 
 // parseRouteTable reads THE route table out of api.go — the one place it exists.

@@ -50,18 +50,23 @@ type streamEmit struct {
 // transcript survives a kill; the returned view is the invocation's settled consumption.
 func CompactStream(r io.Reader, sink Sink, repo string) (model.UsageView, error) {
 	out, err := compactStreamFull(r, streamEmit{
-		transcript: func(text string) { sink.Transcript(repo, transcriptLine(text)) },
+		transcript: func(text string) { sink.Transcript(repo, SessionLine(repo, "", text)) },
 		usage:      func(u model.UsageView, _ int) { sink.Usage(u) },
 	})
 	return out.Usage, err
 }
 
-// transcriptLine renders one visible block as a self-contained JSON journal line.
-func transcriptLine(text string) []byte {
-	b, _ := json.Marshal(struct {
-		At   string `json:"at"`
-		Text string `json:"text"`
-	}{At: time.Now().UTC().Format(time.RFC3339), Text: text})
+// SessionLine renders one line of the session journal as a self-contained JSON record: when it
+// happened, in which repository's session, WHO produced it, and its text. An empty from is the
+// agent's own output; a person's intervention carries their username, so both sides of an open
+// session live in ONE recording instead of two.
+func SessionLine(repo, from, text string) []byte {
+	b, _ := json.Marshal(model.SessionLine{
+		At:   time.Now().UTC().Truncate(time.Second),
+		Repo: repo,
+		From: from,
+		Text: text,
+	})
 	return b
 }
 
@@ -280,7 +285,7 @@ func (t *transcriptBuf) clipped() string { return clip(t.b.String()) }
 func (rc *RepoCtx) transcriptEmitter() streamEmit {
 	base := *rc.usage
 	return streamEmit{
-		transcript: func(text string) { rc.Sink.Transcript(rc.Repo, transcriptLine(text)) },
+		transcript: func(text string) { rc.Sink.Transcript(rc.Repo, SessionLine(rc.Repo, "", text)) },
 		usage: func(u model.UsageView, _ int) {
 			rc.Sink.Usage(model.UsageView{
 				InputTokens:  base.in + u.InputTokens,

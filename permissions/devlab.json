@@ -1,6 +1,6 @@
 {
   "service": "devlab",
-  "version": 1,
+  "version": 2,
   "categories": [
     {
       "id": "access",
@@ -12,6 +12,27 @@
           "label": "DevLab nutzen",
           "description": "Erlaubt die Nutzung der DevLab-Entwicklungsumgebung. Ohne dieses Recht ist DevLab nicht zugänglich. Alle weiteren Rechte (Repo-Sichtbarkeit, Schreib- und Push-Rechte) werden über GitHub verwaltet.",
           "group": "hp_devlab_access",
+          "default": false
+        }
+      ]
+    },
+    {
+      "id": "session",
+      "label": "Sitzung eines Laufs",
+      "description": "Die Sitzung, in der ein Lauf arbeitet: ihr zusehen und in sie hineinschreiben. Zusehen und Mitreden sind zwei getrennte Rechte — wer zusehen darf, darf damit noch nicht hineinschreiben.",
+      "permissions": [
+        {
+          "id": "watch",
+          "label": "Sitzung eines Laufs mitlesen",
+          "description": "Erlaubt, die laufende Sitzung eines Laufs mitzulesen, während sie entsteht, und eine beendete Sitzung nachzulesen. Ein reines Lese-Recht: es erlaubt nicht, in die Sitzung hineinzuschreiben.",
+          "group": "hp_devlab_session_watch",
+          "default": false
+        },
+        {
+          "id": "speak",
+          "label": "In die Sitzung eines Laufs schreiben",
+          "description": "Erlaubt, in die laufende Sitzung eines Laufs hineinzuschreiben und sie damit zu lenken, zu korrigieren oder zu stoppen. Ein Lauf, in den geschrieben wurde, weist das anschließend aus: wer, wann, und dass überhaupt eingegriffen wurde.",
+          "group": "hp_devlab_session_speak",
           "default": false
         }
       ]

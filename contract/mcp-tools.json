@@ -1701,6 +1701,81 @@
       }
     },
     {
+      "name": "run_session_read",
+      "description": "Read a portion of one execution's agent session: what it said and did, and what people wrote into it. Newest portion by default; follow it forward with `at`, fetch older lines with `at` plus `back`.",
+      "dataSourceOp": "mercuryRunSession",
+      "method": "GET",
+      "route": "GET /api/mercury/runs/{id}/results/{rid}/session",
+      "tier": "read",
+      "readOnly": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "description": "Where to read from — the `next` of a previous portion to follow forward, or its `from` together with back=true for older lines.",
+            "type": "integer"
+          },
+          "back": {
+            "description": "Read the portion BEFORE `at` instead of the one after it.",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          },
+          "max": {
+            "description": "How many lines the portion holds at most.",
+            "type": "integer"
+          },
+          "resultId": {
+            "description": "Result document id.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resultId"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_session_speak",
+      "description": "Write into an execution's RUNNING session and steer it. Only while it is running; the message is recorded in the session together with who wrote it, and the execution then shows that a person intervened.",
+      "dataSourceOp": "mercuryRunSessionSpeak",
+      "method": "POST",
+      "route": "POST /api/mercury/runs/{id}/results/{rid}/session",
+      "tier": "csrf",
+      "readOnly": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "description": "Run id (a ToDo or an automatic run).",
+            "type": "string"
+          },
+          "repo": {
+            "description": "Which repository's session is meant. Needed only while several are working at once.",
+            "type": "string"
+          },
+          "resultId": {
+            "description": "Result document id.",
+            "type": "string"
+          },
+          "text": {
+            "description": "What to say to the running session.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resultId",
+          "text"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "run_snapshot_list",
       "description": "List the snapshots of the run plan, newest first.",
       "dataSourceOp": "mercuryRunHistory",
