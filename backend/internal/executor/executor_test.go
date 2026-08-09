@@ -184,6 +184,55 @@ func TestFailedStageMakesFollowersNotExecuted(t *testing.T) {
 	}
 }
 
+// KEIN STUMMES SCHEITERN: a stage that fails carries the failed step's FULL output — stderr and exit
+// status — in its OWN protocol (StageView.Log), not only a condensed one-line reason and not only in a
+// side-channel alarm that can be lost. The cause a run overlooked ("Permission denied.") is printed one
+// line ABOVE the last line; the condensed reason keeps only the last line, so the log must keep the whole
+// output for the true cause to survive at the stage itself.
+func TestFailedStageLogCarriesStepOutput(t *testing.T) {
+	stubConstitution(t, nil)
+	deps := newFakeDeps("org/app")
+	deps.deploy.deliverErr = func(int) error {
+		return errors.New("deploy: install of app failed: exit status 1: useradd: Permission denied.\nuseradd: cannot lock /etc/passwd; try again later.")
+	}
+	sink := newFakeSink()
+
+	_ = Execute(context.Background(), deps, mkRequest(model.KindTodo, "org/app"), sink)
+
+	sv, ok := sink.terminal("org/app", model.StageDeliverDev)
+	if !ok || sv.State != model.StepFailed {
+		t.Fatalf("deliver-dev not failed: %+v", sv)
+	}
+	if strings.TrimSpace(sv.Log) == "" {
+		t.Fatalf("a failed stage must never carry an empty protocol; log was empty: %+v", sv)
+	}
+	// The true cause sits one line above the last line — the condensed reason drops it, the log must keep it.
+	if !strings.Contains(sv.Log, "Permission denied") {
+		t.Fatalf("the failed step's full output (incl. the abort-carrying line) must be in the stage log, got: %q", sv.Log)
+	}
+}
+
+// A stage may not reach 'failed' with an empty protocol at all: the invariant is enforced at the ONE
+// choke point, and a failure that recorded neither log nor reason is named as a defect rather than left
+// blank. failedStageLog composes the protocol; here its no-output branch is pinned directly.
+func TestFailedStageLogNeverEmpty(t *testing.T) {
+	if got := failedStageLog(model.StageDeliverDev, "", nil); strings.TrimSpace(got) == "" {
+		t.Fatalf("failedStageLog must never return an empty protocol")
+	}
+	if got := failedStageLog(model.StageDeliverDev, "", nil); !strings.Contains(got, string(model.StageDeliverDev)) || !strings.Contains(got, "no") {
+		t.Fatalf("an output-less failure must name the stage and that it produced no output, got: %q", got)
+	}
+	// stderr present, no captured log ⇒ the step's output IS the protocol.
+	if got := failedStageLog(model.StageDeliverDev, "", errors.New("useradd: Permission denied.")); !strings.Contains(got, "Permission denied") {
+		t.Fatalf("the step error must become the protocol, got: %q", got)
+	}
+	// Both present ⇒ both survive.
+	got := failedStageLog(model.StageDeliverDev, "captured line", errors.New("step stderr"))
+	if !strings.Contains(got, "captured line") || !strings.Contains(got, "step stderr") {
+		t.Fatalf("captured log and step output must both survive, got: %q", got)
+	}
+}
+
 // REQ-031.3: a skip without attested repo evidence is refused — never silent, never green.
 func TestSkipWithoutEvidenceRefused(t *testing.T) {
 	stubConstitution(t, nil)

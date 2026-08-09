@@ -664,7 +664,11 @@ func runRepo(ctx context.Context, rc *RepoCtx) (model.RepoPipeline, error) {
 					// Keep the CAUSE, not the head: tool/wrapper failures print the reason LAST, after
 					// their own green log lines — firstLine would surface the success and drop the failure.
 					sv.Reason = failReason(err.Error())
-					sv.Log = rc.takeFailLogOr()
+					// KEIN STUMMES SCHEITERN: the failed step's OWN output — stderr and exit status, which
+					// every exec-based step folds into its error — is the stage's protocol, not merely a
+					// one-line reason nor a side-channel alarm that can be lost or summarised away. Joined
+					// with any log the stage captured itself so both survive; never blank at state=failed.
+					sv.Log = failedStageLog(spec.Name, rc.takeFailLogOr(), err)
 					failedStage = spec.Name
 				}
 			}
@@ -688,8 +692,39 @@ func finishStage(rc *RepoCtx, sv *model.StageView, views *[]model.StageView) {
 		sv.Link = rc.link
 		rc.link = ""
 	}
+	// KEIN STUMMES SCHEITERN — the ONE choke point every stage view passes through, so no branch above
+	// can reach 'failed' with an empty protocol. Whatever was recorded, a failed stage carries its
+	// reason at least; a stage that recorded neither log nor reason is ITSELF a defect and is named as
+	// one — never left as an unremarkable blank that forces the cause to be hunted elsewhere.
+	if sv.State == model.StepFailed && strings.TrimSpace(sv.Log) == "" {
+		sv.Log = nonEmpty(strings.TrimSpace(sv.Reason),
+			fmt.Sprintf("stage %q reported failure but recorded neither output nor reason — this empty protocol is itself a defect", sv.Stage))
+	}
 	rc.Sink.StageUpdate(rc.Repo, *sv)
 	*views = append(*views, *sv)
+}
+
+// failedStageLog composes the protocol of a FAILED stage so it is never blank (task points 1–3): the
+// stage's own captured log, plus the failed step's full output — the stderr and exit status that every
+// exec-based step folds into its error. When the stage captured nothing and the step produced no
+// output, the protocol says exactly that: the stage, and that it failed without any output. An empty
+// protocol at state=failed is itself the defect and is named, not left as a silent nothing.
+func failedStageLog(stage model.Stage, captured string, err error) string {
+	captured = strings.TrimSpace(captured)
+	detail := ""
+	if err != nil {
+		detail = strings.TrimSpace(err.Error())
+	}
+	switch {
+	case captured != "" && detail != "":
+		return captured + "\n" + detail
+	case captured != "":
+		return captured
+	case detail != "":
+		return detail
+	default:
+		return fmt.Sprintf("stage %q failed but produced no output — no captured log and no step error", stage)
+	}
 }
 
 // finishRepo assembles the pipeline, raises the K-4 alarm when implemented work was left
