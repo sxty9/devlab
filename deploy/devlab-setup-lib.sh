@@ -770,3 +770,49 @@ setup_unit_listen_port() {
   [ -n "$port" ] || port="$(grep -oE -e '--port[=[:space:]]+[0-9]+' -- "$file" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true)"
   printf '%s' "$port"
 }
+
+# ── A SERVE ROOT IS READABLE BY ITS ROLE, NOT BY THE ACCOUNT THAT BUILT IT ────────────────────────
+# A web face is copied into a serve root with `rsync -a`, which carries the SOURCE's owner and mode.
+# The source is the artifact built on the workbench under the unprivileged build account, so with a
+# group-only umask the delivered tree arrives drwxr-x--- / uid-of-the-builder — and the edge webserver,
+# a DIFFERENT account entirely, then answers 404 over a page that is present. A serve root is not a
+# private directory: it is public by role, because the browser fetches every byte of it through the
+# edge. So the readability comes from the SERVING side, never from whoever happened to build.
+#
+# These two functions are the ONE place that rule lives, shared by every serve-root copy — the dev
+# installer's self web and dashboard serve roots (devlab-install) and the production receiver's web
+# root (devlab-deploy-recv) — so no site re-implements it and none can drift. They are the symmetric
+# twin of the `chmod -R a+rX /opt/<repo>` the program install applies so the service account can read
+# and run the interpreter it did not build.
+
+# setup_serve_root_readable <serve-root> — DERIVE the permissions from the public role: directories
+# traversable, files readable for every reader (a+rX), regardless of who built or under which umask.
+# World-read (rather than adding the webserver to a group) needs no knowledge of the webserver's
+# account — instance configuration this template does not and should not carry — and makes the tree
+# reachable for ANY edge identity.
+setup_serve_root_readable() {  # <serve-root>
+  chmod -R a+rX "$1"
+}
+
+# setup_serve_root_check <serve-root> — PROVE the delivered serve root is actually reachable by the
+# edge (Kein stummes Ausbleiben): a delivery whose result the webserver cannot read is NOT complete and
+# says so, never a silent green. The webserver's account is instance configuration this template does
+# not carry, so we prove the ROLE property that holds for EVERY account: an unprivileged reader can read
+# the start page. Running as root (production, via sudo) we DROP to `nobody` — the nologin account on
+# every host — and read index.html: if `nobody` can read it, the edge can too, whatever its account.
+# Without root (the direct-invocation test seam, where no privilege drop is possible) we check the same
+# property on the mode bits: the other-read bit must be set. It echoes the named reason to stderr and
+# RETURNS non-zero (it does not die), so each caller decides what to report first.
+setup_serve_root_check() {  # <serve-root> → 0 if the edge can read the start page, else 1 (reason on stderr)
+  local index="$1/index.html"
+  [ -f "$index" ] || { echo "serve root $1 has no index.html after delivery — the browser has no start page to fetch (delivery incomplete)" >&2; return 1; }
+  if [ "$(id -u)" = 0 ] && command -v runuser >/dev/null 2>&1 && getent passwd nobody >/dev/null 2>&1; then
+    runuser -u nobody -- test -r "$index" && return 0
+    echo "the delivered start page $index is NOT readable by an unprivileged reader ('nobody') — the webserver would answer 404 over a present page; the serve root's permissions do not match its public role (delivery incomplete)" >&2
+    return 1
+  fi
+  local mode; mode="$(stat -c %a "$index" 2>/dev/null || echo 0)"
+  [ "$(( 8#${mode:-0} & 4 ))" = 4 ] && return 0
+  echo "the delivered start page $index lacks other-read (mode $mode) — the webserver could not read it (404 over a present page; delivery incomplete)" >&2
+  return 1
+}
