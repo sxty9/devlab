@@ -396,23 +396,81 @@ handle /api/* {
 ROUTE
 }
 
-# setup_edge_caddyfile_text <conf_dir> <www_dir> [<site>] — THE host edge shell: the ONE site block
-# the per-service routes REQUIRE. Every route from setup_route_text is a naked `handle` block that is
-# valid only inside a site block, so the shell imports the whole route directory INSIDE one and adds a
-# static fallback for the dashboard. This is the SAME shape a grown holistic host carries (a site block
-# whose body imports conf.d and ends in a file_server), reduced to its instance-neutral core: no
-# hostname (the site is a bare port so no domain is baked in — Keine Instanz-Spezifika), the conf.d and
-# web paths supplied by the caller. It lives HERE, beside the route template, so the container and the
-# thing it must contain can never drift into two incompatible descriptions of the same edge.
+# ── the edge address: ONE declaration both the edge and the routing layer read ───────────────────────
+# WHERE THIS ENVIRONMENT'S EDGE ANSWERS is a single fact about a single entity, and it must be stated in
+# exactly ONE place — otherwise the edge binds one address (historically the baked-in ":80") while the
+# routing layer forwards to another (e.g. :8080), and every request for a production hostname ends as a
+# 502 in front of a face that is listening somewhere else. That declaration lives in RUNTIME
+# CONFIGURATION, never baked into a repository (Keine Instanz-Spezifika): a one-line file under the
+# shared holistic config dir, beside jwt-secret, holding the address in Caddy site-address form
+# (`host:port` or `:port`) — a form that is EQUALLY a valid forward target for the routing layer, so a
+# production-side sxgate can own this declaration without changing its shape.
+#
+# This file is NOT the "dead twin" the prod-target sweep removes. A dead twin is a file that steers
+# NOTHING (the one source is a single process's environment). This file steers TWO independent readers
+# that cannot share one process's environment — the Caddy edge built here AND the routing layer — so a
+# file is the only single source both can read. Both resolve it through setup_edge_address; neither
+# guesses the other's default.
+SETUP_EDGE_ADDRESS_FILE="${DEVLAB_EDGE_ADDRESS_FILE:-${DEVLAB_HOLISTIC_DIR:-/etc/holistic}/edge-address}"
+
+# setup_valid_edge_address <addr> — true when <addr> is a Caddy site address / forward target: an
+# optional host followed by ':' and a port in 1..65535. `:8080` (bind all interfaces) and
+# `10.10.0.1:8080` (a specific overlay address) are both valid; a bare port or a bare host is not.
+setup_valid_edge_address() {
+  local addr="$1" port
+  case "$addr" in *:*) : ;; *) return 1 ;; esac
+  port="${addr##*:}"
+  case "$port" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+}
+
+# setup_edge_address [<file>] — read the ONE declaration of where this environment's edge answers, from
+# the runtime-config file (default $SETUP_EDGE_ADDRESS_FILE). Comments and blank lines are ignored; the
+# first real line is the address. This is the SINGLE reader both the edge builder and the routing layer
+# use to answer "where does this environment answer?" — asking either yields the same address because
+# they read the same file. Returns non-zero (with nothing printed) when the declaration is absent or
+# malformed, so a caller NAMES the deficiency instead of guessing a default (Kein stummes Ausbleiben).
+setup_edge_address() {
+  local file="${1:-$SETUP_EDGE_ADDRESS_FILE}" addr=""
+  [ -r "$file" ] || return 1
+  addr="$(grep -vE '^[[:space:]]*(#|$)' -- "$file" 2>/dev/null | head -n1)"
+  addr="$(printf '%s' "$addr" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -n "$addr" ] || return 1
+  setup_valid_edge_address "$addr" || return 1
+  printf '%s' "$addr"
+}
+
+# setup_edge_caddyfile_text <conf_dir> <www_dir> <site> — THE host edge shell: the ONE site block the
+# per-service routes REQUIRE. Every route from setup_route_text is a naked `handle` block that is valid
+# only inside a site block, so the shell imports the whole route directory INSIDE one and adds a static
+# fallback for the dashboard. This is the SAME shape a grown holistic host carries (a site block whose
+# body imports conf.d and ends in a file_server), reduced to its instance-neutral core: the conf.d and
+# web paths supplied by the caller, and — decisively — the SITE ADDRESS supplied by the caller too, from
+# the ONE declaration (setup_edge_address). There is NO baked-in default: an address invented here is
+# exactly the guess that makes the edge answer somewhere the routing layer does not forward. It lives
+# HERE, beside the route template, so the container and the thing it must contain can never drift into
+# two incompatible descriptions of the same edge.
 setup_edge_caddyfile_text() {
-  local conf_dir="$1" www_dir="$2" site="${3:-:80}"
+  local conf_dir="$1" www_dir="$2" site="${3:-}"
+  if ! setup_valid_edge_address "$site"; then
+    echo "setup_edge_caddyfile_text: refusing to build an edge without a declared site address (got '${site}') — the edge address is read from the ONE declaration (setup_edge_address), never guessed" >&2
+    return 1
+  fi
+  # The edge is the PLAIN-HTTP face behind the routing layer (sxgate), which owns hostnames and TLS. So
+  # the declared socket is rendered as an explicit `http://` site: without a scheme, Caddy treats a
+  # host-bearing address (10.10.0.1:8080) as needing automatic HTTPS and tries to bind :80 for the
+  # HTTP→HTTPS redirect, which is both wrong here and fails on a host that does not own :80. The stored
+  # declaration stays the bare socket (what the routing layer forwards to); only the Caddy label carries
+  # the scheme. An address that already names a scheme is left as the operator wrote it.
+  local label="$site"
+  case "$site" in *://*) : ;; *) label="http://$site" ;; esac
   cat <<EDGE
 # Managed by devlab-install-recv — the Holistic edge shell. The per-service routes the receiver drops
 # into ${conf_dir} are naked \`handle\` blocks; a naked directive is valid ONLY inside a site block, so
 # they are imported INSIDE one here. Never add a bare directive or a second site block beside this one:
 # Caddy refuses that as an ambiguous site definition and then NO delivered route validates. Regenerated
 # on --provision; do not edit by hand.
-${site} {
+${label} {
 	import ${conf_dir}/*.caddy
 	handle {
 		root * ${www_dir}

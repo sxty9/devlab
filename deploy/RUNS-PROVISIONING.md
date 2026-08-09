@@ -190,7 +190,25 @@ as root, from a checkout of the merged standard branch. It takes only the PUBLIC
 (a private key is never created on or written to the target):
 
 ```sh
-sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <path-to-deploy.pub> [service ...]
+sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <path-to-deploy.pub> \
+     --edge-address <host:port|:port> [service ...]
+```
+
+**Where this environment's edge answers is ONE declaration, read by BOTH sides.** The edge (the Caddy
+site block built here) and the routing layer (a production-side `sxgate`) must agree on the socket this
+environment answers on — otherwise the edge listens on one address while the routing layer forwards to
+another, and every request for a production hostname ends as a 502 in front of a face that is elsewhere.
+That address is stated in exactly ONE runtime-config file — `/etc/holistic/edge-address`, beside
+`jwt-secret` (overridable only as a test seam), holding the bare socket in Caddy site-address / forward
+target form (`10.10.0.1:8080` or `:8080`). `--edge-address` writes that declaration and the edge is
+BUILT ON it (as a plain-HTTP site — the routing layer owns hostnames and TLS); the routing layer reads
+the SAME file. There is NO baked-in default and neither side guesses the other's: a missing declaration
+is a NAMED deficiency, fail-closed, never a silent `:80`. The address is an instance value and lives ONLY
+in that file, never in the repository — so a production-side `sxgate` can own this declaration without
+changing its shape. Ask it back (the routing layer's read) with:
+
+```sh
+devlab-install-recv --print-edge-address
 ```
 
 It is one pass, idempotent, fail-closed and reversible, and it PROVES the result instead of claiming it.
