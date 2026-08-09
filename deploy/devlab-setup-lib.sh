@@ -480,27 +480,111 @@ ${label} {
 EDGE
 }
 
+# ── system-account creation: serialised, and resilient to a momentarily-held account database ────────
+# Creating the service account writes /etc/passwd (and /etc/group), and the tool that does it —
+# `useradd` — takes a short EXCLUSIVE lock on those files while it writes. When two first-time setups
+# run on the SAME host at once (two services delivered in one wave), the second's `useradd` can arrive
+# while the first still holds that lock; it then refuses with
+#   "useradd: cannot lock /etc/passwd; try again later."
+# and says "try again later" precisely because the condition is momentary — nothing is wrong with the
+# account being created. A setup that reads this refusal as a verdict throws a finished implementation
+# away over a scheduling coincidence. Two guards, sharing ONE path (setup_account_cmd), so every caller
+# that creates an account behaves identically — no second, similar sibling:
+#
+#   SERIALISE      A host-wide advisory lock (flock on SETUP_ACCOUNT_LOCK) is held for the whole create,
+#                  so two Holistic setups take their turns instead of racing. The second WAITS.
+#   RETRY THE LOCK The account database can also be held by a NON-Holistic operation the flock knows
+#                  nothing about. So a create that fails with the DATABASE-LOCK signature — and ONLY
+#                  that signature — is retried until SETUP_ACCOUNT_LOCK_WAIT seconds have passed; only
+#                  then is it a failure, and a loud one. Any OTHER failure (an invalid name, an
+#                  exhausted UID range) is a factual rejection repetition cannot cure: it fails at once.
+#
+# What "momentary" MEANS is defined HERE, once — no caller re-guesses it per site. `useradd`, `groupadd`
+# and `usermod` all name a busy database with these two phrases and nothing else does: "cannot lock" is
+# emitted only when acquiring the lock fails, and "try again later" is the tool's own advice to retry.
+SETUP_ACCOUNT_LOCK_SIGNATURE='cannot lock|try again later'
+# Tunables (overridable for tests; the defaults bound a real host's momentary contention):
+: "${SETUP_ACCOUNT_LOCK:=/run/lock/holistic-account.lock}"  # the host-wide account-creation lock file
+: "${SETUP_ACCOUNT_LOCK_WAIT:=30}"                          # seconds a momentary lock may persist
+: "${SETUP_ACCOUNT_LOCK_STEP:=1}"                           # seconds between retry attempts
+
+# setup_account_cmd <describe> <cmd> [args…] — the ONE choke point every account create passes through.
+# It holds the host-wide lock (waiting for a busy peer up to the deadline) and runs <cmd>, retrying it
+# ONLY while it fails because the account database is momentarily locked. Returns 0 on success, the
+# command's own non-zero status on a factual failure, or 75 (EX_TEMPFAIL) when the deadline is reached
+# with a peer still holding the lock. It never hangs: both the wait for the peer and the retry are
+# bounded. Runs in a subshell so the private lock fd is released the instant the create is done.
+setup_account_cmd() {
+  local describe="$1"; shift
+  mkdir -p -- "$(dirname -- "$SETUP_ACCOUNT_LOCK")" 2>/dev/null || true
+  (
+    # Acquire the host-wide account lock on fd 9; wait up to the deadline for a busy peer, then report
+    # THAT as its own bounded failure rather than hanging. (No flock ⇒ degrade to retry-only below.)
+    # The fd-9 open is wrapped in a brace group so its stderr suppression is scoped to the open alone —
+    # `exec 9>file 2>/dev/null` would redirect the WHOLE subshell's stderr and swallow every later message.
+    if command -v flock >/dev/null 2>&1 && { exec 9>"$SETUP_ACCOUNT_LOCK"; } 2>/dev/null; then
+      if ! flock -w "$SETUP_ACCOUNT_LOCK_WAIT" 9; then
+        echo "devlab: another setup on this host held the account lock ($SETUP_ACCOUNT_LOCK) for more than ${SETUP_ACCOUNT_LOCK_WAIT}s while creating the account for '$describe' — stopping rather than hanging" >&2
+        exit 75
+      fi
+    fi
+    setup_account_retry "$describe" "$@"
+  )
+}
+
+# setup_account_retry <describe> <cmd> [args…] — run <cmd>, retrying ONLY on the database-lock signature,
+# bounded by SETUP_ACCOUNT_LOCK_WAIT. Assumes the caller already serialised (setup_account_cmd). The
+# command's stderr is captured so the signature can be judged and, on a factual failure, surfaced intact.
+setup_account_retry() {
+  local describe="$1"; shift
+  local elapsed=0 step="$SETUP_ACCOUNT_LOCK_STEP" err rc
+  [ "$step" -ge 1 ] 2>/dev/null || step=1
+  while :; do
+    err="$("$@" 2>&1 1>/dev/null)"; rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if printf '%s' "$err" | grep -Eqi "$SETUP_ACCOUNT_LOCK_SIGNATURE"; then
+      if [ "$elapsed" -ge "$SETUP_ACCOUNT_LOCK_WAIT" ]; then
+        echo "devlab: the account database stayed locked for more than ${SETUP_ACCOUNT_LOCK_WAIT}s while creating the account for '$describe' — last message: ${err}" >&2
+        return "$rc"
+      fi
+      sleep "$SETUP_ACCOUNT_LOCK_STEP" 2>/dev/null || true
+      elapsed=$(( elapsed + step ))
+      continue
+    fi
+    # A factual rejection repetition cannot cure — fail now, loudly, with the tool's own words.
+    [ -n "$err" ] && printf '%s\n' "$err" >&2
+    return "$rc"
+  done
+}
+
 # setup_ensure_account <repo> — the service's own identity: a nologin SYSTEM account whose home is
 # /var/lib/<repo>, created only when absent (idempotent). This is what `User=<repo>` in the unit runs
-# as; devlab-install and devlab-deploy-recv create it identically at first-time setup.
+# as; devlab-install and devlab-deploy-recv create it identically at first-time setup. The create runs
+# through setup_account_cmd, so a momentarily-locked account database makes it WAIT, not fail.
+setup_ensure_account() {
+  local repo="$1"
+  setup_account_cmd "$repo" setup_ensure_account_locked "$repo" || return 1
+  install -d -o "$repo" -g "$repo" -m 0755 "/var/lib/$repo"
+}
+
+# setup_ensure_account_locked <repo> — the create itself, run UNDER the host-wide lock. The existence
+# re-check lives here (not in the caller) so two setups for the same repo cannot both decide it is
+# absent and then collide — the loser of the lock finds it present and returns.
 #
 # On a BARE host a same-named GROUP may already exist without the matching user — the landscape's own
 # prerequisites create a `holistic` group before any service is installed. `useradd` defaults (Debian
 # USERGROUPS_ENAB) to creating a per-user group of the same name, which then FAILS ("group holistic
 # exists") and aborts the whole first-time setup. So when a group under the name is already present, the
 # account is created bound to THAT group (-g <repo>) instead of trying to mint a second one; when no such
-# group exists the default per-user group is created as before. This is another check that silently
-# assumed nothing was there yet — it only ever fired once a bare host actually had the group.
-setup_ensure_account() {
+# group exists the default per-user group is created as before.
+setup_ensure_account_locked() {
   local repo="$1"
-  if ! getent passwd "$repo" >/dev/null 2>&1; then
-    if getent group "$repo" >/dev/null 2>&1; then
-      useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" -g "$repo" "$repo"
-    else
-      useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" "$repo"
-    fi
+  getent passwd "$repo" >/dev/null 2>&1 && return 0
+  if getent group "$repo" >/dev/null 2>&1; then
+    useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" -g "$repo" "$repo"
+  else
+    useradd --system --shell /usr/sbin/nologin --home-dir "/var/lib/$repo" "$repo"
   fi
-  install -d -o "$repo" -g "$repo" -m 0755 "/var/lib/$repo"
 }
 
 # setup_fragment_path <repo> [<systemctl>] — echoes the FragmentPath systemd already knows for
