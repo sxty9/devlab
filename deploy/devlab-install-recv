@@ -30,14 +30,22 @@
 # RUN IT ON THE PRODUCTION HOST, AS ROOT, FROM A CHECKOUT OF THE MERGED STANDARD BRANCH:
 #     sudo /path/to/deploy/devlab-install-recv [service ...]                       # refresh receiver
 #     sudo /path/to/deploy/devlab-install-recv --provision \
-#          --deploy-pubkey <path|-|literal> [--recv-user <user>] \
+#          --deploy-pubkey <path|-|literal> --edge-address <host:port|:port> [--recv-user <user>] \
 #          [--staging <dir>] [--www <dir>] [--caddyfile <file>] [--no-pkg] \
 #          [--overlay-address <cidr> --overlay-listen-port <port> \
 #           --overlay-peer-pubkey <key|path|-> --overlay-peer-allowed <cidr> \
 #           [--overlay-endpoint <host:port>] [--overlay-verify-peer <ip>]] [service ...]
-#   e.g.  sudo ./deploy/devlab-install-recv --provision --deploy-pubkey /root/deploy.pub prizm presentr
+#   e.g.  sudo ./deploy/devlab-install-recv --provision --deploy-pubkey /root/deploy.pub \
+#              --edge-address 10.10.0.1:8080 prizm presentr
 # With no service names it installs/refreshes (and, with --provision, provisions) the host and proves
 # it, but triggers no service.
+#
+# THE EDGE ADDRESS IS ONE DECLARATION, READ BY BOTH SIDES: where this environment's edge answers is a
+# single fact stated in ONE runtime-config file (default /etc/holistic/edge-address, beside jwt-secret).
+# --provision writes it there from --edge-address and BUILDS the Caddy edge on it; the routing layer (a
+# production-side sxgate) reads the SAME file. There is NO baked-in default and neither side guesses the
+# other's — a missing declaration is a NAMED deficiency, not a silent ":80". Ask the declaration with:
+#     devlab-install-recv --print-edge-address        # prints the address the routing layer forwards to
 #
 #   3. --overlay-here: catch up THIS (home/chain) host's side of the production overlay after the far
 #      side was rebuilt — swap in the far side's NEW public key and PROVE the tunnel. Same script, no
@@ -92,6 +100,13 @@ WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 CADDY_CONF="${DEVLAB_CADDY_CONF:-/etc/caddy/conf.d}"
 CADDY_MAIN="${DEVLAB_CADDY_MAIN:-/etc/caddy/Caddyfile}"
 CADDY_BIN="${DEVLAB_CADDY_BIN:-caddy}"
+# WHERE THIS ENVIRONMENT'S EDGE ANSWERS — stated in exactly ONE runtime-config file, read by BOTH the
+# edge shell built here AND the routing layer (a production-side sxgate) that forwards this
+# environment's hostnames to it. This is the same path the sourced library resolves through
+# setup_edge_address (SETUP_EDGE_ADDRESS_FILE); it is kept in step with that default here so the flag
+# help and the reader name one file. The ADDRESS is an instance value and lives ONLY in this file —
+# --edge-address writes it, never the repository. Overridable ONLY as the direct-invocation test seam.
+EDGE_ADDRESS_FILE="${DEVLAB_EDGE_ADDRESS_FILE:-/etc/holistic/edge-address}"
 
 # ── overlay (WireGuard) transport ────────────────────────────────────────────────────────────────────
 # The private transport the chain reaches production over is the FIRST stage of a production target, not
@@ -124,7 +139,10 @@ sha()  { sha256sum -- "$1" | cut -d' ' -f1; }
 # --provision turns on the bare-server bring-up; the rest configure it. Everything that is NOT a flag
 # is a service name (today's positional contract), collected in SERVICES and passed on unchanged.
 PROVISION=0
+PRINT_EDGE_ADDRESS=0  # query mode: print the ONE declared edge address (what the routing layer reads) and exit
 DEPLOY_PUBKEY=""      # PUBLIC deploy key: a path, '-' for stdin, or the literal key line
+EDGE_ADDRESS=""       # where this environment's edge answers (Caddy site addr / forward target, host:port|:port)
+EDGE_BUILT=0          # set to 1 when ensure_caddy built/holds OUR shell (so its site label IS $EDGE_ADDRESS)
 RECV_USER="root"      # the account whose authorized_keys carries the forced command (the deploy login)
 USE_PKG=1             # ask the package manager for a missing OS prerequisite (idempotent, fail-closed)
 # Overlay transport (same entry point — Keine ähnlichen Geschwister; there is no second script for it).
@@ -144,6 +162,9 @@ declare -a SERVICES=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --provision)      PROVISION=1; shift ;;
+    --print-edge-address) PRINT_EDGE_ADDRESS=1; shift ;;
+    --edge-address)   EDGE_ADDRESS="${2:-}"; shift 2 ;;
+    --edge-address=*) EDGE_ADDRESS="${1#*=}"; shift ;;
     --deploy-pubkey)  DEPLOY_PUBKEY="${2:-}"; shift 2 ;;
     --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}"; shift ;;
     --recv-user)      RECV_USER="${2:-}"; shift 2 ;;
@@ -180,6 +201,20 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 set -- "${SERVICES[@]+"${SERVICES[@]}"}"
+
+# ── query: ask the ONE declaration where this environment answers ─────────────────────────────────────
+# This is the SAME read the routing layer (a production-side sxgate) performs to learn where to forward.
+# It is a pure read — no root, no host changes — and it uses setup_edge_address, the single reader, so
+# the answer is byte-for-byte what the edge is built on. Absence is NAMED, never a guessed default.
+if [ "$PRINT_EDGE_ADDRESS" = 1 ]; then
+  # shellcheck source=/dev/null
+  . "$SRC_DIR/$LIB" 2>/dev/null || die "could not source $SRC_DIR/$LIB — cannot read the edge-address declaration"
+  if addr="$(setup_edge_address "$EDGE_ADDRESS_FILE")"; then
+    printf '%s\n' "$addr"; exit 0
+  fi
+  echo "devlab-install-recv: this environment's edge address is not declared at $EDGE_ADDRESS_FILE — provision with --edge-address <host:port> (or seed that ONE file). The generated edge and the routing layer both read this declaration." >&2
+  exit 1
+fi
 
 # Backups made THIS run, newest first, so the rollback restores them in the reverse of install order.
 # Each entry is a TAB-separated triple "target<TAB>backup<TAB>abs": target is the file to restore
@@ -346,6 +381,40 @@ edge_imports_holistic_routes() {
   grep -Eq "^[[:space:]]*import[[:space:]]+.*${CADDY_CONF//\//\\/}/\*\.caddy" -- "$1" 2>/dev/null
 }
 
+# ensure_edge_address — establish the ONE declaration of where this environment's edge answers, and set
+# $EDGE_ADDRESS to it, BEFORE the edge is built from it. This closes the single-source-of-truth gap: the
+# edge shell and the routing layer (a production-side sxgate) both read this ONE file, so they can never
+# name different addresses. It NEVER guesses: if --edge-address is given it is validated and written to
+# the file (backed up first, so a rollback restores the host; idempotent when the file already holds it);
+# otherwise an already-present declaration is used as is; if neither exists the run stops with a NAMED
+# deficiency (Kein stummes Ausbleiben) — a guessed default is exactly the bug this fixes. The address is
+# an instance value and lives ONLY in this runtime-config file, never in the repository.
+ensure_edge_address() {
+  local want="$EDGE_ADDRESS" have=""
+  have="$(setup_edge_address "$EDGE_ADDRESS_FILE" 2>/dev/null || true)"
+  if [ -n "$want" ]; then
+    setup_valid_edge_address "$want" \
+      || die "--edge-address '$want' is not a valid edge address — give a Caddy site address / forward target like ':8080' or '10.10.0.1:8080'"
+    if [ "$want" = "$have" ]; then
+      EDGE_ADDRESS="$have"
+      log "edge address already declared as '$EDGE_ADDRESS' in $EDGE_ADDRESS_FILE — left untouched (the edge and the routing layer both read this ONE declaration)"
+      return 0
+    fi
+    local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+    install -d "${own[@]}" -m 0755 "$(dirname -- "$EDGE_ADDRESS_FILE")"
+    backup_file "$EDGE_ADDRESS_FILE"   # notes absence too, so rollback removes a file we create
+    printf '# Managed by devlab-install-recv — the ONE declaration of where this environment'\''s edge\n# answers. Read by the generated Caddy edge AND by the routing layer (sxgate). Instance value;\n# never copy it into a repository.\n%s\n' "$want" > "$EDGE_ADDRESS_FILE"
+    [ "${DEVLAB_RECV_TEST:-0}" != 1 ] && chmod 0644 "$EDGE_ADDRESS_FILE"
+    EDGE_ADDRESS="$want"
+    log "declared this environment's edge address as '$EDGE_ADDRESS' in $EDGE_ADDRESS_FILE (the edge and the routing layer both read this ONE declaration)"
+  elif [ -n "$have" ]; then
+    EDGE_ADDRESS="$have"
+    log "using the edge address already declared as '$EDGE_ADDRESS' in $EDGE_ADDRESS_FILE"
+  else
+    die "this environment's edge address is not declared — pass --edge-address <host:port> (e.g. --edge-address 10.10.0.1:8080) so the edge and the routing layer read the SAME address from $EDGE_ADDRESS_FILE; it is never guessed"
+  fi
+}
+
 # ensure_caddy — the edge, built in THE shape the delivered routes require. Caddy must be installed and
 # its route directory must exist; the main Caddyfile must be a SITE BLOCK that imports that directory
 # from INSIDE it (setup_edge_caddyfile_text — the one source, shared with the route it contains), not a
@@ -365,19 +434,23 @@ ensure_caddy() {
   local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
   install -d "${own[@]}" -m 0755 "$CADDY_CONF" && log "edge route dir ready: $CADDY_CONF"
 
-  local desired; desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$WWW_DIR")"
+  local desired
+  desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$WWW_DIR" "$EDGE_ADDRESS")" \
+    || die "cannot build the edge: no declared edge address (ensure_edge_address must run first) — the edge address is read from $EDGE_ADDRESS_FILE, never guessed"
   local seam=0; [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && seam=1
 
   write_edge() {  # back up (backup_file notes absence too, so rollback removes what we create), then write
     backup_file "$CADDY_MAIN"
     install -d "${own[@]}" -m 0755 "$(dirname -- "$CADDY_MAIN")"
     printf '%s\n' "$desired" > "$CADDY_MAIN"
+    EDGE_BUILT=1   # our shell, so its site label is the declared $EDGE_ADDRESS (proven in the self-check)
   }
 
   if [ ! -f "$CADDY_MAIN" ]; then
     write_edge
-    log "created the holistic edge shell at $CADDY_MAIN (a site block importing $CADDY_CONF)"
+    log "created the holistic edge shell at $CADDY_MAIN (a site block on $EDGE_ADDRESS importing $CADDY_CONF)"
   elif [ "$(cat -- "$CADDY_MAIN")" = "$desired" ]; then
+    EDGE_BUILT=1   # already OUR shell on the declared address (idempotent re-run)
     log "the holistic edge shell is already in place at $CADDY_MAIN — left untouched"
   elif grep -Fq -- "/usr/share/caddy" "$CADDY_MAIN"; then
     write_edge
@@ -666,6 +739,7 @@ if [ "$PROVISION" = 1 ]; then
   PUBKEY="$(read_pubkey)"
   ensure_rrsync
   ensure_roots
+  ensure_edge_address
   ensure_caddy
   install_forced_command "$PUBKEY"
   sweep_dead_prod_target
@@ -763,6 +837,26 @@ if [ "$PROVISION" = 1 ]; then
   fi
 fi
 
+# 6b. SINGLE SOURCE OF TRUTH: the edge is BUILT ON the one declared address, and asking the declaration
+#     (the same read the routing layer performs) yields that very address. If these two disagree the edge
+#     answers where nothing forwards — the exact 502 this fixes — so the provision fails closed here.
+if [ "$PROVISION" = 1 ]; then
+  declared="$(setup_edge_address "$EDGE_ADDRESS_FILE" 2>/dev/null || true)"
+  if [ -z "$declared" ]; then
+    sc_fail "the edge address is not declared at $EDGE_ADDRESS_FILE — the routing layer has nothing to read"
+  elif [ "$declared" != "$EDGE_ADDRESS" ]; then
+    sc_fail "the declaration ($declared) and the address the edge was built on ($EDGE_ADDRESS) disagree — one source, two answers"
+  elif [ "$EDGE_BUILT" != 1 ]; then
+    # A grown edge we left untouched carries the operator's own site address; we do not govern its label.
+    # The declaration is still established, so the routing layer reads the same address the operator runs.
+    sc_ok "edge address declared as $EDGE_ADDRESS ($EDGE_ADDRESS_FILE); a grown edge at $CADDY_MAIN was kept as is, so its own site address stands and the routing layer reads the declaration"
+  elif grep -Fq -- "$EDGE_ADDRESS {" "$CADDY_MAIN" 2>/dev/null; then
+    sc_ok "edge answers on the ONE declared address $EDGE_ADDRESS ($EDGE_ADDRESS_FILE) — the routing layer reads the same"
+  else
+    sc_fail "the edge at $CADDY_MAIN is not a site block on the declared address $EDGE_ADDRESS"
+  fi
+fi
+
 # 7. the overlay transport (only when we set it up). The interface must be up and carry the intended
 #    config; the deep proof (handshake + ping) is reported below and, when --overlay-verify-peer is
 #    given, is fail-closed there. The dead production-target twin must NOT be present after a provision.
@@ -838,6 +932,9 @@ echo
 echo "devlab-install-recv — done."
 if [ "$PROVISION" = 1 ]; then
   echo "  provisioned: rrsync, staging ($STAGING_ROOT), web ($WWW_DIR), edge ($CADDY_MAIN), deploy-key forced command ($RECV_USER)"
+  echo "  edge address: this environment answers on $EDGE_ADDRESS, declared once in $EDGE_ADDRESS_FILE."
+  echo "                The routing layer (a production-side sxgate) reads the SAME declaration —"
+  echo "                'devlab-install-recv --print-edge-address' returns it. Neither side guesses the other."
   if [ -n "$OVERLAY_ADDRESS" ]; then
     echo "  overlay:   this host's side up on $OVERLAY_IFACE at $OVERLAY_ADDRESS${OVERLAY_LISTEN_PORT:+ (listening on $OVERLAY_LISTEN_PORT)}"
     overlay_report_pubkey

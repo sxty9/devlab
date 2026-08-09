@@ -160,11 +160,27 @@ func provisionEnv(t *testing.T) (env map[string]string, sbin, staging, www, cadd
 		"DEVLAB_CADDY_CONF": filepath.Join(root, "caddy", "conf.d"),
 		"DEVLAB_CADDY_MAIN": caddyMain,
 		"DEVLAB_RECV_AK":    ak, // test seam: authorized_keys at a fixture, not a real home
+		// The ONE declaration of where this environment's edge answers, at a fixture path (never the real
+		// /etc/holistic). Seeded here as a PRE-EXISTING declaration (the operator's runtime config), so
+		// provision runs that are not ABOUT the edge address read it and proceed; tests that ARE about the
+		// declaration clear it and pass --edge-address, or assert the fail-closed absence.
+		"DEVLAB_EDGE_ADDRESS_FILE": filepath.Join(root, "holistic", "edge-address"),
+	}
+	if err := os.MkdirAll(filepath.Join(root, "holistic"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env["DEVLAB_EDGE_ADDRESS_FILE"], []byte(testEdgeAddress+"\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 	return env, sbin, staging, www, caddyMain, ak
 }
 
 const testDeployPubKey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURE000000000000000000000000000000 devlab-prod-deploy"
+
+// testEdgeAddress is where this environment's edge answers in the fixtures — a specific overlay socket,
+// so a test proves the edge is BUILT ON the declared address (not a baked-in ":80") and the routing
+// layer reads the very same value.
+const testEdgeAddress = "10.10.0.1:8080"
 
 // A bare host is brought to a production target in ONE pass: rrsync is present, the staging and web
 // roots exist, the edge imports the per-service route directory, the deploy key is pinned behind the
@@ -374,6 +390,125 @@ func TestProvisionRefusesForeignEdge(t *testing.T) {
 	}
 }
 
+// ── the edge address: ONE declaration, read by both the edge and the routing layer ──────────────────
+// WHERE THIS ENVIRONMENT'S EDGE ANSWERS was decided in two places that did not agree: the generated edge
+// listened on a baked-in ":80" while the routing layer forwarded production's hostnames to :8080, so
+// every production request ended as a 502 in front of a face listening elsewhere. These tests pin the
+// fix: the address is stated in exactly ONE runtime-config file; --provision BUILDS the edge on it and
+// answering "where does this environment answer?" (--print-edge-address, the routing layer's read)
+// yields the very same address; and a missing declaration is a NAMED deficiency, never a guessed ":80".
+
+// The edge is BUILT ON the ONE declared address (not a baked-in default): the Caddy site block opens on
+// exactly the address the declaration holds, and asking the declaration back yields the same address —
+// the two places that used to disagree now read one source.
+func TestProvisionEdgeBoundToDeclaredAddress(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t) // seeds the declaration with testEdgeAddress
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit != 0 {
+		t.Fatalf("provisioning with a declared edge address must succeed, got %d\n%s", res.exit, res.out)
+	}
+	cb, _ := os.ReadFile(caddyMain)
+	if !strings.Contains(string(cb), testEdgeAddress+" {") {
+		t.Errorf("the edge must be a site block on the declared address %q, got:\n%s", testEdgeAddress, string(cb))
+	}
+	// It must NOT fall back to the old baked-in :80 (the very bug — the edge answering where nothing forwards).
+	if strings.Contains(string(cb), ":80 {") {
+		t.Errorf("the edge must not carry the baked-in :80 default, got:\n%s", string(cb))
+	}
+	if !strings.Contains(res.out, "edge answers on the ONE declared address "+testEdgeAddress) {
+		t.Errorf("the self-check must prove the edge answers on the declared address:\n%s", res.out)
+	}
+	// Asking the routing layer where this environment answers yields the SAME address (single source).
+	ask := runInstallRecv(t, env, "--print-edge-address")
+	if ask.exit != 0 {
+		t.Fatalf("--print-edge-address must succeed after provisioning, got %d\n%s", ask.exit, ask.out)
+	}
+	if got := strings.TrimSpace(ask.out); got != testEdgeAddress {
+		t.Errorf("asking where the environment answers must yield the built address %q, got %q", testEdgeAddress, got)
+	}
+}
+
+// --edge-address WRITES the ONE declaration on a host that has none, and the edge is built on it. This is
+// the operator declaring the address once; both the edge and the routing layer then read that one file.
+func TestProvisionWritesEdgeDeclarationFromFlag(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	edgeFile := env["DEVLAB_EDGE_ADDRESS_FILE"]
+	if err := os.Remove(edgeFile); err != nil { // a bare host: no declaration yet
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey, "--edge-address", ":8080")
+	if res.exit != 0 {
+		t.Fatalf("provisioning with --edge-address must succeed, got %d\n%s", res.exit, res.out)
+	}
+	b, err := os.ReadFile(edgeFile)
+	if err != nil {
+		t.Fatalf("the declaration must be written: %v", err)
+	}
+	if !strings.Contains(string(b), ":8080") {
+		t.Errorf("the declaration must record the address given, got:\n%s", string(b))
+	}
+	if cb, _ := os.ReadFile(caddyMain); !strings.Contains(string(cb), ":8080 {") {
+		t.Errorf("the edge must be built on the address just declared, got:\n%s", string(cb))
+	}
+	if !strings.Contains(res.out, "declared this environment's edge address as ':8080'") {
+		t.Errorf("writing the declaration must be named:\n%s", res.out)
+	}
+}
+
+// A bare host with NO declaration and NO --edge-address is a NAMED deficiency, fail-closed — never a
+// silent fallback to :80. Absence of the setup is a deficiency, not a property (Kein stummes Ausbleiben).
+func TestProvisionRefusesUndeclaredEdgeAddress(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if err := os.Remove(env["DEVLAB_EDGE_ADDRESS_FILE"]); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey)
+	if res.exit == 0 {
+		t.Fatalf("provisioning without a declared edge address must fail closed (exit != 0):\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "edge address is not declared") {
+		t.Errorf("the deficiency must be named:\n%s", res.out)
+	}
+	// Fail-closed: no edge is left written on a guessed address.
+	if _, err := os.Stat(caddyMain); err == nil {
+		if cb, _ := os.ReadFile(caddyMain); strings.Contains(string(cb), ":80 {") {
+			t.Errorf("a refused provision must not leave an edge on a guessed :80, got:\n%s", string(cb))
+		}
+	}
+}
+
+// A malformed --edge-address (a bare port, no ':') is refused with its own reason — the routing layer
+// forwards to a socket, not a naked number.
+func TestProvisionRefusesMalformedEdgeAddress(t *testing.T) {
+	env, _, _, _, _, _ := provisionEnv(t)
+	if err := os.Remove(env["DEVLAB_EDGE_ADDRESS_FILE"]); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey, "--edge-address", "8080")
+	if res.exit == 0 {
+		t.Fatalf("a malformed edge address must be refused (exit != 0):\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "not a valid edge address") {
+		t.Errorf("the refusal must name the malformed address:\n%s", res.out)
+	}
+}
+
+// The query mode with no declaration present is a NAMED non-zero — the routing layer learns the address
+// is undeclared rather than being handed a guess.
+func TestPrintEdgeAddressUndeclared(t *testing.T) {
+	env, _, _, _, _, _ := provisionEnv(t)
+	if err := os.Remove(env["DEVLAB_EDGE_ADDRESS_FILE"]); err != nil {
+		t.Fatal(err)
+	}
+	res := runInstallRecv(t, env, "--print-edge-address")
+	if res.exit == 0 {
+		t.Fatalf("--print-edge-address with no declaration must be non-zero:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "not declared") {
+		t.Errorf("the undeclared answer must be named:\n%s", res.out)
+	}
+}
+
 // bashRenderTemplate sources the shared library and echoes ONE template function's output — proving the
 // caddy tests below run against the SAME template the receiver and installer use, not a Go copy of it.
 func bashRenderTemplate(t *testing.T, call string) string {
@@ -384,6 +519,37 @@ func bashRenderTemplate(t *testing.T, call string) string {
 		t.Fatalf("rendering %q failed: %v\n%s", call, err, out)
 	}
 	return string(out)
+}
+
+// The edge template carries NO baked-in address: it renders the site block on the address it is GIVEN
+// (from the ONE declaration) and REFUSES to render at all without one — an invented default is exactly
+// the guess that made the edge answer where the routing layer does not forward.
+func TestEdgeTemplateRequiresDeclaredAddress(t *testing.T) {
+	lib := filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh")
+	// Given an address, the site block opens on it.
+	got := bashRenderTemplate(t, "setup_edge_caddyfile_text /etc/caddy/conf.d /var/www 10.10.0.1:8080")
+	if !strings.Contains(got, "10.10.0.1:8080 {") {
+		t.Errorf("the edge template must open the site block on the given address, got:\n%s", got)
+	}
+	// Without an address the template fails (non-zero) and emits nothing usable — no ":80" fallback.
+	out, err := exec.Command("bash", "-c", ". "+lib+" && setup_edge_caddyfile_text /etc/caddy/conf.d /var/www").CombinedOutput()
+	if err == nil {
+		t.Fatalf("the edge template must refuse to render without a declared address, got:\n%s", out)
+	}
+	if strings.Contains(string(out), ":80 {") {
+		t.Errorf("the edge template must not emit a :80 site block when no address is given, got:\n%s", out)
+	}
+	// setup_edge_address reads the declaration back; a missing file yields nothing and a non-zero status.
+	f := filepath.Join(t.TempDir(), "edge-address")
+	if err := os.WriteFile(f, []byte("# a comment\n\n  10.10.0.1:8080  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(bashRenderTemplate(t, "setup_edge_address "+f)); got != "10.10.0.1:8080" {
+		t.Errorf("setup_edge_address must read the declared address (trimmed, comments ignored), got %q", got)
+	}
+	if out, err := exec.Command("bash", "-c", ". "+lib+" && setup_edge_address /nope/edge-address").CombinedOutput(); err == nil {
+		t.Errorf("setup_edge_address must fail on a missing declaration, got:\n%s", out)
+	}
 }
 
 // DECISIVE, against the real caddy: the edge shell the template builds VALIDATES with a delivered route
@@ -417,7 +583,7 @@ func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
 	}
 
 	// The FIX: the edge shell from the shared template, WITH the delivered route present, must validate.
-	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www)
+	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www+" :8080")
 	if out, ok := validate(edge); !ok {
 		t.Fatalf("the holistic edge shell must validate WITH a delivered route present:\n%s", out)
 	}
@@ -456,7 +622,7 @@ func TestSelfRouteCoexistsInEdgeCaddy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(uniform), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www)
+	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www+" :8080")
 	p := filepath.Join(root, "Caddyfile")
 	if err := os.WriteFile(p, []byte(edge), 0o644); err != nil {
 		t.Fatal(err)
