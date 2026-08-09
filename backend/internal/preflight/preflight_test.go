@@ -141,6 +141,71 @@ func TestDeriveThreeStates(t *testing.T) {
 	})
 }
 
+// "Already delivered?" is bound to the CONTENT of the todo (the work it demands), not to its id: a
+// merged delivery keeps the todo delivered only while its text still asks for the same work. This is
+// the fix for a grown todo that could never run again.
+func TestDeliveredIsBoundToContentNotIdentity(t *testing.T) {
+	ctx := context.Background()
+	title := "One edge for sxgate"
+	body := "sxgate owns the whole outward connection of its environment."
+	run := runs.Run{ID: "run_edge", Kind: model.KindTodo, Title: title, Task: body,
+		Targets: []runs.Target{{Repo: "org/app"}}}
+
+	mergedWith := func(req string) *fakeSources {
+		return &fakeSources{
+			ahead: false, head: "dddd4444",
+			deliveries: map[string][]runs.Delivery{"run_edge/org/app": {{
+				ID: "dlv_edge", Repo: "org/app", ToCommit: "dddd",
+				MergedAt: ts("2026-08-06T10:00:00Z"), Requirement: req,
+			}}},
+		}
+	}
+
+	t.Run("a: text unchanged since delivery ⇒ still delivered", func(t *testing.T) {
+		src := mergedWith(runs.RequirementDigest(title, body))
+		f, _ := Derive(ctx, src, "org/app", run)
+		if f.State != model.TaskDelivered {
+			t.Fatalf("state = %s, want delivered", f.State)
+		}
+	})
+
+	t.Run("b: text grew a binding addition ⇒ NOT delivered, evidence names the stand", func(t *testing.T) {
+		// Delivered against the ORIGINAL wording; the run now carries the grown wording.
+		src := mergedWith(runs.RequirementDigest(title, body))
+		grown := run
+		grown.Task = body + " It must also refuse to hold zones of an environment it does not belong to."
+		f, _ := Derive(ctx, src, "org/app", grown)
+		if f.State != model.TaskNotImplemented {
+			t.Fatalf("state = %s, want not-implemented (the added demand is undelivered)", f.State)
+		}
+		joined := strings.Join(f.Evidence, " ")
+		if !strings.Contains(joined, "dlv_edge") || !strings.Contains(joined, "added demand is not delivered") {
+			t.Fatalf("evidence does not name the delivered stand it rests on: %v", f.Evidence)
+		}
+	})
+
+	t.Run("c: an editorial edit ⇒ still delivered", func(t *testing.T) {
+		src := mergedWith(runs.RequirementDigest(title, "sxgate owns the whole outward conection of its environment."))
+		// The current text fixes the typo and rewraps — editorial, no new work.
+		fixed := run
+		fixed.Task = "sxgate owns the whole outward\nconnection of its environment."
+		f, _ := Derive(ctx, src, "org/app", fixed)
+		if f.State != model.TaskDelivered {
+			t.Fatalf("state = %s, want delivered (a typo fix is not new work)", f.State)
+		}
+	})
+
+	t.Run("legacy: a delivery with no recorded stand stays delivered", func(t *testing.T) {
+		src := mergedWith("") // recorded before this determination existed
+		grown := run
+		grown.Task = body + " and a great deal more demanded here, well beyond any editorial budget."
+		f, _ := Derive(ctx, src, "org/app", grown)
+		if f.State != model.TaskDelivered {
+			t.Fatalf("state = %s, want delivered — no stand to compare, trust the historical verdict", f.State)
+		}
+	})
+}
+
 // K-3: the state is observed fresh each time — there is nothing stored that a manipulation
 // could flip. Deriving twice over the same truth yields the same state; changing the TRUTH
 // (not a flag) changes the state.

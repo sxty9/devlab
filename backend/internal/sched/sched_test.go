@@ -783,6 +783,11 @@ func TestDeliveredTargetsCreateNoDocument(t *testing.T) {
 	if out.NotStarted == "" || out.TaskStates["alpha"] != model.TaskDelivered {
 		t.Fatalf("the refusal must carry reason + evidence: %+v", out)
 	}
+	// A "delivered" refusal must be checkable: it names the stand it rests on (D-d), not a bare
+	// "already delivered" with no reference to what counts as delivered.
+	if len(out.TaskEvidence["alpha"]) == 0 || out.TaskEvidence["alpha"][0] != "contained in default branch" {
+		t.Fatalf("the refusal must name the delivered stand per target: %+v", out.TaskEvidence)
+	}
 	docs, _ := h.docs.List()
 	if len(docs) != 0 {
 		t.Fatalf("no document may exist, found %d", len(docs))

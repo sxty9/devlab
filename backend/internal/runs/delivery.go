@@ -51,6 +51,13 @@ type Delivery struct {
 	ReversalOf   string     `json:"reversalOf,omitempty"`
 	ExecutionID  string     `json:"executionId,omitempty"`
 
+	// Requirement is the normalised digest of the todo's demand (title + task) AS IT STOOD when this
+	// delivery was recorded — see RequirementDigest. It is the stand "already delivered?" is measured
+	// against: a merged delivery keeps its todo delivered only while the todo's text still asks for the
+	// same work. Empty on deliveries recorded before this determination existed (or issued by hand),
+	// which the preflight then treats as "no stand to compare — trust the historical verdict".
+	Requirement string `json:"requirement,omitempty"`
+
 	// ── The production step (WHAT-1): the LAST step of the chain, AFTER the merge ──────────────
 	//
 	// A merged delivery has reached the dev branch AND the default branch, but the work is not with

@@ -401,6 +401,9 @@ export interface StartOutcome {
   fresh?: boolean;
   notStarted?: string;
   taskStates?: Record<string, TaskState>;
+  // taskEvidence names, per target repo, the observation the state rests on — for a "delivered"
+  // refusal it names the delivered stand, so the rejection is checkable against the todo's text.
+  taskEvidence?: Record<string, string[]>;
   suggestion?: DeferSuggestion;
   restartPending?: boolean;
 }

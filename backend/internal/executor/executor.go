@@ -147,6 +147,9 @@ type DeliverPRIn struct {
 	DeliveryID                    string
 	ExecutionID                   string
 	FromCommit, ToCommit          string
+	// Requirement is the normalised digest of the todo's demand at delivery time (runs.RequirementDigest);
+	// the ledger intent records it so a later start can tell a delivered todo from one whose text has grown.
+	Requirement string
 }
 
 // Detection is the deploy detection across the seam (kinds: "service" | "library" |
