@@ -391,3 +391,38 @@ func TestEdgeHostDeclaredReadsTheHost(t *testing.T) {
 		t.Error("no id is no declaration")
 	}
 }
+
+// THE CONTRADICTION IS THE FINDING. A host declares a hostname for an application; the package under that
+// id declares itself a uniform service. Both declarations cannot be true, and the QUIET outcome is the bad
+// one: the package would be routed under the dashboard's name, its face installed and served nowhere, and
+// the hostname the operator declared would answer the edge's refusal. Nobody sees a failure; they see a
+// 404 and look for it in the wrong place.
+//
+// This is the exact shape of the one ordering risk this whole change carries. The landscape dashboard's
+// repository must declare edge.role=dashboard; until it does, an operator who has already declared its
+// hostname would otherwise get a silently unreachable dashboard AND, because the uniform services hang
+// under it, a silently unreachable landscape. Named, it stops instead — with both halves in the message.
+func TestAHostnameForAPackageThatClaimsNoRoleIsRefused(t *testing.T) {
+	env, art, conf := edgeFixture(t, "holistic", "service", "",
+		map[string]string{"holistic": "dash.example.test"})
+	res, _ := prepareRoute(t, env, art, "holistic", "8770", conf)
+	if res.exit == 0 {
+		t.Fatalf("a hostname for a package that claims no root-application role must be refused:\n%s", res.out)
+	}
+	for _, want := range []string{"contradictory", "dash.example.test", "edge.role=application|dashboard"} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("the refusal must show BOTH halves and how to resolve them (%q missing):\n%s", want, res.out)
+		}
+	}
+	for _, shelf := range []string{"apps", "services"} {
+		if entries, _ := os.ReadDir(filepath.Join(conf, shelf)); len(entries) != 0 {
+			t.Errorf("a refused route must leave the %s shelf empty", shelf)
+		}
+	}
+
+	// A uniform service the host names NOTHING for is untouched by this — the ordinary case stays ordinary.
+	env2, art2, conf2 := edgeFixture(t, "prizm", "service", "", map[string]string{"holistic": "dash.example.test"})
+	if res2, _ := prepareRoute(t, env2, art2, "prizm", "18811", conf2); res2.exit != 0 {
+		t.Errorf("a uniform service the host names nothing for must route as usual:\n%s", res2.out)
+	}
+}

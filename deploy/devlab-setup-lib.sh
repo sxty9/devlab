@@ -948,6 +948,16 @@ setup_prepare_route() {
   role="$(setup_read_edge_role "$art")" || return 1
   case "$role" in
     service)
+      # THE CONTRADICTION IS ITSELF THE FINDING. This host declares a hostname for '<repo>' — which it does
+      # only for a ROOT APPLICATION — while the package declares itself a uniform service. The two exclude
+      # each other, and the QUIET outcome is the bad one: the package would be routed under the dashboard's
+      # name, its face would be installed and served nowhere, and the hostname the operator declared would
+      # answer the edge's refusal. Nobody would see a failure; they would see a 404 and look for it in the
+      # wrong place. It is caught here because here is the one point where both halves are readable at once.
+      if host="$(setup_edge_host "$repo")"; then
+        echo "'$repo' is contradictory on this host: the host declares the hostname '$host' for it in $SETUP_EDGE_HOSTS_DIR/$repo — which it does only for a root application — while the package declares itself a uniform service (edge.role=service, or no declaration at all). One of the two must give: either the package declares edge.role=application|dashboard in its $SETUP_DECL_FILE, or $SETUP_EDGE_HOSTS_DIR/$repo is removed. Refusing to route '$repo' under a name it does not claim" >&2
+        return 1
+      fi
       dest="$(setup_edge_services_dir "$conf")/${repo}.caddy"
       if [ -n "$deliv" ] && [ -f "$deliv" ]; then
         cat -- "$deliv" > "$out" || { echo "could not stage the delivered route of '$repo'" >&2; return 1; }
