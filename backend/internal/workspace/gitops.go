@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -148,15 +149,22 @@ func (e Executor) clone(ctx context.Context, wt, url, token string) error {
 // The prompt and flags are passed as argv (exec, not a shell) so there is no injection surface.
 // Long-running; the caller owns the context deadline. stderr is folded into the error on failure.
 func (e Executor) Agent(ctx context.Context, wt string, args ...string) ([]byte, error) {
-	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), nil)
+	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), nil, nil)
 }
 
 // AgentStream is Agent that ALSO reports stdout line by line as it arrives (via onStdout), so the
-// autonomous runner can be followed live while it works. onStdout receives each raw line with its
-// trailing newline stripped; it must not retain the slice. The FULL stdout is still returned, so the
-// caller parses the final result exactly as in the buffered path. A nil onStdout is exactly Agent.
-func (e Executor) AgentStream(ctx context.Context, wt string, onStdout func([]byte), args ...string) ([]byte, error) {
-	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), onStdout)
+// autonomous runner can be followed live while it works, and that hands out its INPUT: onInput
+// receives the running conversation's stdin once the process is up, so whatever is written there
+// reaches the agent — this is what makes the session speakable-to instead of sealed. onStdout
+// receives each raw line with its trailing newline stripped; it must not retain the slice. The FULL
+// stdout is still returned, so the caller parses the final result exactly as in the buffered path.
+// A nil onInput is exactly Agent's closed input.
+//
+// The conversation ENDS when that writer is closed — closing it is the caller's grip on the end.
+// The writer is the process's real pipe, so it is also closed automatically once the process is
+// reaped: a caller that never closes it can stall the agent, never this function.
+func (e Executor) AgentStream(ctx context.Context, wt string, onInput func(io.WriteCloser), onStdout func([]byte), args ...string) ([]byte, error) {
+	return runAgentCmd(ctx, e.buildAgentCmd(wt, args...), onInput, onStdout)
 }
 
 // buildAgentCmd constructs the claude CLI invocation (per-user via devlab-exec, or direct under
@@ -182,15 +190,29 @@ func (e Executor) buildAgentCmd(wt string, args ...string) *exec.Cmd {
 // enforces the process-group kill-switch on ctx cancellation. It returns the FULL stdout captured — even
 // on error or cancel, so the caller keeps whatever the agent produced — and folds stderr into the error.
 // The single implementation behind both Agent (onStdout nil, buffered) and AgentStream (live).
-func runAgentCmd(ctx context.Context, cmd *exec.Cmd, onStdout func([]byte)) ([]byte, error) {
+func runAgentCmd(ctx context.Context, cmd *exec.Cmd, onInput func(io.WriteCloser), onStdout func([]byte)) ([]byte, error) {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
+	}
+	// A nil onInput leaves the invocation exactly as it was: no input, closed from the start.
+	// StdinPipe (not an io.Reader on cmd.Stdin) is deliberate: it is the process's OWN pipe, which
+	// os/exec closes when it reaps the process. An io.Reader would be drained by a copier goroutine
+	// that Wait joins — and that goroutine blocks on a reader nobody feeds, so an agent that died on
+	// its own would hang the whole execution in Wait instead of ending it.
+	var stdin io.WriteCloser
+	if onInput != nil {
+		if stdin, err = cmd.StdinPipe(); err != nil {
+			return nil, err
+		}
 	}
 	var stderr bytes.Buffer // an io.Writer (not *os.File) → os/exec drains it in its own goroutine (no deadlock)
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return nil, err
+	}
+	if onInput != nil {
+		onInput(stdin) // handed over only once the process is up, so nothing is written into the void
 	}
 	done := make(chan struct{})
 	go func() {

@@ -15,7 +15,17 @@ export const stubSource: DataSource = {
     return false;
   },
   async getUser() {
-    return { username: 'dev', displayName: 'Dev (offline)', isAdmin: false, canUseDevlab: true, githubLinked: true };
+    return {
+      username: 'dev',
+      displayName: 'Dev (offline)',
+      isAdmin: false,
+      canUseDevlab: true,
+      // Offline there is no session to follow and none to write into: both rights read false,
+      // which is the honest state and not a withheld one.
+      canWatchSession: false,
+      canSpeakSession: false,
+      githubLinked: true,
+    };
   },
   async repos() {
     return [];
@@ -118,6 +128,10 @@ export const stubSource: DataSource = {
     return { results: [] };
   },
   mercuryRunResult: offline,
+  async mercuryRunSession() {
+    return { lines: [], from: 0, next: 0, older: false, open: false };
+  },
+  mercuryRunSessionSpeak: offline,
   async mercuryRunCalendar() {
     const now = new Date().toISOString();
     return { from: now, to: now, occurrences: [] };

@@ -662,7 +662,7 @@ reads that name), plus the two probes the step itself performs.
 **Who:** repair wave 4 (U1).
 **Reason:** the runbook claimed exactly one thing reaches outside DevLab (the branch-protection pass).
 Read against the code that is wrong by an order of magnitude, and the difference is not academic:
-`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:246 s.runMaintain`), so from the FIRST tick
+`deliver.Maintain` is driven by the scheduler's tick (`sched/sched.go:260 s.runMaintain`), so from the FIRST tick
 after the first start it posts a delivery-origin status on every open pull request of every managed
 repository — hand-raised ones included — deletes the delivery branch of any tracked pull request a
 human merged meanwhile, and merges whatever has passed its window. The daily reporter performs a pass
@@ -921,7 +921,7 @@ Identity` is its armed counterpart.
 `continue`, a `}` and a `default:`; the remaining four sat one line above their call. That is the
 one table with which the operator is told where to READ each writing call before the first start.
 **What changed:** every anchor was verified against the code and corrected, and each one now carries
-the CALL it points at (`deliver/deliver.go:881 gh.PostCommitStatus`) instead of a bare line number.
+the CALL it points at (`deliver/deliver.go:1353 gh.PostCommitStatus`) instead of a bare line number.
 **Diff hint:** `git diff 2e6a1ab -- deploy/migration/00-cutover.md`.
 **Proof:** new check `doc-b` in `tools/abnahme.sh` reads every `datei:zeile <aufruf>` anchor of the
 runbook parts and fails unless the named line really carries the named call — and fails on an anchor
@@ -1382,3 +1382,106 @@ existing caller of a program-only service (no `ui/`) changes; its half-report re
 wrapper tests run the real `deploy/devlab-install` under `--check`, so the security cascade still
 precedes the UI step, and the plan now covers the wire-in, the owner-run rebuild AND the delivery to
 the serve root the browser reads (`built` is gated on arrival there, not on the build).
+
+## 27. The implement stage's session becomes open — watchable and writable
+
+**Who:** run `fix/die_implement_stufe_ist_keine_schwarze` (the DevLab runner).
+**Reason:** the `implement` stage was a black box. Its agent conversation was recorded line by line
+into `executions/<id>/transcript.jsonl`, but NO read path served that file — `ReadTranscriptTail`
+had only test callers, and a running stage was written as `StageView{running}` with an empty `Log`,
+so the surface showed "The agent is working…" and nothing else until the stage ended. Every wrong
+turn therefore ran to completion before a person could see it, let alone intervene.
+
+**What changed, per frozen file:**
+
+* `backend/internal/model/model.go@bbc2a8e87001` — `StageView.Session` (the SERVER's mark for the
+  stage whose record IS an agent conversation, so no client recognises that stage by name);
+  `SessionLine` (one recorded line: when, which repository, WHO — empty author = the agent itself,
+  a username = a person's intervention, both in ONE recording); `Intervention` (that a person wrote
+  into a run: who, when, where); `User.CanWatchSession` / `User.CanSpeakSession` (the two session
+  rights on the identity probe, kept apart on the wire exactly as they are kept apart in the rights
+  system).
+* `backend/internal/model/contract_test.go@c45b48b88048` — the canonical user now WATCHES sessions
+  and may NOT speak into them, and `session_line` joins the golden fixtures: the split is pinned in
+  the contract itself, so a build that collapses the two rights into one fails on both sides.
+* `backend/internal/executor/chain.go@971e8771c859` — `StageSpec.Session`, set on `implement`. The
+  chain's own stage table is where "this stage runs an open conversation" is stated; the mark travels
+  with the stage state to the surface.
+* `backend/internal/api/api.go@8ec186a31134` — `Server.sessions` (the register of the conversations
+  open in THIS process — nothing persisted: an execution that was running when the daemon stopped is
+  simply no longer open); the two guards `guardSessionWatch` / `guardSessionSpeak`; the two routes
+  `GET|POST /api/mercury/runs/{id}/results/{rid}/session`; the identity probe answers both rights.
+* `backend/internal/live/live.go@8012b4f2f007` — the topic constants gain `TopicSession`. It rides on
+  the SAME stream as every other topic (there is no second channel) but stays its own topic: a
+  session grows many times per second while a stage changes rarely, and only the pane that follows a
+  session should refetch at that rate. The entry also records the state of `TopicQuestions`, which an
+  earlier delivery added without an entry here.
+* `src/types.ts@b7456564c78b` — `SessionLine`, `Intervention`, `SessionPortion`, `StageView.session`,
+  the two rights on `User`, and `LiveTopic` gains `'session'`.
+* `src/data/source.ts@9605201f58e2` — `mercuryRunSession` (one PORTION of a session: nothing named
+  opens on the newest, `at` follows forward, `at`+`back` fetches earlier lines) and
+  `mercuryRunSessionSpeak` (write into a running one; answers with the newest portion, so the writer
+  sees its own words land instead of a bare acknowledgement).
+* `src/data/httpSource.ts@7c5147541faa` — both calls, on the caller's OWN origin: the request carries
+  a path and nothing else. Where the conversation lives is decided inside the service and never
+  travels in a request.
+* `contract/fixtures/user.json@6f0ec4633f1c`, `contract/fixtures/session_line.json@caee98a85055` —
+  the golden values of both wire changes.
+
+**Consequence for operation:** the agent is now invoked with `--input-format stream-json` and its
+opening message travels on that input instead of on the command line — with streaming input the CLI
+reads its prompt from stdin and IGNORES one given as an argument, so the two had to move together.
+The input stays connected while the agent works and is closed once every message handed over has
+been answered; that close is what lets the invocation end at all. Two new Linux groups back the two
+rights: `hp_devlab_session_watch` (follow a run's session, live and afterwards) and
+`hp_devlab_session_speak` (write into a running one). Neither is granted by `hp_devlab_access`.
+
+**Not covered by this entry:** `backend/internal/statepath/statepath.go`,
+`backend/internal/statepath/statepath_test.go` and `contract/fixtures/start_outcome.json` changed in
+earlier deliveries and are still undescribed here. This delivery did not touch them and does not
+claim to describe them; `contract-a` therefore stays open on exactly those three paths.
+
+**Diff hint:** `git diff main -- backend/internal/model backend/internal/live backend/internal/api
+backend/internal/runs backend/internal/executor src/types.ts src/data src/views/mercury/exec
+permissions/devlab.json`.
+**Proof:** `backend/internal/runs/session_test.go` (the portioned read: newest first, follow without
+repetition, earlier lines without overlap, tolerant of old and half-written records),
+`backend/internal/api/exec_session_test.go` (a person's message reaches the agent, is recorded with
+its author and marks the execution; the conversation still ends; a message that cannot arrive leaves
+no trace; the register is a window, not a valve), `backend/internal/auth/session_rights_test.go`
+(watching is not writing), `backend/internal/api/handlers_mcp_test.go`
+(`TestToolsCarryTheExtraRightOfTheirRoute` — the MCP surface is not the way around a right),
+`backend/it/session_address_test.go` (no address anywhere on this path) and
+`src/views/mercury/exec/session.test.ts` (the anchors that make following and reloading land in the
+same place).
+
+## 28. Catch-up record: four frozen files whose change was never entered here
+
+**Who:** written by the run `fix/die_implement_stufe_ist_keine_schwarze` while auditing its own
+delivery. This entry does NOT describe work of that run — it records, factually, the state of four
+frozen files that earlier deliveries changed without an entry, so `contract-a` measures a complete
+protocol instead of standing red on a gap nobody owns. Where an earlier entry above already
+describes the feature behind a change, it is named.
+
+* `backend/internal/statepath/statepath.go@583a6315ea21` — four state paths were added as their
+  features landed: `ProdState()` (`mercury/runs-prodstate.json`, what production is known to carry —
+  entry on the production reconciliation), `QuestionsFile()` (`mercury/runs-questions.json`, the
+  blocking-question pool behind the Blocked surface), `WrapperGrants()`
+  (`mercury/wrapper-grants`, where the daemon stages a renewal grant the root tool verifies — it sits
+  under the daemon-owned state root precisely so an agent run cannot forge one) and
+  `ProdKnownHosts()` (`<root>/prod-known_hosts`, the production host key recorded on first contact,
+  durable across a restart because the service user has no home ssh directory).
+* `backend/internal/statepath/statepath_test.go@550b4590335a` — the path table of that test grew with
+  those four paths; every path is asserted to live under the one state root.
+* `backend/cmd/devlabd/main.go@befa97ee0541` — the boot sequence gained the steps the deliveries
+  above needed: the readiness socket as a boot PRECONDITION (a daemon that cannot serve the interlock
+  refuses to start, so a migration can never run against a live daemon), the settings pool with its
+  first-start env seed, and the asynchronous tail after listen (startup reconciliation, resumes,
+  ticks). Entry 1 above describes the original construction of this sequence.
+* `contract/fixtures/start_outcome.json@f85e25bd07da` — the start outcome gained `taskEvidence`: the
+  refusal of an already-delivered start now names the EVIDENCE per repository, not merely the state.
+
+**Diff hint:** `git diff cbffed4 -- backend/internal/statepath backend/cmd/devlabd/main.go
+contract/fixtures/start_outcome.json`.
+**Proof:** `backend/internal/statepath/statepath_test.go`, `backend/it/boot_wiring_test.go` and the
+`contract-a` check in `tools/abnahme.sh`.

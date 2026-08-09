@@ -66,9 +66,16 @@ func TestContractFixtures(t *testing.T) {
 
 	check(t, "health", model.Health{OK: true, Mode: "devlab/0.2.0"})
 
+	// The canonical user WATCHES sessions but may not speak into them — the split is pinned in the
+	// contract itself, so a build that collapses the two rights into one fails on both sides.
 	check(t, "user", model.User{
 		Username: "alice", DisplayName: "Alice", IsAdmin: false, CanUseDevlab: true,
+		CanWatchSession: true, CanSpeakSession: false,
 		GithubLinked: true, GithubLogin: "alice-gh",
+	})
+
+	check(t, "session_line", model.SessionLine{
+		At: t0, Repo: "svc-a", From: "alice", Text: "stop and check the migration first",
 	})
 
 	check(t, "repo", model.Repo{

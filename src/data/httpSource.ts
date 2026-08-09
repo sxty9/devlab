@@ -311,6 +311,17 @@ export const httpSource: DataSource = {
   async mercuryRunResult(id, resultId) {
     return json(await request(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}`));
   },
+  async mercuryRunSession(id, resultId, at, back, max) {
+    const p = new URLSearchParams();
+    if (at !== undefined) p.set('at', String(at));
+    if (back) p.set('back', '1');
+    if (max) p.set('max', String(max));
+    const q = p.toString();
+    return json(await request(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}/session${q ? `?${q}` : ''}`));
+  },
+  async mercuryRunSessionSpeak(id, resultId, text, repo) {
+    return json(await post(`/api/mercury/runs/${enc(id)}/results/${enc(resultId)}/session`, { text, repo: repo ?? '' }));
+  },
   async mercuryRunCalendar(days, kind) {
     const p = new URLSearchParams();
     if (days) p.set('days', String(days));

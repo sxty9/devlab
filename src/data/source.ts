@@ -45,6 +45,7 @@ import type {
   RunResult,
   RunSnapshotMeta,
   ServiceConfig,
+  SessionPortion,
   SlotOverview,
   StartOutcome,
   StorageView,
@@ -221,6 +222,13 @@ export interface DataSource {
   mercuryRunResults(id: string): Promise<{ results: RunResult[] }>;
   /** One execution result document — carries THE server stage array. */
   mercuryRunResult(id: string, resultId: string): Promise<RunResult>;
+  /** One PORTION of an execution's agent session. Nothing named opens on the newest portion;
+   *  `at` = a previous portion's `next` follows it forward, `at` = its `from` with `back` fetches
+   *  the older lines. The whole record is never fetched at once. */
+  mercuryRunSession(id: string, resultId: string, at?: number, back?: boolean, max?: number): Promise<SessionPortion>;
+  /** Write into an execution's RUNNING session. Answers with the newest portion, so the writer
+   *  sees its own words in the record instead of a bare acknowledgement. */
+  mercuryRunSessionSpeak(id: string, resultId: string, text: string, repo?: string): Promise<SessionPortion>;
   /** The one calendar access point (REQ-012); `kind` narrows to one surface. */
   mercuryRunCalendar(days?: number, kind?: RunKind): Promise<RunCalendar>;
   /** Stored executions (history), newest first; `kind` narrows per surface. */

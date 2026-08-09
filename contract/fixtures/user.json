@@ -3,6 +3,8 @@
   "displayName": "Alice",
   "isAdmin": false,
   "canUseDevlab": true,
+  "canWatchSession": true,
+  "canSpeakSession": false,
   "githubLinked": true,
   "githubLogin": "alice-gh"
 }

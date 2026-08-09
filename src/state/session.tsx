@@ -12,7 +12,15 @@ import { Splash } from '@/shell/Splash';
 type Phase = 'boot' | 'login' | 'denied' | 'github-link' | 'ready';
 
 const DEFAULT_SETTINGS: EditorSettings = { fontSize: 13, tabSize: 2 };
-const FALLBACK_USER: User = { username: '', displayName: '', isAdmin: false, canUseDevlab: false, githubLinked: false };
+const FALLBACK_USER: User = {
+  username: '',
+  displayName: '',
+  isAdmin: false,
+  canUseDevlab: false,
+  canWatchSession: false,
+  canSpeakSession: false,
+  githubLinked: false,
+};
 const LAST_REPO_KEY = 'dl.lastRepo';
 
 function readSettings(): EditorSettings {

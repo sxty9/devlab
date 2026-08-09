@@ -11,6 +11,10 @@ export interface User {
   displayName: string;
   isAdmin: boolean;
   canUseDevlab: boolean;
+  /** May read the session a run works in — live and afterwards. */
+  canWatchSession: boolean;
+  /** May write INTO a running session. Separate from watching: the two are two rights. */
+  canSpeakSession: boolean;
   githubLinked: boolean;
   githubLogin?: string;
 }
@@ -309,6 +313,9 @@ export interface StageView {
   reason?: string;
   evidence?: string;
   log?: string;
+  /** The SERVER's mark for the stage whose record is the agent session, not a log text. The
+   *  client never recognises that stage by its name — it reads this. */
+  session?: boolean;
   link?: string;
   startedAt?: string;
   endedAt?: string;
@@ -810,8 +817,42 @@ export interface RunResult {
   usage: UsageView;
   prompt?: string;
   requested: Authorship;
+  /** Every time a PERSON wrote into this execution's running session. Present ⇒ the run did not
+   *  work purely by itself. */
+  interventions?: Intervention[];
   synthetic?: boolean;
   legacy?: boolean;
+}
+
+/** One line of an execution's agent session (model.SessionLine): what the agent said or did, or
+ *  what a person wrote into it. `from` empty ⇒ the agent itself; otherwise the person's username. */
+export interface SessionLine {
+  at: string;
+  repo?: string;
+  from?: string;
+  text: string;
+}
+
+/** That a PERSON wrote into a running execution (model.Intervention): who, when, where. */
+export interface Intervention {
+  by: Actor;
+  at: string;
+  repo?: string;
+}
+
+/** One PORTION of a session together with what a viewer must know about it (api.sessionView).
+ *  `from`/`next` are the anchors for older lines and for the next follow-up read. */
+export interface SessionPortion {
+  lines: SessionLine[];
+  from: number;
+  next: number;
+  /** The journal continues BEFORE `from` — there are older lines to load. */
+  older: boolean;
+  /** The conversation is running right now and can take a message. */
+  open: boolean;
+  /** Which repositories' conversations are open — what to name when several are working. */
+  repos?: string[];
+  interventions?: Intervention[];
 }
 
 /** One calendar entry (model.RunOccurrence): future firing (schedule) or past execution
@@ -900,7 +941,8 @@ export interface AtlasGraph {
 
 // ── Live updates (S12) ────────────────────────────────────────────────────────
 
-/** The EXACTLY EIGHT topics of the one SSE stream. */
+/** The CLOSED topic set of the ONE SSE stream (live.Topics on the server). Every live surface
+ *  rides on this one stream — a new surface takes a topic here, never a second channel. */
 export type LiveTopic =
   | 'axioms'
   | 'runs'
@@ -910,4 +952,5 @@ export type LiveTopic =
   | 'notices'
   | 'slots'
   | 'restart'
-  | 'questions';
+  | 'questions'
+  | 'session';

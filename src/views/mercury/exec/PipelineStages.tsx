@@ -12,7 +12,7 @@ import { renderMarkdown } from '@/lib/markdown';
 import { Button } from '@/ui/Button';
 import { badgeTone } from '@/ui/tint';
 import type { RepoPipeline, StageView } from '@/types';
-import { Transcript } from './Transcript';
+import { SessionPane } from './Session';
 import { blockSummary, needsDelivery, repoOutcome, stageBadge, stageHasDetail, stageLabel, TASK_STATE, TERMINAL_STATES, stagesOf } from './logic';
 
 /** The shared pass/fail chip. */
@@ -101,12 +101,18 @@ export function PipelineStages({
   );
 }
 
-/** The open stage's detail: its evidence or short skip reason, its link, and its recorded log —
- *  as the LIVE transcript while it runs, as rendered (sanitized) Markdown once it has settled
- *  (REQ-038). A skip states its reason plainly; it can never be mistaken for a success. */
-export function StageDetail({ repo, stage }: { repo: string; stage: StageView }) {
+/** The open stage's detail: its evidence or short skip reason, its link, and its record. For the
+ *  stage the server MARKED as carrying an agent session, that record is the session itself — open
+ *  while it runs, readable afterwards, and writable by whoever may (REQ-036/038). Every other
+ *  stage shows its recorded log as sanitized Markdown. A skip states its reason plainly; it can
+ *  never be mistaken for a success.
+ *
+ *  Which stage carries a session is the SERVER's word (stage.session), never a name this client
+ *  recognises — an archived execution with historical stage names therefore renders unchanged. */
+export function StageDetail({ repo, stage, runId, resultId }: { repo: string; stage: StageView; runId?: string; resultId?: string }) {
   const running = stage.state === 'running';
   const note = stage.reason || stage.evidence;
+  const session = !!stage.session && !!runId && !!resultId;
   return (
     <div className={cn('mt-2 rounded-card border bg-bg-base p-3', running ? 'border-warning/40' : 'border-separator')}>
       <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
@@ -121,8 +127,8 @@ export function StageDetail({ repo, stage }: { repo: string; stage: StageView })
         )}
       </div>
       {note && <p className="mb-1.5 text-caption text-text-secondary">{note}</p>}
-      {running ? (
-        <Transcript text={stage.log} live />
+      {session ? (
+        <SessionPane runId={runId} resultId={resultId} repo={repo} />
       ) : (
         stage.log && (
           <div

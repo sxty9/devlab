@@ -288,7 +288,7 @@ function LiveSession({ view, busy, onAct }: { view: ExecutionView; busy: boolean
                   onResume={rp.block ? () => onAct('resume') : undefined}
                   resuming={busy}
                 >
-                  {stage && <StageDetail repo={rp.repo} stage={stage} />}
+                  {stage && <StageDetail repo={rp.repo} stage={stage} runId={view.runId} resultId={view.id} />}
                 </RepoPipelineCard>
               );
             })}

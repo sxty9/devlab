@@ -77,10 +77,10 @@ const noRefresh = async () => true;
 
 // ── Vocabulary ───────────────────────────────────────────────────────────────────────────
 
-test('LIVE_TOPICS pins exactly the nine backend topics', () => {
+test('LIVE_TOPICS pins exactly the backend topic set, in order', () => {
   assert.deepEqual(
     [...LIVE_TOPICS],
-    ['axioms', 'runs', 'active', 'progress', 'deliveries', 'notices', 'slots', 'restart', 'questions'],
+    ['axioms', 'runs', 'active', 'progress', 'deliveries', 'notices', 'slots', 'restart', 'questions', 'session'],
   );
 });
 

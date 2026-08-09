@@ -29,6 +29,10 @@ type StageSpec struct {
 	Name    model.Stage
 	Applies func(ctx context.Context, rc *RepoCtx) (ok bool, evidence string)
 	Run     func(ctx context.Context, rc *RepoCtx) error
+	// Session marks the stage that runs an OPEN agent conversation: its record is the execution's
+	// session journal, not a log text. The mark travels with the stage state to the surface, so
+	// the view knows where to open the session without recognising any stage by name.
+	Session bool
 }
 
 // Chain returns THE chain: preflight → implement → deliver-dev → publish → pull-request
@@ -36,7 +40,7 @@ type StageSpec struct {
 func Chain() []StageSpec {
 	return []StageSpec{
 		{Name: model.StagePreflight, Applies: preflightApplies, Run: preflightRun},
-		{Name: model.StageImplement, Applies: implementApplies, Run: implementRun},
+		{Name: model.StageImplement, Applies: implementApplies, Run: implementRun, Session: true},
 		{Name: model.StageDeliverDev, Applies: deliverDevApplies, Run: deliverDevRun},
 		{Name: model.StagePublish, Applies: publishApplies, Run: publishRun},
 		{Name: model.StagePullRequest, Applies: pullRequestApplies, Run: pullRequestRun},
