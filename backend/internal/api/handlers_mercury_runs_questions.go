@@ -36,6 +36,9 @@ func (s *Server) StartQuestionDelivery() {
 			if q.QKind == runs.QuestionWrapperRenewal {
 				text = "A run asks to renew the root wrapper scripts and needs your explicit approval: " + firstLineOf(q.Question)
 			}
+			if q.QKind == runs.QuestionProdReceiver {
+				text = "A production delivery is held NOT live until the root receiver scripts on the production host are brought current: " + firstLineOf(q.Question)
+			}
 			if _, err := s.runNotices.Coalesce(runs.Notice{
 				Kind: runs.NoticeQuestion, Repo: q.Repo, Text: text,
 				NextStep: "Answer it in the Blocked tab — the run continues with your answer.",

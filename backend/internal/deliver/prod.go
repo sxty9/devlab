@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"devlab/backend/internal/live"
@@ -43,6 +44,17 @@ type ProdOutcome struct {
 	// distinct reason and a deliberate approval, rather than a masked retry (task part 2).
 	HostKeyChanged bool
 	HostKeyTarget  string
+	// ReceiverStale is set when the production host still carries a DIFFERENT version of the root receiver
+	// scripts (devlab-deploy-recv / devlab-setup-lib.sh) than the merged delivery ships — measured from
+	// the receiver's own self-report. The chain deliberately cannot install them (the deploy key is a
+	// forced command that cannot overwrite its own gatekeeper), so this part of the delivery did NOT reach
+	// the host: the send is not a full delivery and must NOT settle live. The production pass surfaces the
+	// outstanding step as a deliberate approval on the Blocked surface, carrying the operator command and
+	// the checksums that bind it. ReceiverTarget names the production host; ReceiverGrants pins each script
+	// and the sha256 it must reach (the same (name, checksum) shape the wrapper renewal uses).
+	ReceiverStale  bool
+	ReceiverTarget string
+	ReceiverGrants []runs.WrapperGrant
 }
 
 // HostKeyGate is the deliberate accept path for a CHANGED production host key, wired in the api layer
@@ -193,6 +205,13 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 			}
 			recordProdCarries(prodState, d.Repo, out.Commit, currentHostKey, now)
 			settleAfterProd(ledger, res, d)
+			// The delivery is fully live — for the self repo that also PROVES the production host now carries
+			// the receiver scripts it ships (DeployProd would have returned ReceiverStale otherwise). Retire
+			// any receiver approval still open for this repository: the drift the operator was asked to close
+			// is measured closed, so the question has done its job and drops off the Blocked surface.
+			if questions != nil {
+				_, _ = questions.RetireProdReceiverQuestions(d.Repo, "the production host now carries the receiver scripts this delivery ships; the delivery settled live")
+			}
 			publishDeliveries(pub)
 
 		default:
@@ -213,12 +232,16 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 				firstErr = orFirst(firstErr, err)
 				continue
 			}
-			// A CHANGED production host key gets its OWN distinct reason and a deliberate approval — never
-			// a masked "connection failed" retried in silence (task part 2). Everything else reports as a
-			// plain undelivered production send. Both keep the merged layer beneath untouched.
+			// A CHANGED production host key, and a STALE production receiver, each get their OWN distinct
+			// reason and a deliberate approval — never a masked "connection failed" or a false "shipped and
+			// live" (task part 2). Everything else reports as a plain undelivered production send. All three
+			// keep the merged layer beneath untouched.
 			if out.HostKeyChanged {
 				raiseHostKeyQuestion(ctx, questions, hostkey, out.HostKeyTarget, d.Repo)
 				notify(n, runs.NoticeProdHostKeyChanged, d.Repo, prodHostKeyChangedText(out.HostKeyTarget, reason))
+			} else if out.ReceiverStale {
+				raiseReceiverQuestion(questions, d.Repo, out.ReceiverTarget, out.ReceiverGrants, out.Commit)
+				notify(n, runs.NoticeProdUndelivered, d.Repo, prodReceiverUndeliveredText(out.ReceiverTarget))
 			} else {
 				// The message carries NO attempt count or next-time on purpose, so a repeat of the SAME
 				// failure coalesces into one record (the user hears it once) while the growing retry state
@@ -239,7 +262,7 @@ func MaintainProd(ctx context.Context, prod ProdDeployer, landscape LandscapeSou
 	// moved past on another path — stays silent. reconcileProd measures both against the roster and the
 	// recorded production state, names each ("Kein stummes Ausbleiben"), and brings production up over
 	// the SAME production path.
-	reconcileProd(ctx, prod, landscapeRoster(ctx, landscape), all, prodState, currentHostKey, n, pub, handled, now)
+	reconcileProd(ctx, prod, landscapeRoster(ctx, landscape), all, prodState, currentHostKey, n, pub, questions, handled, now)
 	return firstErr
 }
 
@@ -297,7 +320,7 @@ func landscapeRoster(ctx context.Context, landscape LandscapeSource) []string {
 // because those the chain itself is still driving. A read it cannot complete (the tip could not be
 // resolved) is left for the next pass rather than guessed at; a reconciliation read failure is never
 // the production pass's error, so it does not mask a real delivery failure.
-func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, currentHostKey string, n *runs.NoticeStore, pub live.Publisher, handled map[string]bool, now time.Time) {
+func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all []runs.Delivery, prodState *runs.ProdStateStore, currentHostKey string, n *runs.NoticeStore, pub live.Publisher, questions *runs.QuestionStore, handled map[string]bool, now time.Time) {
 	if prodState == nil {
 		return // nowhere to record what production carries — the reconciliation has no reference
 	}
@@ -339,11 +362,23 @@ func reconcileProd(ctx context.Context, prod ProdDeployer, roster []string, all 
 		switch {
 		case derr == nil && out.Running:
 			recordProdCarries(prodState, repo, out.Commit, currentHostKey, now)
+			// The reconciled send is fully live — for the self repo it proves the host carries the receiver
+			// scripts too, so any receiver approval still open for it is measured closed and retired.
+			if questions != nil {
+				_, _ = questions.RetireProdReceiverQuestions(repo, "the production host now carries the receiver scripts the standard branch ships; the reconciled send is live")
+			}
 			publishDeliveries(pub)
 		case derr == nil && out.NotApplicable:
 			// The roster listed this repository, yet the send proves it no service (a routed id whose
 			// repository is a library, or a member that was reshaped). Nothing runs in production, so
 			// there is nothing to keep even — and nothing further to report.
+		case out.ReceiverStale:
+			// The reconciled send shipped the service but the production host still runs an older receiver
+			// than the standard branch ships — the chain cannot install it (task): name it its own way and
+			// raise the same deliberate approval the booked loop does, never a masked undelivered.
+			raiseReceiverQuestion(questions, repo, out.ReceiverTarget, out.ReceiverGrants, out.Commit)
+			notify(n, runs.NoticeProdUndelivered, repo, prodReceiverUndeliveredText(out.ReceiverTarget))
+			publishDeliveries(pub)
 		default:
 			// The gap is named, but production could not be brought current (an unreachable receiver,
 			// an unconfigured target). Report it the same way a merged delivery's failed send is.
@@ -580,6 +615,107 @@ func raiseHostKeyQuestion(ctx context.Context, questions *runs.QuestionStore, ho
 			"known-hosts file. The acceptance re-reads the host's key at apply time and refuses to install it if it "+
 			"no longer matches this fingerprint, so the approval covers this one key only.", target, fp),
 	})
+}
+
+// raiseReceiverQuestion asks the user to bring the production host's root receiver scripts current —
+// the SAME Blocked/approval path the wrapper renewal and the host-key change use (reuse the existing
+// approval, do not build a second one beside it). Unlike those two, the chain performs NOTHING on this
+// approval: it deliberately lacks the right to install the receiver on the production host (the deploy
+// key is a forced command that cannot overwrite its own gatekeeper), so the question carries the exact
+// one-line command an operator with root runs on the target and the checksums the scripts must reach,
+// and the production pass re-measures the host before it settles the delivery live. It is asked once per
+// repository while the SAME checksums stand; a newer delivery that changes the receiver again (different
+// pinned checksums) retires the stale question and raises a fresh one so the surface always names the
+// current version.
+func raiseReceiverQuestion(questions *runs.QuestionStore, repo, target string, grants []runs.WrapperGrant, commit string) {
+	if questions == nil || len(grants) == 0 {
+		return
+	}
+	if existing, err := questions.OpenProdReceiverQuestion(repo); err == nil && existing != nil {
+		if sameGrantSet(existing.Wrappers, grants) {
+			return // the same version is already asked for — do not duplicate it
+		}
+		_ = questions.Resolve(existing.ID) // a newer version supersedes it — retire and re-ask below
+	}
+	command := prodReceiverCommand(commit)
+	_, _ = questions.Raise(runs.Question{
+		QKind:               runs.QuestionProdReceiver,
+		Repo:                repo,
+		RunTitle:            "Production receiver scripts",
+		ProdReceiverTarget:  target,
+		ProdReceiverCommand: command,
+		Wrappers:            grants,
+		Question: fmt.Sprintf("The production host %q still runs an OLDER version of the root receiver scripts "+
+			"(%s) than the merged delivery ships. The delivery chain cannot install them itself — the deploy key is a "+
+			"forced command that can only rsync into staging and trigger an install, never overwrite its own gatekeeper "+
+			"— so this part of the delivery has NOT reached production and the delivery is held NOT live. Bring the "+
+			"scripts current with the one command below, then it settles live on its own.", target, grantNames(grants)),
+		Recommendation: "Run the command below on the production host as root, from a checkout of the merged standard " +
+			"branch. It installs exactly the reviewed bytes and prints their sha256, so you can check the installed scripts " +
+			"against the checksums here.",
+		Detail: fmt.Sprintf("command: %s\n\nscripts that must reach the production host, each pinned to the checksum "+
+			"the merged delivery ships:\n%s", command, renderReceiverGrants(grants)),
+	})
+}
+
+// prodReceiverCommand is the ONE line an operator with root runs on the production host to bring the
+// root receiver scripts current — the existing operator installer (devlab-install-recv), which installs
+// exactly the reviewed bytes beside it and prints their sha256 (Handarbeit kommt als Skript; reuse
+// before build). The merged commit is named so the operator checks out the exact standard-branch state.
+func prodReceiverCommand(commit string) string {
+	return "sudo ./deploy/devlab-install-recv   # on the production host, as root, from a checkout of the standard branch at " + shortSHA(commit)
+}
+
+// grantNames lists the receiver scripts for a one-line sentence.
+func grantNames(grants []runs.WrapperGrant) string {
+	names := make([]string, len(grants))
+	for i, g := range grants {
+		names[i] = g.Name
+	}
+	return strings.Join(names, ", ")
+}
+
+// renderReceiverGrants renders each receiver script and the checksum it must reach, one per line, for
+// the question detail a human reads before running the command.
+func renderReceiverGrants(grants []runs.WrapperGrant) string {
+	var b strings.Builder
+	for _, g := range grants {
+		b.WriteString("  - " + g.Name + " → sha256 " + g.SHA)
+		if g.Summary != "" {
+			b.WriteString(" (" + g.Summary + ")")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// sameGrantSet reports whether two grant sets pin the same files to the same checksums — the test for
+// "the same receiver version is already asked for", so a repeated pass does not raise a duplicate.
+func sameGrantSet(a, b []runs.WrapperGrant) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := make(map[string]string, len(a))
+	for _, g := range a {
+		m[g.Name] = g.SHA
+	}
+	for _, g := range b {
+		if m[g.Name] != g.SHA {
+			return false
+		}
+	}
+	return true
+}
+
+// prodReceiverUndeliveredText is the disturbance the user sees when the merged work reached production
+// as a running service but the root receiver scripts it also ships did not — because the chain cannot
+// install them. It states the effect (held NOT live), the cause, and where the exact command waits.
+func prodReceiverUndeliveredText(target string) string {
+	return fmt.Sprintf("the merged work has NOT fully reached production: the production host %q still runs an OLDER "+
+		"version of the root receiver scripts than this delivery ships, and the chain cannot install them itself (the "+
+		"deploy key is a forced command that cannot overwrite its own gatekeeper). The delivery is held NOT live until "+
+		"an operator brings the receiver current — the exact command waits on the Blocked surface. The merged work on "+
+		"the default branch is unaffected.", target)
 }
 
 // prodHostKeyChangedText is the disturbance the user sees when the production host key changed — its

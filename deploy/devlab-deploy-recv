@@ -203,6 +203,26 @@ SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}
 # shellcheck source=/dev/null
 . "$SETUP_LIB"
 
+# ── self-report: the sha256 of THIS receiver and the library it sources ─────────────────────────────
+# The sending side (the delivery chain) cannot read this host's filesystem — the deploy key is a forced
+# command limited to rsync-into-staging and this install trigger, and that limit is CORRECT and stays.
+# So the receiver reports its OWN installed checksums here, as ordinary output of the install it already
+# runs. This is purely READ-ONLY self-reporting: it adds no operation, no argument and no writable path
+# to the forced command, so it widens the deploy key's rights by NOTHING — it only lets the chain MEASURE
+# whether a devlab delivery whose content changes these root scripts actually reached this host. A stale
+# (or older, silent) receiver cannot install a new receiver over itself; the chain then surfaces the
+# outstanding step as a Blocked approval naming devlab-install-recv. It runs only on the install path
+# (the rsync-receive branch above exec's rrsync and never returns here), and in --check too (read-only).
+recv_self_sha() { # <file> <name>
+  local f="$1" name="$2" h=""
+  if   command -v sha256sum >/dev/null 2>&1; then h="$(sha256sum -- "$f" 2>/dev/null | cut -d' ' -f1)"
+  elif command -v shasum    >/dev/null 2>&1; then h="$(shasum -a 256 -- "$f" 2>/dev/null | cut -d' ' -f1)"; fi
+  [ -n "$h" ] && echo "RECV-SELF-SHA $name $h"
+}
+RECV_SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+recv_self_sha "$RECV_SELF_PATH" devlab-deploy-recv
+recv_self_sha "$SETUP_LIB" devlab-setup-lib.sh
+
 # ensure_secrets_for <repo> <unit-file> — MINT this host's instance secrets before the service starts,
 # derived from what the unit demands (the SAME rule the dev host applies via devlab-install). A blank
 # host has none, so without this the service installs and then dies at start with "no JWT secret …" and

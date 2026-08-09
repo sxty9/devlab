@@ -41,6 +41,19 @@ const (
 	// It is a production-only hold: unlike a wrapper-renewal or decision question it does NOT hold a
 	// repository's dev branch (a production failure never blocks the stack), so OpenForRepo skips it.
 	QuestionProdHostKey = "prod-host-key"
+	// QuestionProdReceiver is the THIRD guarded handle, the same Blocked/approval shape as the two above:
+	// a devlab (self) delivery whose merged content changes the ROOT RECEIVER SCRIPTS that live on the
+	// production host (devlab-deploy-recv and the library it sources, devlab-setup-lib.sh) cannot install
+	// them over the chain — the deploy key is a forced command that can only rsync into staging and
+	// trigger an install, never overwrite its own gatekeeper. That part of the delivery therefore does
+	// NOT reach the host, so the delivery must not settle live; the outstanding step is surfaced here as a
+	// concrete approval carrying the exact command an operator with root runs on the target and the
+	// checksums the merged scripts must reach (Wrappers). Like the host-key hold it is production-only
+	// (OpenForRepo skips it) and, unlike the wrapper renewal, the chain never installs it itself — it
+	// deliberately lacks the right — so an approval only records that the operator ran the command; the
+	// production pass re-MEASURES the host's receiver checksums and settles the delivery live only once
+	// they match (approval is never a bypass of the measurement).
+	QuestionProdReceiver = "prod-receiver"
 )
 
 // Wrapper renewal SOURCE — where the approved content is re-read from at install time. There is now
@@ -95,12 +108,14 @@ type Question struct {
 	AnsweredAt *time.Time  `json:"answeredAt,omitempty"`
 	AnsweredBy model.Actor `json:"answeredBy,omitempty"`
 
-	// Wrappers pins EXACTLY WHICH root wrapper scripts (by name) and WHICH content (by sha256) the
-	// user's approval covers — one entry per file. It is set only on a wrapper-renewal question and is
-	// derived from committed history (the stack tip or the delivering branch, per WrapperSource), never
-	// from an unpinned working tree. The approval frees the renewal of these named files with these
-	// exact checksums and nothing else: if the source content changes after the approval, the recorded
-	// sha no longer matches and the renewal is refused (single-use and content-pinned, never blanket).
+	// Wrappers pins EXACTLY WHICH root scripts (by name) and WHICH content (by sha256) the user's
+	// approval covers — one entry per file. On a wrapper-renewal question it names the root wrappers under
+	// /usr/local/sbin, derived from committed history (the delivering branch, per WrapperSource) and
+	// re-read and re-checked at install time, so a stale approval installs nothing (single-use,
+	// content-pinned). On a QuestionProdReceiver it names the root receiver scripts on the production host
+	// and the sha256 each must reach — the "checksums that bind it"; there the chain never installs them
+	// (it lacks the right), so the pins are what the operator's command brings the host to and what the
+	// production pass re-measures against before it settles the delivery live.
 	Wrappers []WrapperGrant `json:"wrappers,omitempty"`
 
 	// HostKeyTarget and HostKeyFingerprint pin a QuestionProdHostKey to ONE production host and ONE
@@ -110,6 +125,14 @@ type Question struct {
 	// key that changed again after the human looked. Set only on a host-key question.
 	HostKeyTarget      string `json:"hostKeyTarget,omitempty"`
 	HostKeyFingerprint string `json:"hostKeyFingerprint,omitempty"`
+
+	// ProdReceiverTarget and ProdReceiverCommand belong to a QuestionProdReceiver: the production host
+	// whose root receiver scripts are older than the merged delivery ships, and the exact one-line command
+	// an operator with root runs ON THAT HOST to bring them current. The scripts and the exact sha256 each
+	// must reach are pinned in Wrappers. The chain never installs these itself (it deliberately lacks the
+	// right), so the command is Handarbeit for a human — the chain re-measures the host afterwards.
+	ProdReceiverTarget  string `json:"prodReceiverTarget,omitempty"`
+	ProdReceiverCommand string `json:"prodReceiverCommand,omitempty"`
 
 	// WrapperSource names where the approved wrapper content is re-read from at install time. A question
 	// raised today always sets WrapperSourceWorking — this run's own delivering branch, the ONE stand the
@@ -184,9 +207,34 @@ func (q Question) GuardedApprovalStatement() string {
 		return wrapperApprovalStatement(q.Wrappers)
 	case QuestionProdHostKey:
 		return hostKeyApprovalStatement(q.HostKeyTarget, q.HostKeyFingerprint)
+	case QuestionProdReceiver:
+		return prodReceiverApprovalStatement(q.ProdReceiverTarget, q.ProdReceiverCommand, q.Wrappers)
 	default:
 		return ""
 	}
+}
+
+// prodReceiverApprovalStatement spells out, for the human and for the ledger, WHICH production host and
+// WHICH exact command an approval confirms — and the checksums the receiver scripts must reach. Unlike
+// the wrapper renewal and the host-key accept, the chain performs nothing on this approval: it cannot
+// install the receiver on the production host (the deploy key is a forced command that cannot overwrite
+// its own gatekeeper), so the consent is honest about that — it confirms an operator ran the command,
+// and states plainly that the chain re-measures the host before it settles the delivery live, so the
+// confirmation is never a bypass of the measurement.
+func prodReceiverApprovalStatement(target, command string, grants []WrapperGrant) string {
+	var b strings.Builder
+	b.WriteString("I confirm that on the production host " + target + " I have run the following as root, from a " +
+		"checkout of the standard branch, to bring the root receiver scripts current:\n  " + command +
+		"\nThe approval covers exactly these scripts, each pinned to the checksum the merged delivery ships:")
+	for _, g := range grants {
+		b.WriteString("\n  - ")
+		b.WriteString(g.Name)
+		b.WriteString(" → sha256 ")
+		b.WriteString(g.SHA)
+	}
+	b.WriteString("\nThe chain re-reads the production host's receiver checksums before it settles the delivery live, " +
+		"so this confirmation settles nothing on its own — the delivery stays NOT live until the host actually carries these scripts.")
+	return b.String()
 }
 
 // wrapperApprovalStatement spells out, for the human and for the ledger, WHICH version of the root
@@ -334,9 +382,9 @@ func (s *QuestionStore) OpenForRepo(repo, exceptRunID string) (*Question, error)
 	}
 	for i := range cur {
 		q := cur[i]
-		// A host-key question holds the PRODUCTION send, not a dev branch: a production failure never
-		// blocks the stack (WHAT-3), so it must not halt new orders branching on this repository.
-		if q.QKind == QuestionProdHostKey {
+		// A host-key or receiver question holds the PRODUCTION send, not a dev branch: a production failure
+		// never blocks the stack (WHAT-3), so it must not halt new orders branching on this repository.
+		if q.QKind == QuestionProdHostKey || q.QKind == QuestionProdReceiver {
 			continue
 		}
 		if q.Open() && sameRepoID(q.Repo, repo) && q.RunID != exceptRunID {
@@ -363,6 +411,61 @@ func (s *QuestionStore) OpenHostKeyQuestion(target string) (*Question, error) {
 		}
 	}
 	return nil, nil
+}
+
+// OpenProdReceiverQuestion returns the oldest still-open receiver question for a repository, or nil.
+// The production pass calls it to avoid raising a duplicate while one already waits for the same repo:
+// the receiver drift is a property of the production host and this repo's merged content, so it is
+// asked once — and re-raised only when the required checksums change (a newer delivery changed the
+// receiver again), which the caller detects by comparing the pinned Wrappers.
+func (s *QuestionStore) OpenProdReceiverQuestion(repo string) (*Question, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	for i := range cur {
+		if cur[i].Open() && cur[i].QKind == QuestionProdReceiver && sameRepoID(cur[i].Repo, repo) {
+			q := cur[i]
+			return &q, nil
+		}
+	}
+	return nil, nil
+}
+
+// RetireProdReceiverQuestions resolves every not-yet-consumed receiver question for a repository —
+// OPEN or ANSWERED — once the production pass has MEASURED that the host carries the receiver scripts
+// the delivery ships (the drift cleared). It is the counterpart of the host-key accept's Resolve: the
+// chain performs no install here, so the question is retired by the measurement rather than by an
+// applied approval. Returns how many it retired (0 → nothing written). The note records why it closed.
+func (s *QuestionStore) RetireProdReceiverQuestions(repo, note string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.load()
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	n := 0
+	for i := range cur {
+		if cur[i].Resolved || cur[i].QKind != QuestionProdReceiver || !sameRepoID(cur[i].Repo, repo) {
+			continue
+		}
+		cur[i].Resolved = true
+		cur[i].ResolvedAt = &now
+		if cur[i].CloseNote == "" {
+			cur[i].CloseNote = note
+		}
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	if err := s.save(cur); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 // ApprovedHostKeyQuestion returns the newest ANSWERED-and-APPROVED, not-yet-consumed host-key question

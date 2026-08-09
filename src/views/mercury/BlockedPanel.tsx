@@ -11,12 +11,15 @@
 // also the way a stack tip a question blocked is released. A question whose run no longer exists is
 // gegenstandslos: the backend retires it on its own, so it neither shows here nor holds a repository.
 //
-// Two kinds are special: a GUARDED question moves a security boundary, so it is presented as an
-// explicit approval rather than a free-text answer. A wrapper-renewal carries the exact difference to
-// the installed root scripts; a prod-host-key carries the fingerprint of a production host's new ssh
-// key. Approving never writes anything on its own — the chain re-checks the exact content (the scripts
-// still match / the host still presents the approved key) before it acts; this surface only carries
-// the user's decision.
+// Three kinds are special: a GUARDED question moves a security boundary (or names a step the chain
+// cannot take itself), so it is presented as an explicit approval rather than a free-text answer. A
+// wrapper-renewal carries the exact difference to the installed root scripts; a prod-host-key carries
+// the fingerprint of a production host's new ssh key; a prod-receiver carries the command an operator
+// with root runs on the production host to bring the root receiver scripts current and the checksums
+// they must reach. Approving never writes anything on its own — the chain re-checks the exact content
+// (the scripts still match / the host still presents the approved key / the host now carries the
+// receiver scripts) before it acts or settles a delivery live; this surface only carries the user's
+// decision.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { getDataSource } from '@/data';
 import { useLiveTopic } from '@/state/live';
@@ -177,7 +180,8 @@ function QuestionRow({
 }) {
   const wrapper = q.qKind === 'wrapper-renewal';
   const hostKey = q.qKind === 'prod-host-key';
-  const guarded = wrapper || hostKey;
+  const receiver = q.qKind === 'prod-receiver';
+  const guarded = wrapper || hostKey || receiver;
   const [text, setText] = useState('');
   const [confirmed, setConfirmed] = useState(false);
   const waited = waitingSince(q.askedAt, Date.now());
@@ -227,7 +231,11 @@ function QuestionRow({
       {guarded && q.detail && (
         <details className="mt-2" open>
           <summary className="cursor-pointer text-caption text-danger">
-            {wrapper ? 'What would be installed (the version this delivery ships)' : 'The new host key that would be trusted'}
+            {wrapper
+              ? 'What would be installed (the version this delivery ships)'
+              : receiver
+                ? 'The command to run on the production host, and the checksums it must reach'
+                : 'The new host key that would be trusted'}
           </summary>
           <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-fill/[0.04] px-2.5 py-1.5 text-caption text-text-secondary">
             {q.detail}
