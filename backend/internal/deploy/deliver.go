@@ -52,11 +52,15 @@ const (
 // incomplete delivery that says so.
 type WebState string
 
+// The states are read off the ONE line the wrapper writes per run. That line is written at the END of
+// the run (setup_confirm_web), not when the bytes were copied: a face that is installed and then removed
+// again by a later step of the same run was never installed, and used to be reported as installed
+// anyway — the whole reason the state exists is to stop that.
 const (
 	WebNone      WebState = "none"      // the package ships no face and declares none
-	WebInstalled WebState = "installed" // the face is on the host at the declared serve root, proven readable
+	WebInstalled WebState = "installed" // the face is on the host at the declared serve root when the run ENDS, proven readable
 	WebPlanned   WebState = "planned"   // --check dry-run reached the face step
-	WebFailed    WebState = "failed"    // a face that could not be installed — a named stage failure
+	WebFailed    WebState = "failed"    // a face that could not be installed, or did not survive the run — a named stage failure
 )
 
 // InstallResult is what the wrapper reports beyond the raw error: the outcome of each interface half,

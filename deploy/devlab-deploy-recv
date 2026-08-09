@@ -79,6 +79,12 @@ SYSTEMCTL="${DEVLAB_SYSTEMCTL:-systemctl}"
 # environment, so a client cannot move them; in production these are the real tools.
 GETENT="${DEVLAB_GETENT:-getent}"
 DPKG="${DEVLAB_DPKG:-dpkg-query}"
+# The ownership every system file this receiver installs carries: root's. RECV_OWN is the same
+# DIRECT-INVOCATION test seam the shared library uses (DEVLAB_RECV_TEST — stripped by sudo's env_reset
+# and never passed by sshd's forced command, so it cannot be set in operation): dropping the flags is
+# what lets a WHOLE delivery be driven unprivileged against a fixture host, which is how "the delivered
+# face is still there when the run ends" is measured on a host instead of read off a report.
+RECV_OWN=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && RECV_OWN=()
 
 log() { logger -t devlab-deploy-recv -- "$*" 2>/dev/null || true; echo "devlab-deploy-recv: $*" >&2; }
 die() { log "$1"; exit "${2:-2}"; }
@@ -229,16 +235,46 @@ recv_self_sha "$RECV_SELF_PATH" devlab-deploy-recv
 recv_self_sha "$SETUP_LIB" devlab-setup-lib.sh
 
 # install_web <artifact> <repo> — the service's OWN face, installed where the PACKAGE says it belongs
-# and reported on the single MERCURY-WEB line (setup_install_web in the shared library — the identical
-# call the dev installer makes). This receiver holds no web root of its own any more: it installs what
-# was delivered, where the delivery declares, for EVERY service — the branch that copied a face for one
-# repository and dropped every other one is gone. A face that cannot be installed fails the production
-# delivery by name (exit 11, the same code a service that does not come up gets): a delivered interface
-# that never reaches the host is an incomplete delivery, not a service without an interface.
+# (setup_install_web in the shared library — the identical call the dev installer makes). This receiver
+# holds no web root of its own any more: it installs what was delivered, where the delivery declares, for
+# EVERY service — the branch that copied a face for one repository and dropped every other one is gone. A
+# face that cannot be installed fails the production delivery by name (exit 11, the same code a service
+# that does not come up gets): a delivered interface that never reaches the host is an incomplete
+# delivery, not a service without an interface.
+#
+# WHETHER IT WORKED IS SAID AT THE END OF THE RUN, not here (web_end_state below).
 install_web() {  # <artifact> <repo>
+  WEB_HALF_RAN=1
   setup_install_web "$1" "$2" "$CHECK" \
     || die "prod delivery of '$2' is incomplete: the delivered face was not installed (see the reason above)" 11
 }
+
+# ── THE FACE'S END STATE — the ONE place this receiver states the outcome of the web half ────────────
+# The success mark belongs to the state at the END of the run, never to the moment of copying: this
+# receiver installed the delivered face and then, in the same run, deleted it again with the program
+# copy's `rsync --delete`, and reported success anyway (measured on production 2026-08-09: the mark named
+# the dashboard's serve root as installed, the service's directory held nothing but the payload's own
+# pybase and venv, and the instance root answered 503). The delete is bounded now
+# (setup_install_program), but a mark that is issued before the run is over would keep making the same
+# claim the next time something else empties that directory.
+#
+# So the verdict is bound to the END of the process — an EXIT hook, which every path of this receiver
+# passes through, rather than a line each branch has to remember. A run that is already failing reports
+# its own failure and needs no second verdict; a run that would otherwise succeed FAILS here (exit 11,
+# the same code an incomplete face gets anywhere else) when the face it installed is no longer there.
+WEB_HALF_RAN=0
+WEB_END_STATED=0
+web_end_state() {
+  local rc=$?
+  [ "$WEB_END_STATED" = 1 ] && return 0
+  WEB_END_STATED=1
+  [ "$rc" = 0 ] || return 0            # already failed — that failure is the report
+  [ "$WEB_HALF_RAN" = 1 ] || return 0  # this process never reached the face half (e.g. a refused package)
+  setup_confirm_web "$real" "$REPO" "$CHECK" && return 0
+  log "prod delivery of '$REPO' is incomplete: the delivered face is gone at the end of this run (see the reason above)"
+  exit 11
+}
+trap web_end_state EXIT
 
 # ensure_secrets_for <repo> <unit-file> — MINT this host's instance secrets before the service starts,
 # derived from what the unit demands (the SAME rule the dev host applies via devlab-install). A blank
@@ -280,7 +316,7 @@ case "$REPO" in
 
     # The program and the web SPA are installed the SAME way in both cases — the layout is what makes
     # devlab special, and the layout does not change between a first-time setup and a renewal.
-    run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
+    run install "${RECV_OWN[@]}" -m 0755 "$BIN" /usr/local/bin/devlabd
     install_web "$real" devlab
 
     if [ "$SELF_FIRST" = 1 ]; then
@@ -318,7 +354,7 @@ case "$REPO" in
       fi
 
       setup_ensure_account devlab
-      install -o root -g root -m 0644 "$DELIV_UNIT" "$DEVLABD_UNIT_FILE"
+      install "${RECV_OWN[@]}" -m 0644 "$DELIV_UNIT" "$DEVLABD_UNIT_FILE"
 
       if [ -f "$DELIV_ROUTE" ] && [ -d "$CADDY_CONF" ]; then
         rc=0; reason="$(setup_install_route "$DELIV_ROUTE" "$CADDY_CONF/devlab.caddy" "$CADDY_BIN" "$CADDY_MAIN" "$SYSTEMCTL" "$DEVLABD_UNIT_FILE" 2>&1)" || rc=$?
@@ -383,29 +419,13 @@ case "$REPO" in
         ;;
     esac
 
-    # install_program / plan_program — install the prebuilt program per its declared kind (a pure copy;
-    # THIS HOST NEVER BUILDS). go-daemon: the single <repo>d binary. python-app: the payload/ tree copied
-    # verbatim to /opt/<repo> (venv shebangs relocated at build time), --safe-links dropping any escaping
-    # symlink, then a+rX so the service account (User=<repo>, not root) can read and run the interpreter.
-    install_program() {
-      case "$KIND" in
-        go-daemon)
-          install -d -o root -g root -m 0755 "/opt/$REPO/bin"
-          install -o root -g root -m 0755 "$gbin" "/opt/$REPO/bin/${REPO}d"
-          ;;
-        python-app)
-          install -d -o root -g root -m 0755 "/opt/$REPO"
-          rsync -a --delete --safe-links "$payload/" "/opt/$REPO/"
-          chmod -R a+rX "/opt/$REPO"
-          ;;
-      esac
-    }
-    plan_program() {
-      case "$KIND" in
-        go-daemon)  echo "PLAN: install binary $gbin -> /opt/$REPO/bin/${REPO}d" ;;
-        python-app) echo "PLAN: copy prebuilt payload $payload/ -> /opt/$REPO/ (rsync --delete --safe-links + chmod a+rX; this host never builds)" ;;
-      esac
-    }
+    # install_program / plan_program — install the prebuilt program per its declared kind, through the ONE
+    # shared program install the dev installer also takes (setup_install_program): a pure copy, THIS HOST
+    # NEVER BUILDS, and the copy removes only what belongs to the program — never the face of the same
+    # service, which lives in the same directory and which this receiver used to delete right after
+    # installing it. One rule, both build kinds, both hosts; no second copy of it lives here.
+    install_program() { setup_install_program "$real" "$REPO" "$KIND" 0; }
+    plan_program()    { setup_install_program "$real" "$REPO" "$KIND" 1; }
 
     # The UNIT NAME comes from the DELIVERED setup product, not from the repository name: a service whose
     # unit is legitimately named otherwise (a dashboard shipping <repo>-dashboard.service) carries that
@@ -509,7 +529,7 @@ case "$REPO" in
       # but one repository, and an incomplete package must change as little as possible before it fails.
       install_web "$real" "$REPO"
       install_program
-      install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
+      install "${RECV_OWN[@]}" -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
       # The route dir is SHARED by every service of the host (setup_install_route validates the ASSEMBLED
       # config and takes OUR file — plus the freshly written unit — back out on failure). A delivered
@@ -551,4 +571,9 @@ case "$REPO" in
     ;;
 esac
 
+# The face's end state is settled BEFORE this run calls itself done — a "done" printed above a verdict
+# that then fails is the same lie in smaller print. The EXIT hook stays as the safety net for every path
+# that leaves earlier (the dry runs, and anything that exits without reaching this line); it states the
+# verdict exactly once, so calling it here costs nothing and only fixes the order.
+web_end_state
 log "prod deploy of '$REPO' done"
