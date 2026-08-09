@@ -37,14 +37,19 @@
 #   * env is exactly `dev` or `prod` (prod is NOT armed in this phase — it dies)
 #   * install-only for the SERVICE artifact: root copies the validated program + rights and restarts
 #     the unit; root NEVER builds and NEVER executes the service's own repo code (E §7.4)
+#   * the service's OWN face (a staged web/ in the artifact) is installed at the serve root the
+#     PACKAGE declares (web.root), validated to lie in that service's own territory — the wrapper
+#     never derives a serve root from the repository name. Reported on a single
+#     `MERCURY-WEB: <none|installed|planned|failed>` line; a face that cannot be installed FAILS the
+#     install, because a delivery whose interface never reaches the host is not a delivery
 #   * the service UI (a staged ui/ in the artifact) is wired into the instance's holistic dashboard
 #     (<holistic>/<frontend>/external/<repo>), the SHARED dashboard is rebuilt AS THE CHECKOUT OWNER
 #     (never as root — the same "root never builds" rule as the program half; runuser drops privilege
 #     so no root-owned file is left in the operator's checkout), and the freshly built bundle is then
-#     DELIVERED to the serve root the browser fetches from (DEVLAB_HOLISTIC_WWW). `built` is reported
-#     ONLY once the bundle has arrived there — a rebuilt-but-undelivered dashboard is a failure, not
-#     green (the browser would keep serving the old bundle). The dashboard path and serve root are
-#     instance configuration (DEVLAB_HOLISTIC_REPO / DEVLAB_HOLISTIC_WWW / root-owned files); absent
+#     DELIVERED to the instance root — the root application's serve root (setup_root_app_www). `built`
+#     is reported ONLY once the bundle has arrived there — a rebuilt-but-undelivered dashboard is a
+#     failure, not green (the browser would keep serving the old bundle). The dashboard CHECKOUT is
+#     instance configuration (DEVLAB_HOLISTIC_REPO / root-owned file); absent
 #     dashboard config is a NAMED deficiency, never a silent skip. The half's outcome is reported on a
 #     single `MERCURY-UI: <none|built|unconfigured|failed|foreign-blocked|planned|would-fail>` line
 #     (would-fail is --check-only: the dry-run predicts the relocation would carry an outside-tree config
@@ -86,16 +91,14 @@ PERMS_DIR="${DEVLAB_HOLISTIC_PERMS:-/etc/holistic/permissions.d}"
 HOLISTIC_REPO="${DEVLAB_HOLISTIC_REPO:-}"
 HOLISTIC_REPO_FILE="${DEVLAB_HOLISTIC_REPO_FILE:-/etc/devlab/holistic-repo}"
 HOLISTIC_FRONTEND="${DEVLAB_HOLISTIC_FRONTEND:-frontend}"
-# WHERE THE BROWSER FETCHES THE DASHBOARD FROM — the serve root the edge exposes (Caddy: `root *
-# <www>`). Building the dashboard is only half the delivery: "delivered" means the freshly built
-# bundle sits HERE, where the browser reads it, not merely in the checkout's build output. This is
-# an instance value like every path above (the served tree is `/opt/<product>/www` by the holistic
-# convention, holding no user- or machine-specific segment), so it is an env-overridable DEFAULT
-# with a root-owned file seam — never asked of the caller. HOLISTIC_DIST is the built-SPA subtree
-# the dashboard's own build writes under <frontend> (holistic emits `app/dist`).
-HOLISTIC_WWW="${DEVLAB_HOLISTIC_WWW:-}"
-HOLISTIC_WWW_FILE="${DEVLAB_HOLISTIC_WWW_FILE:-/etc/devlab/holistic-www}"
-HOLISTIC_WWW_DEFAULT="/opt/holistic/www"
+# WHERE THE BROWSER FETCHES THE DASHBOARD FROM is NOT a value of its own. It IS the instance root, and
+# the instance root is the ROOT APPLICATION's serve root — one fact, decided once in the shared library
+# (SETUP_ROOT_APP / setup_root_app_www) and read from there by everything that touches it: the edge the
+# receiver builds, the delivered-face installer, and this dashboard delivery. A separately configurable
+# second path for the same fact is precisely how a dashboard ends up delivered where the edge does not
+# look. Resolved after the library is sourced, below. HOLISTIC_DIST is the built-SPA subtree the
+# dashboard's own build writes under <frontend> (holistic emits `app/dist`).
+HOLISTIC_WWW=""
 HOLISTIC_DIST="${DEVLAB_HOLISTIC_DIST:-app/dist}"
 RESTART_HELPER="/usr/local/sbin/devlab-restart-when-free"
 # The ONE artifact directory the unprivileged per-user build produces inside a working tree
@@ -542,6 +545,18 @@ SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}
 # shellcheck source=/dev/null
 . "$SETUP_LIB"
 
+# install_web_half <artifact> <repo> — THE service's OWN face: install the web bundle the package
+# carries at the serve root the package DECLARES, and state the outcome on the single MERCURY-WEB line.
+# The work, the judgement and the wording all live in the shared library (setup_install_web — the same
+# call the production receiver makes, so a face arrives on this workbench and on a production host by
+# ONE rule); this wrapper only turns a refusal into its own exit code. A face that could not be
+# installed is not a warning beside a green install: a service whose interface never reaches its host
+# is an incomplete delivery, so the install FAILS here and the stage fails with it.
+install_web_half() {  # <artifact> <repo>
+  setup_install_web "$1" "$2" "$CHECK" \
+    || die "the delivered face of '$2' was not installed — see the reason above; a delivery whose interface does not reach the host is incomplete, not green" 4
+}
+
 # ── validation cascade (every step BEFORE any effect) ────────────────────────────────────────────
 [ "${#POSITIONAL[@]}" -eq 3 ] || die "usage: devlab-install <repo> <artifact-dir> <env> [--port <n>] [--handover] [--check]" 2
 
@@ -766,15 +781,13 @@ if [ "$REPO" = "$SELF_REPO" ]; then
   [ -d "$WEB" ] || die "staged self web dir missing: $WEB" 5
 
   run install -o root -g root -m 0755 "$BIN" "/usr/local/bin/${SELF_UNIT}"
-  run install -d -m 0755 "$STATE_DIR/www"
-  run rsync -a --delete "$WEB/" "$STATE_DIR/www/"
-  # The self web is a SERVE ROOT like the dashboard's: `rsync -a` above carries the artifact's owner and
-  # mode (built under the unprivileged runner's umask), so the served tree is made readable by its PUBLIC
-  # ROLE — never by the account that built it — exactly as the production receiver and serve_dashboard do
-  # (the ONE shared rule, setup_serve_root_readable). Without this the edge answers 404 over a present
-  # start page on a host whose www root never carried serving permissions from an earlier era.
-  run setup_serve_root_readable "$STATE_DIR/www"
-  log "self install done (binary + web, served readable by role); running process keeps its loaded image"
+  # The self face goes where the PACKAGE says, through the same one installer every other service's face
+  # takes (install_web_half → setup_install_web): devlabd serves its own start page out of its state
+  # directory, so that is what its package declares — this wrapper no longer holds a www path of its own.
+  # The copy is made readable by its PUBLIC ROLE and that readability is PROVEN, so a served tree the
+  # webserver cannot read fails here instead of answering 404 over a present start page.
+  install_web_half "$real" "$REPO"
+  log "self install done (binary + face); running process keeps its loaded image"
 
   # Keep devlabd's OWN unit current from the delivered, checked-in copy, so a SECURITY directive the unit
   # template gained reaches a devlabd that was installed before it. A self UPDATE otherwise replaces only
@@ -1006,6 +1019,14 @@ fi
 if [ "$CHECK" = 1 ]; then setup_plan_secrets "$secret_unit"; else setup_ensure_secrets "$REPO" "$UNIT_FILE"; fi
 [ "$secret_tmp" = 1 ] && rm -f -- "$secret_unit"
 
+# The service's OWN face, installed where its package declares — the half that used to exist for exactly
+# ONE repository and dropped every other service's start page on the floor. It runs for EVERY service on
+# the ONE generic path (no per-repo branch), and it runs BEFORE the program is replaced: an incomplete
+# package (a face with no declared destination, or a destination outside the service's own territory)
+# then changes nothing at all on this host, instead of leaving a new program behind an interface that
+# never arrived.
+install_web_half "$real" "$REPO"
+
 # Install the prebuilt program per its DECLARED kind — a pure copy of already-built bytes; root never
 # builds (E §7.4). The unit installed above (delivered or generated) already names how to start it.
 case "$KIND" in
@@ -1074,13 +1095,21 @@ CO_GROUP="$(stat -c %G "$HOLISTIC_REPO" 2>/dev/null || true)"
   || die "holistic checkout '$HOLISTIC_REPO' is owned by '$CO_OWNER' — the dashboard build must run unprivileged (root never builds); give the checkout a non-root owner" 5
 CO_HOME="$(getent passwd "$CO_OWNER" | cut -d: -f6)"
 
-# WHERE the browser reads the dashboard from — the serve root. Instance config like the checkout: env
-# seam, root-owned file, else the holistic convention. This is the MEASURE of the ui half: a build that
-# does not reach here has not been delivered, whatever the checkout's build output says.
-if [ -z "$HOLISTIC_WWW" ] && [ -r "$HOLISTIC_WWW_FILE" ]; then
-  HOLISTIC_WWW="$(head -n1 -- "$HOLISTIC_WWW_FILE" | tr -d '[:space:]')"
-fi
-[ -n "$HOLISTIC_WWW" ] || HOLISTIC_WWW="$HOLISTIC_WWW_DEFAULT"
+# WHERE the browser reads the dashboard from — the instance root, i.e. the ROOT APPLICATION's serve
+# root, taken from the ONE place that decides it (setup_root_app_www) and from nowhere else. This is the
+# MEASURE of the ui half: a build that does not reach here has not been delivered, whatever the
+# checkout's build output says.
+#
+# TWO WRITERS, ONE TREE, AND ONLY ON A HOST LIKE THIS ONE: the instance root is written HERE (the
+# dashboard built from the configured checkout, carrying every service's wired-in face) and by the root
+# application's OWN delivery (install_web_half above, carrying that application's own build). A
+# production host has no checkout and therefore only the second. The last delivery wins; each writer
+# says what it replaced (setup_install_web notes the tree it overwrites, and the log below names the
+# serve root before and after); and a wired-in service face returns with the next ui-bearing delivery,
+# because the wire-in itself lives in the checkout, not in this tree. Folding the two into one — building
+# the DELIVERED dashboard package together with the delivered service uis — is a change to how the
+# dashboard is built, not to this wrapper, and is deliberately not smuggled in here.
+HOLISTIC_WWW="$(setup_root_app_www)"
 DIST_DIR="$FRONT/$HOLISTIC_DIST"
 
 # ── the ONE rule for relocating a service ui into the dashboard ──────────────────────────────────

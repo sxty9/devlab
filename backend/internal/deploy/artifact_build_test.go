@@ -273,3 +273,43 @@ func TestArtifactBuildFindsRootBundle(t *testing.T) {
 		t.Errorf("the staged start page must be the built one, got:\n%s", string(got))
 	}
 }
+
+// The package SAYS where its face belongs: a build that stages a web bundle stamps `web.root` beside
+// it, and the installer reads that stamp instead of deriving a destination from the repository name.
+// The value follows the landscape's serve convention (/opt/<repo>/www), with the self repo as the one
+// named layout exception it already is elsewhere — devlabd serves its own start page out of its state
+// directory, so that is what its package declares.
+func TestArtifactBuildStampsWhereTheFaceBelongs(t *testing.T) {
+	needNPM(t)
+	files := map[string]string{
+		"package.json": `{"name":"svc","private":true,"version":"0.0.0","scripts":{` +
+			`"build":"mkdir -p dist && printf '<!doctype html><title>ok</title>' > dist/index.html"}}`,
+	}
+
+	env, wt := artifactWorkspace(t, files)
+	if res := runWrapper(t, "deploy/devlab-exec", env, "artifact-build", wt); res.exit != 0 {
+		t.Fatalf("the build must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	got, err := os.ReadFile(filepath.Join(wt, ".mercury-artifact", "web.root"))
+	if err != nil {
+		t.Fatalf("a staged face must travel with the declaration of where it belongs: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "/opt/svc/www" {
+		t.Errorf("a uniform service's face belongs at its own serve root, got %q", strings.TrimSpace(string(got)))
+	}
+
+	// The self repo's layout exception: its own daemon serves its face out of the state directory.
+	env2, wt2 := artifactWorkspace(t, files)
+	env2["DEVLAB_SELF_REPO"] = "svc"
+	if res := runWrapper(t, "deploy/devlab-exec", env2, "artifact-build", wt2); res.exit != 0 {
+		t.Fatalf("the self build must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	got, err = os.ReadFile(filepath.Join(wt2, ".mercury-artifact", "web.root"))
+	if err != nil {
+		t.Fatalf("the self package must declare its face's place too: %v", err)
+	}
+	if want := filepath.Join(env2["DEVLAB_STATE_DIR"], "www"); strings.TrimSpace(string(got)) != want {
+		t.Errorf("the self face belongs in the state directory its daemon serves from: got %q, want %q",
+			strings.TrimSpace(string(got)), want)
+	}
+}

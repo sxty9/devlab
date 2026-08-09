@@ -375,21 +375,32 @@ func TestDeliverDevForeignBlockedUIStillDelivers(t *testing.T) {
 	}
 }
 
-// parseUILine reads the wrapper's machine-readable half-report off the combined output.
-func TestParseUILine(t *testing.T) {
+// parseHalves reads the wrapper's machine-readable half-reports off the combined output — the dashboard
+// contribution (MERCURY-UI) and the service's OWN face (MERCURY-WEB), each on its own, by ONE reader.
+func TestParseHalves(t *testing.T) {
 	for _, tc := range []struct {
-		out    string
-		state  UIState
-		detail string
+		out       string
+		state     UIState
+		detail    string
+		web       WebState
+		webDetail string
 	}{
-		{"install-only deploy done\nMERCURY-UI: built\n", UIBuilt, ""},
-		{"MERCURY-UI: none", UINone, ""},
-		{"MERCURY-UI: foreign-blocked | external/other: TS2307 here", UIForeign, "external/other: TS2307 here"},
-		{"no ui line at all", "", ""},
+		{"install-only deploy done\nMERCURY-UI: built\n", UIBuilt, "", "", ""},
+		{"MERCURY-UI: none", UINone, "", "", ""},
+		{"MERCURY-UI: foreign-blocked | external/other: TS2307 here", UIForeign, "external/other: TS2307 here", "", ""},
+		{"no ui line at all", "", "", "", ""},
+		// both halves in one output, in the order the wrapper prints them
+		{"MERCURY-WEB: installed | /opt/holistic/www\ninstall done\nMERCURY-UI: none\n", UINone, "", WebInstalled, "/opt/holistic/www"},
+		{"MERCURY-WEB: none\n", "", "", WebNone, ""},
+		// a face that did not reach the host is its own belegter Zustand, not the ui half's silence
+		{"MERCURY-WEB: failed\n", "", "", WebFailed, ""},
 	} {
-		got := parseUILine(tc.out)
+		got := parseHalves(tc.out)
 		if got.UI != tc.state || got.UIDetail != tc.detail {
-			t.Errorf("parseUILine(%q) = %+v, want %q / %q", tc.out, got, tc.state, tc.detail)
+			t.Errorf("parseHalves(%q) ui = %+v, want %q / %q", tc.out, got, tc.state, tc.detail)
+		}
+		if got.Web != tc.web || got.WebDetail != tc.webDetail {
+			t.Errorf("parseHalves(%q) web = %+v, want %q / %q", tc.out, got, tc.web, tc.webDetail)
 		}
 	}
 }
@@ -441,16 +452,22 @@ func TestDeliverDevInstallFailure(t *testing.T) {
 
 // Self repo: install + handover in ONE wrapper call; a failed handover FAILS the stage (K-2).
 func TestSelfInstallAndHandover(t *testing.T) {
-	ri := &fakeInstaller{}
-	if err := SelfInstallAndHandover(context.Background(), ri, "devlab", "/work/self/.mercury-artifact"); err != nil {
+	ri := &fakeInstaller{res: InstallResult{Web: WebInstalled, WebDetail: "/var/lib/devlab/www"}}
+	res, err := SelfInstallAndHandover(context.Background(), ri, "devlab", "/work/self/.mercury-artifact")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ri.calls) != 1 || !strings.Contains(ri.calls[0], "handover=true") {
 		t.Fatalf("want one install WITH handover, got %v", ri.calls)
 	}
+	// The self repository has a face of its own, and its outcome is handed back like any other
+	// service's — the one delivery that installs this very chain is not the one nobody accounts for.
+	if res.Web != WebInstalled || res.WebDetail != "/var/lib/devlab/www" {
+		t.Errorf("the self install must report its face half, got %+v", res)
+	}
 
 	ri = &fakeInstaller{err: errors.New("systemd-run failed")}
-	if err := SelfInstallAndHandover(context.Background(), ri, "devlab", "/x"); err == nil ||
+	if _, err := SelfInstallAndHandover(context.Background(), ri, "devlab", "/x"); err == nil ||
 		!strings.Contains(err.Error(), "no inline restart") {
 		t.Fatalf("a failed handover must fail the stage with the no-inline-restart doctrine, got %v", err)
 	}

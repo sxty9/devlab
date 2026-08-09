@@ -31,7 +31,7 @@
 #     sudo /path/to/deploy/devlab-install-recv [service ...]                       # refresh receiver
 #     sudo /path/to/deploy/devlab-install-recv --provision \
 #          --deploy-pubkey <path|-|literal> --edge-address <host:port|:port> [--recv-user <user>] \
-#          [--staging <dir>] [--www <dir>] [--caddyfile <file>] [--no-pkg] \
+#          [--staging <dir>] [--caddyfile <file>] [--no-pkg] \
 #          [--overlay-address <cidr> --overlay-listen-port <port> \
 #           --overlay-peer-pubkey <key|path|-> --overlay-peer-allowed <cidr> \
 #           [--overlay-endpoint <host:port>] [--overlay-verify-peer <ip>]] [service ...]
@@ -88,11 +88,18 @@ RECV="devlab-deploy-recv"
 LIB="devlab-setup-lib.sh"
 
 # The ONE state-root derivation the receiver itself carries: every host path DERIVES from it, so a
-# provisioned host stages, serves and confines under the same root the running daemon expects. These
-# are DEFAULTS; --staging / --www override them, and the receiver reads the same env at run time.
+# provisioned host stages and confines under the same root the running daemon expects. This is a
+# DEFAULT; --staging overrides it, and the receiver reads the same env at run time.
+#
+# WHAT THIS HOST SERVES AT THE INSTANCE ROOT is NOT derived here, and it is no longer a provisioning
+# option. It is the ROOT APPLICATION's serve root, decided once in the shared library (SETUP_ROOT_APP /
+# setup_root_app_www) and read from there — resolved below, once the library is sourced. Deriving it
+# from a SINGLE service's state root is exactly what made a provisioned host answer with that service's
+# login screen instead of the landscape's dashboard, and an operator flag for it would only move the
+# same guess into a command line.
 STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
 STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
-WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
+ROOT_APP_WWW=""
 # The edge the receiver reloads. conf.d holds the per-service routes the receiver drops in; the main
 # Caddyfile is a site block that imports them from INSIDE it (each route is a naked handle, valid only
 # inside a site block — see setup_edge_caddyfile_text). Instance-neutral defaults; the receiver reads
@@ -171,8 +178,6 @@ while [ "$#" -gt 0 ]; do
     --recv-user=*)    RECV_USER="${1#*=}"; shift ;;
     --staging)        STAGING_ROOT="${2:-}"; shift 2 ;;
     --staging=*)      STAGING_ROOT="${1#*=}"; shift ;;
-    --www)            WWW_DIR="${2:-}"; shift 2 ;;
-    --www=*)          WWW_DIR="${1#*=}"; shift ;;
     --caddyfile)      CADDY_MAIN="${2:-}"; shift 2 ;;
     --caddyfile=*)    CADDY_MAIN="${1#*=}"; shift ;;
     --no-pkg)         USE_PKG=0; shift ;;
@@ -263,6 +268,10 @@ bash -n -- "$SRC_DIR/$LIB"  || die "$SRC_DIR/$LIB does not parse — refusing to
 # library so --provision builds the edge from that one source rather than a second, hand-written shape.
 # shellcheck source=/dev/null
 . "$SRC_DIR/$LIB" || die "could not source $SRC_DIR/$LIB — the edge shell and route templates are unavailable"
+# WHAT THE INSTANCE ROOT ANSWERS WITH, read from the ONE place that decides it. The provisioning
+# prepares this directory and points the edge at it; the root application's own delivery fills it. Until
+# then the edge SAYS the root application is missing rather than serving something else in its place.
+ROOT_APP_WWW="$(setup_root_app_www)"
 # A port used only to PROVE the edge accepts a route (a probe route is dropped in, the edge is validated
 # with it, and it is removed). It is never served; any valid port number does.
 CADDY_PROBE_PORT="${DEVLAB_CADDY_PROBE_PORT:-65535}"
@@ -351,11 +360,14 @@ ensure_rrsync() {
 }
 
 # ensure_roots — the two host paths the receiver stages into and serves from. Pure filesystem, no
-# fetch; created only when absent (idempotent), root-owned.
+# fetch; created only when absent (idempotent), root-owned. The second is the INSTANCE ROOT: the root
+# application's serve root, prepared empty here and filled by that application's own delivery. Preparing
+# it is not the same as filling it, and the edge tells the two apart — an empty one answers "no root
+# application on this host", never with another service's files.
 ensure_roots() {
   local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
-  install -d "${own[@]}" -m 0755 "$STAGING_ROOT" && log "staging root ready: $STAGING_ROOT"
-  install -d "${own[@]}" -m 0755 "$WWW_DIR"      && log "web root ready:     $WWW_DIR"
+  install -d "${own[@]}" -m 0755 "$STAGING_ROOT"  && log "staging root ready: $STAGING_ROOT"
+  install -d "${own[@]}" -m 0755 "$ROOT_APP_WWW"  && log "instance root ready: $ROOT_APP_WWW (serve root of the root application '$SETUP_ROOT_APP')"
 }
 
 # caddy_validates_with_probe — PROVE the edge accepts a route, not merely that it parses empty (an empty
@@ -435,7 +447,7 @@ ensure_caddy() {
   install -d "${own[@]}" -m 0755 "$CADDY_CONF" && log "edge route dir ready: $CADDY_CONF"
 
   local desired
-  desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$WWW_DIR" "$EDGE_ADDRESS")" \
+  desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$EDGE_ADDRESS")" \
     || die "cannot build the edge: no declared edge address (ensure_edge_address must run first) — the edge address is read from $EDGE_ADDRESS_FILE, never guessed"
   local seam=0; [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && seam=1
 
@@ -485,6 +497,34 @@ ensure_caddy() {
       fi
     fi
   fi
+}
+
+# refresh_managed_edge — bring an ALREADY PROVISIONED host's edge up to the current shell, WITHOUT
+# provisioning it again. The edge is written once, at provisioning time, so a correction to its SHAPE —
+# such as the instance root no longer being one service's directory — would otherwise sit in the
+# repository while the host kept answering the old way, and collecting it would mean re-running a full
+# --provision with a deploy key that has nothing to do with it. Updating the receiver scripts on a
+# production host is ALREADY a one-line hand step (this script; the receiver cannot deliver itself), so
+# the edge catches up inside that same pass — one line, one run, nothing left for a second visit.
+#
+# It touches ONLY an edge THIS SCRIPT wrote (our marker) and only when it differs; a grown or foreign
+# edge is left exactly as it stands and NAMED, so nothing hand-built is overwritten and nothing silently
+# stays behind. A host with no edge at all is not refreshed — standing one up is provisioning, not a
+# refresh. Without a declared edge address there is nothing to rebuild from: that is named, never guessed.
+refresh_managed_edge() {
+  [ -f "$CADDY_MAIN" ] || return 0
+  if ! grep -Fq -- "devlab-install-recv" "$CADDY_MAIN"; then
+    log "the edge at $CADDY_MAIN was not written by this script — left untouched; check that its last block serves this instance's root application ($ROOT_APP_WWW) and no single service's directory"
+    return 0
+  fi
+  if ! EDGE_ADDRESS="$(setup_edge_address "$EDGE_ADDRESS_FILE")"; then
+    log "the edge at $CADDY_MAIN is ours, but this environment's edge address is not declared in $EDGE_ADDRESS_FILE — it cannot be rebuilt; restate it with --provision --edge-address <host:port>"
+    return 0
+  fi
+  # ensure_caddy decides from the file itself: identical → untouched, our OLDER output → replaced
+  # (backed up, validated with a delivered route present, then reloaded). No second decision is written
+  # here, so the refresh and the provisioning can never disagree about what the edge should be.
+  ensure_caddy
 }
 
 # read_pubkey — resolve the PUBLIC deploy key from a path, stdin ('-'), or a literal argument. It
@@ -750,6 +790,11 @@ if [ "$PROVISION" = 1 ]; then
     log "── setting up this host's side of the production overlay ──"
     overlay_setup_this_side
   fi
+else
+  # A host that was provisioned EARLIER carries the edge of that day. The receiver refresh is the hand
+  # step this host already needs (the receiver cannot deliver itself), so the edge it serves the instance
+  # root from catches up in the same run — see refresh_managed_edge for what it will and will not touch.
+  refresh_managed_edge
 fi
 
 # ── receiver install (REUSED by both modes) ─────────────────────────────────────────────────────────
@@ -784,9 +829,14 @@ fi
 # still run; the ones that need root/systemd (caddy validate, forced-command over sshd) are skipped and
 # named as skipped rather than faked.
 selfcheck_failed=0
+OPEN_AFTER=()
 sc_ok()   { echo "  [ok]   $*"; }
 sc_fail() { echo "  [FAIL] $*"; selfcheck_failed=1; }
 sc_skip() { echo "  [skip] $*"; }
+# sc_note — a fact this pass PROVED but does not itself produce: a step that belongs to somebody else and
+# is still outstanding. Neither green nor a failure of this pass, and never left unsaid: the closing
+# report repeats it under what remains, so a provisioned host is not read as a complete one.
+sc_note() { echo "  [open] $*"; OPEN_AFTER+=("$*"); }
 echo
 echo "devlab-install-recv — self-check:"
 
@@ -816,7 +866,15 @@ fi
 #    them — the receiver creates its staging at run time — so this is checked only when we provisioned).
 if [ "$PROVISION" = 1 ]; then
   [ -d "$STAGING_ROOT" ] && sc_ok "staging root exists ($STAGING_ROOT)" || sc_fail "staging root missing ($STAGING_ROOT)"
-  [ -d "$WWW_DIR" ]      && sc_ok "web root exists ($WWW_DIR)"         || sc_fail "web root missing ($WWW_DIR)"
+  [ -d "$ROOT_APP_WWW" ] && sc_ok "instance root exists ($ROOT_APP_WWW)" || sc_fail "instance root missing ($ROOT_APP_WWW)"
+  # The instance root EXISTING and the instance root ANSWERING are two different facts, and the second is
+  # not this script's to produce: the root application's own delivery fills it. So its absence is stated
+  # as what it is — a service still to be delivered — and never passed over in silence.
+  if [ -f "$ROOT_APP_WWW/index.html" ]; then
+    sc_ok "root application '$SETUP_ROOT_APP' is installed — the instance root serves its dashboard"
+  else
+    sc_note "root application '$SETUP_ROOT_APP' is NOT yet on this host — the instance root answers 503 naming it, and no other service's interface is served in its place; deliver '$SETUP_ROOT_APP' to complete the host"
+  fi
 fi
 
 # 6. the edge validates WITH a delivered route (not merely empty) and imports the route directory from
@@ -931,7 +989,7 @@ done
 echo
 echo "devlab-install-recv — done."
 if [ "$PROVISION" = 1 ]; then
-  echo "  provisioned: rrsync, staging ($STAGING_ROOT), web ($WWW_DIR), edge ($CADDY_MAIN), deploy-key forced command ($RECV_USER)"
+  echo "  provisioned: rrsync, staging ($STAGING_ROOT), instance root ($ROOT_APP_WWW), edge ($CADDY_MAIN), deploy-key forced command ($RECV_USER)"
   echo "  edge address: this environment answers on $EDGE_ADDRESS, declared once in $EDGE_ADDRESS_FILE."
   echo "                The routing layer (a production-side sxgate) reads the SAME declaration —"
   echo "                'devlab-install-recv --print-edge-address' returns it. Neither side guesses the other."
@@ -959,6 +1017,10 @@ if [ "${#WENT_UP[@]}" -gt 0 ]; then
 fi
 if [ "${#STAYED_DOWN[@]}" -gt 0 ]; then
   echo "  NOT brought up: ${STAYED_DOWN[*]}"
+fi
+if [ "${#OPEN_AFTER[@]}" -gt 0 ]; then
+  echo "  still outstanding after this pass (not this script's to do):"
+  for o in "${OPEN_AFTER[@]}"; do echo "    - $o"; done
 fi
 echo
 if [ "$PROVISION" = 1 ]; then

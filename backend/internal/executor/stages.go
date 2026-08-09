@@ -870,12 +870,15 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 		if errors.Is(err, ErrWrappersStale) {
 			return rc.raiseWrapperQuestion(ctx, out.WrapperDrift)
 		}
-		// Both halves are named even when the stage fails: a UI half that could not be built in
-		// (unconfigured/failed) still leaves the program installed — the stage fails BENANNT, but the
-		// program's own result is not swallowed by the interface's failure.
+		// EVERY half is named even when the stage fails: a face that did not reach the host, or a
+		// dashboard ui that could not be built in, still leaves the program installed — the stage fails
+		// BENANNT, but the program's own result is not swallowed by an interface half's failure.
 		if out.Installed && (out.UI == "failed" || out.UI == "unconfigured") {
 			rc.logf("program: installed on port %d (%s@%s); interface: %s — the stage fails on the interface half",
 				out.Port, rc.branchName(), short(rc.head), out.UI)
+		}
+		if out.Web == "failed" {
+			rc.logf("face: NOT installed — this service ships a web interface that did not reach its host; an interface that never arrives makes the delivery incomplete, not green")
 		}
 		return err // named failure, exactly one attempt — e.g. "delivery not yet set up" (K-4)
 	}
@@ -888,8 +891,17 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 	if out.Detail != "" {
 		rc.logf("%s", clip(out.Detail))
 	}
-	// The delivery reports BOTH halves a service needs: program (above) and dashboard UI (here). A
-	// service without a ui says so ausdrücklich — the half is not silently omitted.
+	// The delivery reports EVERY half a service needs: program (above), the service's OWN face (here)
+	// and its dashboard contribution (below). A service without one says so ausdrücklich — no half is
+	// silently omitted, because silence is exactly what let a delivered interface stay in the package.
+	switch out.Web {
+	case "", "none":
+		rc.logf("face: none — this service ships no web interface of its own")
+	case "installed":
+		rc.logf("face: installed at %s — the host now serves this service's own interface from where its package declares", clip(out.WebDetail))
+	default:
+		rc.logf("face: %s", clip(out.Web))
+	}
 	switch out.UI {
 	case "", "none":
 		rc.logf("interface: none — this service ships no dashboard face")

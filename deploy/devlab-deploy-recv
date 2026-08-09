@@ -9,7 +9,8 @@
 #   command="/usr/local/sbin/devlab-deploy-recv",restrict ssh-ed25519 AAAA...devkey... devlab-prod-deploy
 #
 # You do NOT transcribe this line by hand: `devlab-install-recv --provision --deploy-pubkey <pubkey>`
-# writes it (and stands up rrsync, the staging/web roots and the Caddy edge) in one self-checking pass.
+# writes it (and stands up rrsync, the staging root, the instance root and the Caddy edge) in one
+# self-checking pass.
 #
 #   `restrict` = no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding (and any
 #   future restrictions). Combined with command="…" it means: whatever the client asks for, sshd runs
@@ -48,15 +49,19 @@ set -euo pipefail
 # devlab-mkworkspace carry it verbatim): every path this receiver touches DERIVES from the state root,
 # so an instance with a different root does not end up with a receiver staging in one place and a
 # daemon serving from another. This host has no per-user workspaces — it is install-only — so what it
-# derives are the staging root the forced command receives into and the web root it serves from
-# (mirroring statepath.Www()).
+# derives is the staging root the forced command receives into.
 #
 # The overrides are a DIRECT-INVOCATION seam, never an input of the forced command: sshd hands the
 # client no environment (AcceptEnv does not list these names, and the key's `restrict` option disables
 # user-rc), so a client cannot move the staging boundary it is confined to.
+#
+# There is NO web root among these paths any more, and that absence is the point: this receiver used to
+# derive one from the state root of a SINGLE service and install every delivered face into it, which is
+# how the instance root came to answer with that one service and how every other service's face was
+# dropped on arrival. Where a face belongs is READ from the package it travelled in (setup_install_web),
+# and what the instance root answers with is decided once in the shared library (SETUP_ROOT_APP).
 STATE_DIR="${DEVLAB_STATE_DIR:-/var/lib/devlab}"
 STAGING_ROOT="${DEVLAB_STAGING:-$STATE_DIR/staging}"
-WWW_DIR="${DEVLAB_STATIC_DIR:-$STATE_DIR/www}"
 
 # The system paths a first-time setup writes into, and the tools it asks. Instance-neutral defaults of
 # this template; the env overrides are the direct-invocation test seam (sshd strips the client's env).
@@ -223,6 +228,18 @@ RECV_SELF_PATH="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH
 recv_self_sha "$RECV_SELF_PATH" devlab-deploy-recv
 recv_self_sha "$SETUP_LIB" devlab-setup-lib.sh
 
+# install_web <artifact> <repo> — the service's OWN face, installed where the PACKAGE says it belongs
+# and reported on the single MERCURY-WEB line (setup_install_web in the shared library — the identical
+# call the dev installer makes). This receiver holds no web root of its own any more: it installs what
+# was delivered, where the delivery declares, for EVERY service — the branch that copied a face for one
+# repository and dropped every other one is gone. A face that cannot be installed fails the production
+# delivery by name (exit 11, the same code a service that does not come up gets): a delivered interface
+# that never reaches the host is an incomplete delivery, not a service without an interface.
+install_web() {  # <artifact> <repo>
+  setup_install_web "$1" "$2" "$CHECK" \
+    || die "prod delivery of '$2' is incomplete: the delivered face was not installed (see the reason above)" 11
+}
+
 # ensure_secrets_for <repo> <unit-file> — MINT this host's instance secrets before the service starts,
 # derived from what the unit demands (the SAME rule the dev host applies via devlab-install). A blank
 # host has none, so without this the service installs and then dies at start with "no JWT secret …" and
@@ -240,7 +257,8 @@ ensure_secrets_for() {
 case "$REPO" in
   devlab)
     # The self repo is a genuine LAYOUT special case (its Code-Struktur differs by necessity): a daemon
-    # PLUS a web SPA, its binary at /usr/local/bin/devlabd, its dashboard mirrored into the www root, and
+    # PLUS a web SPA, its binary at /usr/local/bin/devlabd, its face installed where its own package
+    # declares (the SAME shared installer every other service's face takes), and
     # its unit named devlabd.service (not devlab.service). What is NOT special is the DECISION between a
     # first-time setup and a renewal, nor the refusal of a foreign unit — those are the SAME shared logic
     # the uniform branch uses (setup_unit_state), so a bare host sets devlab up completely instead of
@@ -249,6 +267,7 @@ case "$REPO" in
     BIN="$real/devlabd"; WEB="$real/web"
     [[ -f "$BIN" ]] || die "staged binary missing: $BIN" 10
     [[ -d "$WEB" ]] || die "staged web dir missing:  $WEB" 10
+    # shellcheck disable=SC2034  # WEB is the staged-face existence check above; the copy is install_web's
 
     DEVLABD_UNIT_FILE="$UNIT_DIR/devlabd.service"
     state="$(setup_unit_state devlabd "$DEVLABD_UNIT_FILE" "$SYSTEMCTL")" || die "could not ask systemd about devlabd.service" 4
@@ -262,21 +281,7 @@ case "$REPO" in
     # The program and the web SPA are installed the SAME way in both cases — the layout is what makes
     # devlab special, and the layout does not change between a first-time setup and a renewal.
     run install -o root -g root -m 0755 "$BIN" /usr/local/bin/devlabd
-    run mkdir -p "$WWW_DIR"
-    run rsync -a --delete "$WEB"/ "$WWW_DIR"/
-    # THE SERVED FACE IS READABLE BY THE EDGE, NOT BY THE BUILD ACCOUNT. `rsync -a` above carries the
-    # SOURCE's owner and mode, and the source is the artifact built on the workbench under the
-    # unprivileged build account — so on a freshly provisioned host the web root arrived drwxr-x--- /
-    # uid 1001 and the edge (a different account) answered 404 over a present page. The serving side sets
-    # the public-by-role readability (a+rX), symmetric to the a+rX the program install gives /opt/<repo>,
-    # never the account that happened to build (setup_serve_root_readable) — then PROVE the edge can read
-    # the start page, so a served tree it cannot read is a FAILED delivery named here, not a silent 404.
-    if [ "$CHECK" = 1 ]; then
-      echo "PLAN: make the served web root $WWW_DIR readable by the edge's role (a+rX; symmetric to /opt/<repo>), then PROVE the edge account can read $WWW_DIR/index.html — else fail the delivery BENANNT"
-    else
-      setup_serve_root_readable "$WWW_DIR"
-      serve_reason="$(setup_serve_root_check "$WWW_DIR" 2>&1)" || die "prod web delivery of 'devlab' failed: $serve_reason" 11
-    fi
+    install_web "$real" devlab
 
     if [ "$SELF_FIRST" = 1 ]; then
       # ── FIRST-TIME SETUP of devlab — install the DELIVERED unit/route/rights (the receiver erzeugt
@@ -483,6 +488,7 @@ case "$REPO" in
       if [ "$CHECK" = 1 ]; then
         echo "PLAN: Erstinstallation of '$REPO' (no unit ${UNIT_NAME}.service on this host)"
         echo "PLAN: create nologin system account '$REPO' (home /var/lib/$REPO) if missing"
+        install_web "$real" "$REPO"
         plan_program
         echo "PLAN: install delivered unit $DELIV_UNIT -> $UNIT_FILE (verified User=$REPO)"
         [ -f "$DELIV_ROUTE" ] && echo "PLAN: install delivered route $DELIV_ROUTE -> $CADDY_CONF/$REPO.caddy (caddy validate + reload; unwind on failure)" \
@@ -497,6 +503,11 @@ case "$REPO" in
       fi
 
       setup_ensure_account "$REPO"
+      # The face travels WITH the program and is installed WITH it — for every service, on the one
+      # generic path, and BEFORE the program: a first-time setup that brings up a program without the
+      # interface its package carries is exactly the half-arrival this receiver used to produce for all
+      # but one repository, and an incomplete package must change as little as possible before it fails.
+      install_web "$real" "$REPO"
       install_program
       install -o root -g root -m 0644 "$DELIV_UNIT" "$UNIT_FILE"
 
@@ -529,6 +540,7 @@ case "$REPO" in
     else
       # ── UPDATE — the unit already exists: replace the program and restart (today's behaviour) ──
       log "Aktualisierung of '$REPO' — unit '${UNIT_NAME}.service' already present; replacing the program and restarting"
+      install_web "$real" "$REPO"
       if [ "$CHECK" = 1 ]; then plan_program; else install_program; fi
       # Self-heal a host set up before secrets were minted: ensure them (idempotent) before restart, so
       # an update of a service that has been looping on a missing secret can finally stay up.

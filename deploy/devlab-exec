@@ -113,6 +113,13 @@ case "$verb" in
     declared_kind=""
     [ -f build.kind ] && declared_kind="$(head -n1 build.kind | tr -d '[:space:]')"
     repo_name="$(basename -- "$wt")"
+    # The shared setup library, sourced ONCE for the whole build: the serve-root convention the web stamp
+    # follows and the python bundling the payload branch uses come from the SAME source the installer and
+    # the production receiver read, so a build can never stamp a destination the installer would not accept.
+    SETUP_LIB="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
+    [ -r "$SETUP_LIB" ] || die "shared setup library not found: $SETUP_LIB"
+    # shellcheck source=/dev/null
+    . "$SETUP_LIB"
     if [ -f package.json ]; then
       npm ci --no-audit --no-fund || npm install --no-audit --no-fund
       # Where the built web bundle lands is READ FROM THE BUILD'S OWN RESULT, never guessed from a
@@ -151,6 +158,23 @@ case "$verb" in
         echo "devlab-exec: note: the build wrote more than one web bundle (${webdirs[*]}); delivering the shallowest ($webdir)" >&2
       fi
       cp -a "$webdir" "$art/web"; built=1
+      # ── THE PACKAGE SAYS WHERE ITS FACE BELONGS ────────────────────────────────────────────────
+      # A built web bundle travels with a `web.root` stamp: the absolute directory the target host must
+      # install it into. The installer and the production receiver READ that stamp; neither derives a
+      # destination from the repository name. That derivation is exactly what left every service's face
+      # in the package — the receiver installed a web bundle for ONE name and dropped every other — and
+      # what made the instance root serve that one service instead of the landscape's dashboard.
+      #
+      # The value FOLLOWS the landscape's serve convention (setup_service_www: /opt/<repo>/www), with the
+      # self repo as the one named layout exception it already is everywhere else: devlabd serves its own
+      # face out of its state directory (statepath.Www), so its face is installed there and nowhere else.
+      # Both are inside the service's OWN territory, which is what the installer re-validates before it
+      # copies (setup_valid_web_root) — the stamp says where, it does not grant where.
+      if [ "$repo_name" = "${DEVLAB_SELF_REPO:-devlab}" ]; then
+        printf '%s\n' "$STATE_DIR/www" > "$art/web.root"
+      else
+        printf '%s\n' "$(setup_service_www "$repo_name")" > "$art/web.root"
+      fi
     fi
     if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
     if [ -n "$gd" ]; then
@@ -219,10 +243,6 @@ case "$verb" in
         "$venv/bin/python" -m pip install --disable-pip-version-check --no-input . \
           || die "pip install . failed for the python-app payload (the app package must be installable)"
       fi
-      SETUP_LIB_PY="${DEVLAB_SETUP_LIB:-$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/devlab-setup-lib.sh}"
-      [ -r "$SETUP_LIB_PY" ] || die "shared setup library not found: $SETUP_LIB_PY"
-      # shellcheck source=/dev/null
-      . "$SETUP_LIB_PY"
       # Bundle the interpreter + stdlib so the venv is version-portable, then relocate its shebangs to the
       # final install prefix. Both come from the ONE shared library the installer and receiver also source.
       pyver="$(setup_bundle_python "$venv" "/opt/$repo_name/venv")" \

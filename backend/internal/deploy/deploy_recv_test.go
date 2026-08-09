@@ -84,6 +84,11 @@ func recvSelfFixture(t *testing.T, userLine string) (env map[string]string, unit
 	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<html>"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// WHERE that face belongs is carried by the package, not derived here from the repository name:
+	// devlabd serves its own start page out of its state directory, so that is what the build stamped.
+	if err := os.WriteFile(filepath.Join(art, "web.root"), []byte("/var/lib/devlab/www\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	// The delivered unit is devlab's real unit name (devlabd.service), declares the JWT secret it reads,
 	// and binds its fixed loopback port — exactly what emit-setup ships (the checked-in unit verbatim).
 	unit := "[Unit]\nDescription=DevLab backend (devlabd)\nAfter=network.target\n\n[Service]\nType=simple\n" +
@@ -124,9 +129,12 @@ func TestRecvSelfFirstTimeWhenUnitMissing(t *testing.T) {
 		"mint instance secret 'jwt-secret'",
 		// restarted through the EXISTING self restart, and proven to STAY up holding its fixed port
 		"restart devlabd", "STAYS up", "(:8781)",
-		// the served web root is made readable by the EDGE's role (a+rX) and PROVEN readable — else the
-		// edge answers 404 over a present page on a freshly built host (the build account's group-only mode)
-		"readable by the edge's role", "PROVE the edge account can read"} {
+		// the delivered face goes where the PACKAGE declares (never a path this receiver holds), is made
+		// readable by its public ROLE (a+rX) and PROVEN readable — else the edge answers 404 over a present
+		// page on a freshly built host (the build account's group-only mode)
+		"the serve root the package declares (/var/lib/devlab/www)",
+		"readable by its public role", "PROVE the webserver can read its start page",
+		"MERCURY-WEB: planned | /var/lib/devlab/www"} {
 		if !strings.Contains(res.out, want) {
 			t.Errorf("first-time self setup plan must mention %q:\n%s", want, res.out)
 		}
@@ -149,9 +157,9 @@ func TestRecvSelfUpdateWhenUnitPresent(t *testing.T) {
 	if !strings.Contains(res.out, "Aktualisierung of 'devlab'") || !strings.Contains(res.out, "restart devlabd") {
 		t.Errorf("a renewal must be named and plan the restart:\n%s", res.out)
 	}
-	// A renewal replaces the web too, so it also makes the served root readable by the edge's role and
+	// A renewal replaces the face too, so it also makes the served root readable by its public role and
 	// proves it — the fix must not be limited to the first-time branch.
-	if !strings.Contains(res.out, "readable by the edge's role") || !strings.Contains(res.out, "PROVE the edge account can read") {
+	if !strings.Contains(res.out, "readable by its public role") || !strings.Contains(res.out, "PROVE the webserver can read its start page") {
 		t.Errorf("a renewal must also make the served web root readable by the edge and prove it:\n%s", res.out)
 	}
 	if strings.Contains(res.out, "Erstinstallation") || strings.Contains(res.out, "install delivered unit") {
@@ -298,5 +306,74 @@ func TestRecvCheckFirstTimeNeedsDeliveredSetup(t *testing.T) {
 	}
 	if !strings.Contains(res.out, "did not attach the unit") {
 		t.Errorf("the failure must name the missing delivered setup:\n%s", res.out)
+	}
+}
+
+// DECISIVE — the fault this whole change is about, at the production receiver: a face used to be
+// installed for exactly ONE repository (the self repo, in a branch of its own), so every OTHER
+// service's built bundle travelled to the host inside the package and was dropped on arrival. The
+// landscape dashboard was the service that cost: its bundle lay complete in the staging directory
+// while its serve root did not exist, and the delivery reported success.
+//
+// Here the UNIFORM branch — the one every service but devlab takes — receives a package that carries a
+// face and declares where it belongs, in both of its cases (a bare host and a renewal), and installs it
+// there. Nothing about the repository's NAME decides the destination; the package says it.
+func TestRecvUniformServiceInstallsItsDeliveredFace(t *testing.T) {
+	for _, tc := range []struct{ name, fragment string }{
+		{"first-time on a bare host", ""},
+		{"renewal of an installed service", "present"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, unitPath := recvFixture(t, "holistic", "User=holistic", true, false)
+			art := filepath.Join(env["DEVLAB_STAGING"], "holistic")
+			web := filepath.Join(art, "web")
+			if err := os.MkdirAll(web, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<html>dashboard</html>"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(art, "web.root"), []byte("/opt/holistic/www\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fragment := ""
+			if tc.fragment != "" {
+				fragment = unitPath
+				if err := os.WriteFile(unitPath, []byte("[Service]\nUser=holistic\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			res := runRecv(t, env, fragment, "holistic")
+			if res.exit != 0 {
+				t.Fatalf("a service that ships a face must install cleanly (exit 0), got %d\n%s", res.exit, res.out)
+			}
+			if !strings.Contains(res.out, "the serve root the package declares (/opt/holistic/www)") {
+				t.Errorf("the face must be installed where the PACKAGE declares:\n%s", res.out)
+			}
+			if !strings.Contains(res.out, "MERCURY-WEB: planned | /opt/holistic/www") {
+				t.Errorf("the face half must be stated on its own machine-readable line:\n%s", res.out)
+			}
+		})
+	}
+}
+
+// A package that carries a face but declares no destination is an INCOMPLETE package: the receiver
+// refuses it by name (exit 11 — the same code a service that does not come up gets) instead of
+// installing the program and quietly leaving the interface in the package.
+func TestRecvRefusesAFaceWithoutADeclaration(t *testing.T) {
+	env, _ := recvFixture(t, "prizm", "User=prizm", true, false)
+	web := filepath.Join(env["DEVLAB_STAGING"], "prizm", "web")
+	if err := os.MkdirAll(web, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("<html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res := runRecv(t, env, "", "prizm")
+	if res.exit != 11 {
+		t.Fatalf("an undeclared face must fail the delivery with exit 11, got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "MERCURY-WEB: failed") || !strings.Contains(res.out, "declares no serve root") {
+		t.Errorf("the refusal must name the incomplete package:\n%s", res.out)
 	}
 }

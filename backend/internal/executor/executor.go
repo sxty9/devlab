@@ -172,6 +172,12 @@ type DeployOutcome struct {
 	// UIDetail carries the reason when another service blocks the shared dashboard build.
 	UI       string
 	UIDetail string
+	// Web names the service's OWN face — the web bundle its package carries, installed at the serve root
+	// that package declares; WebDetail carries that serve root. A service that ships a face which never
+	// reaches its host is an incomplete delivery, so this half is stated on its own and never inferred
+	// from the program's success.
+	Web       string
+	WebDetail string
 	// WrapperDrift carries the exact difference between the repository's root wrapper scripts and the
 	// installed ones, set ONLY when the self delivery refused because they drifted (ErrWrappersStale).
 	// The stage turns it into the wrapper-renewal question the user must explicitly approve.

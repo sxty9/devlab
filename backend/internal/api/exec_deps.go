@@ -1174,11 +1174,14 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 			return executor.DeployOutcome{Self: true, WrapperDrift: err.Error()},
 				fmt.Errorf("%w: %s", executor.ErrWrappersStale, err.Error())
 		}
-		if err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact); err != nil {
-			return executor.DeployOutcome{Self: true}, err
+		res, err := deploy.SelfInstallAndHandover(ctx, deploy.SudoInstaller{}, repoShort(repo), artifact)
+		if err != nil {
+			return executor.DeployOutcome{Self: true, UI: string(res.UI), UIDetail: res.UIDetail,
+				Web: string(res.Web), WebDetail: res.WebDetail}, err
 		}
 		return executor.DeployOutcome{
 			Installed: true, Running: true, Self: true,
+			UI: string(res.UI), UIDetail: res.UIDetail, Web: string(res.Web), WebDetail: res.WebDetail,
 			Detail: "artifact installed; the restart is handed over to the root wrapper and fires once the slots are free",
 		}, nil
 	}
@@ -1192,6 +1195,7 @@ func (c chainDeploy) DeliverDev(ctx context.Context, repo string) (executor.Depl
 	return executor.DeployOutcome{
 		Installed: out.Installed, Running: out.Running, Port: out.Port, Detail: out.Detail,
 		UI: string(out.UI), UIDetail: out.UIDetail,
+		Web: string(out.Web), WebDetail: out.WebDetail,
 	}, err
 }
 

@@ -146,20 +146,23 @@ func provisionEnv(t *testing.T) (env map[string]string, sbin, staging, www, cadd
 	root := t.TempDir()
 	sbin = filepath.Join(root, "sbin")
 	staging = filepath.Join(root, "staging")
-	www = filepath.Join(root, "www")
+	// The host's INSTANCE ROOT is not a provisioning input: it is the root application's serve root,
+	// derived from the ONE decision in the shared library. The fixture can only move the whole service
+	// tree under the temp root; it cannot name a different directory, because no such input exists.
+	www = filepath.Join(root, "opt", "holistic", "www")
 	caddyMain = filepath.Join(root, "caddy", "Caddyfile")
 	ak = filepath.Join(root, "home", ".ssh", "authorized_keys")
 	if err := os.MkdirAll(sbin, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	env = map[string]string{
-		"DEVLAB_RECV_TEST":  "1",
-		"DEVLAB_SBIN":       sbin,
-		"DEVLAB_STAGING":    staging,
-		"DEVLAB_STATIC_DIR": www,
-		"DEVLAB_CADDY_CONF": filepath.Join(root, "caddy", "conf.d"),
-		"DEVLAB_CADDY_MAIN": caddyMain,
-		"DEVLAB_RECV_AK":    ak, // test seam: authorized_keys at a fixture, not a real home
+		"DEVLAB_RECV_TEST":    "1",
+		"DEVLAB_SBIN":         sbin,
+		"DEVLAB_STAGING":      staging,
+		"DEVLAB_SERVICE_ROOT": filepath.Join(root, "opt"),
+		"DEVLAB_CADDY_CONF":   filepath.Join(root, "caddy", "conf.d"),
+		"DEVLAB_CADDY_MAIN":   caddyMain,
+		"DEVLAB_RECV_AK":      ak, // test seam: authorized_keys at a fixture, not a real home
 		// The ONE declaration of where this environment's edge answers, at a fixture path (never the real
 		// /etc/holistic). Seeded here as a PRE-EXISTING declaration (the operator's runtime config), so
 		// provision runs that are not ABOUT the edge address read it and proceed; tests that ARE about the
@@ -527,12 +530,12 @@ func bashRenderTemplate(t *testing.T, call string) string {
 func TestEdgeTemplateRequiresDeclaredAddress(t *testing.T) {
 	lib := filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh")
 	// Given an address, the site block opens on it.
-	got := bashRenderTemplate(t, "setup_edge_caddyfile_text /etc/caddy/conf.d /var/www 10.10.0.1:8080")
+	got := bashRenderTemplate(t, "setup_edge_caddyfile_text /etc/caddy/conf.d 10.10.0.1:8080")
 	if !strings.Contains(got, "10.10.0.1:8080 {") {
 		t.Errorf("the edge template must open the site block on the given address, got:\n%s", got)
 	}
 	// Without an address the template fails (non-zero) and emits nothing usable — no ":80" fallback.
-	out, err := exec.Command("bash", "-c", ". "+lib+" && setup_edge_caddyfile_text /etc/caddy/conf.d /var/www").CombinedOutput()
+	out, err := exec.Command("bash", "-c", ". "+lib+" && setup_edge_caddyfile_text /etc/caddy/conf.d").CombinedOutput()
 	if err == nil {
 		t.Fatalf("the edge template must refuse to render without a declared address, got:\n%s", out)
 	}
@@ -583,7 +586,7 @@ func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
 	}
 
 	// The FIX: the edge shell from the shared template, WITH the delivered route present, must validate.
-	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www+" :8080")
+	edge := bashRenderTemplate(t, "SETUP_SERVICE_ROOT="+root+"; setup_edge_caddyfile_text "+conf+" :8080")
 	if out, ok := validate(edge); !ok {
 		t.Fatalf("the holistic edge shell must validate WITH a delivered route present:\n%s", out)
 	}
@@ -622,7 +625,7 @@ func TestSelfRouteCoexistsInEdgeCaddy(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(uniform), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	edge := bashRenderTemplate(t, "setup_edge_caddyfile_text "+conf+" "+www+" :8080")
+	edge := bashRenderTemplate(t, "SETUP_SERVICE_ROOT="+root+"; setup_edge_caddyfile_text "+conf+" :8080")
 	p := filepath.Join(root, "Caddyfile")
 	if err := os.WriteFile(p, []byte(edge), 0o644); err != nil {
 		t.Fatal(err)
@@ -633,5 +636,70 @@ func TestSelfRouteCoexistsInEdgeCaddy(t *testing.T) {
 	// The self template must target the whole /api/* prefix, not the per-service /api/services path.
 	if !strings.Contains(self, "handle /api/* {") {
 		t.Errorf("the self route must handle the whole /api/* prefix, got:\n%s", self)
+	}
+}
+
+// A host provisioned BEFORE the instance root was decided carries the edge of that day: its last block
+// serves ONE service's directory, so calling the instance answers with that service. The edge is written
+// at provisioning time, so nothing would have collected the correction — the receiver refresh (the hand
+// step such a host needs anyway, since the receiver cannot deliver itself) now brings it up to the
+// current shell in the SAME run.
+func TestReceiverRefreshCatchesTheEdgeUp(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// exactly what such a host carries: our own marker, and one service's directory at the instance root
+	old := "# Managed by devlab-install-recv — the Holistic edge shell.\n" + testEdgeAddress +
+		" {\n\timport " + env["DEVLAB_CADDY_CONF"] + "/*.caddy\n\thandle {\n\t\troot * /var/lib/devlab/www\n\t\tfile_server\n\t}\n}\n"
+	if err := os.WriteFile(caddyMain, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runInstallRecv(t, env) // NO --provision: the plain receiver refresh
+	if res.exit != 0 {
+		t.Fatalf("a receiver refresh must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	got, err := os.ReadFile(caddyMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "/var/lib/devlab/www") {
+		t.Errorf("the refresh must take one service's directory out of the instance root:\n%s", string(got))
+	}
+	if !strings.Contains(string(got), "root * "+filepath.Join(env["DEVLAB_SERVICE_ROOT"], "holistic", "www")) {
+		t.Errorf("the refreshed edge must serve the root application at the instance root:\n%s", string(got))
+	}
+	if !strings.Contains(string(got), "has no root application") {
+		t.Errorf("the refreshed edge must answer honestly while the root application is absent:\n%s", string(got))
+	}
+	if m, _ := filepath.Glob(caddyMain + ".bak-*"); len(m) == 0 {
+		t.Errorf("the replaced edge must be backed up first:\n%s", res.out)
+	}
+}
+
+// …but a refresh touches ONLY an edge this script wrote. A grown, hand-built edge is left exactly as it
+// stands — and NAMED, so the operator learns that this host's instance root is not this script's to fix.
+func TestReceiverRefreshLeavesAGrownEdgeAlone(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	grown := "holistic.local {\n\timport " + env["DEVLAB_CADDY_CONF"] +
+		"/*.caddy\n\thandle {\n\t\troot * /opt/holistic/www\n\t\tfile_server\n\t}\n}\n"
+	if err := os.WriteFile(caddyMain, []byte(grown), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := runInstallRecv(t, env)
+	if res.exit != 0 {
+		t.Fatalf("a receiver refresh must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	got, _ := os.ReadFile(caddyMain)
+	if string(got) != grown {
+		t.Errorf("a hand-grown edge must be left exactly as it stands, got:\n%s", string(got))
+	}
+	if !strings.Contains(res.out, "was not written by this script") {
+		t.Errorf("leaving it alone must be NAMED, not silent:\n%s", res.out)
 	}
 }
