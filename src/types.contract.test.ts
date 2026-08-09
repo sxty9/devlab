@@ -175,6 +175,11 @@ pin('start_outcome', {
   started: false,
   notStarted: 'already delivered',
   taskStates: { 'svc-a': 'delivered' },
+  taskEvidence: {
+    'svc-a': [
+      'delivery dlv_1 merged at 2026-07-28T05:00:00Z; the todo text still asks for exactly this work (editorial edits aside)',
+    ],
+  },
   suggestion: { executionId: 'exec_2', reason: 'longest idle', score: 7 },
 } satisfies StartOutcome);
 

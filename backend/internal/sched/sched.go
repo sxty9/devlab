@@ -531,8 +531,14 @@ func (s *Scheduler) lastStart(runID string) (*time.Time, error) {
 
 // StartRequest asks to start (or resume) a run.
 type StartRequest struct {
-	RunID     string
-	By        model.Actor
+	RunID string
+	By    model.Actor
+	// Fresh discards a resumable execution (paused/blocked/interrupted) and starts over. It is scoped
+	// to the resume decision ALONE: it never overrides the "already delivered" determination (the K-3
+	// start ban), which is bound to the todo's content and decided by the preflight gate. A delivered
+	// todo whose text has not grown stays refused with fresh=true; a grown todo starts with or without
+	// it. There is deliberately NO switch that bypasses the delivered determination (it is made right,
+	// not skipped).
 	Fresh     bool
 	Placement *Placement
 }
@@ -564,7 +570,7 @@ func (s *Scheduler) Submit(ctx context.Context, req StartRequest) (model.StartOu
 
 	// The B-4 preflight gate runs BEFORE any document exists and outside the admission mutex
 	// (it talks to git/GitHub). Only fresh starts of todos gate; a resume keeps its document.
-	taskStates, remaining, gateErr := s.gateTargets(ctx, run)
+	taskStates, taskEvidence, remaining, gateErr := s.gateTargets(ctx, run)
 	if gateErr != nil {
 		return model.StartOutcome{}, gateErr
 	}
@@ -643,8 +649,9 @@ func (s *Scheduler) Submit(ctx context.Context, req StartRequest) (model.StartOu
 	// K-3 start ban: every target already delivered ⇒ no document at all.
 	if run.Kind == model.KindTodo && len(run.Targets) > 0 && len(remaining) == 0 {
 		return model.StartOutcome{
-			NotStarted: "already delivered — every target repository carries this work in its default branch",
-			TaskStates: taskStates,
+			NotStarted:   "already delivered — every target repository carries this todo's work in its default branch, and the todo text still asks for exactly that work; see taskEvidence for the delivered stand",
+			TaskStates:   taskStates,
+			TaskEvidence: taskEvidence,
 		}, nil
 	}
 
@@ -703,13 +710,15 @@ func (s *Scheduler) Submit(ctx context.Context, req StartRequest) (model.StartOu
 	}
 }
 
-// gateTargets runs the B-4 preflight gate per target repo. Delivered targets drop out WITH
-// their evidence recorded; an unreachable source keeps the target (unknown — never guessed).
-func (s *Scheduler) gateTargets(ctx context.Context, run runs.Run) (map[string]model.TaskState, []string, error) {
+// gateTargets runs the B-4 preflight gate per target repo. Delivered targets drop out WITH their
+// evidence recorded (so a "delivered" rejection can name the stand it rests on); an unreachable
+// source keeps the target (unknown — never guessed).
+func (s *Scheduler) gateTargets(ctx context.Context, run runs.Run) (map[string]model.TaskState, map[string][]string, []string, error) {
 	if run.Kind != model.KindTodo || len(run.Targets) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	states := map[string]model.TaskState{}
+	evidence := map[string][]string{}
 	remaining := []string{}
 	for _, t := range run.Targets {
 		if t.Repo == "" {
@@ -728,11 +737,14 @@ func (s *Scheduler) gateTargets(ctx context.Context, run runs.Run) (map[string]m
 			continue
 		}
 		states[t.Repo] = f.State
+		if len(f.Evidence) > 0 {
+			evidence[t.Repo] = f.Evidence
+		}
 		if f.State != model.TaskDelivered {
 			remaining = append(remaining, t.Repo)
 		}
 	}
-	return states, remaining, nil
+	return states, evidence, remaining, nil
 }
 
 func (s *Scheduler) resultsForRun(runID string) ([]runs.Result, error) {

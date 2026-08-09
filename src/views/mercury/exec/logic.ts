@@ -264,7 +264,23 @@ export function classifyStartOutcome(o: StartOutcome): StartVerdict {
   if (o.suggestion) {
     return { kind: 'contended', title: 'Slots are contended', detail: o.notStarted || 'All slots are occupied.' };
   }
-  return { kind: 'refused', title: 'Not started', detail: o.notStarted || 'The start was refused without a reason.' };
+  return {
+    kind: 'refused',
+    title: 'Not started',
+    detail: withEvidence(o.notStarted || 'The start was refused without a reason.', o.taskEvidence),
+  };
+}
+
+/** Appends the per-repo observation a refusal rests on, so an "already delivered" answer names the
+ *  delivered stand the user can check against the todo's current text — a bare "already delivered"
+ *  is not verifiable. Empty evidence changes nothing. */
+function withEvidence(detail: string, evidence?: Record<string, string[]>): string {
+  const repos = Object.keys(evidence ?? {});
+  if (!evidence || repos.length === 0) return detail;
+  const lines = repos
+    .flatMap((repo) => (evidence[repo] ?? []).map((e) => `${repo}: ${e}`))
+    .filter(Boolean);
+  return lines.length === 0 ? detail : `${detail}\n\n${lines.join('\n')}`;
 }
 
 /** The slot placements a contended start may choose, given the server's own slot projection.

@@ -149,8 +149,9 @@ func TestContractFixtures(t *testing.T) {
 
 	check(t, "start_outcome", model.StartOutcome{
 		Started: false, NotStarted: "already delivered",
-		TaskStates: map[string]model.TaskState{"svc-a": model.TaskDelivered},
-		Suggestion: &model.DeferSuggestion{ExecutionID: "exec_2", Reason: "longest idle", Score: 7},
+		TaskStates:   map[string]model.TaskState{"svc-a": model.TaskDelivered},
+		TaskEvidence: map[string][]string{"svc-a": {"delivery dlv_1 merged at 2026-07-28T05:00:00Z; the todo text still asks for exactly this work (editorial edits aside)"}},
+		Suggestion:   &model.DeferSuggestion{ExecutionID: "exec_2", Reason: "longest idle", Score: 7},
 	})
 
 	check(t, "restart_state", model.RestartState{

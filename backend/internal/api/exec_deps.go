@@ -901,15 +901,23 @@ func (c chainDeliver) OpenOrAdoptPR(ctx context.Context, in executor.DeliverPRIn
 		return model.PRRef{}, false, err
 	}
 	if in.DeliveryID != "" {
-		if _, ok, err := c.d.s.deliveries.ByID(in.DeliveryID); err != nil {
+		if existing, ok, err := c.d.s.deliveries.ByID(in.DeliveryID); err != nil {
 			return model.PRRef{}, false, err
 		} else if !ok {
 			if err := c.d.s.deliveries.Put(runs.Delivery{
 				ID: in.DeliveryID, ExecutionID: in.ExecutionID,
 				Repo: full, Branch: in.Head,
 				FromCommit: in.FromCommit, ToCommit: in.ToCommit,
-				CreatedAt: time.Now().UTC(),
+				CreatedAt:   time.Now().UTC(),
+				Requirement: in.Requirement,
 			}); err != nil {
+				return model.PRRef{}, false, err
+			}
+		} else if existing.Requirement == "" && in.Requirement != "" {
+			// A delivery first written as a failed attempt (RecordFailedDelivery, no requirement) now
+			// ships its PR: stamp the delivered stand so "already delivered?" has something to measure.
+			existing.Requirement = in.Requirement
+			if err := c.d.s.deliveries.Put(existing); err != nil {
 				return model.PRRef{}, false, err
 			}
 		}

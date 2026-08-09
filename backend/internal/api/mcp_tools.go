@@ -642,7 +642,7 @@ func mcpToolRows() []mcpTool {
 			Handler: (*Server).runNow,
 			Params: []mcpParam{
 				pathArg("id", "", runIDDesc),
-				bodyArg("fresh", mcp.KindBoolean, false, "Start over instead of resuming what is left."),
+				bodyArg("fresh", mcp.KindBoolean, false, "Discard a paused or blocked execution and start it over instead of resuming what is left. It does NOT touch the 'already delivered' determination: a todo whose work already merged is re-run when — and only when — its text grows to demand new work, which the determination decides on its own; fresh neither forces nor suppresses that."),
 				bodyArg("placement", mcp.KindObject, false,
 					"What to do when no slot is free: {kind, deferExecutionId} with kind one of: "+joinEnum(placementKinds)+"."),
 			},
