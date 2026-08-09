@@ -440,22 +440,70 @@ setup_edge_address() {
   printf '%s' "$addr"
 }
 
-# setup_edge_caddyfile_text <conf_dir> <www_dir> <site> — THE host edge shell: the ONE site block the
-# per-service routes REQUIRE. Every route from setup_route_text is a naked `handle` block that is valid
-# only inside a site block, so the shell imports the whole route directory INSIDE one and adds a static
-# fallback for the dashboard. This is the SAME shape a grown holistic host carries (a site block whose
-# body imports conf.d and ends in a file_server), reduced to its instance-neutral core: the conf.d and
-# web paths supplied by the caller, and — decisively — the SITE ADDRESS supplied by the caller too, from
-# the ONE declaration (setup_edge_address). There is NO baked-in default: an address invented here is
-# exactly the guess that makes the edge answer somewhere the routing layer does not forward. It lives
-# HERE, beside the route template, so the container and the thing it must contain can never drift into
-# two incompatible descriptions of the same edge.
+# ── THE ROOT APPLICATION: what a host answers with at the root of the instance ───────────────────────
+# The root of an instance is the root application of the LANDSCAPE — the dashboard through which every
+# service is reached — and never whichever service happens to have laid files on the host. The receiver
+# used to hand its edge the state directory of ONE service (devlab's), so a browser asking for the
+# instance got that service's login screen instead of the dashboard, and the dashboard's own absence
+# stayed invisible behind it (measured on production, 2026-08-09).
+#
+# WHICH application that is, is decided HERE and once. It is a LANDSCAPE fact, not an instance value: an
+# instance chooses its address, its organisation and its paths — it does not choose which product it is.
+# Holistic's root application is its dashboard, the service `holistic`; the reserved list above already
+# names that identity as belonging "to the landscape as a whole", and this is the same identity read for
+# the same reason. A host therefore never derives the root from a name it finds lying around, and no
+# runtime switch can point the instance root at an arbitrary service — which is exactly the state being
+# removed. What REMAINS instance configuration is where the edge answers (setup_edge_address), not what
+# it answers with.
+SETUP_ROOT_APP="holistic"
+
+# The directory services are installed under (/opt/<repo>/bin, /opt/<repo>/www). Instance-neutral like
+# every path in this library; the env override is a DIRECT-INVOCATION test seam only (sudo's env_reset
+# strips it in production, and sshd hands the forced command no environment at all), so a test can build
+# a whole fixture host under a temp root without a second copy of the serve-root convention.
+SETUP_SERVICE_ROOT="${DEVLAB_SERVICE_ROOT:-/opt}"
+
+# setup_service_www <repo> — THE serve-root convention: where a Holistic service's own web face is
+# served from on a host, `/opt/<repo>/www`, symmetric to the `/opt/<repo>/bin` its program is installed
+# into. This is the convention a delivery FOLLOWS when it stamps its own serve root (devlab-exec) and the
+# yardstick an installer validates that stamp against — the installer itself never derives a destination
+# from the repository name; it reads what the package declares (setup_read_web_root).
+setup_service_www() {  # <repo>
+  local repo="$1"
+  [ -n "$repo" ] || return 1
+  printf '%s/%s/www' "$SETUP_SERVICE_ROOT" "$repo"
+}
+
+# setup_root_app_www — the serve root the INSTANCE ROOT answers from: the root application's own serve
+# root. The edge must know it BEFORE any delivery has arrived (a bare host is provisioned first and
+# delivered to afterwards), so it comes from the two facts decided above — which service is the root
+# application, and where a service serves its face from — and never from what is currently on disk.
+setup_root_app_www() {
+  setup_service_www "$SETUP_ROOT_APP"
+}
+
+# setup_edge_caddyfile_text <conf_dir> <site> — THE host edge shell: the ONE site block the per-service
+# routes REQUIRE. Every route from setup_route_text is a naked `handle` block that is valid only inside a
+# site block, so the shell imports the whole route directory INSIDE one and ends in the instance root.
+# This is the SAME shape a grown holistic host carries (a site block whose body imports conf.d and ends
+# in a file_server), reduced to its instance-neutral core: the conf.d path supplied by the caller, and —
+# decisively — the SITE ADDRESS supplied by the caller too, from the ONE declaration (setup_edge_address).
+# There is NO baked-in default: an address invented here is exactly the guess that makes the edge answer
+# somewhere the routing layer does not forward. It lives HERE, beside the route template, so the
+# container and the thing it must contain can never drift into two incompatible descriptions of one edge.
+#
+# THE LAST BLOCK IS THE INSTANCE ROOT, AND IT IS THE ROOT APPLICATION'S — never a directory handed in by
+# the caller. Two states are told apart, and BOTH are stated (Kein stummes Ausbleiben):
+#   * the root application's start page is on this host → it is served, deep links included;
+#   * it is NOT → the answer SAYS the root application is missing, with 503. A substitute that looks like
+#     success (another service's files) would hide the very deficiency this block exists to expose.
 setup_edge_caddyfile_text() {
-  local conf_dir="$1" www_dir="$2" site="${3:-}"
+  local conf_dir="$1" site="${2:-}" root_www
   if ! setup_valid_edge_address "$site"; then
     echo "setup_edge_caddyfile_text: refusing to build an edge without a declared site address (got '${site}') — the edge address is read from the ONE declaration (setup_edge_address), never guessed" >&2
     return 1
   fi
+  root_www="$(setup_root_app_www)"
   # The edge is the PLAIN-HTTP face behind the routing layer (sxgate), which owns hostnames and TLS. So
   # the declared socket is rendered as an explicit `http://` site: without a scheme, Caddy treats a
   # host-bearing address (10.10.0.1:8080) as needing automatic HTTPS and tries to bind :80 for the
@@ -472,9 +520,17 @@ setup_edge_caddyfile_text() {
 # on --provision; do not edit by hand.
 ${label} {
 	import ${conf_dir}/*.caddy
-	handle {
-		root * ${www_dir}
+	@root_app_installed file {
+		root ${root_www}
+		try_files /index.html
+	}
+	handle @root_app_installed {
+		root * ${root_www}
+		try_files {path} /index.html
 		file_server
+	}
+	handle {
+		respond "This Holistic instance has no root application: the landscape dashboard (${SETUP_ROOT_APP}) is not installed on this host, so there is nothing to serve at the instance root. No other service's interface is served in its place." 503
 	}
 }
 EDGE
@@ -950,4 +1006,118 @@ setup_serve_root_check() {  # <serve-root> → 0 if the edge can read the start 
   [ "$(( 8#${mode:-0} & 4 ))" = 4 ] && return 0
   echo "the delivered start page $index lacks other-read (mode $mode) — the webserver could not read it (404 over a present page; delivery incomplete)" >&2
   return 1
+}
+
+# ── THE DELIVERED FACE: a package that carries a web bundle gets it INSTALLED ─────────────────────
+# A service's face travels in the artifact as `web/` (the built SPA). It used to be installed for
+# exactly ONE repository — the self repo, in a branch of its own — so every other service's face rode
+# along to the host and was dropped there: the package carried a start page, the host never received
+# one, and the delivery still reported success (measured on production 2026-08-09: the holistic
+# dashboard's bundle sat complete in the staging directory while /opt/holistic/www did not exist).
+#
+# WHERE the face belongs is said by the DELIVERY, in `web.root` beside `build.kind` — never derived by
+# the receiver from the repository name, which is the same defect the unit name, the unit port and the
+# build kind were each taken out of before. The installer reads that declaration, judges it, and copies
+# there. It judges it because a package must not be able to aim a root-run `rsync --delete` wherever it
+# likes: the declared root must lie in the SERVICE'S OWN territory (its /opt/<repo> tree or its
+# /var/lib/<repo> state tree), so a delivery can place its face inside itself and nowhere else.
+
+# setup_read_web_root <artifact-dir> — echo the serve root a package DECLARES (the trimmed first line of
+# <artifact-dir>/web.root), or nothing when absent. Never validated here: the caller runs
+# setup_valid_web_root, so an absent declaration and a bad one get their own named refusals.
+setup_read_web_root() {  # <artifact-dir>
+  local dir="$1"
+  [ -r "$dir/web.root" ] || return 0
+  head -n1 -- "$dir/web.root" | tr -d '[:space:]'
+}
+
+# setup_valid_web_root <root> <repo> — 0 when <root> is a serve root this service may own: an absolute
+# path, free of relative and empty segments, strictly INSIDE the service's own /opt/<repo> or
+# /var/lib/<repo> tree (never the tree itself, never another service's, never a system directory).
+# Prints the reason to stderr and returns 1 otherwise.
+setup_valid_web_root() {  # <root> <repo>
+  local root="$1" repo="$2"
+  [ -n "$root" ] || { echo "no serve root declared" >&2; return 1; }
+  case "$root" in
+    /*) : ;;
+    *) echo "declared serve root '$root' is not absolute — a face is installed at an absolute path on the target host" >&2; return 1 ;;
+  esac
+  case "$root" in
+    *//* | */. | */./* | */.. | */../*)
+      echo "declared serve root '$root' contains an empty or relative segment — refusing to resolve it" >&2; return 1 ;;
+  esac
+  case "$root" in
+    "$SETUP_SERVICE_ROOT/$repo"/?* | "/var/lib/$repo"/?*) return 0 ;;
+  esac
+  echo "declared serve root '$root' lies outside the territory of service '$repo' (expected below $SETUP_SERVICE_ROOT/$repo or /var/lib/$repo) — a delivery installs its face inside itself, never elsewhere on the host" >&2
+  return 1
+}
+
+# setup_install_web <artifact-dir> <repo> [<plan-only>] — install the delivered face, and STATE the
+# outcome. THE ONE path both the dev installer and the production receiver take, so a face arrives on a
+# workbench and on a production host by the identical rule and neither can grow a second one.
+#
+# It reports on a single machine-readable line, the twin of the `MERCURY-UI:` line the dashboard half
+# reports on, so a delivery names BOTH halves of a service's interface instead of inferring one from the
+# other's silence:
+#   MERCURY-WEB: none                  the package ships no face and declares none
+#   MERCURY-WEB: installed | <root>    the face is on this host, proven readable by the webserver
+#   MERCURY-WEB: planned   | <root>    <plan-only>=1: everything judged, nothing copied
+#   MERCURY-WEB: failed                with the named reason on stderr; the function returns 1 and the
+#                                      caller fails the install with ITS OWN exit code
+# The three faults it refuses are all incomplete packages, never silent skips: a face without a
+# declaration, a declaration without a face, and a declaration outside the service's own territory. A
+# service that ships a face which never reaches its host is an INCOMPLETE DELIVERY — the very state this
+# reporting exists to end — so it is never a warning beside a green result.
+#
+# After the copy the tree is made readable BY ITS PUBLIC ROLE and that readability is PROVEN
+# (setup_serve_root_readable / setup_serve_root_check): a face the webserver cannot read is a 404 over a
+# present page, which is not a delivery either. <plan-only>=1 judges everything and copies nothing (the
+# --check dry run), so a plan can never read clean where the real run would fail.
+setup_install_web() {  # <artifact-dir> <repo> [<plan-only>]
+  local art="$1" repo="$2" plan="${3:-0}" root have_web=0 reason
+  [ -d "$art/web" ] && have_web=1
+  root="$(setup_read_web_root "$art")"
+  if [ "$have_web" = 0 ] && [ -z "$root" ]; then
+    echo "MERCURY-WEB: none"; return 0
+  fi
+  if [ -z "$root" ]; then
+    echo "MERCURY-WEB: failed"
+    echo "the delivery of '$repo' carries a web face (web/) but declares no serve root (no web.root in the package) — where a face belongs is said by the delivery, never derived from the repository name; refusing to guess a destination" >&2
+    return 1
+  fi
+  if [ "$have_web" = 0 ]; then
+    echo "MERCURY-WEB: failed"
+    echo "the delivery of '$repo' declares the serve root '$root' but carries no web/ — the face was announced and did not travel; that is an incomplete delivery, not a service without a face" >&2
+    return 1
+  fi
+  if ! reason="$(setup_valid_web_root "$root" "$repo" 2>&1)"; then
+    echo "MERCURY-WEB: failed"; echo "$reason" >&2; return 1
+  fi
+  if [ "$plan" = 1 ]; then
+    echo "PLAN: install the delivered face $art/web -> the serve root the package declares ($root), make it readable by its public role, and PROVE the webserver can read its start page — else fail the delivery BENANNT"
+    echo "MERCURY-WEB: planned | $root"
+    return 0
+  fi
+  if ! mkdir -p -- "$root"; then
+    echo "MERCURY-WEB: failed"; echo "could not create the serve root '$root' for '$repo'" >&2; return 1
+  fi
+  # WHAT IS BEING REPLACED IS SAID OUT LOUD. The copy is a `--delete` copy: whatever stood at this serve
+  # root is gone afterwards. On a workbench that ALSO builds the shared dashboard from an operator
+  # checkout, the root application's serve root has two writers — this delivery and that build — and the
+  # last one wins. That is a real interaction, so it is named in the log of every run that overwrites an
+  # existing tree, rather than left for somebody to discover as a face that silently changed back.
+  if [ -f "$root/index.html" ]; then
+    echo "note: the serve root '$root' already carries a start page (last written $(date -r "$root/index.html" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'unknown')); the delivered face of '$repo' replaces it" >&2
+  fi
+  if ! rsync -a --delete "$art/web"/ "$root"/; then
+    echo "MERCURY-WEB: failed"; echo "could not copy the delivered face of '$repo' into '$root'" >&2; return 1
+  fi
+  setup_serve_root_readable "$root"
+  if ! reason="$(setup_serve_root_check "$root" 2>&1)"; then
+    echo "MERCURY-WEB: failed"
+    echo "the delivered face of '$repo' did not become servable at '$root': $reason" >&2
+    return 1
+  fi
+  echo "MERCURY-WEB: installed | $root"
 }

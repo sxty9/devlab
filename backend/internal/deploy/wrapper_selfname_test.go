@@ -21,7 +21,9 @@ import (
 )
 
 // selfFixture builds a complete self delivery: <state>/workspaces/<user>/<self>/.mercury-artifact
-// carrying the daemon binary and the built web dir. origin decides whether the checkout presents one.
+// carrying the daemon binary, the built web dir AND the declaration of where that face belongs on the
+// host (web.root — a package says where its face goes; the installer never derives it from the name).
+// origin decides whether the checkout presents one.
 func selfFixture(t *testing.T, repo, origin string) (env map[string]string, artifact string) {
 	t.Helper()
 	state := t.TempDir()
@@ -30,6 +32,7 @@ func selfFixture(t *testing.T, repo, origin string) (env map[string]string, arti
 	if err := os.MkdirAll(filepath.Join(artifact, "web"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampWebRoot(t, artifact, "/var/lib/"+repo+"/www")
 	if err := os.WriteFile(filepath.Join(artifact, "devlabd"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +118,7 @@ func TestInstallCheckRefusesADirectoryThatIsNotTheStagedArtifact(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(loose, "web"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampWebRoot(t, loose, "/var/lib/devlab/www")
 	if err := os.WriteFile(filepath.Join(loose, "devlabd"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}

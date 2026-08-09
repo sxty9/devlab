@@ -40,11 +40,33 @@ const (
 	UIWouldFail UIState = "would-fail"      // --check only: the relocation would carry an outside-tree config into the dashboard
 )
 
-// InstallResult is what the wrapper reports beyond the raw error: the UI half's outcome, parsed off
-// the wrapper's `MERCURY-UI:` line, so the calling stage can report program AND ui, each on its own.
+// WebState is the outcome of a service's OWN face — the web bundle its package carries and the host
+// serves from the serve root the package declares. It is a SEPARATE half from UIState: the ui half is a
+// service's contribution to the shared dashboard, this one is the service's own start page. Both are
+// stated; neither is inferred from the other's silence.
+//
+// It exists because that half used to be performed for exactly ONE repository: every other service's
+// face travelled to the host inside the delivery package and was dropped there, with the delivery still
+// reporting success (the holistic dashboard's bundle lay complete in production's staging directory
+// while its serve root did not exist — measured 2026-08-09). A face that does not arrive is now an
+// incomplete delivery that says so.
+type WebState string
+
+const (
+	WebNone      WebState = "none"      // the package ships no face and declares none
+	WebInstalled WebState = "installed" // the face is on the host at the declared serve root, proven readable
+	WebPlanned   WebState = "planned"   // --check dry-run reached the face step
+	WebFailed    WebState = "failed"    // a face that could not be installed — a named stage failure
+)
+
+// InstallResult is what the wrapper reports beyond the raw error: the outcome of each interface half,
+// parsed off the wrapper's `MERCURY-UI:` and `MERCURY-WEB:` lines, so the calling stage can report the
+// program, the service's own face and its dashboard contribution, each on its own.
 type InstallResult struct {
-	UI       UIState
-	UIDetail string
+	UI        UIState
+	UIDetail  string
+	Web       WebState
+	WebDetail string // the serve root the face was installed at (or planned for)
 }
 
 // PortSource answers "which port does this service use?" from observed state: an already-routed
@@ -63,6 +85,10 @@ type Outcome struct {
 	// UI is the dashboard-UI half's outcome; UIDetail carries the reason for the foreign-blocked case.
 	UI       UIState
 	UIDetail string
+	// Web is the service's OWN face: installed at the serve root its package declares, or not shipped at
+	// all. WebDetail carries that serve root.
+	Web       WebState
+	WebDetail string
 }
 
 // Honest no-attempt reasons: these repos are never installed, and the caller can prove WHY
@@ -165,7 +191,7 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 		// A reported UI state means the program install reached the ui step, i.e. the program itself
 		// installed — the failure is the UI half (unconfigured/failed). Both halves are reported, and
 		// the stage still fails: a ui that could not be built in is a deficiency, never green (K-4).
-		o := Outcome{Port: port, Detail: err.Error(), UI: res.UI, UIDetail: res.UIDetail}
+		o := Outcome{Port: port, Detail: err.Error(), UI: res.UI, UIDetail: res.UIDetail, Web: res.Web, WebDetail: res.WebDetail}
 		if res.UI != "" {
 			o.Installed = true
 		}
@@ -176,10 +202,10 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 	// otherwise the setup FAILED, never green by default (REQ-044.3, K-4). It probes the unit that was
 	// actually INSTALLED and the port that unit BINDS, both read above from the delivered setup product.
 	if err := gate.VerifyRunning(ctx, unit, port); err != nil {
-		return Outcome{Installed: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
+		return Outcome{Installed: true, Port: port, UI: res.UI, UIDetail: res.UIDetail, Web: res.Web, WebDetail: res.WebDetail,
 			Detail: "installed, but the service is not running: " + err.Error()}, fmt.Errorf("deploy: failed setup of %s: %w", key, err)
 	}
-	return Outcome{Installed: true, Running: true, Port: port, UI: res.UI, UIDetail: res.UIDetail,
+	return Outcome{Installed: true, Running: true, Port: port, UI: res.UI, UIDetail: res.UIDetail, Web: res.Web, WebDetail: res.WebDetail,
 		Detail: "installed and started (active, holding :" + strconv.Itoa(port) + ")"}, nil
 }
 
@@ -188,11 +214,16 @@ func DeliverDev(ctx context.Context, ri RootInstaller, ports PortSource, gate Ga
 // happen in ONE wrapper call (B-2); devlabd itself never calls systemd-run. A failed handover is
 // a failed stage, never an inline restart (K-2). The running proof for self is the restart marker
 // plus the next boot — there is no port probe here.
-func SelfInstallAndHandover(ctx context.Context, ri RootInstaller, repo, artifactDir string) error {
-	if _, err := ri.Install(ctx, repo, artifactDir, "dev", 0, true); err != nil {
-		return fmt.Errorf("deploy: self install/handover failed (stage fails, no inline restart): %w", err)
+//
+// It returns the interface halves the wrapper reported, exactly as the foreign path does: the self
+// repository has a face of its own too, and dropping its report here would make the ONE service whose
+// delivery installs this very chain the one service whose interface nobody has to account for.
+func SelfInstallAndHandover(ctx context.Context, ri RootInstaller, repo, artifactDir string) (InstallResult, error) {
+	res, err := ri.Install(ctx, repo, artifactDir, "dev", 0, true)
+	if err != nil {
+		return res, fmt.Errorf("deploy: self install/handover failed (stage fails, no inline restart): %w", err)
 	}
-	return nil
+	return res, nil
 }
 
 // ─── the production seams ────────────────────────────────────────────────────
@@ -210,27 +241,33 @@ func (SudoInstaller) Install(ctx context.Context, repo, artifactDir, env string,
 		args = append(args, "--handover")
 	}
 	out, err := exec.CommandContext(ctx, "sudo", args...).CombinedOutput()
-	res := parseUILine(string(out))
+	res := parseHalves(string(out))
 	if err != nil {
 		return res, fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 	}
 	return res, nil
 }
 
-// parseUILine reads the wrapper's single `MERCURY-UI: <state> [| detail]` line off its output — the
-// machine-readable half-report that lets the stage name program AND ui separately. Absent (a wrapper
-// that predates the ui half, or a program that never reached the ui step) yields the zero UIState.
-func parseUILine(out string) InstallResult {
+// parseHalves reads the wrapper's machine-readable half-reports off its output: `MERCURY-UI: <state>
+// [| detail]` for the dashboard contribution and `MERCURY-WEB: <state> [| detail]` for the service's
+// own face. They are read by ONE reader, so a half can never be reported in a shape the other half's
+// reader would not understand. An absent line (a wrapper that predates a half, or a program that never
+// reached that step) yields that half's zero state — the caller decides what an unstated half means.
+func parseHalves(out string) InstallResult {
+	res := InstallResult{}
 	for _, line := range strings.Split(out, "\n") {
-		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "MERCURY-UI:")
-		if !ok {
+		line = strings.TrimSpace(line)
+		if rest, ok := strings.CutPrefix(line, "MERCURY-UI:"); ok {
+			state, detail, _ := strings.Cut(strings.TrimSpace(rest), "|")
+			res.UI, res.UIDetail = UIState(strings.TrimSpace(state)), strings.TrimSpace(detail)
 			continue
 		}
-		rest = strings.TrimSpace(rest)
-		state, detail, _ := strings.Cut(rest, "|")
-		return InstallResult{UI: UIState(strings.TrimSpace(state)), UIDetail: strings.TrimSpace(detail)}
+		if rest, ok := strings.CutPrefix(line, "MERCURY-WEB:"); ok {
+			state, detail, _ := strings.Cut(strings.TrimSpace(rest), "|")
+			res.Web, res.WebDetail = WebState(strings.TrimSpace(state)), strings.TrimSpace(detail)
+		}
 	}
-	return InstallResult{}
+	return res
 }
 
 // LivePorts is the production PortSource: the ledger is derived fresh from the host's routes and

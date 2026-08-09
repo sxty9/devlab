@@ -61,6 +61,20 @@ const testOwner = "example-org"
 // stamps it). The installer reads it rather than guessing a Bauart from a filename, so a fixture that
 // stages a prebuilt program must also declare its kind — exactly as a real delivery would. Go fixtures
 // pass "go-daemon"; python fixtures pass "python-app".
+// stampWebRoot writes the `web.root` declaration a real package carries beside its web/ bundle — WHERE
+// that face belongs on the target host. The build stamps it (devlab-exec); the installer reads it and
+// never derives a destination from the repository name, so a fixture without it is not a package the
+// installer may install (and is refused by name).
+func stampWebRoot(t *testing.T, artifactDir, root string) {
+	t.Helper()
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "web.root"), []byte(root+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func stampBuildKind(t *testing.T, artifactDir, kind string) {
 	t.Helper()
 	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
@@ -216,6 +230,7 @@ func TestInstallCheckSelfHandoverPlansTransientUnit(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(self, "web"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stampWebRoot(t, self, "/var/lib/devlab/www")
 	if err := os.WriteFile(filepath.Join(self, "devlabd"), []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -287,9 +302,13 @@ func TestInstallCheckUIConfiguredPlansWireInBuildAndServe(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(holistic, "frontend", "external"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	www := filepath.Join(t.TempDir(), "www") // the serve root the browser reads — named in the plan
+	// The serve root the browser reads is the INSTANCE ROOT — the root application's serve root, derived
+	// from the ONE decision in the shared library. The fixture moves the whole service tree under a temp
+	// root; it cannot name a serve root of its own, because no such second source exists any more.
+	svcRoot := t.TempDir()
+	www := filepath.Join(svcRoot, "holistic", "www")
 	env["DEVLAB_HOLISTIC_REPO"] = holistic
-	env["DEVLAB_HOLISTIC_WWW"] = www
+	env["DEVLAB_SERVICE_ROOT"] = svcRoot
 	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
 	if res.exit != 0 {
 		t.Fatalf("a configured ui check must exit 0, got %d\n%s", res.exit, res.out)
@@ -365,10 +384,11 @@ func TestInstallCheckUINeutralisesEditorTsconfig(t *testing.T) {
 				t.Fatal(err)
 			}
 			writeOrigin(t, filepath.Dir(artifact), testOwner, repo)
-			www := filepath.Join(state, "www") // a distinct serve root per service — the browser's source
+			svcRoot := filepath.Join(state, "opt")           // this subtest's whole service tree
+			www := filepath.Join(svcRoot, "holistic", "www") // …and therefore its instance root
 			env := map[string]string{
 				"DEVLAB_STATE_DIR": state, "DEVLAB_GH_OWNER": testOwner, "DEVLAB_HOLISTIC_REPO": holistic,
-				"DEVLAB_HOLISTIC_WWW": www,
+				"DEVLAB_SERVICE_ROOT": svcRoot,
 			}
 			res := runWrapper(t, "deploy/devlab-install", env, repo, artifact, "dev", "--check", "--port", "8772")
 			if res.exit != 0 {
@@ -483,5 +503,49 @@ func TestServiceCLISmoke(t *testing.T) {
 	res = runWrapper(t, "service", nil, "no-such-verb")
 	if res.exit != 2 {
 		t.Errorf("unknown verb must exit 2 (template convention), got %d\n%s", res.exit, res.out)
+	}
+}
+
+// The dev half of the same fault: the install wrapper used to copy a web bundle only for the SELF repo,
+// inside the self branch, so a foreign service's face never left the artifact on the workbench either
+// (holistic's serve root did not exist there, and the edge answered 404 over a service that was
+// running). The generic path now installs the face of EVERY service, where its package declares.
+func TestInstallCheckInstallsAForeignServiceFace(t *testing.T) {
+	env, _, artifact := installEnv(t)
+	if err := os.MkdirAll(filepath.Join(artifact, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stampWebRoot(t, artifact, "/opt/svc-a/www")
+
+	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8772")
+	if res.exit != 0 {
+		t.Fatalf("a foreign service that ships a face must plan cleanly, got %d\n%s", res.exit, res.out)
+	}
+	if !strings.Contains(res.out, "the serve root the package declares (/opt/svc-a/www)") {
+		t.Errorf("the face must be planned for where the package declares:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "MERCURY-WEB: planned | /opt/svc-a/www") {
+		t.Errorf("the face half must be stated on its own machine-readable line:\n%s", res.out)
+	}
+
+	// A service without a face says so — the half is stated, not omitted.
+	env2, _, artifact2 := installEnv(t)
+	res = runWrapper(t, "deploy/devlab-install", env2, "svc-a", artifact2, "dev", "--check", "--port", "8772")
+	if res.exit != 0 || !strings.Contains(res.out, "MERCURY-WEB: none") {
+		t.Errorf("a service without a face must state that half too (exit %d):\n%s", res.exit, res.out)
+	}
+
+	// A face that carries no declaration is an incomplete package: the install FAILS by name rather
+	// than bringing up a program whose interface stays in the artifact.
+	env3, _, artifact3 := installEnv(t)
+	if err := os.MkdirAll(filepath.Join(artifact3, "web"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	res = runWrapper(t, "deploy/devlab-install", env3, "svc-a", artifact3, "dev", "--check", "--port", "8772")
+	if res.exit == 0 {
+		t.Fatalf("a face without a declaration must fail the install:\n%s", res.out)
+	}
+	if !strings.Contains(res.out, "MERCURY-WEB: failed") || !strings.Contains(res.out, "not green") {
+		t.Errorf("the refusal must name the incomplete delivery:\n%s", res.out)
 	}
 }

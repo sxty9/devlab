@@ -213,8 +213,11 @@ devlab-install-recv --print-edge-address
 
 It is one pass, idempotent, fail-closed and reversible, and it PROVES the result instead of claiming it.
 In that single run it: ensures `rrsync` is present (the receiver confines every rsync receive through
-it); creates the staging root it receives into and the web root it serves from (both derived from
-`DEVLAB_STATE_DIR`, overridable with `--staging` / `--www`); installs Caddy and builds the edge as a
+it); creates the staging root it receives into (derived from `DEVLAB_STATE_DIR`, overridable with
+`--staging`) and the INSTANCE ROOT it serves at — the serve root of the landscape's root application,
+which is decided once in the shared library (`SETUP_ROOT_APP` / `setup_root_app_www`) and is deliberately
+NOT a provisioning option: a host that took its instance root from one service's state directory answered
+the whole instance with that service's login screen; installs Caddy and builds the edge as a
 **site block** that imports the per-service route directory from INSIDE it (each route the receiver
 drops in is a naked `handle` block, valid in Caddy only inside a site block — the shell comes from the
 one template beside the route, `setup_edge_caddyfile_text`, so the container and its contents cannot
@@ -225,10 +228,13 @@ destroyed. It writes the locked-down deploy-key line — `command="/usr/local/sb
 the receiver login's `authorized_keys` (default `root`, override with `--recv-user`); and installs the
 receiver + shared library themselves (the SAME install path the receiver-only mode uses — no second
 copy). It closes with a self-check: `rrsync` resolves, the forced command actually rejects a shell
-request, the receiver and library carry the expected checksums, the staging and web roots exist, and
-the edge validates **with a delivered route present** (not merely empty — an empty edge validates even
-when its shape could not hold a single route). Any failure is fail-closed (non-zero exit, nothing
-half-done). After it passes,
+request, the receiver and library carry the expected checksums, the staging root and the instance root
+exist, and the edge validates **with a delivered route present** (not merely empty — an empty edge
+validates even when its shape could not hold a single route). Any failure is fail-closed (non-zero exit,
+nothing half-done). Whether the root application has actually been DELIVERED to this host is a separate
+fact the provisioning does not produce: it is reported as still outstanding, and until it arrives the
+instance root answers `503` naming the missing root application — never with another service's
+interface. After it passes,
 **no further step on the target is needed to accept a delivery** — arm the DEV side by naming this host
 in the environment (`DEVLAB_RUNS_PROD_TARGET`, `DEVLAB_RUNS_PROD_RECV`, `DEVLAB_RUNS_PROD_KEY`, §5).
 

@@ -19,27 +19,41 @@
 #             · 2 configuration missing (cannot locate checkout or serve root)
 set -euo pipefail
 
-# Instance configuration — the SAME seams devlab-install reads (env override, else root-owned file,
-# else the holistic convention). No value is asked of the caller; all are resolved here.
+# Instance configuration — the SAME seams devlab-install reads (env override, else root-owned file).
+# No value is asked of the caller; all are resolved here.
 HOLISTIC_REPO="${DEVLAB_HOLISTIC_REPO:-}"
 HOLISTIC_REPO_FILE="${DEVLAB_HOLISTIC_REPO_FILE:-/etc/devlab/holistic-repo}"
 HOLISTIC_FRONTEND="${DEVLAB_HOLISTIC_FRONTEND:-frontend}"
 HOLISTIC_DIST="${DEVLAB_HOLISTIC_DIST:-app/dist}"
-HOLISTIC_WWW="${DEVLAB_HOLISTIC_WWW:-}"
-HOLISTIC_WWW_FILE="${DEVLAB_HOLISTIC_WWW_FILE:-/etc/devlab/holistic-www}"
-HOLISTIC_WWW_DEFAULT="/opt/holistic/www"
+# WHERE the browser reads the dashboard from is the INSTANCE ROOT, and that is not a value of this
+# tool's own: it is the root application's serve root, decided once in the shared setup library
+# (SETUP_ROOT_APP / setup_root_app_www) and read from there by the edge, by the installer and by this
+# check alike. A second, separately configured path for the same fact is how a dashboard gets delivered
+# where the edge does not look — the very split this tool exists to catch.
+# The library BESIDE this tool comes first: tool and library ship in one delivery, so a checkout's copy
+# is the one that matches this check. The installed copy is the fallback for a tool run on its own.
+SETUP_LIB="${DEVLAB_SETUP_LIB:-}"
+if [ -z "$SETUP_LIB" ]; then
+  for cand in "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/../deploy/devlab-setup-lib.sh" \
+              /usr/local/sbin/devlab-setup-lib.sh; do
+    [ -r "$cand" ] && { SETUP_LIB="$cand"; break; }
+  done
+fi
 
 die() { printf 'verify-dashboard-arrival: %s\n' "$1" >&2; exit "${2:-2}"; }
+
+[ -n "$SETUP_LIB" ] && [ -r "$SETUP_LIB" ] \
+  || die "shared setup library not found (installed beside the wrappers, or deploy/devlab-setup-lib.sh in a checkout) — the instance root is read from it, never guessed here" 2
+# shellcheck source=/dev/null
+. "$SETUP_LIB"
+command -v setup_root_app_www >/dev/null 2>&1 \
+  || die "the setup library at $SETUP_LIB predates the instance-root decision (no setup_root_app_www) — this host still carries an older library; refusing to guess where the browser reads the dashboard from" 2
+HOLISTIC_WWW="$(setup_root_app_www)"
 
 if [ -z "$HOLISTIC_REPO" ] && [ -r "$HOLISTIC_REPO_FILE" ]; then
   HOLISTIC_REPO="$(head -n1 -- "$HOLISTIC_REPO_FILE" | tr -d '[:space:]')"
 fi
 [ -n "$HOLISTIC_REPO" ] || die "no holistic dashboard checkout configured (DEVLAB_HOLISTIC_REPO / $HOLISTIC_REPO_FILE)" 2
-
-if [ -z "$HOLISTIC_WWW" ] && [ -r "$HOLISTIC_WWW_FILE" ]; then
-  HOLISTIC_WWW="$(head -n1 -- "$HOLISTIC_WWW_FILE" | tr -d '[:space:]')"
-fi
-[ -n "$HOLISTIC_WWW" ] || HOLISTIC_WWW="$HOLISTIC_WWW_DEFAULT"
 
 DIST_DIR="$HOLISTIC_REPO/$HOLISTIC_FRONTEND/$HOLISTIC_DIST"
 

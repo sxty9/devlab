@@ -112,6 +112,16 @@ install_artifacts() {
   rm -f "/tmp/${UNIT_NAME}.build"
   install -d -m 0755 "$STATE_DIR/www"
   rsync -a --delete "$REPO_ROOT/dist/" "$STATE_DIR/www/"
+  # A SERVE ROOT IS READABLE BY ITS ROLE, not by whoever built it: `rsync -a` above carries the
+  # builder's owner and mode, and the browser fetches every byte of this tree through the edge, which
+  # runs as a different account entirely. The rule lives once in the shared setup library, so this
+  # hand-run setup delivers exactly what the delivery chain delivers — and PROVES it, rather than
+  # leaving the edge to answer 404 over a start page that is present.
+  # shellcheck source=deploy/devlab-setup-lib.sh
+  . "$REPO_ROOT/deploy/devlab-setup-lib.sh"
+  setup_serve_root_readable "$STATE_DIR/www"
+  setup_serve_root_check "$STATE_DIR/www" \
+    || die "the start page at $STATE_DIR/www is not readable by the webserver — see the reason above; setup is incomplete, not done" 4
 }
 
 install_wrappers() {
