@@ -143,9 +143,9 @@ func TestMaintainProd_WholePathAgainstRealRepo(t *testing.T) {
 		},
 		// The send to the foreign host and its receiver stay placeholders (WHAT-2): record the values
 		// and stop here — this is the "immediately before the send" boundary.
-		prodSend: func(_ context.Context, _ deploy.ProdConfig, repo, artifact string) error {
+		prodSend: func(_ context.Context, _ deploy.ProdConfig, repo, artifact string) (string, error) {
 			sent.called, sent.repo, sent.artifact, sent.wt = true, repo, artifact, wt
-			return nil
+			return "", nil
 		},
 	}
 

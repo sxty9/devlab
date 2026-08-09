@@ -686,10 +686,13 @@ export interface RunNotice {
 }
 
 /** One blocking question on the Blocked surface (runs.Question): a run that stopped and asked, plus
- *  the answer once given. Two qKinds are GUARDED handles whose freeing needs an explicit approval:
- *  'wrapper-renewal' (detail carries the exact difference to the installed root scripts) and
- *  'prod-host-key' (the production host presented a new ssh key; hostKeyFingerprint pins the key the
- *  approval covers). Everything else is a plain 'decision' answered with free text. */
+ *  the answer once given. Three qKinds are GUARDED handles whose freeing needs an explicit approval:
+ *  'wrapper-renewal' (detail carries the exact difference to the installed root scripts), 'prod-host-key'
+ *  (the production host presented a new ssh key; hostKeyFingerprint pins the key the approval covers), and
+ *  'prod-receiver' (a devlab delivery changed the root receiver scripts the chain cannot install on the
+ *  production host; prodReceiverCommand carries the operator command and wrappers pins the checksums it
+ *  must reach — the chain re-measures the host before it settles the delivery live). Everything else is a
+ *  plain 'decision' answered with free text. */
 export interface RunQuestion {
   id: string;
   runId: string;
@@ -697,7 +700,7 @@ export interface RunQuestion {
   kind?: RunKind;
   executionId: string;
   repo: string;
-  qKind: 'decision' | 'wrapper-renewal' | 'prod-host-key';
+  qKind: 'decision' | 'wrapper-renewal' | 'prod-host-key' | 'prod-receiver';
   autonomy?: AutonomyLevel;
   question: string;
   recommendation?: string;
@@ -726,16 +729,22 @@ export interface RunQuestion {
    *  this run delivers (its own branch, not yet merged). Approving installs only these named files with
    *  these checksums; detail renders the same set for the reader. */
   wrappers?: { name: string; sha: string }[];
-  /** For a GUARDED question ('wrapper-renewal' | 'prod-host-key'): the exact sentence the user affirms
-   *  to approve, derived by the backend from the question's own subject (which version, which files and
-   *  checksums, or which host key). It is both the consent shown on the checkbox and — verbatim — the
-   *  answer recorded in the ledger, so the two can never describe different things. Absent for a plain
-   *  'decision'. */
+  /** For a GUARDED question ('wrapper-renewal' | 'prod-host-key' | 'prod-receiver'): the exact sentence
+   *  the user affirms to approve, derived by the backend from the question's own subject (which version,
+   *  which files and checksums, which host key, or which receiver command). It is both the consent shown
+   *  on the checkbox and — verbatim — the answer recorded in the ledger, so the two can never describe
+   *  different things. Absent for a plain 'decision'. */
   approvalStatement?: string;
   /** For a 'prod-host-key' question: the production host whose key changed and the SHA256 fingerprint
    *  of the key now presented — the exact key the approval covers (the accept path re-verifies it). */
   hostKeyTarget?: string;
   hostKeyFingerprint?: string;
+  /** For a 'prod-receiver' question: the production host whose root receiver scripts are older than the
+   *  merged delivery ships, and the exact one-line command an operator with root runs on that host to
+   *  bring them current (wrappers pins the checksums each script must reach). The chain never installs
+   *  them itself — it re-measures the host afterwards and settles the delivery live only once they match. */
+  prodReceiverTarget?: string;
+  prodReceiverCommand?: string;
 }
 
 export interface PlannedRun {

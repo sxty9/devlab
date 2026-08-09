@@ -58,9 +58,9 @@ func TestProdMissingKeyNamesItsOwnReason(t *testing.T) {
 	cfg := ProdConfig{
 		RsyncTarget: t.TempDir(),
 		Identity:    ProdIdentity{KeyFile: absent, KnownHostsFile: filepath.Join(t.TempDir(), "kh")},
-		Trigger:     func(context.Context, string) error { t.Fatal("trigger must never fire on an unusable key"); return nil },
+		Trigger:     func(context.Context, string) (string, error) { t.Fatal("trigger must never fire on an unusable key"); return "", nil },
 	}
-	err := SendProd(context.Background(), cfg, "svc-a", art)
+	_, err := SendProd(context.Background(), cfg, "svc-a", art)
 	if err == nil {
 		t.Fatal("a missing key must refuse")
 	}
@@ -124,7 +124,7 @@ func TestSendProdAgainstFixtureTarget(t *testing.T) {
 	}
 	staging := t.TempDir() // the fixture rsync target — a local directory, never a live host
 
-	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: staging}, "svc-a", art); err != nil {
+	if _, err := SendProd(context.Background(), ProdConfig{RsyncTarget: staging}, "svc-a", art); err != nil {
 		t.Fatal(err)
 	}
 
@@ -156,7 +156,7 @@ func TestSendProdExcludesUISource(t *testing.T) {
 	}
 
 	staging := t.TempDir()
-	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: staging}, "svc-a", art); err != nil {
+	if _, err := SendProd(context.Background(), ProdConfig{RsyncTarget: staging}, "svc-a", art); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,9 +181,9 @@ func TestSendProdTriggerSeam(t *testing.T) {
 	fired := ""
 	cfg := ProdConfig{
 		RsyncTarget: t.TempDir(),
-		Trigger:     func(_ context.Context, repo string) error { fired = repo; return nil },
+		Trigger:     func(_ context.Context, repo string) (string, error) { fired = repo; return "", nil },
 	}
-	if err := SendProd(context.Background(), cfg, "svc-a", art); err != nil {
+	if _, err := SendProd(context.Background(), cfg, "svc-a", art); err != nil {
 		t.Fatal(err)
 	}
 	if fired != "svc-a" {
@@ -194,18 +194,18 @@ func TestSendProdTriggerSeam(t *testing.T) {
 func TestSendProdValidation(t *testing.T) {
 	art := t.TempDir()
 	// Repo grammar guards the remote path composition.
-	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "../evil", art); err == nil {
+	if _, err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "../evil", art); err == nil {
 		t.Fatal("a traversal repo name must be rejected")
 	}
-	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "UPPER", art); err == nil {
+	if _, err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "UPPER", art); err == nil {
 		t.Fatal("the name grammar is lowercase")
 	}
 	// The target comes from server-side config; an empty one is an honest refusal.
-	if err := SendProd(context.Background(), ProdConfig{}, "svc-a", art); err == nil {
+	if _, err := SendProd(context.Background(), ProdConfig{}, "svc-a", art); err == nil {
 		t.Fatal("a missing prod target must refuse")
 	}
 	// No prebuilt artifact ⇒ nothing to ship.
-	if err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "svc-a",
+	if _, err := SendProd(context.Background(), ProdConfig{RsyncTarget: t.TempDir()}, "svc-a",
 		filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Fatal("a missing artifact must refuse")
 	}

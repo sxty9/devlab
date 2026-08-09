@@ -82,9 +82,11 @@ type ProdConfig struct {
 	// Identity is the shared ssh key + known-hosts used by BOTH the rsync transport and the trigger.
 	// Empty (no KeyFile) is the local-directory fixture path — no ssh, no key.
 	Identity ProdIdentity
-	// Trigger fires the install-only receiver on the target (the forced-command ssh call).
+	// Trigger fires the install-only receiver on the target (the forced-command ssh call) and returns
+	// the receiver's OUTPUT — which carries its READ-ONLY self-report of the installed receiver-script
+	// checksums (RECV-SELF-SHA lines), so the sending side can measure what the host actually carries.
 	// nil = NOT ARMED: the artifact is staged, nothing is installed — the state of this phase.
-	Trigger func(ctx context.Context, repo string) error
+	Trigger func(ctx context.Context, repo string) (string, error)
 }
 
 // ProdSendExcludes names — at the ONE place, in code, never a silent rsync flag buried elsewhere —
@@ -121,21 +123,21 @@ func rsyncArgs(cfg ProdConfig, src, dest string) []string {
 // trigger authenticate with the one configured deploy key; a missing or unreadable key is refused
 // up front with its own reason (never a masked connection error). Prod is fed exclusively from the
 // default branch — that policy sits with the caller of this function.
-func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) error {
+func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) (string, error) {
 	if !prodRepoRe.MatchString(repo) {
-		return fmt.Errorf("deploy: invalid repo name %q", repo)
+		return "", fmt.Errorf("deploy: invalid repo name %q", repo)
 	}
 	if strings.TrimSpace(cfg.RsyncTarget) == "" {
-		return fmt.Errorf("deploy: prod target is not configured (server-side)")
+		return "", fmt.Errorf("deploy: prod target is not configured (server-side)")
 	}
 	if fi, err := os.Stat(artifactDir); err != nil || !fi.IsDir() {
-		return fmt.Errorf("deploy: no prebuilt artifact at %s", artifactDir)
+		return "", fmt.Errorf("deploy: no prebuilt artifact at %s", artifactDir)
 	}
 	// A key is proven readable BEFORE any transport runs, so its absence names itself instead of
 	// hiding behind a later "connection failed". The fixture path (no key) skips this.
 	if cfg.Identity.armed() {
 		if err := cfg.Identity.checkReadable(); err != nil {
-			return err
+			return "", err
 		}
 	}
 
@@ -146,18 +148,21 @@ func SendProd(ctx context.Context, cfg ProdConfig, repo, artifactDir string) err
 		// A CHANGED host key gets its OWN distinct reason (the target was reinstalled, or the connection
 		// is intercepted) — never a masked "connection failed". Any other rsync failure keeps its detail.
 		if hk := asHostKeyChanged(cfg.RsyncTarget, string(out), err); hk != err {
-			return hk
+			return "", hk
 		}
-		return fmt.Errorf("deploy: prod send failed: %w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
+		return "", fmt.Errorf("deploy: prod send failed: %w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 	}
 
 	if cfg.Trigger == nil {
-		return nil // staged only — no receiver fired (used by fixtures; the armed path always sets it)
+		return "", nil // staged only — no receiver fired (used by fixtures; the armed path always sets it)
 	}
-	if err := cfg.Trigger(ctx, repo); err != nil {
-		return fmt.Errorf("deploy: prod install trigger failed: %w", err)
+	// The trigger's output carries the receiver's self-report; it is returned so the caller can measure
+	// what the production host actually carries (the receiver-drift check).
+	out, err := cfg.Trigger(ctx, repo)
+	if err != nil {
+		return "", fmt.Errorf("deploy: prod install trigger failed: %w", err)
 	}
-	return nil
+	return out, nil
 }
 
 // triggerCmdArgs builds the trigger's ssh argument list: the shared identity options followed by the
@@ -174,19 +179,22 @@ func triggerCmdArgs(id ProdIdentity, recv, repo string) []string {
 // failed install or a service that did not come up — is therefore the production failure, surfaced
 // by name. The identity supplies the key (BatchMode keeps a misconfigured key from hanging) and the
 // durable known-hosts file (the host key is recorded on first contact and checked thereafter).
-func SSHTrigger(recv string, id ProdIdentity) func(ctx context.Context, repo string) error {
-	return func(ctx context.Context, repo string) error {
+func SSHTrigger(recv string, id ProdIdentity) func(ctx context.Context, repo string) (string, error) {
+	return func(ctx context.Context, repo string) (string, error) {
 		if !prodRepoRe.MatchString(repo) {
-			return fmt.Errorf("deploy: invalid repo name %q", repo)
+			return "", fmt.Errorf("deploy: invalid repo name %q", repo)
 		}
 		cmd := exec.CommandContext(ctx, "ssh", triggerCmdArgs(id, recv, repo)...)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
 			// A CHANGED host key is surfaced by its own reason, exactly as on the file transport.
 			if hk := asHostKeyChanged(recv, string(out), err); hk != err {
-				return hk
+				return "", hk
 			}
-			return fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
+			return "", fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(out)), 2000))
 		}
-		return nil
+		// The receiver's combined output carries its RECV-SELF-SHA self-report — returned so the sending
+		// side can measure the production host's receiver-script checksums against the merged delivery.
+		return string(out), nil
 	}
 }

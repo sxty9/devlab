@@ -94,7 +94,9 @@ type ChainDeps struct {
 	// foreign host are what a test substitutes, because a hermetic test has neither the wrapper nor a
 	// remote target. nil means the production function.
 	prodBuild func(ctx context.Context, ex workspace.Executor, wt string) (string, error)
-	prodSend  func(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error
+	// prodSend returns the receiver's OUTPUT (its RECV-SELF-SHA self-report) so the caller can measure
+	// what the production host carries; a fixture returns "" and the receiver-drift check is inert.
+	prodSend func(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) (string, error)
 	// prodEmit lays the first-time SETUP product (unit/route/rights) into the artifact before the send,
 	// AS THE RUNNER through the pinned wrapper. Like prodBuild, a hermetic test substitutes it (no
 	// wrapper, no runner). nil means the production function.
@@ -118,7 +120,7 @@ func (d *ChainDeps) buildProd(ctx context.Context, ex workspace.Executor, wt str
 }
 
 // sendProd ships the prebuilt artifact to the production host, honouring the test seam.
-func (d *ChainDeps) sendProd(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) error {
+func (d *ChainDeps) sendProd(ctx context.Context, cfg deploy.ProdConfig, repo, artifact string) (string, error) {
 	if d.prodSend != nil {
 		return d.prodSend(ctx, cfg, repo, artifact)
 	}
@@ -1265,7 +1267,8 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 	}
 	// The send expects the SHORT repo id (its name grammar rejects a slash); the ledger carries the
 	// full "owner/repo", so it is reduced here — the same value-form seam that the workbench needs.
-	if err := c.d.sendProd(ctx, cfg, repoShort(repo), artifact); err != nil {
+	recvOut, err := c.d.sendProd(ctx, cfg, repoShort(repo), artifact)
+	if err != nil {
 		// A CHANGED production host key is not a plain failure: it is carried up as its own signal so the
 		// production pass can hold the send and ask for a deliberate approval, instead of masking it as a
 		// generic "connection failed" retried in silence (task part 2).
@@ -1275,11 +1278,46 @@ func (c chainDeploy) DeployProd(ctx context.Context, repo string) (deliver.ProdO
 		}
 		return deliver.ProdOutcome{Detail: err.Error()}, err
 	}
-	// The receiver installed the prebuilt artifact AND proved the service running on the target, so a
-	// clean send is the honest running proof (F10), executed on the second machine. Commit names the
-	// standard-branch state now running in production, for the production-state record.
+	// The self repo's delivery CARRIES the root receiver scripts (devlab-deploy-recv and the library it
+	// sources), which the chain deliberately cannot install on the production host — the deploy key is a
+	// forced command that can only rsync into staging and trigger an install, never overwrite its own
+	// gatekeeper. Prove, from the receiver's OWN self-report, that the host already carries exactly the
+	// merged receiver scripts; if it does not, that part of the delivery did NOT arrive, so the send is
+	// NOT a full delivery and must not settle live. It is carried up as its own signal — like a changed
+	// host key — so the production pass surfaces the outstanding step as a deliberate approval naming the
+	// operator command and the checksums that bind it, rather than a masked "shipped and live".
+	if repoShort(repo) == selfRepo() {
+		drifts, stale := deploy.ReceiverDrift(wt, "origin/"+def, deploy.ParseReceiverSelfSHA(recvOut))
+		if stale {
+			grants, _ := wrapperGrants(drifts, nil)
+			recv := strings.TrimSpace(os.Getenv("DEVLAB_RUNS_PROD_RECV"))
+			return deliver.ProdOutcome{
+				ReceiverStale:  true,
+				ReceiverTarget: recv,
+				ReceiverGrants: grants,
+				Commit:         shipped,
+				Detail: fmt.Sprintf("the production host still carries an older version of the root receiver "+
+					"scripts (%s) than %s ships; the chain cannot install them itself (the deploy key is a forced "+
+					"command that cannot overwrite its own gatekeeper) — an operator with root must bring them current",
+					receiverDriftNames(drifts), repo),
+			}, fmt.Errorf("deploy: the production host still carries an older version of the root receiver scripts than %s ships (%s)", repo, receiverDriftNames(drifts))
+		}
+	}
+	// The receiver installed the prebuilt artifact AND proved the service running on the target, and (for
+	// the self repo) the host carries exactly the receiver scripts this delivery ships, so a clean send is
+	// the honest running proof (F10), executed on the second machine. Commit names the standard-branch
+	// state now running in production, for the production-state record.
 	return deliver.ProdOutcome{Running: true, Commit: shipped,
 		Detail: "shipped to production and proven running on the target"}, nil
+}
+
+// receiverDriftNames lists the drifted receiver scripts for a one-line reason.
+func receiverDriftNames(drifts []deploy.WrapperDrift) string {
+	names := make([]string, len(drifts))
+	for i, d := range drifts {
+		names[i] = d.Name
+	}
+	return strings.Join(names, ", ")
 }
 
 // DefaultBranchTip resolves the current commit at the tip of a repository's standard (default)
