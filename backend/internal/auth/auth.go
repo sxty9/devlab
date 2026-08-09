@@ -30,8 +30,14 @@ const (
 	csrfCookie    = "h_csrf"
 	csrfHeader    = "X-CSRF-Token"
 
-	// devlabGroup is the sole DevLab right: the distributable "developer" Linux group.
+	// devlabGroup is the DevLab entry right: the distributable "developer" Linux group.
 	devlabGroup = "hp_devlab_access"
+
+	// The two rights over the session a run works in. They are DELIBERATELY separate: watching a
+	// run think is a different act from steering it, so holding the first never confers the second.
+	// Each is backed one-to-one by a Linux group, like every other right in the landscape.
+	sessionWatchGroup = "hp_devlab_session_watch"
+	sessionSpeakGroup = "hp_devlab_session_speak"
 
 	// AccessTTL is the minted access-token lifetime, matching holistic's 15 minutes. The cookie
 	// max-age is set to match so browser and token expire together.
@@ -55,6 +61,17 @@ func (u *User) Can(group string) bool { return u.IsAdmin || contains(u.Groups, g
 
 // CanUseDevlab reports whether the user may use DevLab at all (the hp_devlab_access gate).
 func (u *User) CanUseDevlab() bool { return u.Can(devlabGroup) }
+
+// CanWatchSession reports whether the user may read the session a run works in — live while it
+// happens and afterwards. Whoever may speak into a session may also read it: steering something
+// one cannot see is not a right anybody can exercise. The reverse does NOT hold, and that is the
+// whole point of the two groups.
+func (u *User) CanWatchSession() bool {
+	return u.Can(sessionWatchGroup) || u.Can(sessionSpeakGroup)
+}
+
+// CanSpeakInSession reports whether the user may write INTO a running session.
+func (u *User) CanSpeakInSession() bool { return u.Can(sessionSpeakGroup) }
 
 // Verifier holds the shared signing secret, the admin group, and the dev-bypass flag.
 type Verifier struct {

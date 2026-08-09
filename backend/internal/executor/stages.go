@@ -577,7 +577,7 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 		if q, aerr := deps.Questions().AnsweredForRun(ctx, rc.Run.ID, rc.Repo); aerr == nil && q != nil && q.QKind == runs.QuestionDecision {
 			prompt = answerContinuation(*q)
 			rc.answeredQuestionID = q.ID
-			rc.Sink.Transcript(rc.Repo, transcriptLine("continuing with the user's answer to the open question"))
+			rc.Sink.Transcript(rc.Repo, SessionLine(rc.Repo, "", "continuing with the user's answer to the open question"))
 		}
 	}
 	// THE AGENT MUST KNOW it stands on a moved base: when the branch was just caught up onto the tip,
@@ -600,7 +600,7 @@ func implementRun(ctx context.Context, rc *RepoCtx) error {
 	// missing conversation as failed work.
 	if rc.session.Resume && lostConversation(werr, out.RawFinal) {
 		rc.settleUsage(out) // the failed attempt still consumed what it consumed
-		rc.Sink.Transcript(rc.Repo, transcriptLine("the earlier conversation is gone — continuing in a new one on the same workbench"))
+		rc.Sink.Transcript(rc.Repo, SessionLine(rc.Repo, "", "the earlier conversation is gone — continuing in a new one on the same workbench"))
 		rc.session.Resume = false
 		stream, err = deps.Agent(ctx, rc.Repo, prompt, rc.Tuning, rc.session)
 		if err != nil {

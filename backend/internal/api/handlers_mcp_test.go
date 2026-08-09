@@ -17,7 +17,11 @@ import (
 
 const rightGroup = "hp_devlab_access"
 
-func withRight() auth.User    { return auth.User{Username: "ada", Groups: []string{rightGroup}} }
+// withRight is a caller who holds EVERY DevLab right, so a test that measures ONE dimension (the
+// CSRF token, the GitHub link) measures only that dimension. withoutRight holds none.
+func withRight() auth.User {
+	return auth.User{Username: "ada", Groups: []string{rightGroup, "hp_devlab_session_watch", "hp_devlab_session_speak"}}
+}
 func withoutRight() auth.User { return auth.User{Username: "bob"} }
 
 // mcpCtx is the per-call context the endpoint builds: CSRF verdict plus forwarded credentials.
@@ -101,7 +105,10 @@ func TestToolTableMirrorsTheDataSource(t *testing.T) {
 	}
 }
 
-var routeRe = regexp.MustCompile(`mux\.HandleFunc\("([^"]+)",\s*s\.(guardAuthed|guardWrite|guardCSRF|guard)?\(?`)
+// The alternation is LONGEST-FIRST: Go's regexp is leftmost-first, so a shorter guard name that
+// is a prefix of a longer one would otherwise swallow it and the route would be read as laxer
+// than it is.
+var routeRe = regexp.MustCompile(`mux\.HandleFunc\("([^"]+)",\s*s\.(guardSessionWatch|guardSessionSpeak|guardAuthed|guardWrite|guardCSRF|guard)?\(?`)
 
 type routeEntry struct {
 	route string // "METHOD /path" as written in the route table
@@ -168,7 +175,12 @@ func TestToolTierMatchesTheRouteGuard(t *testing.T) {
 	for _, r := range routeTable(t) {
 		guards[r.route] = r.guard
 	}
-	want := map[string]mcpTier{"guard": tierRead, "guardCSRF": tierCSRF, "guardWrite": tierWrite}
+	// A guard that adds a right on top of a tier maps onto that tier: the extra right is checked
+	// separately (TestToolsCarryTheExtraRightOfTheirRoute), the tier is what this test measures.
+	want := map[string]mcpTier{
+		"guard": tierRead, "guardCSRF": tierCSRF, "guardWrite": tierWrite,
+		"guardSessionWatch": tierRead, "guardSessionSpeak": tierCSRF,
+	}
 	for _, row := range mcpToolRows() {
 		route := row.Method + " " + row.Path
 		guard, ok := guards[route]
@@ -752,5 +764,37 @@ func TestEndpointValidatesArgumentsBeforeCalling(t *testing.T) {
 		if msg, _ := e["message"].(string); !strings.Contains(msg, c.want) {
 			t.Errorf("%s: message %q, want %q", c.msg, msg, c.want)
 		}
+	}
+}
+
+// A route that demands MORE than the DevLab right demands it over MCP too. Without this the tool
+// surface would be the way AROUND a right: an agent could write into a run its caller may only
+// watch.
+func TestToolsCarryTheExtraRightOfTheirRoute(t *testing.T) {
+	s := &Server{}
+	watcher := auth.User{Username: "ada", Groups: []string{rightGroup, "hp_devlab_session_watch"}}
+
+	tools := map[string]mcpTool{}
+	for _, row := range mcpToolRows() {
+		tools[row.Name] = row
+	}
+	read, ok := tools["run_session_read"]
+	if !ok {
+		t.Fatal("no tool reads a run's session — the capability is not offered over MCP at all")
+	}
+	if err := s.mcpAuthorize(read, &watcher, mcpCallInfo{csrfOK: true}); err != nil {
+		t.Errorf("a watcher may not read the session over MCP: %v", err)
+	}
+
+	speak, ok := tools["run_session_speak"]
+	if !ok {
+		t.Fatal("no tool writes into a run's session")
+	}
+	err := s.mcpAuthorize(speak, &watcher, mcpCallInfo{csrfOK: true})
+	if err == nil {
+		t.Fatal("a watcher could WRITE into a session over MCP — the right is bypassed by the tool surface")
+	}
+	if !strings.Contains(err.Error(), "hp_devlab_session_speak") {
+		t.Errorf("the refusal does not name the missing right: %v", err)
 	}
 }

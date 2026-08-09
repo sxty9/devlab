@@ -24,6 +24,7 @@ import type {
   ServiceConfig,
   ServiceNotice,
   SlotOverview,
+  SessionLine,
   StageView,
   StartOutcome,
   UsageView,
@@ -42,14 +43,25 @@ function pin(name: string, value: unknown) {
 
 pin('health', { ok: true, mode: 'devlab/0.2.0' } satisfies Health);
 
+// The canonical user WATCHES sessions but may not speak into them — the split is pinned in the
+// contract itself, so a build that collapses the two rights into one fails on both sides.
 pin('user', {
   username: 'alice',
   displayName: 'Alice',
   isAdmin: false,
   canUseDevlab: true,
+  canWatchSession: true,
+  canSpeakSession: false,
   githubLinked: true,
   githubLogin: 'alice-gh',
 } satisfies User);
+
+pin('session_line', {
+  at: '2026-07-28T03:00:00Z',
+  repo: 'svc-a',
+  from: 'alice',
+  text: 'stop and check the migration first',
+} satisfies SessionLine);
 
 pin('repo', {
   id: 'svc-a',

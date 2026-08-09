@@ -10,8 +10,11 @@ import type {
   Backoff,
   ExecutionView,
   PauseView,
+  Intervention,
   RepoPipeline,
   RunResult,
+  SessionLine,
+  SessionPortion,
   SlotOverview,
   StageView,
   StartOutcome,
@@ -69,10 +72,14 @@ export function stageLabel(stage: string): string {
   return s.replace(/[-_]+/g, ' ');
 }
 
-/** Whether this stage still carries something to read: its report/transcript, its short skip
- *  reason, its evidence or a link. Drives whether the badge is inspectable at all. */
+/** Whether this stage still carries something to read: its agent session, its recorded log, its
+ *  short skip reason, its evidence or a link. Drives whether the badge is inspectable at all.
+ *
+ *  A stage the server marked as carrying a session is ALWAYS inspectable — that is the whole point
+ *  of the mark. It has to be, or the way into a running conversation would open only once the
+ *  conversation had already said something. */
 export function stageHasDetail(sv: StageView): boolean {
-  return !!(sv.log || sv.reason || sv.evidence || sv.link);
+  return !!(sv.session || sv.log || sv.reason || sv.evidence || sv.link);
 }
 
 // ── Task states (REQ-020.4) ───────────────────────────────────────────────────
@@ -202,7 +209,23 @@ export function provenanceChips(res: RunResult): string[] {
   const out: string[] = [];
   if (res.legacy) out.push('archive');
   if (res.synthetic) out.push('reconciled');
+  // A run a PERSON wrote into did not work purely by itself, and must not read as though it had.
+  // The chip is the at-a-glance fact; WHO wrote WHAT stands in the session itself.
+  const people = steeredBy(res);
+  if (people.length > 0) out.push(`steered by ${people.join(', ')}`);
   return out;
+}
+
+/** Who wrote into this execution's running session, each named once, in the order they first did.
+ *  An entry without a name reads as "someone" rather than being dropped: that a person intervened
+ *  is the fact, and it stands even when the record cannot say who. */
+export function steeredBy(res: RunResult): string[] {
+  const seen: string[] = [];
+  for (const iv of res.interventions ?? []) {
+    const who = iv.by?.user || 'someone';
+    if (!seen.includes(who)) seen.push(who);
+  }
+  return seen;
 }
 
 // ── History ordering & membership ─────────────────────────────────────────────
@@ -341,4 +364,59 @@ export function usageParts(u: { inputTokens: number; outputTokens: number; costU
   const output = u?.outputTokens ?? 0;
   const costUsd = u?.costUsd ?? 0;
   return { input, output, costUsd, any: input > 0 || output > 0 || costUsd > 0 };
+}
+
+// ── The session of an execution, followed in portions ─────────────────────
+
+/** What the pane holds right now: the lines it has, and the two anchors it reads from. */
+export interface HeldSession {
+  lines: SessionLine[];
+  from: number;
+  next: number;
+  older: boolean;
+  open: boolean;
+  repos: string[];
+  interventions: Intervention[];
+}
+
+export const EMPTY_SESSION: HeldSession = {
+  lines: [],
+  from: 0,
+  next: 0,
+  older: false,
+  open: false,
+  repos: [],
+  interventions: [],
+};
+
+/** foldPortion puts a freshly read portion into what is already held, in the right direction.
+ *  Exported because it is the whole correctness of the portioned read: earlier lines go in FRONT
+ *  and move only the start anchor, later lines go BEHIND and move only the end anchor. */
+export function foldPortion(held: HeldSession, got: SessionPortion, back: boolean): HeldSession {
+  const meta = { open: got.open, repos: got.repos ?? [], interventions: got.interventions ?? [] };
+  if (back) {
+    return { ...held, ...meta, lines: [...got.lines, ...held.lines], from: got.from, older: got.older };
+  }
+  // An opening read (nothing held yet) takes BOTH anchors from the portion itself.
+  const first = held.lines.length === 0;
+  if (got.lines.length === 0) {
+    return { ...held, ...meta, next: Math.max(held.next, got.next) };
+  }
+  return {
+    ...held,
+    ...meta,
+    lines: [...held.lines, ...got.lines],
+    from: first ? got.from : held.from,
+    next: got.next,
+    older: first ? got.older : held.older,
+  };
+}
+
+/** speakableHere decides whether an input belongs on THIS repository's pane. `open` is measured
+ *  for the whole execution, but a message is addressed to one repository — so an execution whose
+ *  other repository is working must not offer an input here. */
+export function speakableHere(held: HeldSession, repo: string): boolean {
+  if (!held.open) return false;
+  if (!repo || held.repos.length === 0) return true;
+  return held.repos.includes(repo);
 }

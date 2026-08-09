@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"devlab/backend/internal/auth"
 	"devlab/backend/internal/mcp"
 	"devlab/backend/internal/model"
 	"devlab/backend/internal/sched"
@@ -87,6 +88,11 @@ type mcpTool struct {
 	Path    string
 	Tier    mcpTier
 	Handler func(*Server, http.ResponseWriter, *http.Request)
+	// Right is the ADDITIONAL right the route demands beyond the tier, with the name it is refused
+	// under. Without it a capability offered over MCP would be laxer than the same capability over
+	// HTTP — an agent could do what the person driving it may not.
+	Right      func(*auth.User) bool
+	RightRefus string
 	// Destructive marks a capability that removes or overwrites state (REQ-040.6): the client
 	// sees the hint before it calls.
 	Destructive bool
@@ -604,6 +610,33 @@ func mcpToolRows() []mcpTool {
 			Params: []mcpParam{
 				pathArg("id", "", runIDDesc),
 				pathArg("resultId", "rid", "Result document id."),
+			},
+		},
+		{
+			Name: "run_session_read", Desc: "Read a portion of one execution's agent session: what it said and did, and what people wrote into it. Newest portion by default; follow it forward with `at`, fetch older lines with `at` plus `back`.",
+			Op: "mercuryRunSession", Method: http.MethodGet, Path: "/api/mercury/runs/{id}/results/{rid}/session", Tier: tierRead,
+			Handler:    (*Server).runSessionRead,
+			Right:      (*auth.User).CanWatchSession,
+			RightRefus: "Following a run's session requires the hp_devlab_session_watch right",
+			Params: []mcpParam{
+				pathArg("id", "", runIDDesc),
+				pathArg("resultId", "rid", "Result document id."),
+				queryArg("at", "", mcp.KindInteger, false, "Where to read from — the `next` of a previous portion to follow forward, or its `from` together with back=true for older lines."),
+				queryArg("back", "", mcp.KindBoolean, false, "Read the portion BEFORE `at` instead of the one after it."),
+				queryArg("max", "", mcp.KindInteger, false, "How many lines the portion holds at most."),
+			},
+		},
+		{
+			Name: "run_session_speak", Desc: "Write into an execution's RUNNING session and steer it. Only while it is running; the message is recorded in the session together with who wrote it, and the execution then shows that a person intervened.",
+			Op: "mercuryRunSessionSpeak", Method: http.MethodPost, Path: "/api/mercury/runs/{id}/results/{rid}/session", Tier: tierCSRF,
+			Handler:    (*Server).runSessionSpeak,
+			Right:      (*auth.User).CanSpeakInSession,
+			RightRefus: "Writing into a run's session requires the hp_devlab_session_speak right",
+			Params: []mcpParam{
+				pathArg("id", "", runIDDesc),
+				pathArg("resultId", "rid", "Result document id."),
+				bodyArg("text", mcp.KindString, true, "What to say to the running session."),
+				bodyArg("repo", mcp.KindString, false, "Which repository's session is meant. Needed only while several are working at once."),
 			},
 		},
 		{

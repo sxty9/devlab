@@ -44,6 +44,10 @@ type Result struct {
 	// Prompt is the exact prompt this execution was driven by (snapshot).
 	Prompt    string           `json:"prompt,omitempty"`
 	Requested model.Authorship `json:"requested"`
+	// Interventions records every time a PERSON wrote into this execution's running session. An
+	// execution with entries here did not run purely by itself, and says so — the words themselves
+	// stand in the session journal, this is only the who and when.
+	Interventions []model.Intervention `json:"interventions,omitempty"`
 	// Synthetic marks a result synthesized by the startup reconciliation (B-5), never by a run.
 	Synthetic bool `json:"synthetic,omitempty"`
 	// Legacy is true for a document read from the pre-rebuild archive — display-only provenance.
@@ -168,13 +172,13 @@ func (r *ResultStore) AppendTranscript(execID string, line []byte) error {
 	if execID == "" {
 		return errors.New("transcript without execution id")
 	}
-	return fsatomic.AppendLine(filepath.Join(r.execDir, execID, "transcript.jsonl"), line)
+	return fsatomic.AppendLine(r.sessionPath(execID), line)
 }
 
 // ReadTranscriptTail returns up to maxBytes from the end of the execution's transcript journal,
 // starting at a line boundary (the torn first line of a mid-file cut is dropped).
 func (r *ResultStore) ReadTranscriptTail(execID string, maxBytes int) (string, error) {
-	f, err := os.Open(filepath.Join(r.execDir, execID, "transcript.jsonl"))
+	f, err := os.Open(r.sessionPath(execID))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil

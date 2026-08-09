@@ -601,9 +601,12 @@ func runRepo(ctx context.Context, rc *RepoCtx) (model.RepoPipeline, error) {
 		}
 
 		started := rc.Deps.Now().UTC()
-		rc.Sink.StageUpdate(rc.Repo, model.StageView{Stage: spec.Name, State: model.StepRunning, StartedAt: &started})
+		// The session mark travels with the stage from the moment it starts: the surface can open
+		// the running conversation immediately, and it stays open on the settled stage afterwards —
+		// a closed session remains readable (it is never marked only while it lives).
+		rc.Sink.StageUpdate(rc.Repo, model.StageView{Stage: spec.Name, State: model.StepRunning, StartedAt: &started, Session: spec.Session})
 
-		sv := model.StageView{Stage: spec.Name, StartedAt: &started}
+		sv := model.StageView{Stage: spec.Name, StartedAt: &started, Session: spec.Session}
 		ok, evidence := spec.Applies(ctx, rc)
 		if !ok {
 			if strings.TrimSpace(evidence) == "" {

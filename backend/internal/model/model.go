@@ -175,11 +175,40 @@ type StageView struct {
 	// Reason is mandatory for failed | not-applicable | not-executed.
 	Reason string `json:"reason,omitempty"`
 	// Evidence is mandatory for not-applicable: the attested repo property (REQ-031.3).
-	Evidence  string     `json:"evidence,omitempty"`
-	Log       string     `json:"log,omitempty"`
+	Evidence string `json:"evidence,omitempty"`
+	Log      string `json:"log,omitempty"`
+	// Session marks the stage whose work IS an open agent conversation. Its record is not the
+	// Log text but the execution's session journal, which is followed while it runs and stays
+	// readable afterwards. The SERVER names it (it comes off the chain's own stage table), so no
+	// client ever has to recognise a stage by its name.
+	Session   bool       `json:"session,omitempty"`
 	Link      string     `json:"link,omitempty"`
 	StartedAt *time.Time `json:"startedAt,omitempty"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
+}
+
+// ── The session journal — one open agent conversation, line by line ──────────────────────
+
+// SessionLine is ONE recorded line of an execution's agent session: what the agent said or did,
+// or what a person wrote INTO the running session. Both live in the same recording — a human's
+// words are not kept in a second place — and the line says which of the two it is.
+//
+// From is empty for the agent's own output and carries the person's username for an
+// intervention. Repo is empty on records written before the session carried its repository.
+type SessionLine struct {
+	At   time.Time `json:"at"`
+	Repo string    `json:"repo,omitempty"`
+	From string    `json:"from,omitempty"`
+	Text string    `json:"text"`
+}
+
+// Intervention is the fact that a PERSON wrote into a running execution: who, when, and into
+// which repository's session. Its presence is what makes "this run was not purely self-acting"
+// visible without reading the whole journal.
+type Intervention struct {
+	By   Actor     `json:"by"`
+	At   time.Time `json:"at"`
+	Repo string    `json:"repo,omitempty"`
 }
 
 // Backoff is a persisted retry state (K-5): why, how it is classified, how often it was tried,
@@ -465,8 +494,12 @@ type User struct {
 	DisplayName  string `json:"displayName"`
 	IsAdmin      bool   `json:"isAdmin"`
 	CanUseDevlab bool   `json:"canUseDevlab"`
-	GithubLinked bool   `json:"githubLinked"`
-	GithubLogin  string `json:"githubLogin,omitempty"`
+	// The two rights over the session a run works in, kept apart on the wire exactly as they are
+	// kept apart in the rights system: watching is not writing.
+	CanWatchSession bool   `json:"canWatchSession"`
+	CanSpeakSession bool   `json:"canSpeakSession"`
+	GithubLinked    bool   `json:"githubLinked"`
+	GithubLogin     string `json:"githubLogin,omitempty"`
 }
 
 // ── Calendar + coverage (ported wire forms; REQ-012) ─────────────────────────────────────

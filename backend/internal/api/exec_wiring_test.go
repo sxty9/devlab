@@ -57,6 +57,7 @@ func newExecFixture(t *testing.T) *execFixture {
 		results:    res,
 		runNotices: runs.NewNoticeStore(paths),
 		deliveries: runs.NewDeliveryStore(paths),
+		sessions:   newOpenSessions(),
 	}
 	srv.SetSettings(set)
 	srv.SetExecution(docs, scheduler)

@@ -12,6 +12,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -272,6 +273,11 @@ func (d *ChainDeps) Workbench(repo string) executor.WorkbenchOps {
 // Agent starts the agent on the repo's workbench in stream-json form and hands back the live
 // stream. --verbose is what makes the CLI emit every event as it happens in -p mode, which is what
 // keeps the transcript and the live token counters honest (F7/F11).
+//
+// The conversation is started OPEN: its input stays connected for as long as it works, so a person
+// may write into it (see exec_session.go). The opening message therefore travels on that input
+// rather than on the command line — with streaming input the CLI takes its prompt from stdin and
+// ignores a prompt given as an argument, which is the whole reason the two must move together.
 func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) (executor.AgentStream, error) {
 	_, wt, err := d.bench(ctx, repo)
 	if err != nil {
@@ -285,14 +291,16 @@ func (d *ChainDeps) Agent(ctx context.Context, repo, prompt string, t runs.Resol
 	if branch == "" || branch == "HEAD" {
 		branch = workbench.LegacyShared
 	}
-	return startAgentStream(ctx, ex, wt, chainAgentArgs(repo, branch, prompt, t, sess)), nil
+	return d.startAgent(ctx, ex, wt, sess.Key, repo, prompt, chainAgentArgs(repo, branch, t, sess)), nil
 }
 
 // chainAgentArgs is the agent invocation of ONE stage, as a value — the seam that lets the
-// invocation be verified without a workspace and without root.
-func chainAgentArgs(repo, branch, prompt string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
+// invocation be verified without a workspace and without root. The opening message is NOT among
+// them: it goes over the open input, together with everything a person adds later.
+func chainAgentArgs(repo, branch string, t runs.ResolvedTuning, sess executor.AgentSession) []string {
 	args := []string{
-		"-p", prompt,
+		"-p",
+		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--verbose",
 		"--permission-mode", "bypassPermissions",
@@ -1463,12 +1471,54 @@ type agentStream struct {
 // adapter testable without a claude binary and without sudo.
 type streamFunc func(ctx context.Context, onStdout func(line []byte)) error
 
-// startAgentStream runs the agent in the working tree through the ported per-user primitive.
-func startAgentStream(ctx context.Context, ex workspace.Executor, wt string, args []string) *agentStream {
+// startAgent runs the agent in the working tree through the ported per-user primitive, as an OPEN
+// conversation: the opening message is written into its input, the input is registered so a person
+// can write into it too, and it is closed again once every message handed over has been answered —
+// which is what lets the invocation end at all.
+//
+// Registering is a WINDOW, never a valve: an execution without a register entry (an
+// observation-only composition, a test) runs exactly as before, only unspeakable-to.
+func (d *ChainDeps) startAgent(ctx context.Context, ex workspace.Executor, wt, execID, repo, prompt string, args []string) *agentStream {
+	var desk *agentDesk
 	return startAgentStreamWith(ctx, func(runCtx context.Context, onStdout func([]byte)) error {
-		_, err := ex.AgentStream(runCtx, wt, onStdout, args...)
+		// The release sits INSIDE the invocation, so it happens the moment the invocation ends —
+		// however it ended — and can never be missed by an invocation that finished before the
+		// caller got its handle back.
+		defer func() { d.s.dropDesk(execID, repo, desk) }()
+		_, err := ex.AgentStream(runCtx, wt,
+			func(w io.WriteCloser) {
+				desk = d.s.openDesk(execID, repo, w)
+				// The chain's own opening message travels the SAME way a person's does — one way
+				// into a conversation, not two.
+				if werr := desk.speak(prompt); werr != nil {
+					// It could not be handed over: end the conversation at once rather than leave
+					// the agent waiting on an input that will never speak.
+					desk.shut()
+				}
+			},
+			func(line []byte) {
+				// A turn that came back releases one handed-over message. Reading this from the
+				// stream itself — not from a timer — is what makes the close exact.
+				if desk != nil && isAgentTurnEnd(line) {
+					desk.answer()
+				}
+				onStdout(line)
+			},
+			args...)
 		return err
 	})
+}
+
+// isAgentTurnEnd reports whether a stream line is the summary that closes ONE turn. Anything else
+// — including the events of a turn still in flight — leaves the conversation open.
+func isAgentTurnEnd(line []byte) bool {
+	if len(line) == 0 || line[0] != '{' {
+		return false
+	}
+	var ev struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(line, &ev) == nil && ev.Type == "result"
 }
 
 func startAgentStreamWith(ctx context.Context, run streamFunc) *agentStream {

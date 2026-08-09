@@ -172,7 +172,7 @@ function ExecutionDetailBody({
                   onDeliver={onDeliver ? () => onDeliver(rp.repo) : undefined}
                   delivering={busy}
                 >
-                  {stage && <StageDetail repo={rp.repo} stage={stage} />}
+                  {stage && <StageDetail repo={rp.repo} stage={stage} runId={res.runId} resultId={res.id} />}
                 </RepoPipelineCard>
               );
             })}

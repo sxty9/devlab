@@ -127,6 +127,11 @@ func (s *Server) mcpAuthorize(t mcpTool, u *auth.User, call mcpCallInfo) error {
 	if !u.CanUseDevlab() {
 		return errMCPNoRight
 	}
+	// A route that demands more than the DevLab right demands it here too, by the SAME predicate —
+	// otherwise the MCP surface would be the way around a right instead of a way to exercise it.
+	if t.Right != nil && !t.Right(u) {
+		return errors.New(t.RightRefus)
+	}
 	if t.Tier == tierRead {
 		return nil
 	}
