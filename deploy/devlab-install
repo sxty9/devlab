@@ -138,6 +138,10 @@ die() { printf 'devlab-install: error: %s\n' "$1" >&2; exit "${2:-2}"; }
 
 CHECK=0; HANDOVER=0; PORT=0; RENEW=0
 POSITIONAL=()
+# The invocation EXACTLY as it arrived, kept before the loop below consumes it. A hand-out re-enters
+# this same tool outside the service cgroup with these very arguments, so what runs out there is the
+# identical call and not a reconstruction of it (see hand_out_of_cgroup).
+ORIG_ARGV=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)          CHECK=1 ;;
@@ -218,29 +222,138 @@ own_root() { [ "$(id -u)" -eq 0 ] && chown root:root -- "$@" || true; }
 # would fail again, which is the silent loop the user cannot win (task points 3/4). A failed hand-out
 # (systemd-run absent or the transient unit erroring) fails the renewal WITH the real reason, which the
 # daemon surfaces as one disturbance rather than re-asking.
+# hand_out_of_cgroup <unit-tag> <what> <argv…> — THE ONE ESCAPE. It re-enters this very tool, with
+# <argv…>, inside a transient systemd unit that is NOT a child of the devlab service, and EXITS with
+# that unit's status. Both operations the service is deliberately confined out of — the approved wrapper
+# renewal and the first-time setup of a service — leave through here, so there is one escape to reason
+# about and not two similar ones. The caller fills HANDOUT_ENV with the --setenv options its own re-entry
+# needs (its recursion marker above all); <what> names the operation in the failure message.
+#
+# --wait: block and adopt the unit's exit status · --pipe: forward the unit's output back to the daemon
+# that invoked us · --collect: reap the unit even on failure. A non-zero exit propagates out of this
+# wrapper, so the operation fails with the transient unit's REAL reason rather than a second-hand one.
+# Nothing the confined caller decided is trusted across the boundary: the re-entered tool runs its whole
+# validation cascade again, outside, before it writes anything.
+HANDOUT_ENV=()
+hand_out_of_cgroup() {
+  local tag="$1" what="$2"; shift 2
+  command -v "$SYSTEMD_RUN" >/dev/null 2>&1 \
+    || die "the devlab service confines this path read-only (ProtectSystem=strict) and '$SYSTEMD_RUN' is not available to hand $what out of the service — it cannot be carried out" 4
+  local self
+  self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "cannot resolve this wrapper's own path to hand $what out" 4
+  "$SYSTEMD_RUN" --quiet --wait --pipe --collect \
+    --unit="devlab-${tag}-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
+    "${HANDOUT_ENV[@]}" \
+    -- "$self" "$@"
+  exit $?
+}
+
 maybe_hand_out_renewal() {  # <grant-file> <name> <content-file> [<name> <content-file> ...]
   [ "$CHECK" = 1 ] && return 0
   [ "${DEVLAB_WRENEW_HANDED_OUT:-0}" = 1 ] && return 0
   [ -w "$SBIN_DIR" ] && return 0
-  command -v "$SYSTEMD_RUN" >/dev/null 2>&1 \
-    || die "cannot write $SBIN_DIR — the devlab service confines it read-only (ProtectSystem=strict) and '$SYSTEMD_RUN' is not available to hand the renewal out of the service; the approved renewal cannot be installed" 4
-  local self
-  self="$(readlink -f -- "${BASH_SOURCE[0]}")" || die "cannot resolve this wrapper's own path to hand the renewal out" 4
   log "cannot write $SBIN_DIR from inside the service (ProtectSystem=strict) — handing the approved renewal out to a transient unit outside the cgroup (like the self-repo restart)"
-  # --wait: block and adopt the unit's exit status · --pipe: forward the unit's output back to the daemon
-  # that invoked us · --collect: reap the unit even on failure. --setenv carries the recursion marker and
-  # the already-resolved (pinned) paths so the transient unit measures the identical state. The FULL
-  # argument list of this renewal follows `--`, so the transient unit renews the same set in one atomic
-  # pass. A non-zero exit propagates out of this wrapper: the renewal fails with the transient unit's
-  # real reason.
-  "$SYSTEMD_RUN" --quiet --wait --pipe --collect \
-    --unit="devlab-wrapper-renew-$(date -u +%Y%m%dT%H%M%SZ)-$$" \
-    --setenv=DEVLAB_WRENEW_HANDED_OUT=1 \
-    --setenv="DEVLAB_STATE_DIR=$STATE_DIR" \
-    --setenv="DEVLAB_SBIN_DIR=$SBIN_DIR" \
-    --setenv="DEVLAB_WRAPPER_AUDIT_DIR=$WRENEW_AUDIT_DIR" \
-    -- "$self" --renew-wrapper "$@"
-  exit $?
+  # The recursion marker plus the already-resolved (pinned) paths, so the transient unit measures the
+  # identical state. The FULL argument list of this renewal follows, so the transient unit renews the
+  # same set in ONE atomic pass.
+  HANDOUT_ENV=(
+    --setenv=DEVLAB_WRENEW_HANDED_OUT=1
+    --setenv="DEVLAB_STATE_DIR=$STATE_DIR"
+    --setenv="DEVLAB_SBIN_DIR=$SBIN_DIR"
+    --setenv="DEVLAB_WRAPPER_AUDIT_DIR=$WRENEW_AUDIT_DIR"
+  )
+  hand_out_of_cgroup wrapper-renew "the approved renewal" --renew-wrapper "$@"
+}
+
+# maybe_hand_out_setup — THE SAME ESCAPE, for the other operation the service is confined out of:
+# setting a service up on this host for the FIRST time.
+#
+# Setting a service up writes three things that are NOT in the devlab service's ReadWritePaths, and
+# deliberately so — standing write over them would let the service grant itself system identity and
+# rights unattended:
+#   * the ACCOUNT DATABASE (/etc/passwd, /etc/shadow, /etc/group) — `useradd` for the service's own
+#     nologin account, `groupadd` for the hp_* groups its rights manifest declares;
+#   * the RIGHTS DIRECTORY (/etc/holistic/permissions.d) — the manifest the central rights management
+#     reads;
+#   * the SECRET DIRECTORY (/etc/holistic) — the instance secrets this host mints for the service.
+# ProtectSystem=strict makes all three read-only for the service AND for every child it starts, this
+# root-raised wrapper included, so the setup died at its very first write with
+# "useradd: cannot lock /etc/passwd; try again later." — a message about rights the host cannot grant,
+# not about a busy database. Every service that was already installed had its account from an earlier
+# era, so the capability was never exercised until the first genuinely new service arrived and found it
+# missing (measured 2026-08-09, the seventh halt of the same family).
+#
+# The fix is the one the wrapper renewal already established and NOT a wider sandbox: run the SAME
+# install outside the cgroup, in a transient unit, where /etc is what it really is. The whole invocation
+# goes out as ONE pass — never a per-write escape — because a half-escaped setup is what made the
+# wrapper renewal fail file-by-file in the first place (2026-08-08). Out there the tool re-runs its
+# entire validation cascade before it writes anything: root re-verifies, it does not trust the confined
+# caller.
+#
+# WHICH paths this invocation needs is MEASURED, never inferred from the shape of the call: the account
+# database only when an account will really be created, the rights directory only when a manifest will
+# really be installed, the secret directory only when the unit that will be in place demands a secret
+# this host does not already have. Whether each is reachable is measured too (setup_path_writable), so
+# on a host where the wrapper is NOT confined — the production receiver, an unconfined root install, a
+# direct-invocation test — nothing is handed out and nothing changes.
+maybe_hand_out_setup() {
+  [ "$CHECK" = 1 ] && return 0                              # a dry run writes nothing, so it escapes nothing
+  [ "${DEVLAB_SETUP_HANDED_OUT:-0}" = 1 ] && return 0       # we ARE the transient unit — do the work
+
+  local need=() blocked="" p u
+  # 1) THE ACCOUNT DATABASE — asked of the host (`getent`), not derived from "this looks like a first
+  #    install": an account left behind by an earlier partial setup needs no write here.
+  if [ "$FIRST_TIME" = 1 ] && ! "$GETENT" passwd "$REPO" >/dev/null 2>&1; then
+    need+=("$SETUP_ACCOUNT_DB_DIR")
+  fi
+  # 2) THE RIGHTS DIRECTORY, plus the account database again for the hp_* groups the manifest declares.
+  if [ "$FIRST_TIME" = 1 ] && [ -n "$MANIFEST" ]; then
+    need+=("$PERMS_DIR" "$SETUP_ACCOUNT_DB_DIR")
+  fi
+  # 3) THE SECRET DIRECTORY — read from the unit that WILL be in place (the installed one on an update,
+  #    the delivered one at first-time setup), because a secret already on this host is left exactly as
+  #    it is and needs no write. An update is therefore NOT excluded by its kind: a unit that newly
+  #    demands a secret this host lacks escapes for the same measured reason a first-time setup does.
+  #    When no unit is readable yet, a first-time setup will generate one that demands the shared
+  #    secret, so the need is taken as given rather than guessed away.
+  u=""
+  if [ -r "$UNIT_FILE" ]; then
+    u="$UNIT_FILE"
+  elif [ "$DELIVERED_SETUP" = 1 ] && [ -r "$SETUP_SRC/${UNIT_NAME}.service" ]; then
+    u="$SETUP_SRC/${UNIT_NAME}.service"
+  fi
+  if [ -n "$u" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      [ -e "$p" ] || { need+=("$SETUP_HOLISTIC_DIR"); break; }
+    done <<EOF
+$(setup_unit_secret_files "$u")
+EOF
+  elif [ "$FIRST_TIME" = 1 ]; then
+    need+=("$SETUP_HOLISTIC_DIR")
+  fi
+
+  [ "${#need[@]}" -gt 0 ] || return 0
+  for p in "${need[@]}"; do
+    setup_path_writable "$p" && continue
+    case " $blocked " in *" $p "*) continue ;; esac      # name each unreachable path once
+    blocked="${blocked:+$blocked }$p"
+  done
+  [ -n "$blocked" ] || return 0
+
+  # The transient unit starts in systemd's own working directory, not this one, so a relative artifact
+  # path would resolve somewhere else out there. That difference is refused by name rather than left to
+  # surface as a confusing "staged binary missing" from the other side of the boundary.
+  case "$ARTIFACT" in
+    /*) : ;;
+    *)  die "cannot hand the setup of '$REPO' out of the service: the artifact path '$ARTIFACT' is relative and the transient unit outside the cgroup starts in a different working directory — pass an absolute artifact path" 2 ;;
+  esac
+
+  log "setting '$REPO' up on this host must write $blocked, which the devlab service confines read-only (ProtectSystem=strict) — handing the whole install out to a transient unit outside the cgroup, exactly as an approved wrapper renewal is handed out"
+  # ONLY the recursion marker crosses: every path the transient unit uses is re-derived from its own
+  # root-owned defaults, so nothing the confined caller could have set redirects root's writes.
+  HANDOUT_ENV=(--setenv=DEVLAB_SETUP_HANDED_OUT=1)
+  hand_out_of_cgroup "setup-$REPO" "the setup of '$REPO'" "${ORIG_ARGV[@]}"
 }
 
 # renew_wrapper installs ONE approval — which may cover SEVERAL wrapper files — as ONE UNIT: either every
@@ -742,6 +855,14 @@ case "$KIND" in
     if [ "$CHECK" = 1 ]; then echo "PLAN: pre-copy gate — bundled python $PYSELF verified runnable on this host"; else log "python-app '$REPO': bundled python $PYSELF verified runnable on this host"; fi
     ;;
 esac
+
+# THE BOUNDARY BETWEEN CHECKING AND WRITING. Everything above this line only reads and judges; the first
+# effect on this host happens below it. So this is where the install asks whether it can reach the paths
+# it is about to write, and — if the devlab service's sandbox confines it out of them — hands the whole
+# install out to a transient unit outside the cgroup and exits with its result. Placed here, nothing has
+# been written yet when the escape is taken, so the handed-out run is a clean, complete install and never
+# a continuation of a half-done one.
+maybe_hand_out_setup
 
 # UNIT_FILE / UNIT_NAME / DELIVERED_SETUP / FIRST_TIME / MANIFEST were decided in the validation cascade
 # (step 5) — systemd was asked about the delivered unit name, the account was judged and the manifest was

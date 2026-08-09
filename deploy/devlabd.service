@@ -189,12 +189,26 @@ UMask=0027
 #                         deploy/devlab-install (maybe_hand_out_renewal). Before that existed, an approved
 #                         renewal hit "mktemp: Read-only file system" and the same question came back in a
 #                         loop (measured 2026-08-06).
-# KNOWN, NOT YET CLOSED — the SAME class, named so nobody rediscovers it by running into it (task point
-# 5). First-time setup of a FOREIGN service writes three paths that are ALSO read-only here, so it would
-# fail the same way the wrapper renewal did, and the right fix is the same hand-out, never adding these to
-# the list (that would hand the service standing write over system identity and rights):
-#   /etc/passwd,/etc/shadow,/etc/group   useradd/groupadd for the new service account (setup_ensure_account)
-#   /etc/holistic/permissions.d          the service's rights manifest copied in at first-time setup
+#   /etc                  the ACCOUNT DATABASE (/etc/passwd, /etc/shadow, /etc/group). useradd and groupadd
+#                         create their lock files BESIDE those files, so the directory itself must be
+#                         writable; read-only, an otherwise privileged useradd prints "cannot lock
+#                         /etc/passwd; try again later." — a message about a right the sandbox withholds,
+#                         not about a busy database. Standing write here would let the service mint system
+#                         identities unattended, so setting a service up is handed out instead
+#                         (deploy/devlab-install, maybe_hand_out_setup).
+#   /etc/holistic         the shared landscape directory: permissions.d/<repo>.json, the rights manifest
+#                         the central rights management reads, and the instance secrets this host mints
+#                         for a service (setup_install_rights, setup_ensure_secrets). Standing write here
+#                         would let the service grant itself rights, so it leaves through the same hand-out.
+# All three lie behind ONE escape and not three: the whole install re-enters outside the cgroup in a single
+# pass, because a half-escaped operation is exactly what made the wrapper renewal fail file-by-file
+# (2026-08-08). Every check runs again out there — root re-verifies, it does not trust the confined caller.
+#
+# This was the SEVENTH halt of one family (measured 2026-08-09): every service already on this host carried
+# its account from an earlier era, so the chain's ability to set a NEW service up had never once been
+# exercised. It was not broken; it was untried. A capability that no delivery has ever run is not proven by
+# the deliveries that did not need it.
+#
 # Two more paths must lie UNDER a writable root above (they are instance configuration, not literals
 # here): the holistic dashboard checkout and its serve root, which the confined ui rebuild/serve writes —
 # place them under /opt or /var/lib, or that step fails read-only the same way.

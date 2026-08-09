@@ -480,6 +480,38 @@ ${label} {
 EDGE
 }
 
+# ── can this process WRITE there, in THIS mount namespace? ───────────────────────────────────────────
+# A systemd unit with ProtectSystem=strict mounts the whole hierarchy read-only apart from its
+# ReadWritePaths, and that mount namespace is inherited by EVERY child the unit starts — a child that
+# sudo raised to root included. Against a read-only mount point, being root does not help: the write
+# fails with EROFS no matter who attempts it. So "may I write there" is a question about the NAMESPACE,
+# not about rights, and it has to be MEASURED rather than derived from the fact that we are root.
+#
+# access(2) — which `test -w` calls — answers exactly that question: for root it passes the permission
+# bits but still returns EROFS on a read-only mount. That is what makes a plain `-w` the honest probe,
+# and it is the probe the approved wrapper renewal has used since 2026-08-06.
+#
+# The path asked about need not exist yet (a first-time setup writes into directories it also creates),
+# so the probe walks up to the nearest EXISTING ancestor: creating /etc/holistic/permissions.d requires
+# /etc to be writable, and that is precisely what is asked. Returns 0 when writable, 1 when not.
+setup_path_writable() {
+  local p="${1:-}" parent
+  [ -n "$p" ] || return 1
+  while [ ! -e "$p" ]; do
+    parent="$(dirname -- "$p")"
+    [ "$parent" = "$p" ] && break
+    p="$parent"
+  done
+  [ -w "$p" ]
+}
+
+# The directory the ACCOUNT DATABASE lives in. `useradd`/`groupadd` do not merely rewrite /etc/passwd,
+# /etc/shadow and /etc/group — they first create their lock files (/etc/passwd.lock …) BESIDE them, so
+# the directory itself must be writable. A read-only /etc is exactly what makes an otherwise privileged
+# `useradd` print "cannot lock /etc/passwd; try again later." Named here so the one probe above can be
+# aimed at it, and overridable only as a direct-invocation test seam like every other path here.
+SETUP_ACCOUNT_DB_DIR="${DEVLAB_ACCOUNT_DB_DIR:-/etc}"
+
 # ── system-account creation: serialised, and resilient to a momentarily-held account database ────────
 # Creating the service account writes /etc/passwd (and /etc/group), and the tool that does it —
 # `useradd` — takes a short EXCLUSIVE lock on those files while it writes. When two first-time setups
