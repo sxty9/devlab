@@ -31,6 +31,7 @@
 #     sudo /path/to/deploy/devlab-install-recv [service ...]                       # refresh receiver
 #     sudo /path/to/deploy/devlab-install-recv --provision \
 #          --deploy-pubkey <path|-|literal> --edge-address <host:port|:port> [--recv-user <user>] \
+#          [--edge-host <id>=<name> ...] \
 #          [--staging <dir>] [--caddyfile <file>] [--no-pkg] \
 #          [--overlay-address <cidr> --overlay-listen-port <port> \
 #           --overlay-peer-pubkey <key|path|-> --overlay-peer-allowed <cidr> \
@@ -46,6 +47,17 @@
 # production-side sxgate) reads the SAME file. There is NO baked-in default and neither side guesses the
 # other's — a missing declaration is a NAMED deficiency, not a silent ":80". Ask the declaration with:
 #     devlab-install-recv --print-edge-address        # prints the address the routing layer forwards to
+#
+# AND THE HOSTNAMES ARE DECLARED HERE TOO. Behind that one socket several ROOT APPLICATIONS stand side by
+# side — the landscape dashboard, and on equal footing an application like DevLab — and they are told
+# apart by the NAME the caller asked for. Which name belongs to which application is an instance value,
+# so it is declared on the host, one file per application under /etc/holistic/edge/hosts, written by a
+# repeatable --edge-host <id>=<name>. The PACKAGE declares its role (holistic-service.json, edge.role),
+# the HOST declares its name, and neither can state the other's half. An application for which this host
+# names no hostname is not silently given one: its delivery fails BY NAME. E.g.
+#     sudo ./deploy/devlab-install-recv --provision --deploy-pubkey /root/deploy.pub \
+#          --edge-address 10.10.0.1:8080 \
+#          --edge-host holistic=<dashboard name> --edge-host devlab=<devlab name>
 #
 #   3. --overlay-here: catch up THIS (home/chain) host's side of the production overlay after the far
 #      side was rebuilt — swap in the far side's NEW public key and PROVE the tunnel. Same script, no
@@ -150,6 +162,13 @@ PRINT_EDGE_ADDRESS=0  # query mode: print the ONE declared edge address (what th
 DEPLOY_PUBKEY=""      # PUBLIC deploy key: a path, '-' for stdin, or the literal key line
 EDGE_ADDRESS=""       # where this environment's edge answers (Caddy site addr / forward target, host:port|:port)
 EDGE_BUILT=0          # set to 1 when ensure_caddy built/holds OUR shell (so its site label IS $EDGE_ADDRESS)
+# --edge-host <id>=<name>, repeatable: WHICH hostname each ROOT APPLICATION answers to. An application
+# that owns a whole hostname (the landscape dashboard, DevLab) is reached by NAME and by nothing else, and
+# the name is an instance value: it lives in this host's runtime configuration and never in a repository.
+# The package declares its ROLE, the host declares its NAME — and that split is what keeps a package from
+# declaring itself a root application and thereby taking the instance over: without a name here, its
+# delivery fails BY NAME. A value that is absent is NEVER a default; there is no name to fall back to.
+declare -a EDGE_HOSTS=()
 RECV_USER="root"      # the account whose authorized_keys carries the forced command (the deploy login)
 USE_PKG=1             # ask the package manager for a missing OS prerequisite (idempotent, fail-closed)
 # Overlay transport (same entry point — Keine ähnlichen Geschwister; there is no second script for it).
@@ -172,6 +191,8 @@ while [ "$#" -gt 0 ]; do
     --print-edge-address) PRINT_EDGE_ADDRESS=1; shift ;;
     --edge-address)   EDGE_ADDRESS="${2:-}"; shift 2 ;;
     --edge-address=*) EDGE_ADDRESS="${1#*=}"; shift ;;
+    --edge-host)      EDGE_HOSTS+=("${2:-}"); shift 2 ;;
+    --edge-host=*)    EDGE_HOSTS+=("${1#*=}"); shift ;;
     --deploy-pubkey)  DEPLOY_PUBKEY="${2:-}"; shift 2 ;;
     --deploy-pubkey=*) DEPLOY_PUBKEY="${1#*=}"; shift ;;
     --recv-user)      RECV_USER="${2:-}"; shift 2 ;;
@@ -372,25 +393,47 @@ ensure_roots() {
 
 # caddy_validates_with_probe — PROVE the edge accepts a route, not merely that it parses empty (an empty
 # edge validates even when its shape cannot hold a single delivered route — the exact defect this fixes).
-# A probe route (the very shape setup_route_text emits) is dropped into the route directory, the ASSEMBLED
-# edge is validated with it present, and the probe is ALWAYS removed. Returns caddy's verdict. Requires
-# the real caddy; callers gate it behind the test seam. If a probe cannot be written, that is itself a
-# failure (return 2), never a silent pass.
+# BOTH shelves are probed, and that is not thoroughness but necessity: MEASURED against caddy 2.11.4, a
+# BROKEN fragment on the services shelf validates clean while no application imports that shelf ("Valid
+# configuration"), because nothing ever parses it. A service probe alone would therefore prove exactly
+# nothing about the shelf every uniform service lands on. So an APP probe (a whole site block on a
+# throwaway hostname, carrying the services import) is placed beside it, and only their combination
+# exercises the shape a delivered route actually meets. Both are ALWAYS removed. Returns caddy's verdict;
+# a probe that cannot be written is itself a failure (return 2), never a silent pass.
 caddy_validates_with_probe() {
-  local probe="$CADDY_CONF/zz-devlab-provision-probe.caddy"
-  setup_route_text "devlabprovisionprobe" "$CADDY_PROBE_PORT" > "$probe" 2>/dev/null \
-    || { rm -f -- "$probe"; return 2; }
-  local rc=0
+  local svc_probe app_probe rc=0
+  svc_probe="$(setup_edge_services_dir "$CADDY_CONF")/zz-devlab-provision-probe.caddy"
+  app_probe="$(setup_edge_apps_dir "$CADDY_CONF")/zz-devlab-provision-probe.caddy"
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0755 "$(dirname -- "$svc_probe")" "$(dirname -- "$app_probe")" 2>/dev/null || return 2
+  local port="${EDGE_ADDRESS##*:}"
+  setup_route_text "devlabprovisionprobe" "$CADDY_PROBE_PORT" > "$svc_probe" 2>/dev/null \
+    || { rm -f -- "$svc_probe"; return 2; }
+  # The throwaway hostname is deliberately in the reserved `.invalid` TLD: it can never collide with a
+  # real name of this instance, and the block exists only for the length of one `caddy validate`.
+  setup_app_route_text "devlabprovisionprobe" "probe.devlab.invalid" "$port" "$CADDY_PROBE_PORT" "$ROOT_APP_WWW" 1 > "$app_probe" 2>/dev/null \
+    || { rm -f -- "$svc_probe" "$app_probe"; return 2; }
   "$CADDY_BIN" validate --config "$CADDY_MAIN" >/dev/null 2>&1 || rc=1
-  rm -f -- "$probe"
+  rm -f -- "$svc_probe" "$app_probe"
   return "$rc"
 }
 
-# edge_imports_holistic_routes <file> — true when the edge already pulls in our route directory (the
-# grown holistic edge, e.g. the home host, does this inside its site block). Matched loosely so a grown
-# file that imports the same directory under a slightly different spelling still counts.
+# edge_imports_holistic_routes <file> — true when the edge already pulls in our shelves (our own shell
+# imports the apps shelf at top level; a grown holistic edge, e.g. the home host, imports the route
+# directory inside its site block). Matched loosely so a grown file that imports the same directory under
+# a slightly different spelling still counts — but it MUST also recognise our own current shell, or the
+# host would take its own new edge for a foreign one and refuse to touch it.
 edge_imports_holistic_routes() {
-  grep -Eq "^[[:space:]]*import[[:space:]]+.*${CADDY_CONF//\//\\/}/\*\.caddy" -- "$1" 2>/dev/null
+  local conf="${CADDY_CONF//\//\\/}"
+  grep -Eq "^[[:space:]]*import[[:space:]]+.*${conf}(/apps|/services)?/\*\.caddy" -- "$1" 2>/dev/null
+}
+
+# edge_imports_holistic_routes_shelves <file> — the STRICTER question: does this edge import the two
+# SHELVES a delivered part actually lands on? An edge can import the flat route directory (and so count
+# as a grown holistic edge, above) and still receive nothing, because nothing is dropped there any more.
+edge_imports_holistic_routes_shelves() {
+  grep -Fq -- "import $(setup_edge_apps_dir "$CADDY_CONF")/*.caddy" -- "$1" 2>/dev/null \
+    && grep -Fq -- "import $(setup_edge_services_dir "$CADDY_CONF")/*.caddy" -- "$1" 2>/dev/null
 }
 
 # ensure_edge_address — establish the ONE declaration of where this environment's edge answers, and set
@@ -427,6 +470,43 @@ ensure_edge_address() {
   fi
 }
 
+# ensure_edge_hosts — write the hostnames this host declares for its ROOT APPLICATIONS, one file per
+# application under $SETUP_EDGE_HOSTS_DIR, from every --edge-host <id>=<name> given. It is the twin of
+# ensure_edge_address in every respect: the value is validated for shape before it is written, the old
+# file is backed up first (so a rollback restores the host exactly), writing the same value again changes
+# nothing, and a name is NEVER invented — an application for which no --edge-host was given simply keeps
+# whatever this host already declares, or none.
+#
+# It is deliberately NOT part of the edge shell. The shell holds no application, and each application's
+# site block is written when that application is DELIVERED — which is the only moment its upstream port
+# and its serve root are known. What is established here is only the NAME, ahead of any delivery.
+ensure_edge_hosts() {
+  [ "${#EDGE_HOSTS[@]}" -eq 0 ] && return 0
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  install -d "${own[@]}" -m 0755 "$SETUP_EDGE_HOSTS_DIR"
+  local spec id name file have
+  for spec in "${EDGE_HOSTS[@]}"; do
+    case "$spec" in
+      *=*) id="${spec%%=*}"; name="${spec#*=}" ;;
+      *) die "--edge-host takes <id>=<name> (the application's id and the hostname it answers to), got '$spec'" ;;
+    esac
+    setup_valid_repo_shape "$id" \
+      || die "--edge-host '$spec': '$id' is not a service id — the file is named after the application it belongs to"
+    setup_valid_edge_host "$name" \
+      || die "--edge-host '$spec': '$name' is not a hostname (letters, digits, dots and hyphens, at least one dot)"
+    file="$SETUP_EDGE_HOSTS_DIR/$id"
+    have="$(setup_edge_host "$id" 2>/dev/null || true)"
+    if [ "$have" = "$name" ]; then
+      log "edge hostname of '$id' already declared as '$name' in $file — left untouched"
+      continue
+    fi
+    backup_file "$file"   # notes absence too, so a rollback removes a file we create
+    printf '# Managed by devlab-install-recv — the hostname the root application '\''%s'\'' answers to on\n# this host. An instance value: it lives here and never in a repository. A package declares its\n# ROLE (holistic-service.json, edge.role); this host declares its NAME.\n%s\n' "$id" "$name" > "$file"
+    [ "${DEVLAB_RECV_TEST:-0}" != 1 ] && chmod 0644 "$file"
+    log "declared the edge hostname of the root application '$id' as '$name' in $file"
+  done
+}
+
 # ensure_caddy — the edge, built in THE shape the delivered routes require. Caddy must be installed and
 # its route directory must exist; the main Caddyfile must be a SITE BLOCK that imports that directory
 # from INSIDE it (setup_edge_caddyfile_text — the one source, shared with the route it contains), not a
@@ -441,10 +521,62 @@ ensure_edge_address() {
 #   * any other foreign Caddyfile               → NAMED and refused (never destroyed).
 # Every replacement backs the old file up first; the assembled edge is proven to validate WITH a route
 # before the running edge is touched, so a bad shape never reaches the live edge (fail-closed).
+# migrate_edge_layout — THE ONE-TIME, SELF-HEALING MOVE of a flat route directory onto the two shelves.
+#
+# This is the single most dangerous moment of the whole change, and that is exactly why it is CODE and not
+# a paragraph in a manual. The new edge shell imports $CADDY_CONF/apps and $CADDY_CONF/services and
+# nothing else. A host whose delivered routes still lie FLAT in $CADDY_CONF would, the instant the new
+# shell is written, stop importing every one of them — and answer 404 for every service it carries. A
+# half-performed move is worse than either state, so the move happens in the same run as the new shell,
+# before it, and by rule rather than by hand:
+#
+#   * a file containing `handle /api/services/` is a uniform service fragment → MOVED to services/, byte
+#     for byte. Nothing about it changes; only which shelf it stands on.
+#   * a file containing a naked `handle /api/*` is one of the two colliding blocks this whole change
+#     exists to end (measured on production 2026-08-09: devlab.caddy and holistic.caddy both claimed it,
+#     and the alphabet decided). It cannot be moved: as a fragment it carries no hostname and no serve
+#     root, so there is nothing to turn it into. It is REMOVED, and its successor comes into being as a
+#     proper site block the next time that application is delivered — which is why the route step now
+#     runs on every install and not only at first-time setup.
+#   * anything else flat in $CADDY_CONF is left exactly where it is and NAMED. It is not ours to move.
+#
+# Every file it touches is backed up first, so the run's rollback restores the host exactly.
+migrate_edge_layout() {
+  local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
+  local services apps f base moved=0 dropped=0 left=""
+  services="$(setup_edge_services_dir "$CADDY_CONF")"
+  apps="$(setup_edge_apps_dir "$CADDY_CONF")"
+  install -d "${own[@]}" -m 0755 "$services" "$apps"
+  for f in "$CADDY_CONF"/*.caddy; do
+    [ -f "$f" ] || continue
+    base="$(basename -- "$f")"
+    if grep -q 'handle[[:space:]]*/api/services/' -- "$f" 2>/dev/null; then
+      backup_file "$f"
+      install "${own[@]}" -m 0644 "$f" "$services/$base" || die "could not move the service route $f onto the services shelf"
+      rm -f -- "$f"
+      moved=$((moved + 1))
+    elif grep -qE 'handle[[:space:]]*/api/\*' -- "$f" 2>/dev/null; then
+      backup_file "$f"
+      rm -f -- "$f"
+      dropped=$((dropped + 1))
+      log "removed the flat route $f — a naked 'handle /api/*' fragment is what made two root applications share one site block; '${base%.caddy}' gets a site block of its own on its declared hostname the next time it is delivered"
+    else
+      left="${left:+$left, }$base"
+    fi
+  done
+  [ "$moved" = 0 ] || log "moved $moved delivered service route(s) from $CADDY_CONF onto the services shelf $services (unchanged, only relocated)"
+  [ "$dropped" = 0 ] || log "removed $dropped colliding root-application fragment(s); each is backed up and its successor is a site block written at the next delivery"
+  [ -z "$left" ] || log "left untouched in $CADDY_CONF (not ours to move, and no longer imported by the edge — check them): $left"
+}
+
 ensure_caddy() {
   command -v "$CADDY_BIN" >/dev/null 2>&1 || pkg_install caddy
   local own=(-o root -g root); [ "${DEVLAB_RECV_TEST:-0}" = 1 ] && own=()
   install -d "${own[@]}" -m 0755 "$CADDY_CONF" && log "edge route dir ready: $CADDY_CONF"
+  # The shelves the new shell imports, and the one-time move of anything still lying flat beside them.
+  # It runs BEFORE the shell is written so the two never disagree for even one moment, and it is
+  # idempotent: on a host that is already laid out this way it finds nothing to move.
+  migrate_edge_layout
 
   local desired
   desired="$(setup_edge_caddyfile_text "$CADDY_CONF" "$EDGE_ADDRESS")" \
@@ -780,6 +912,7 @@ if [ "$PROVISION" = 1 ]; then
   ensure_rrsync
   ensure_roots
   ensure_edge_address
+  ensure_edge_hosts
   ensure_caddy
   install_forced_command "$PUBKEY"
   sweep_dead_prod_target
@@ -794,6 +927,9 @@ else
   # A host that was provisioned EARLIER carries the edge of that day. The receiver refresh is the hand
   # step this host already needs (the receiver cannot deliver itself), so the edge it serves the instance
   # root from catches up in the same run — see refresh_managed_edge for what it will and will not touch.
+  # The hostnames its root applications answer to are established in the SAME run, and by the same flag,
+  # so an already-provisioned host does not have to be provisioned again just to be given a name.
+  ensure_edge_hosts
   refresh_managed_edge
 fi
 
@@ -873,7 +1009,34 @@ if [ "$PROVISION" = 1 ]; then
   if [ -f "$ROOT_APP_WWW/index.html" ]; then
     sc_ok "root application '$SETUP_ROOT_APP' is installed — the instance root serves its dashboard"
   else
-    sc_note "root application '$SETUP_ROOT_APP' is NOT yet on this host — the instance root answers 503 naming it, and no other service's interface is served in its place; deliver '$SETUP_ROOT_APP' to complete the host"
+    sc_note "root application '$SETUP_ROOT_APP' is NOT yet on this host — its hostname answers 503 naming it, and no other application's interface is served in its place; deliver '$SETUP_ROOT_APP' to complete the host"
+  fi
+fi
+
+# 5b. WHO ANSWERS TO WHICH NAME. A root application is reached under a hostname and under nothing else, so
+#     two facts decide whether this host is reachable at all, and BOTH are stated rather than assumed:
+#       * a name is declared for it (this script writes those, from --edge-host);
+#       * one installed application carries the DASHBOARD role — the uniform services hang under it, and
+#         under no other name. If none does, all of them are unreachable from outside. That is a state
+#         somebody must be told about, not one to be discovered later through fifteen 404s.
+if [ "$PROVISION" = 1 ] || [ "${#EDGE_HOSTS[@]}" -gt 0 ]; then
+  declared_names=""
+  if [ -d "$SETUP_EDGE_HOSTS_DIR" ]; then
+    for hf in "$SETUP_EDGE_HOSTS_DIR"/*; do
+      [ -f "$hf" ] || continue
+      hn="$(setup_edge_host "$(basename -- "$hf")" 2>/dev/null || true)"
+      [ -n "$hn" ] && declared_names="${declared_names:+$declared_names, }$(basename -- "$hf")=$hn"
+    done
+  fi
+  if [ -n "$declared_names" ]; then
+    sc_ok "root-application hostnames declared on this host ($SETUP_EDGE_HOSTS_DIR): $declared_names"
+  else
+    sc_note "this host declares NO hostname for any root application ($SETUP_EDGE_HOSTS_DIR is empty) — the landscape dashboard and every application beside it would be unreachable from outside, and their deliveries will fail by name; declare them with --edge-host <id>=<name>"
+  fi
+  if grep -rqE '^[[:space:]]*import[[:space:]]+holistic_service_routes[[:space:]]*$' "$(setup_edge_apps_dir "$CADDY_CONF")" 2>/dev/null; then
+    sc_ok "one application carries the landscape's services (edge.role=dashboard) — the uniform services are reachable under its name"
+  else
+    sc_note "no installed application carries the landscape's services yet (none delivered with edge.role=dashboard) — every uniform service on this host is unreachable from outside until '$SETUP_ROOT_APP' is delivered declaring that role"
   fi
 fi
 
@@ -882,13 +1045,27 @@ fi
 if [ "$PROVISION" = 1 ]; then
   if [ "${DEVLAB_RECV_TEST:-0}" = 1 ]; then
     sc_skip "caddy validation (test seam has no caddy) — edge shape checked textually below"
-    if grep -Fq -- "import ${CADDY_CONF}/*.caddy" "$CADDY_MAIN" 2>/dev/null && grep -Eq '^[^#]*\{[[:space:]]*$' "$CADDY_MAIN" 2>/dev/null; then
-      sc_ok "edge is a site block importing $CADDY_CONF ($CADDY_MAIN)"
+    edge_shelves_ok=1
+    grep -Fq -- "import $(setup_edge_apps_dir "$CADDY_CONF")/*.caddy" "$CADDY_MAIN" 2>/dev/null || edge_shelves_ok=0
+    grep -Fq -- "import $(setup_edge_services_dir "$CADDY_CONF")/*.caddy" "$CADDY_MAIN" 2>/dev/null || edge_shelves_ok=0
+    if [ "$edge_shelves_ok" = 1 ]; then
+      sc_ok "edge imports both shelves — root applications from $(setup_edge_apps_dir "$CADDY_CONF"), uniform services from $(setup_edge_services_dir "$CADDY_CONF") ($CADDY_MAIN)"
+    elif [ "$EDGE_BUILT" = 1 ]; then
+      sc_fail "edge does not import both shelves ($CADDY_MAIN)"
     else
-      sc_fail "edge does not import $CADDY_CONF from inside a site block ($CADDY_MAIN)"
+      # A GROWN edge is never overwritten — but it is also not silently credited. It imports the flat
+      # route directory of an older layout, and delivered parts no longer land there, so it would receive
+      # none of them. Naming it is the whole difference between a kept edge and a broken one.
+      sc_note "the grown edge at $CADDY_MAIN imports the flat $CADDY_CONF and NOT the two shelves the deliveries now land on — it is left exactly as it stands (a hand-grown edge is never overwritten), but until it imports $(setup_edge_apps_dir "$CADDY_CONF")/*.caddy at top level and $(setup_edge_services_dir "$CADDY_CONF")/*.caddy from inside the dashboard's block, no delivered route reaches it"
     fi
   elif command -v "$CADDY_BIN" >/dev/null 2>&1 && caddy_validates_with_probe; then
-    sc_ok "edge configuration validates WITH a delivered route ($CADDY_MAIN)"
+    if [ "$EDGE_BUILT" = 1 ] || edge_imports_holistic_routes_shelves "$CADDY_MAIN"; then
+      sc_ok "edge configuration validates WITH a delivered route ($CADDY_MAIN)"
+    else
+      # It validated — but the probes it validated over are on shelves this edge does not import, so the
+      # verdict is about an edge that never saw them. Said as it is, rather than read as a green result.
+      sc_note "the grown edge at $CADDY_MAIN validates, but it imports the flat $CADDY_CONF and NOT the two shelves the deliveries now land on — it is left exactly as it stands, but until it imports $(setup_edge_apps_dir "$CADDY_CONF")/*.caddy at top level and $(setup_edge_services_dir "$CADDY_CONF")/*.caddy from inside the dashboard's block, no delivered route reaches it"
+    fi
     command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet caddy && sc_ok "caddy is active" || sc_fail "caddy is not active"; }
   else
     sc_fail "edge configuration does not validate WITH a delivered route ($CADDY_MAIN) — a route dropped into $CADDY_CONF could not take effect"
@@ -908,10 +1085,21 @@ if [ "$PROVISION" = 1 ]; then
     # A grown edge we left untouched carries the operator's own site address; we do not govern its label.
     # The declaration is still established, so the routing layer reads the same address the operator runs.
     sc_ok "edge address declared as $EDGE_ADDRESS ($EDGE_ADDRESS_FILE); a grown edge at $CADDY_MAIN was kept as is, so its own site address stands and the routing layer reads the declaration"
-  elif grep -Fq -- "$EDGE_ADDRESS {" "$CADDY_MAIN" 2>/dev/null; then
-    sc_ok "edge answers on the ONE declared address $EDGE_ADDRESS ($EDGE_ADDRESS_FILE) — the routing layer reads the same"
   else
-    sc_fail "the edge at $CADDY_MAIN is not a site block on the declared address $EDGE_ADDRESS"
+    # THE EDGE ANSWERS ON THE DECLARED ADDRESS AND BINDS NOTHING ELSE. Two facts, both read off the file:
+    # every site label carries the declared PORT, and — when the declaration names a host part — the shell
+    # binds exactly that address. The second is not cosmetic: MEASURED against caddy 2.11.4, a site block
+    # without `default_bind` binds *:<port>, which on a host whose edge is meant to answer only on its
+    # private overlay address would place every application on the public internet, past the tunnel that
+    # is supposed to front it.
+    edge_port="${EDGE_ADDRESS##*:}"; edge_bind="${EDGE_ADDRESS%:*}"
+    if ! grep -Fq -- "http://:${edge_port} {" "$CADDY_MAIN" 2>/dev/null; then
+      sc_fail "the edge at $CADDY_MAIN does not answer on the declared port $edge_port"
+    elif [ -n "$edge_bind" ] && ! grep -Eq "^[[:space:]]*default_bind[[:space:]]+${edge_bind//./\\.}[[:space:]]*$" "$CADDY_MAIN" 2>/dev/null; then
+      sc_fail "the edge at $CADDY_MAIN does not bind the declared address $edge_bind — without it caddy binds every interface on port $edge_port"
+    else
+      sc_ok "edge answers on the ONE declared address $EDGE_ADDRESS ($EDGE_ADDRESS_FILE) and binds nothing else — the routing layer reads the same"
+    fi
   fi
 fi
 

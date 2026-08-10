@@ -9,6 +9,9 @@ package deploy
 // missing is NEVER triggered (fail-closed, no half-setup).
 
 import (
+	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,6 +171,10 @@ func provisionEnv(t *testing.T) (env map[string]string, sbin, staging, www, cadd
 		// provision runs that are not ABOUT the edge address read it and proceed; tests that ARE about the
 		// declaration clear it and pass --edge-address, or assert the fail-closed absence.
 		"DEVLAB_EDGE_ADDRESS_FILE": filepath.Join(root, "holistic", "edge-address"),
+		// And WHICH hostname each root application answers to — the other half of the same runtime
+		// configuration, at a fixture path for the same reason: a test must never write into the real
+		// /etc/holistic/edge/hosts, and a test host must be able to declare names of its own.
+		"DEVLAB_EDGE_HOSTS_DIR": filepath.Join(root, "holistic", "edge", "hosts"),
 	}
 	if err := os.MkdirAll(filepath.Join(root, "holistic"), 0o755); err != nil {
 		t.Fatal(err)
@@ -216,10 +223,20 @@ func TestProvisionBareHost(t *testing.T) {
 	if !strings.Contains(string(akb), "AAAAC3NzaC1lZDI1NTE5AAAAIFIXTURE") {
 		t.Errorf("authorized_keys must carry the deploy public key:\n%s", string(akb))
 	}
-	// The edge imports the route directory the receiver drops per-service .caddy files into.
+	// The edge imports the two SHELVES the receiver drops delivered parts onto: whole site blocks for
+	// root applications, naked fragments for uniform services. One flat directory is what made a
+	// fragment and a site block indistinguishable.
 	cb, _ := os.ReadFile(caddyMain)
-	if !strings.Contains(string(cb), "import "+filepath.Join(env["DEVLAB_CADDY_CONF"], "*.caddy")) {
-		t.Errorf("the Caddyfile must import the route directory:\n%s", string(cb))
+	for _, shelf := range []string{"apps", "services"} {
+		if !strings.Contains(string(cb), "import "+filepath.Join(env["DEVLAB_CADDY_CONF"], shelf, "*.caddy")) {
+			t.Errorf("the Caddyfile must import the %s shelf:\n%s", shelf, string(cb))
+		}
+	}
+	for _, shelf := range []string{"apps", "services"} {
+		d := filepath.Join(env["DEVLAB_CADDY_CONF"], shelf)
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Errorf("provisioning must create the %s shelf %s: %v", shelf, d, err)
+		}
 	}
 	if !strings.Contains(res.out, "all self-checks passed") {
 		t.Errorf("provisioning must end with a passing self-check:\n%s", res.out)
@@ -248,8 +265,13 @@ func TestProvisionIdempotent(t *testing.T) {
 		t.Errorf("the deploy key line must appear exactly once after a re-run, got %d:\n%s", n, string(akb))
 	}
 	cb, _ := os.ReadFile(caddyMain)
-	if n := strings.Count(string(cb), "import "); n != 1 {
-		t.Errorf("the edge import must appear exactly once after a re-run, got %d:\n%s", n, string(cb))
+	for _, once := range []string{
+		"import " + filepath.Join(env["DEVLAB_CADDY_CONF"], "apps", "*.caddy"),
+		"import " + filepath.Join(env["DEVLAB_CADDY_CONF"], "services", "*.caddy"),
+	} {
+		if n := strings.Count(string(cb), once); n != 1 {
+			t.Errorf("%q must appear exactly once after a re-run, got %d:\n%s", once, n, string(cb))
+		}
 	}
 }
 
@@ -283,13 +305,15 @@ func TestProvisionRefusesBadKey(t *testing.T) {
 }
 
 // ── the edge shape: the delivered routes must have a site block to live in ──────────────────────────
-// The receiver drops each service's route into the route directory as a NAKED `handle` block, valid in
-// Caddy only INSIDE a site block. Provisioning must therefore build the edge as a site block that
-// imports the route directory from inside it — not as a bare top-level import (the state that made
-// every first install fail with "ambiguous site definition" on a freshly built host).
+// The two kinds of delivered part are of two different SHAPES, and a Caddyfile treats them differently:
+// a uniform service's route is a NAKED `handle` fragment, valid only INSIDE a site block, while a root
+// application brings a WHOLE site block of its own, valid only at the TOP level. The shell must import
+// each where its kind is valid — that is the whole reason there are two shelves rather than one flat
+// directory, and one flat directory is what let two applications land in one site block and fight over
+// `/api/*` (measured on production 2026-08-09).
 
-// The built edge is a SITE BLOCK whose body imports the route directory — the import is indented inside
-// braces, never a bare top-level directive.
+// The built edge imports the apps shelf at TOP LEVEL (a site block is only valid there) and the services
+// shelf from INSIDE a snippet the dashboard application imports (a naked fragment is only valid there).
 func TestProvisionEdgeWrapsRoutesInSiteBlock(t *testing.T) {
 	env, _, _, _, caddyMain, _ := provisionEnv(t)
 	if res := runInstallRecv(t, env, "--provision", "--deploy-pubkey", testDeployPubKey); res.exit != 0 {
@@ -301,15 +325,24 @@ func TestProvisionEdgeWrapsRoutesInSiteBlock(t *testing.T) {
 	}
 	s := string(edge)
 	conf := env["DEVLAB_CADDY_CONF"]
-	// the import lives on an INDENTED line (inside the site block), never at column zero.
-	if !strings.Contains(s, "\n\timport "+conf+"/*.caddy") {
-		t.Errorf("the route import must be indented inside a site block, got:\n%s", s)
+	// the apps shelf is imported at COLUMN ZERO — a site block may stand nowhere else.
+	if !strings.Contains(s, "\nimport "+conf+"/apps/*.caddy") {
+		t.Errorf("the apps shelf must be imported at top level, got:\n%s", s)
 	}
-	// a site block opens and closes, and the static fallback is present (as a grown holistic host has).
-	for _, want := range []string{"{", "\n}", "file_server"} {
+	// the services shelf is imported INDENTED, inside the snippet an application pulls into its own block.
+	if !strings.Contains(s, "\n\timport "+conf+"/services/*.caddy") {
+		t.Errorf("the services shelf must be imported from inside a block, got:\n%s", s)
+	}
+	// The shell defines the three pieces a delivered part is built from, and answers for names nobody
+	// claimed. It serves no application of its own — a file_server in the SHELL is what used to make
+	// every hostname answer with the same page.
+	for _, want := range []string{"(holistic_service_routes) {", "(app_web) {", "(edge_absage) {", "import edge_absage"} {
 		if !strings.Contains(s, want) {
-			t.Errorf("the edge must be a site block with a file_server fallback (missing %q):\n%s", want, s)
+			t.Errorf("the edge shell must define %q:\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "\n\tfile_server") {
+		t.Errorf("the shell itself must serve no application (a file_server belongs in an app's own block):\n%s", s)
 	}
 }
 
@@ -333,8 +366,8 @@ func TestProvisionReplacesUbuntuExample(t *testing.T) {
 	if strings.Contains(string(edge), "/usr/share/caddy") {
 		t.Errorf("Ubuntu's example must be replaced, not kept:\n%s", string(edge))
 	}
-	if !strings.Contains(string(edge), "import "+env["DEVLAB_CADDY_CONF"]+"/*.caddy") {
-		t.Errorf("the replacement must import the route directory:\n%s", string(edge))
+	if !strings.Contains(string(edge), "import "+env["DEVLAB_CADDY_CONF"]+"/apps/*.caddy") {
+		t.Errorf("the replacement must import the apps shelf:\n%s", string(edge))
 	}
 	if !strings.Contains(res.out, "replaced Ubuntu's shipped example") {
 		t.Errorf("the replacement must be named:\n%s", res.out)
@@ -353,6 +386,9 @@ func TestProvisionKeepsGrownEdge(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// A grown edge is recognised by the fact that it imports OUR route directory from inside a site block
+	// — the flat spelling included, because that is exactly what a host grown before the two shelves
+	// existed carries. Recognising it is what keeps it from being mistaken for a foreign edge.
 	grown := "example.test {\n\timport " + conf + "/*.caddy\n\thandle /api/* {\n\t\treverse_proxy 127.0.0.1:9000\n\t}\n\thandle {\n\t\troot * /opt/holistic/www\n\t\tfile_server\n\t}\n}\n"
 	if err := os.WriteFile(caddyMain, []byte(grown), 0o644); err != nil {
 		t.Fatal(err)
@@ -411,8 +447,16 @@ func TestProvisionEdgeBoundToDeclaredAddress(t *testing.T) {
 		t.Fatalf("provisioning with a declared edge address must succeed, got %d\n%s", res.exit, res.out)
 	}
 	cb, _ := os.ReadFile(caddyMain)
-	if !strings.Contains(string(cb), testEdgeAddress+" {") {
-		t.Errorf("the edge must be a site block on the declared address %q, got:\n%s", testEdgeAddress, string(cb))
+	// Two halves of ONE declaration: the shell answers on the declared PORT, and it BINDS the declared
+	// address rather than every interface. MEASURED against caddy 2.11.4: without `default_bind` a site
+	// block binds *:<port>, which would put a host meant to answer only on its private overlay address
+	// onto the public internet, past the tunnel that is supposed to front it.
+	host, port, _ := strings.Cut(testEdgeAddress, ":")
+	if !strings.Contains(string(cb), "http://:"+port+" {") {
+		t.Errorf("the edge must answer on the declared port %q, got:\n%s", port, string(cb))
+	}
+	if !strings.Contains(string(cb), "default_bind "+host) {
+		t.Errorf("the edge must bind the declared address %q and nothing else, got:\n%s", host, string(cb))
 	}
 	// It must NOT fall back to the old baked-in :80 (the very bug — the edge answering where nothing forwards).
 	if strings.Contains(string(cb), ":80 {") {
@@ -529,10 +573,20 @@ func bashRenderTemplate(t *testing.T, call string) string {
 // the guess that made the edge answer where the routing layer does not forward.
 func TestEdgeTemplateRequiresDeclaredAddress(t *testing.T) {
 	lib := filepath.Join(repoRoot(t), "deploy", "devlab-setup-lib.sh")
-	// Given an address, the site block opens on it.
+	// Given an address, the shell answers on its port and binds its host part — the two halves of the one
+	// declaration. MEASURED against caddy 2.11.4: without `default_bind` a host-bearing site label binds
+	// *:<port>, which would expose an overlay-only edge on every interface.
 	got := bashRenderTemplate(t, "setup_edge_caddyfile_text /etc/caddy/conf.d 10.10.0.1:8080")
-	if !strings.Contains(got, "10.10.0.1:8080 {") {
-		t.Errorf("the edge template must open the site block on the given address, got:\n%s", got)
+	if !strings.Contains(got, "http://:8080 {") {
+		t.Errorf("the edge shell must answer on the declared port, got:\n%s", got)
+	}
+	if !strings.Contains(got, "default_bind 10.10.0.1") {
+		t.Errorf("the edge shell must bind the declared address and nothing else, got:\n%s", got)
+	}
+	// `:8080` MEANS every interface, so it gets no bind line — the declaration is honoured, not overruled.
+	all := bashRenderTemplate(t, "setup_edge_caddyfile_text /etc/caddy/conf.d :8080")
+	if strings.Contains(all, "default_bind") {
+		t.Errorf("an address with no host part must not be narrowed to one, got:\n%s", all)
 	}
 	// Without an address the template fails (non-zero) and emits nothing usable — no ":80" fallback.
 	out, err := exec.Command("bash", "-c", ". "+lib+" && setup_edge_caddyfile_text /etc/caddy/conf.d").CombinedOutput()
@@ -571,11 +625,13 @@ func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
 	if err := os.MkdirAll(www, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// a delivered route, from the very template the receiver drops into conf.d.
-	route := bashRenderTemplate(t, "setup_route_text prizm 18811")
-	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(route), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// A delivered service fragment on the services shelf, and the dashboard application that imports that
+	// shelf — BOTH are needed. MEASURED against caddy 2.11.4: a fragment on a shelf no application imports
+	// is never parsed at all, so an edge with a BROKEN fragment on it still reports "Valid configuration".
+	// A validation over the services shelf alone therefore proves nothing.
+	mustWrite(t, filepath.Join(conf, "services", "prizm.caddy"), bashRenderTemplate(t, "setup_route_text prizm 18811"))
+	mustWrite(t, filepath.Join(conf, "apps", "holistic.caddy"),
+		bashRenderTemplate(t, "setup_app_route_text holistic dash.example.test 8080 18770 "+www+" 1"))
 	validate := func(caddyfile string) (string, bool) {
 		p := filepath.Join(root, "Caddyfile")
 		if err := os.WriteFile(p, []byte(caddyfile), 0o644); err != nil {
@@ -585,58 +641,153 @@ func TestEdgeShellHoldsADeliveredRouteCaddy(t *testing.T) {
 		return string(out), err == nil
 	}
 
-	// The FIX: the edge shell from the shared template, WITH the delivered route present, must validate.
+	// The FIX: the edge shell from the shared template, WITH both delivered kinds present, must validate.
 	edge := bashRenderTemplate(t, "SETUP_SERVICE_ROOT="+root+"; setup_edge_caddyfile_text "+conf+" :8080")
 	if out, ok := validate(edge); !ok {
-		t.Fatalf("the holistic edge shell must validate WITH a delivered route present:\n%s", out)
+		t.Fatalf("the holistic edge shell must validate WITH delivered parts on both shelves:\n%s", out)
+	}
+	// An EMPTY host validates too — the shelves are globs and a bare host simply has nothing on them.
+	empty := t.TempDir()
+	for _, d := range []string{"apps", "services"} {
+		if err := os.MkdirAll(filepath.Join(empty, "conf.d", d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out, ok := validate(bashRenderTemplate(t, "setup_edge_caddyfile_text "+filepath.Join(empty, "conf.d")+" :8080")); !ok {
+		t.Fatalf("a bare host's edge (both shelves empty) must validate:\n%s", out)
 	}
 
 	// The DEFECT: Ubuntu's example plus a bare top-level import beside it (what --provision used to
-	// leave) must be rejected — the delivered route cannot live at top level next to a site block.
-	broken := ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n\nimport " + conf + "/*.caddy\n"
+	// leave) must be rejected — a naked fragment cannot live at top level next to a site block.
+	broken := ":80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n\nimport " + conf + "/services/*.caddy\n"
 	if out, ok := validate(broken); ok {
 		t.Fatalf("the old bare-top-level-import edge must NOT validate (that was the bug):\n%s", out)
 	}
+	// AND THE SECOND DEFECT, the one this change is about: two root applications under the SAME hostname
+	// are what caddy calls an ambiguous site definition. That is why each must carry a name of its own —
+	// and why devlab-install refuses a second dashboard before it ever writes the file.
+	mustWrite(t, filepath.Join(conf, "apps", "zzdevlab.caddy"),
+		bashRenderTemplate(t, "setup_app_route_text devlab dash.example.test 8080 18781 "+www+" 0"))
+	out, ok := validate(edge)
+	if ok {
+		t.Fatalf("two applications on ONE hostname must not validate:\n%s", out)
+	}
+	if !strings.Contains(out, "ambiguous site definition") {
+		t.Errorf("the collision must be caddy's ambiguous-site verdict, got:\n%s", out)
+	}
+	// Give the second one its own name and the very same pair validates — the hostname IS the separation.
+	mustWrite(t, filepath.Join(conf, "apps", "zzdevlab.caddy"),
+		bashRenderTemplate(t, "setup_app_route_text devlab devlab.example.test 8080 18781 "+www+" 0"))
+	if out, ok := validate(edge); !ok {
+		t.Fatalf("two applications under two hostnames must validate:\n%s", out)
+	}
 }
 
-// The SELF route (devlab's /api/* block, its layout exception) must live in the SAME shared route
-// directory beside a uniform service's /api/services/<repo>/* route and the whole edge must still
-// validate — proving devlab's first-time route coexists with every other service's, at the level caddy
-// actually parses. This is the "Der Web-Anteil und die Route gehoeren zur Ersteinrichtung" half (task
-// point 4): a devlabd that runs but is unreachable is not set up.
-func TestSelfRouteCoexistsInEdgeCaddy(t *testing.T) {
+// mustWrite writes a file and the directories above it, or fails the test.
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// THE MEASUREMENT THIS WHOLE CHANGE IS ABOUT, taken through the REAL caddy on a REAL listener: two root
+// applications stand behind ONE socket, each owning the whole `/api/*` space, and the caller's HOSTNAME
+// decides which one answers.
+//
+// What was measured on production on 2026-08-09, before this change: three different hostnames all got
+// the same page, holistic's own API answered 404 through the edge while answering 200 directly, and
+// nobody could log in to holistic because /api/auth/login reached DevLab. One site block accepted every
+// name, and two `handle /api/*` fragments lay inside it, where devlab.caddy sorted before holistic.caddy.
+//
+// Every line below is one of the acceptance conditions, asked of the edge the shared templates build.
+func TestTwoRootApplicationsAreToldApartByHostname(t *testing.T) {
 	if _, err := exec.LookPath("caddy"); err != nil {
 		t.Skip("caddy not installed — the template shape is proven by the seam tests above")
 	}
 	root := t.TempDir()
 	conf := filepath.Join(root, "conf.d")
-	www := filepath.Join(root, "www")
-	for _, d := range []string{conf, www} {
+	dashWWW := filepath.Join(root, "opt", "holistic", "www")
+	devlabWWW := filepath.Join(root, "opt", "devlab", "www")
+	for _, d := range []string{filepath.Join(conf, "apps"), filepath.Join(conf, "services"), dashWWW, devlabWWW} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// devlab's OWN route (from the self template) and a uniform service's route, both in the shared dir.
-	self := bashRenderTemplate(t, "setup_self_route_text 8781")
-	if err := os.WriteFile(filepath.Join(conf, "devlab.caddy"), []byte(self), 0o644); err != nil {
-		t.Fatal(err)
+	mustWrite(t, filepath.Join(dashWWW, "index.html"), "<!doctype html><title>the dashboard</title>")
+	mustWrite(t, filepath.Join(devlabWWW, "index.html"), "<!doctype html><title>devlab</title>")
+
+	// Three upstreams: the dashboard's own API, DevLab's own API, and one uniform service.
+	dashAPI := stubUpstream(t, "holistic")
+	devlabAPI := stubUpstream(t, "devlab")
+	prizmAPI := stubUpstream(t, "prizm")
+
+	port := freePort(t)
+	mustWrite(t, filepath.Join(conf, "services", "prizm.caddy"),
+		bashRenderTemplate(t, fmt.Sprintf("setup_route_text prizm %d", prizmAPI)))
+	mustWrite(t, filepath.Join(conf, "apps", "holistic.caddy"),
+		bashRenderTemplate(t, fmt.Sprintf("setup_app_route_text holistic dash.example.test %d %d %s 1", port, dashAPI, dashWWW)))
+	mustWrite(t, filepath.Join(conf, "apps", "devlab.caddy"),
+		bashRenderTemplate(t, fmt.Sprintf("setup_app_route_text devlab devlab.example.test %d %d %s 0", port, devlabAPI, devlabWWW)))
+
+	edge := bashRenderTemplate(t, fmt.Sprintf("SETUP_SERVICE_ROOT=%s; setup_edge_caddyfile_text %s 127.0.0.1:%d", root, conf, port))
+	get := serveEdge(t, edge, port)
+
+	for _, c := range []struct{ what, host, path, wantBody string }{
+		// a) the dashboard's OWN api is reachable through the edge — it answered 404 before this change
+		{"the dashboard's own API", "dash.example.test", "/api/instance", "holistic:/api/instance"},
+		// b) …and its face is at the root of its name
+		{"the dashboard's face", "dash.example.test", "/", "the dashboard"},
+		// c) …and the uniform services hang under IT, because it carries the dashboard role
+		{"a uniform service under the dashboard", "dash.example.test", "/api/services/prizm/x", "prizm:/api/services/prizm/x"},
+		// d) DevLab's own API is reachable under DevLab's name — the whole /api/* space is its own
+		{"DevLab's own API", "devlab.example.test", "/api/mercury/runs", "devlab:/api/mercury/runs"},
+		// e) …and DevLab's face is at the root of DevLab's name
+		{"DevLab's face", "devlab.example.test", "/", "devlab"},
+		// a deep link is the application's start page, not a 404 (both are single-page applications)
+		{"a dashboard deep link", "dash.example.test", "/mercury/todo", "the dashboard"},
+	} {
+		code, body := get(c.host, c.path)
+		if code != http.StatusOK || !strings.Contains(body, c.wantBody) {
+			t.Errorf("%s: GET %s with Host %s must answer 200 %q, got %d: %s", c.what, c.path, c.host, c.wantBody, code, body)
+		}
 	}
-	uniform := bashRenderTemplate(t, "setup_route_text prizm 18811")
-	if err := os.WriteFile(filepath.Join(conf, "prizm.caddy"), []byte(uniform), 0o644); err != nil {
-		t.Fatal(err)
+
+	// f) a name nobody claimed gets an honest refusal, not somebody else's page. This is the behaviour
+	//    change an operator will notice: a health check on the bare address must send a Host header now.
+	code, body := get("unbekannt.test", "/")
+	if code != http.StatusNotFound {
+		t.Errorf("an unclaimed hostname must be refused, got %d: %s", code, body)
 	}
-	edge := bashRenderTemplate(t, "SETUP_SERVICE_ROOT="+root+"; setup_edge_caddyfile_text "+conf+" :8080")
-	p := filepath.Join(root, "Caddyfile")
-	if err := os.WriteFile(p, []byte(edge), 0o644); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(body, "no root application answering to the name") {
+		t.Errorf("the refusal must say what is the case, got: %s", body)
 	}
-	if out, err := exec.Command("caddy", "validate", "--config", p, "--adapter", "caddyfile").CombinedOutput(); err != nil {
-		t.Fatalf("the edge shell must validate with BOTH the self /api/* route and a uniform service route present:\n%s", out)
+
+	// AND THE DEFECT ITSELF: prizm is reachable under the DASHBOARD's name and NOT under DevLab's. Under
+	// DevLab's name the whole /api/* space belongs to DevLab — which is precisely what could not be true
+	// while both lived in one site block.
+	if _, body := get("devlab.example.test", "/api/services/prizm/x"); strings.Contains(body, "prizm:") {
+		t.Errorf("a uniform service must NOT be reachable under an application that does not carry the dashboard role, got: %s", body)
 	}
-	// The self template must target the whole /api/* prefix, not the per-service /api/services path.
-	if !strings.Contains(self, "handle /api/* {") {
-		t.Errorf("the self route must handle the whole /api/* prefix, got:\n%s", self)
+}
+
+// stubUpstream starts a tiny HTTP server that echoes "<name>:<path>" and returns its port, so a test can
+// tell WHICH daemon the edge reached — the whole question when two of them claim the same path space.
+func stubUpstream(t *testing.T, name string) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("no free port for the %s stub: %v", name, err)
 	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s:%s", name, r.URL.Path)
+	})}
+	go func() { _ = srv.Serve(l) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 // A host provisioned BEFORE the instance root was decided carries the edge of that day: its last block
@@ -665,13 +816,16 @@ func TestReceiverRefreshCatchesTheEdgeUp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(got), "/var/lib/devlab/www") {
-		t.Errorf("the refresh must take one service's directory out of the instance root:\n%s", string(got))
+		t.Errorf("the refresh must take one service's directory out of the shell:\n%s", string(got))
 	}
-	if !strings.Contains(string(got), "root * "+filepath.Join(env["DEVLAB_SERVICE_ROOT"], "holistic", "www")) {
-		t.Errorf("the refreshed edge must serve the root application at the instance root:\n%s", string(got))
+	// The refreshed shell serves NO application of its own any more: each root application brings its own
+	// site block on its own hostname, from the apps shelf. What the shell still does is answer honestly
+	// for a name nobody claimed — the bare address included, which is what an old health check hits.
+	if !strings.Contains(string(got), "import "+filepath.Join(env["DEVLAB_CADDY_CONF"], "apps", "*.caddy")) {
+		t.Errorf("the refreshed edge must import the apps shelf:\n%s", string(got))
 	}
-	if !strings.Contains(string(got), "has no root application") {
-		t.Errorf("the refreshed edge must answer honestly while the root application is absent:\n%s", string(got))
+	if !strings.Contains(string(got), "has no root application answering to the name") {
+		t.Errorf("the refreshed edge must answer honestly for a name nobody claims:\n%s", string(got))
 	}
 	if m, _ := filepath.Glob(caddyMain + ".bak-*"); len(m) == 0 {
 		t.Errorf("the replaced edge must be backed up first:\n%s", res.out)
@@ -701,5 +855,143 @@ func TestReceiverRefreshLeavesAGrownEdgeAlone(t *testing.T) {
 	}
 	if !strings.Contains(res.out, "was not written by this script") {
 		t.Errorf("leaving it alone must be NAMED, not silent:\n%s", res.out)
+	}
+}
+
+// ── the layout migration: the moment the whole change is most dangerous ──────────────────────────────
+// The new edge shell imports two shelves and NOTHING ELSE. A host whose delivered routes still lie FLAT
+// in the route directory would, the instant that shell is written, stop importing every one of them and
+// answer 404 for every service it carries. A half-performed move is worse than either state — so the move
+// is CODE that runs in the same pass as the new shell, not a paragraph in a manual (Handarbeit kommt als
+// Skript, and this is the part that must never be Handarbeit at all).
+//
+// The rule it follows, and the reason each case is what it is:
+//   - a fragment carrying `handle /api/services/` is a uniform service's route → MOVED, byte for byte;
+//   - a fragment carrying a naked `handle /api/*` is one of the two colliding blocks that caused all of
+//     this → REMOVED, because it carries neither a hostname nor a serve root and so cannot be turned into
+//     the site block that replaces it. Its successor is written at that application's next delivery;
+//   - anything else is left where it is and NAMED. It is not ours to move.
+//
+// Everything it touches is backed up first, so the run's own rollback restores the host exactly.
+func TestRefreshMigratesAFlatRouteDirectoryOntoTheShelves(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	conf := env["DEVLAB_CADDY_CONF"]
+	if err := os.MkdirAll(filepath.Dir(caddyMain), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A host as it stands today: our own older shell, and every delivered route lying flat beside it.
+	old := "# Managed by devlab-install-recv — the Holistic edge shell.\n" + testEdgeAddress +
+		" {\n\timport " + conf + "/*.caddy\n\thandle {\n\t\troot * /var/lib/devlab/www\n\t\tfile_server\n\t}\n}\n"
+	mustWrite(t, caddyMain, old)
+	prizm := "handle /api/services/prizm/* {\n\treverse_proxy 127.0.0.1:18811\n}\n"
+	presentr := "handle /api/services/presentr/* {\n\treverse_proxy 127.0.0.1:18812\n}\n"
+	mustWrite(t, filepath.Join(conf, "prizm.caddy"), prizm)
+	mustWrite(t, filepath.Join(conf, "presentr.caddy"), presentr)
+	// …and the two blocks that collided: both claim the whole /api/*, and `import` expands alphabetically.
+	mustWrite(t, filepath.Join(conf, "devlab.caddy"), "handle /api/* {\n\treverse_proxy 127.0.0.1:8781\n}\n")
+	mustWrite(t, filepath.Join(conf, "holistic.caddy"), "handle /api/* {\n\treverse_proxy 127.0.0.1:8770\n}\n")
+	// Something that is not ours at all.
+	mustWrite(t, filepath.Join(conf, "zz-operators-own.caddy"), "# hand-written by the operator\n")
+
+	res := runInstallRecv(t, env) // NO --provision: the plain receiver refresh, the one-line hand step
+	if res.exit != 0 {
+		t.Fatalf("the refresh must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+
+	// The service routes are on the services shelf, byte for byte, and gone from the flat directory.
+	for name, want := range map[string]string{"prizm.caddy": prizm, "presentr.caddy": presentr} {
+		got, err := os.ReadFile(filepath.Join(conf, "services", name))
+		if err != nil {
+			t.Fatalf("%s must be moved onto the services shelf: %v\n%s", name, err, res.out)
+		}
+		if string(got) != want {
+			t.Errorf("%s must be moved UNCHANGED — only its shelf changes, got:\n%s", name, string(got))
+		}
+		if _, err := os.Stat(filepath.Join(conf, name)); err == nil {
+			t.Errorf("%s must not be left behind in the flat directory too — it would be neither imported nor findable", name)
+		}
+	}
+	// The colliding fragments are gone (and backed up), and neither became an app block: a fragment
+	// carries no hostname, so there is nothing to turn it into.
+	for _, name := range []string{"devlab.caddy", "holistic.caddy"} {
+		if _, err := os.Stat(filepath.Join(conf, name)); err == nil {
+			t.Errorf("the colliding fragment %s must be removed — it is what made two applications share one site block", name)
+		}
+		if _, err := os.Stat(filepath.Join(conf, "apps", name)); err == nil {
+			t.Errorf("%s must NOT be invented into a site block: a fragment carries no hostname and no serve root", name)
+		}
+		if m, _ := filepath.Glob(filepath.Join(conf, name+".bak-*")); len(m) == 0 {
+			t.Errorf("%s must be backed up before it is removed:\n%s", name, res.out)
+		}
+	}
+	// A file that is not ours is left exactly where it is — and SAID, because it is no longer imported.
+	if _, err := os.Stat(filepath.Join(conf, "zz-operators-own.caddy")); err != nil {
+		t.Errorf("a file that is not ours must be left untouched: %v", err)
+	}
+	if !strings.Contains(res.out, "zz-operators-own.caddy") || !strings.Contains(res.out, "not ours to move") {
+		t.Errorf("what is left behind must be NAMED, not silently orphaned:\n%s", res.out)
+	}
+	// What happened is stated in numbers an operator can check against the host.
+	for _, want := range []string{"moved 2 delivered service route", "removed 2 colliding root-application fragment"} {
+		if !strings.Contains(res.out, want) {
+			t.Errorf("the move must report what it did (%q missing):\n%s", want, res.out)
+		}
+	}
+	// And the edge that now stands imports the shelves the routes were moved onto.
+	edge, _ := os.ReadFile(caddyMain)
+	for _, shelf := range []string{"apps", "services"} {
+		if !strings.Contains(string(edge), "import "+filepath.Join(conf, shelf, "*.caddy")) {
+			t.Errorf("the new shell must import the %s shelf the migration filled:\n%s", shelf, string(edge))
+		}
+	}
+
+	// IDEMPOTENT: running it again finds nothing left to move and changes nothing.
+	res2 := runInstallRecv(t, env)
+	if res2.exit != 0 {
+		t.Fatalf("a second refresh must succeed, got %d\n%s", res2.exit, res2.out)
+	}
+	if strings.Contains(res2.out, "moved 1") || strings.Contains(res2.out, "moved 2") {
+		t.Errorf("a host already laid out this way has nothing to move:\n%s", res2.out)
+	}
+	if got, _ := os.ReadFile(filepath.Join(conf, "services", "prizm.caddy")); string(got) != prizm {
+		t.Errorf("a second run must leave the moved route exactly as it stands, got:\n%s", string(got))
+	}
+}
+
+// The hostnames a host gives its root applications are established by the same one-line hand step, without
+// re-provisioning: a host that is already a production target must not have to be provisioned again just
+// to be given a name. And an unusable value is refused rather than written.
+func TestEdgeHostFlagDeclaresNamesOnTheHost(t *testing.T) {
+	env, _, _, _, caddyMain, _ := provisionEnv(t)
+	mustWrite(t, caddyMain, "# Managed by devlab-install-recv — the Holistic edge shell.\n"+testEdgeAddress+
+		" {\n\timport "+env["DEVLAB_CADDY_CONF"]+"/*.caddy\n}\n")
+
+	res := runInstallRecv(t, env, "--edge-host", "holistic=dash.example.test", "--edge-host", "devlab=devlab.example.test")
+	if res.exit != 0 {
+		t.Fatalf("declaring hostnames must succeed without --provision, got %d\n%s", res.exit, res.out)
+	}
+	for id, want := range map[string]string{"holistic": "dash.example.test", "devlab": "devlab.example.test"} {
+		b, err := os.ReadFile(filepath.Join(env["DEVLAB_EDGE_HOSTS_DIR"], id))
+		if err != nil {
+			t.Fatalf("the hostname of '%s' must be declared on the host: %v\n%s", id, err, res.out)
+		}
+		if !strings.Contains(string(b), want) {
+			t.Errorf("the declaration of '%s' must hold %q, got:\n%s", id, want, string(b))
+		}
+	}
+	// Re-declaring the same name changes nothing.
+	res2 := runInstallRecv(t, env, "--edge-host", "holistic=dash.example.test")
+	if res2.exit != 0 || !strings.Contains(res2.out, "already declared as 'dash.example.test'") {
+		t.Errorf("re-declaring the same name must be idempotent and said so:\n%s", res2.out)
+	}
+	// A value that is not a hostname is refused — never written, never guessed into shape.
+	for _, bad := range []string{"holistic=dashboard", "holistic=http://a.test", "holistic", "=a.test"} {
+		r := runInstallRecv(t, env, "--edge-host", bad)
+		if r.exit == 0 {
+			t.Errorf("--edge-host %q must be refused:\n%s", bad, r.out)
+		}
+	}
+	if b, _ := os.ReadFile(filepath.Join(env["DEVLAB_EDGE_HOSTS_DIR"], "holistic")); !strings.Contains(string(b), "dash.example.test") {
+		t.Errorf("a refused value must leave the standing declaration untouched, got:\n%s", string(b))
 	}
 }

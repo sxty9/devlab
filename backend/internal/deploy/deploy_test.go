@@ -182,7 +182,9 @@ func TestFindGapsDistinguishesStates(t *testing.T) {
 	}
 	allocs := []model.PortAllocation{{Port: 8771, Service: "svc-live", Routed: true, Bound: true}}
 
-	gaps := FindGaps(dets, allocs)
+	// No repo here declares itself a root application, so the hostname question never arises; the
+	// fixture answers "no name declared" for everything and no repo is affected by it.
+	gaps := FindGaps(dets, allocs, func(string) bool { return false })
 	byRepo := map[string]Gap{}
 	for _, g := range gaps {
 		byRepo[g.Repo] = g

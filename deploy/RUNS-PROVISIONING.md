@@ -191,7 +191,8 @@ as root, from a checkout of the merged standard branch. It takes only the PUBLIC
 
 ```sh
 sudo ./deploy/devlab-install-recv --provision --deploy-pubkey <path-to-deploy.pub> \
-     --edge-address <host:port|:port> [service ...]
+     --edge-address <host:port|:port> \
+     [--edge-host <id>=<name> ...] [service ...]
 ```
 
 **Where this environment's edge answers is ONE declaration, read by BOTH sides.** The edge (the Caddy
@@ -211,30 +212,73 @@ changing its shape. Ask it back (the routing layer's read) with:
 devlab-install-recv --print-edge-address
 ```
 
+**And WHICH NAME reaches which application is the second half of the same declaration.** Behind that one
+socket several ROOT APPLICATIONS stand side by side — the landscape dashboard, and on equal footing an
+application like DevLab, each owning the whole `/api/*` space beneath its own name and serving its own
+face at the root of it. They are told apart by the hostname the caller asked for and by nothing else. One
+site block that accepts every name gives every name the same answer, and two applications inside it fight
+over `/api/*` where the alphabet decides the winner — measured on production 2026-08-09: three hostnames,
+three identical pages, and the dashboard's own API answering 404 through the edge while answering 200
+directly, so nobody could log in to it.
+
+So a host declares one file per root application under `/etc/holistic/edge/hosts/<id>`, written by a
+repeatable `--edge-host <id>=<name>`. THE SPLIT IS LOAD-BEARING and must not later be "simplified" into
+one half: the PACKAGE declares its ROLE (`holistic-service.json`, `edge.role`: `service` | `application` |
+`dashboard`, absent = `service`), the HOST declares its NAME, and neither can state the other's. A package
+that declares itself a root application therefore cannot take an instance over — without a name declared
+here it gets none, and its delivery dies BY NAME. A hostname is an instance value and lives ONLY in that
+runtime configuration, never in a repository.
+
+Two consequences worth knowing before they are discovered:
+
+* **A request to the bare edge address, with no `Host` header, now gets an honest `404`** instead of a
+  page. Any health check that expects `curl http://<edge>/ -> 200` must send the name a browser would
+  send. It is the more honest measurement — the same request a browser makes — but it is a change.
+* **An application receives its site block when it is DELIVERED**, not when the host is provisioned: only
+  a delivery knows its serve root and the port its unit binds. A host can therefore carry a name for an
+  application that is not yet delivered; that name answers the edge's refusal, never another
+  application's page. A host that already ran Holistic is brought onto this layout in one pass by
+  `sudo bash deploy/adopt-edge-hostnames.sh <dashboard-hostname> <devlab-hostname>`, which installs the
+  current wrappers, declares the names, moves the delivered routes onto their shelves and then MEASURES
+  what each name answers.
+
 It is one pass, idempotent, fail-closed and reversible, and it PROVES the result instead of claiming it.
 In that single run it: ensures `rrsync` is present (the receiver confines every rsync receive through
 it); creates the staging root it receives into (derived from `DEVLAB_STATE_DIR`, overridable with
 `--staging`) and the INSTANCE ROOT it serves at — the serve root of the landscape's root application,
 which is decided once in the shared library (`SETUP_ROOT_APP` / `setup_root_app_www`) and is deliberately
 NOT a provisioning option: a host that took its instance root from one service's state directory answered
-the whole instance with that service's login screen; installs Caddy and builds the edge as a
-**site block** that imports the per-service route directory from INSIDE it (each route the receiver
-drops in is a naked `handle` block, valid in Caddy only inside a site block — the shell comes from the
-one template beside the route, `setup_edge_caddyfile_text`, so the container and its contents cannot
-drift). Ubuntu's shipped example Caddyfile is not the holistic edge and is replaced (backed up first),
-never appended to; a grown holistic edge that already imports the route directory and validates with a
-route is left untouched and named, and any other foreign Caddyfile is named and refused, never
-destroyed. It writes the locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
+the whole instance with that service's login screen; installs Caddy and builds the edge SHELL, which
+carries no application of its own and assembles the delivered parts from TWO SHELVES under the route
+directory: `apps/` holds one whole site block per root application (a site block is valid only at top
+level) and `services/` holds the naked `handle /api/services/<id>/*` fragments of the uniform services (a
+naked directive is valid only inside a site block, and the block it belongs inside is the dashboard's).
+The shell and both route templates come from one place (`setup_edge_caddyfile_text` beside
+`setup_route_text` / `setup_app_route_text`), so the container and its contents cannot drift. The shell
+also BINDS the declared address and nothing else when that address names a host part — measured against
+caddy 2.11.4: without that, a host-bearing site label binds every interface, which on a host meant to
+answer only through its private overlay puts every application in front of the tunnel instead of behind
+it. Ubuntu's shipped example Caddyfile is not the holistic edge and is replaced (backed up first), never
+appended to; a grown holistic edge is left untouched and named — and, if it imports only the old flat
+route directory, told plainly that no delivered route reaches it any more. Any other foreign Caddyfile is
+named and refused, never destroyed. A host whose routes still lie FLAT in the route directory has them
+MOVED onto the two shelves in the same run, by rule: a `/api/services/` fragment is relocated byte for
+byte, a naked `handle /api/*` fragment (the collision itself) is removed and its successor is written as a
+proper site block at that application's next delivery, and anything else is left where it is and named. It writes the locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
 the receiver login's `authorized_keys` (default `root`, override with `--recv-user`); and installs the
 receiver + shared library themselves (the SAME install path the receiver-only mode uses — no second
 copy). It closes with a self-check: `rrsync` resolves, the forced command actually rejects a shell
 request, the receiver and library carry the expected checksums, the staging root and the instance root
-exist, and the edge validates **with a delivered route present** (not merely empty — an empty edge
-validates even when its shape could not hold a single route). Any failure is fail-closed (non-zero exit,
+exist, and the edge validates **with delivered parts on BOTH shelves present** (not merely empty — an
+empty edge validates even when its shape could not hold a single route, and, measured against caddy
+2.11.4, a broken fragment on the services shelf still validates while no application imports that shelf,
+so probing one shelf alone proves nothing). Any failure is fail-closed (non-zero exit,
 nothing half-done). Whether the root application has actually been DELIVERED to this host is a separate
-fact the provisioning does not produce: it is reported as still outstanding, and until it arrives the
-instance root answers `503` naming the missing root application — never with another service's
-interface. After it passes,
+fact the provisioning does not produce: it is reported as still outstanding, and until it arrives its name answers
+`503` naming the missing interface — never with another application's. Whether any installed application
+carries the `dashboard` role is reported the same way: while none does, the uniform services on the
+services shelf are reachable under no name at all, and the provisioning says so rather than letting it be
+found through fifteen 404s. After it passes,
 **no further step on the target is needed to accept a delivery** — arm the DEV side by naming this host
 in the environment (`DEVLAB_RUNS_PROD_TARGET`, `DEVLAB_RUNS_PROD_RECV`, `DEVLAB_RUNS_PROD_KEY`, §5).
 

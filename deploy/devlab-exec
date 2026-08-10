@@ -165,16 +165,16 @@ case "$verb" in
       # in the package — the receiver installed a web bundle for ONE name and dropped every other — and
       # what made the instance root serve that one service instead of the landscape's dashboard.
       #
-      # The value FOLLOWS the landscape's serve convention (setup_service_www: /opt/<repo>/www), with the
-      # self repo as the one named layout exception it already is everywhere else: devlabd serves its own
-      # face out of its state directory (statepath.Www), so its face is installed there and nowhere else.
-      # Both are inside the service's OWN territory, which is what the installer re-validates before it
-      # copies (setup_valid_web_root) — the stamp says where, it does not grant where.
-      if [ "$repo_name" = "${DEVLAB_SELF_REPO:-devlab}" ]; then
-        printf '%s\n' "$STATE_DIR/www" > "$art/web.root"
-      else
-        printf '%s\n' "$(setup_service_www "$repo_name")" > "$art/web.root"
-      fi
+      # The value comes from the PACKAGE'S OWN DECLARATION (holistic-service.json, edge.serveRoot),
+      # falling back to the landscape's serve convention (setup_service_www: /opt/<repo>/www) when the
+      # repository declares nothing. It used to come from a comparison against the repository NAME —
+      # `if [ "$repo_name" = devlab ]` — which is the same defect as the route below in its second guise:
+      # a property of the PACKAGE derived from its spelling, and therefore holdable by exactly one member
+      # of the landscape. Whatever the value, it is inside the service's OWN territory or the installer
+      # refuses it (setup_valid_web_root) — the stamp says where, it does not grant where.
+      web_root="$(setup_decl_serve_root "$wt" "$repo_name")" \
+        || die "cannot stamp where the face of '$repo_name' belongs (see the reason above)"
+      printf '%s\n' "$web_root" > "$art/web.root"
     fi
     if [ -f backend/go.mod ]; then gd=backend; elif [ -f go.mod ]; then gd=.; else gd=""; fi
     if [ -n "$gd" ]; then
@@ -291,6 +291,15 @@ case "$verb" in
     elif [ -n "${gd:-}" ]; then
       printf 'go-daemon\n' > "$art/build.kind"
     fi
+    # ── STAMP THE EDGE ROLE so the installer READS how this delivery is reached, never guesses ─────────
+    # Derived from the repository's own declaration (holistic-service.json, edge.role; absent = service)
+    # and travelling with the artifact exactly like build.kind and web.root. It is stamped for EVERY
+    # package, so a delivery says what it is rather than leaving the installer to fall back on a default.
+    # What it does NOT carry is a hostname: which name a root application answers to is the target host's
+    # to declare, and no package can state it.
+    edge_role="$(setup_decl_edge_role "$wt")" \
+      || die "cannot stamp the edge role of '$repo_name' (see the reason above)"
+    printf '%s\n' "$edge_role" > "$art/edge.role"
     [ "$built" = 1 ] || die "nothing to build (no package.json / go.mod / ui / setup)"
     ;;
 
@@ -324,41 +333,70 @@ case "$verb" in
     dst="$art/setup"
     # Do NOT wipe: artifact-build may have staged a service's OWN setup product here. mkdir is enough.
     mkdir -p -- "$dst"
-    if [ "$repo" = "${DEVLAB_SELF_REPO:-devlab}" ]; then
-      # The self repo (devlab) is a LAYOUT special case: its unit is NOT the generated /opt/<repo>
-      # template but the CHECKED-IN deploy/devlabd.service (User=devlab, /usr/local/bin/devlabd, its own
-      # fixed listen port), and its route answers the whole /api/* prefix. So the delivered setup product
-      # is that checked-in unit verbatim under its real name devlabd.service, plus devlab's own route on
-      # the port the unit itself declares — the receiver installs these unchanged on a bare host. The
-      # atlas-proposed <port> is not used for self: devlab's port is fixed in its committed unit.
+
+    # ── HOW THIS DELIVERY IS REACHED FROM OUTSIDE is read, never derived from the repository name ──────
+    # THE RULE, and it is the whole point of this branch: the SELF REPO NAME decides a LAYOUT question
+    # (which unit file is shipped) and NOTHING about the edge, ever again. It used to decide both, so the
+    # one repository called `devlab` was also the one that could own the whole `/api/*` prefix — and when
+    # the landscape dashboard grew into the same role, the two collided in one site block and the alphabet
+    # decided whose API existed (measured on production 2026-08-09). The edge role now comes from the
+    # PACKAGE (holistic-service.json → $art/edge.role, stamped by artifact-build), and a root application
+    # gets NO caddy text here at all: emit-setup runs in a developer's working tree and cannot know the
+    # hostname of the TARGET host. That site block is rendered where the host is visible — at install.
+    # Re-derived from the SAME one source artifact-build stamped from (the repository's declaration), not
+    # read back off the stamp: emit-setup runs only on the production path and can meet an artifact built
+    # by an older devlab-exec that carries no stamp at all. Reading the declaration makes it independent
+    # of that, and re-stamping keeps the artifact self-describing for the installer that receives it.
+    role="$(setup_decl_edge_role "$wt")" \
+      || die "cannot emit a setup product for '$repo' without knowing how it is reached (see the reason above)"
+    printf '%s\n' "$role" > "$art/edge.role"
+    self_layout=0
+    [ "$repo" = "${DEVLAB_SELF_REPO:-devlab}" ] && self_layout=1
+
+    case "$role" in
+      application|dashboard)
+        # A root application that ALSO ships a naked service fragment is contradicting itself: the
+        # fragment would be a route into a path space that is no longer reached that way. Named, not
+        # silently ignored.
+        if [ -f "$dst/${repo}.caddy" ]; then
+          die "'$repo' declares the edge role '$role' (a root application on its own hostname) but its package also ships a service route fragment at setup/${repo}.caddy — these are two different ways of being reached and only one can be true; remove the fragment"
+        fi
+        ;;
+    esac
+
+    if [ "$self_layout" = 1 ]; then
+      # The self repo (devlab) is a LAYOUT special case, and only that: its unit is NOT the generated
+      # /opt/<repo> template but the CHECKED-IN deploy/devlabd.service (User=devlab, /usr/local/bin/devlabd,
+      # its own fixed listen port), so the delivered setup product is that unit verbatim under its real
+      # name. The atlas-proposed <port> is not used for self: devlab's port is fixed in its committed unit.
       src_unit="$wt/deploy/devlabd.service"
       [ -f "$src_unit" ] || die "self setup needs the checked-in unit at $src_unit"
       cp -- "$src_unit" "$dst/devlabd.service"
       selfport="$(setup_unit_listen_port "$src_unit")"; [ -n "$selfport" ] || selfport="$port"
-      setup_self_route_text "$selfport" > "$dst/devlab.caddy"
+      [ "$role" = service ] && setup_route_text "$repo" "$selfport" > "$dst/${repo}.caddy"
       if [ -f "$wt/permissions/${repo}.json" ]; then
         cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
       fi
-      echo "devlab-exec: emitted self setup product (devlabd.service + /api/* route on :$selfport) into $dst"
+      echo "devlab-exec: emitted self setup product (devlabd.service on :$selfport, edge role '$role') into $dst"
     elif ls "$dst"/*.service >/dev/null 2>&1; then
       # The service SHIPPED its own setup product (a *.service already staged by artifact-build): its unit
       # carries its own name, so nothing is generated over it. The receiver reads that name on install.
-      echo "devlab-exec: setup product already present in $dst (repo-provided) — leaving it, generating nothing"
+      echo "devlab-exec: setup product already present in $dst (repo-provided, edge role '$role') — leaving it, generating nothing"
     else
-      # THE GENERATE BRANCH — emit-setup fabricates the uniform identity <repo>.service (User=<repo>) and
-      # <repo>.caddy. A reserved <repo> would fabricate a colliding OS/package/landscape identity, and a
-      # freshly generated uniform unit can never be the OWNER of a reserved identity (the owner ships its
-      # own setup product and took a branch above, never this one). So the reserved list is enforced HERE,
-      # the one place emit-setup coins a name into an identity. The root installer refuses it again at
-      # install; this is the early, same-rule refusal.
+      # THE GENERATE BRANCH — emit-setup fabricates the uniform identity <repo>.service (User=<repo>) and,
+      # for a uniform service, <repo>.caddy. A reserved <repo> would fabricate a colliding OS/package/
+      # landscape identity, and a freshly generated uniform unit can never be the OWNER of a reserved
+      # identity (the owner ships its own setup product and took a branch above, never this one). So the
+      # reserved list is enforced HERE, the one place emit-setup coins a name into an identity. The root
+      # installer refuses it again at install; this is the early, same-rule refusal.
       setup_valid_repo_name "$repo" || die "refusing to generate a setup product for the reserved name '$repo'"
-      setup_unit_text  "$repo" "$port" > "$dst/${repo}.service"
-      setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
+      setup_unit_text "$repo" "$port" > "$dst/${repo}.service"
+      [ "$role" = service ] && setup_route_text "$repo" "$port" > "$dst/${repo}.caddy"
       # The rights manifest travels too when the checkout carries one — a validated COPY, never executed.
       if [ -f "$wt/permissions/${repo}.json" ]; then
         cp -- "$wt/permissions/${repo}.json" "$dst/${repo}.json"
       fi
-      echo "devlab-exec: emitted setup product for '$repo' (port $port) into $dst"
+      echo "devlab-exec: emitted setup product for '$repo' (port $port, edge role '$role') into $dst"
     fi
     ;;
 

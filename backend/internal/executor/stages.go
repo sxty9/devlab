@@ -849,6 +849,19 @@ func deliverDevRun(ctx context.Context, rc *RepoCtx) error {
 		})
 		return fmt.Errorf("code-structure violation: %s", det.Evidence)
 	}
+	// DELIVERED, BUT UNREACHABLE. A root application answers under a hostname of its own, and this host
+	// declares none for it — so the whole delivery would install cleanly, come up, hold its port, and be
+	// reachable by nobody. The route step refuses this too, further down; saying it HERE is what makes the
+	// reason legible instead of leaving it in a wrapper's output, and it names the one step that ends it.
+	if det.EdgeGap != "" {
+		rc.Sink.Notice(NoticeEvent{
+			Kind:     edgeUnreachableNotice,
+			Repo:     rc.Repo,
+			Text:     "delivered, but unreachable: " + det.EdgeGap,
+			NextStep: "declare the hostname on the target host: sudo devlab-install-recv --edge-host <id>=<name>",
+		})
+		return fmt.Errorf("delivered, but unreachable: %s", det.EdgeGap)
+	}
 
 	// THE WRITE HALF: if the user approved renewing the root wrapper scripts, install the approved
 	// standard-branch versions through the root tool BEFORE the delivery re-checks its guard. Once the

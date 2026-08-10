@@ -133,12 +133,15 @@ func (f *fixtureHost) deliver(t *testing.T) wrapperResult {
 func (f *fixtureHost) servedByTheInstanceRoot(t *testing.T) (int, string) {
 	t.Helper()
 	conf := filepath.Join(f.root, "conf.d")
-	if err := os.MkdirAll(conf, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(conf, "apps"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	port := freePort(t)
+	// The dashboard is reached under the hostname this host declares for it, so the browser's question
+	// carries that name — which is exactly what cloudflared puts in front of this edge in production.
+	deliverDashboardBlock(t, conf, f.serveRoot, port, freePort(t))
 	get := serveEdge(t, renderEdge(t, f.root, conf, fmt.Sprintf("127.0.0.1:%d", port)), port)
-	return get("/")
+	return get(instanceRootHost, "/")
 }
 
 // TEST a — DECISIVE: after a COMPLETE delivery of the landscape dashboard (a python-app, the build kind

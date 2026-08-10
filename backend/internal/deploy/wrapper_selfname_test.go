@@ -142,51 +142,74 @@ func TestInstallCheckSelfFailsClosedWithoutConfiguredOrganisation(t *testing.T) 
 
 // ── 3. the shared edge configuration ────────────────────────────────────────
 
-// The route step writes into a directory the edge serves EVERY other service from, so it must validate
-// the assembled configuration before adopting the route, take its own file back out when validation or
-// the reload fails, and never swallow that failure. The real branch needs root, so the guarantee is
-// pinned where it is decided: in the wrapper's own text plus the decision it prints in a dry run.
+// A route is written onto shelves the edge serves EVERY other service from, so the step must validate the
+// ASSEMBLED configuration before adopting the route, take its own file back out when validation or the
+// reload fails, and never swallow that failure.
+//
+// THAT GUARANTEE NOW LIVES IN ONE PLACE. It used to be spelled out inline in devlab-install's first-time
+// branch, which meant the production receiver carried its own copy of the same rule and the two could
+// drift on what "validated" means. Both installers now decide HOW a route is shaped through one shared
+// switch (setup_prepare_route) and install it through one shared install (setup_install_route). So the
+// guarantee is pinned where it is decided, and both wrappers are pinned to using it rather than
+// re-implementing it beside it.
 func TestInstallRouteIsValidatedBeforeTheSharedEdgeAdoptsIt(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy/devlab-install"))
+	lib, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy/devlab-setup-lib.sh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	src := string(b)
+	src := string(lib)
 
-	iValidate := strings.Index(src, `"$CADDY_BIN" validate --config "$CADDY_MAIN"`)
-	iReload := strings.Index(src, `"$SYSTEMCTL" reload caddy`)
+	iValidate := strings.Index(src, `"$bin" validate --config "$main"`)
+	iReload := strings.Index(src, `"$systemctl" reload caddy`)
 	switch {
 	case iValidate < 0:
-		t.Error("devlab-install never validates the assembled edge configuration before adopting a route")
+		t.Error("the shared route install never validates the assembled edge configuration before adopting a route")
 	case iReload < 0:
-		t.Error("devlab-install never reloads the edge after writing a route")
+		t.Error("the shared route install never reloads the edge after writing a route")
 	case iValidate > iReload:
 		t.Error("the edge configuration must be validated BEFORE the reload, not after")
 	}
-	if strings.Contains(src, `reload caddy 2>/dev/null ||`) || strings.Contains(src, `reload caddy || log`) {
-		t.Error("a failed reload of the SHARED edge must be named, never logged away as unavailable")
+	// The unwind must take the route AND everything the caller handed it (on a first-time setup, the unit
+	// just written). A unit left behind makes the NEXT attempt read as an update, and an update that could
+	// not route would report success over a service nobody can reach.
+	if !strings.Contains(src, `rm -f "$route_file" "${extra[@]}"`) {
+		t.Error("a failed route step must take both the route and what the caller handed it back out")
 	}
-	// The unwind must take the generated unit with it. A unit left behind makes the NEXT attempt read as
-	// an update, which skips the route step entirely and reports success over a service with no route.
-	if !strings.Contains(src, `rm -f "$ROUTE_FILE" "$UNIT_FILE"`) {
-		t.Error("a failed route step must take both the route and the generated unit back out, or the retry silently becomes an update without a route")
+	// MEASURED against caddy 2.11.4: a parse fault in an IMPORTED file is reported against the MAIN file's
+	// line number, so caddy's own message sends the reader to the wrong file. The step must name the file
+	// it just wrote, or such a failure is investigated in the wrong repository.
+	if !strings.Contains(src, `route just written ($route_file`) {
+		t.Error("a failed validation must name the file the route step just wrote, not only caddy's verdict")
 	}
-	for _, path := range []string{"validate --config", "reload caddy"} {
-		if !strings.Contains(src, path) {
-			t.Errorf("the route step no longer performs %q", path)
+
+	// BOTH installers go through the shared switch and the shared install — neither writes a route itself.
+	for _, script := range []string{"devlab-install", "devlab-deploy-recv"} {
+		b, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", script))
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(b)
+		for _, want := range []string{"setup_prepare_route", "setup_install_route"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("%s must reach the edge through %s, not through a route path of its own", script, want)
+			}
+		}
+		if strings.Contains(s, `reload caddy 2>/dev/null ||`) || strings.Contains(s, `reload caddy || log`) {
+			t.Errorf("%s: a failed reload of the SHARED edge must be named, never logged away as unavailable", script)
 		}
 	}
 
-	// The dry run states the same decision, so an operator reading a plan sees it.
+	// The dry run states the same decision, so an operator reading a plan sees it — and it names the SHELF
+	// the route lands on, which is what tells a uniform service from a root application at a glance.
 	env, artifact := foreignFixture(t, "svc-a")
 	env["DEVLAB_SYSTEMCTL"] = fakeSystemctl(t, "")
 	res := runWrapper(t, "deploy/devlab-install", env, "svc-a", artifact, "dev", "--check", "--port", "8779")
 	if res.exit != 0 {
 		t.Fatalf("a valid first-time check must exit 0, got %d\n%s", res.exit, res.out)
 	}
-	for _, want := range []string{"validate", "remove", "shared"} {
+	for _, want := range []string{"validate", "taken back out", "ASSEMBLED", "/conf.d/services/svc-a.caddy"} {
 		if !strings.Contains(res.out, want) {
-			t.Errorf("the first-time plan must name the route validation (%q missing): %s", want, res.out)
+			t.Errorf("the first-time plan must name the route validation and its destination (%q missing): %s", want, res.out)
 		}
 	}
 }

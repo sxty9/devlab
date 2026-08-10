@@ -48,11 +48,22 @@ func emitSetupWorkspace(t *testing.T) (env map[string]string, wt string) {
 	}, wt
 }
 
-// The self emit ships the CHECKED-IN devlabd.service verbatim (not a generated template), a devlab
-// /api/* route on the unit's OWN fixed port (the atlas-proposed port is ignored for self), and the
-// rights manifest — exactly the product the receiver installs on a bare host.
+// The self emit ships the CHECKED-IN devlabd.service verbatim (not a generated template) and the rights
+// manifest — exactly the product the receiver installs on a bare host.
+//
+// AND IT EMITS NO EDGE ROUTE AT ALL, because devlab declares itself a root application. That is the point
+// of this test. The self branch used to emit a naked `handle /api/*` fragment, and that fragment is what
+// collided with the landscape dashboard's identical claim inside one site block, where the alphabet
+// decided whose API existed (measured on production 2026-08-09). A root application's site block cannot be
+// written here in any case: emit-setup runs in a developer's working tree and cannot know the hostname of
+// the TARGET host. It is rendered at install, where the host is visible.
 func TestEmitSetupSelfShipsCheckedInUnit(t *testing.T) {
 	env, wt := emitSetupWorkspace(t)
+	// devlab's own declaration, as it stands in its repository root: a root application, not the dashboard.
+	if err := os.WriteFile(filepath.Join(wt, "holistic-service.json"),
+		[]byte(`{"edge":{"role":"application","serveRoot":"/var/lib/devlab/www"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	// Pass a deliberately WRONG atlas port to prove the self branch reads the port from the unit itself.
 	res := runWrapper(t, "deploy/devlab-exec", env, "emit-setup", wt, "devlab", "9999")
 	if res.exit != 0 {
@@ -69,16 +80,17 @@ func TestEmitSetupSelfShipsCheckedInUnit(t *testing.T) {
 		t.Errorf("the delivered unit must be the checked-in devlabd.service verbatim, got:\n%s", string(got))
 	}
 
-	route, err := os.ReadFile(filepath.Join(setup, "devlab.caddy"))
+	// NO route travels with a root application's package.
+	if b, err := os.ReadFile(filepath.Join(setup, "devlab.caddy")); err == nil {
+		t.Errorf("a root application must ship no route fragment — its site block is written at install, where the host's hostname is known; got:\n%s", string(b))
+	}
+	// …but the ROLE does, so the installer reads it rather than deriving it from the repository name.
+	role, err := os.ReadFile(filepath.Join(wt, ".mercury-artifact", "edge.role"))
 	if err != nil {
-		t.Fatalf("the self setup must contain devlab's route: %v", err)
+		t.Fatalf("the setup product must carry how this delivery is reached: %v", err)
 	}
-	// devlab's own port (8781, from its committed unit), never the wrong atlas port 9999 we passed.
-	if !strings.Contains(string(route), "handle /api/* {") || !strings.Contains(string(route), "127.0.0.1:8781") {
-		t.Errorf("the self route must proxy the whole /api/* to devlab's own port :8781, got:\n%s", string(route))
-	}
-	if strings.Contains(string(route), "9999") {
-		t.Errorf("the self route must use the unit's fixed port, not the atlas proposal:\n%s", string(route))
+	if strings.TrimSpace(string(role)) != "application" {
+		t.Errorf("devlab's declared edge role must travel with its artifact, got %q", strings.TrimSpace(string(role)))
 	}
 
 	if _, err := os.Stat(filepath.Join(setup, "devlab.json")); err != nil {
@@ -87,6 +99,32 @@ func TestEmitSetupSelfShipsCheckedInUnit(t *testing.T) {
 	// It must NOT emit the generic /opt template shape under a devlab.service name.
 	if _, err := os.Stat(filepath.Join(setup, "devlab.service")); err == nil {
 		t.Errorf("the self setup must ship devlabd.service, not a generated devlab.service")
+	}
+}
+
+// The self repo's LAYOUT exception and its EDGE ROLE are two different questions, and only the first is
+// answered by the repository's name. A repo that IS the self repo but declares no edge role still gets a
+// uniform service fragment: the checked-in unit is a layout matter, the route is not.
+func TestEmitSetupSelfNameDoesNotDecideTheEdge(t *testing.T) {
+	env, wt := emitSetupWorkspace(t) // no holistic-service.json: the package declares nothing
+	res := runWrapper(t, "deploy/devlab-exec", env, "emit-setup", wt, "devlab", "9999")
+	if res.exit != 0 {
+		t.Fatalf("emit-setup must succeed (exit 0), got %d\n%s", res.exit, res.out)
+	}
+	setup := filepath.Join(wt, ".mercury-artifact", "setup")
+	if _, err := os.Stat(filepath.Join(setup, "devlabd.service")); err != nil {
+		t.Errorf("the self repo's LAYOUT exception still holds — its checked-in unit is shipped: %v", err)
+	}
+	route, err := os.ReadFile(filepath.Join(setup, "devlab.caddy"))
+	if err != nil {
+		t.Fatalf("a package that declares no edge role is a uniform service and gets a fragment: %v", err)
+	}
+	if !strings.Contains(string(route), "handle /api/services/devlab/*") {
+		t.Errorf("the fragment must be the uniform per-service shape, not a claim on the whole /api/*:\n%s", string(route))
+	}
+	// The unit's own port (8781) still wins over the atlas proposal — that part is unchanged.
+	if !strings.Contains(string(route), "127.0.0.1:8781") || strings.Contains(string(route), "9999") {
+		t.Errorf("the route must use the port the unit fixes, not the atlas proposal:\n%s", string(route))
 	}
 }
 

@@ -132,23 +132,47 @@ func hostNodes() map[string]*Node {
 		sort.Strings(n.Rights)
 	}
 
-	for _, e := range readDir(caddyDir()) {
-		id, ok := stem(e, ".caddy")
-		if !ok {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(caddyDir(), e))
-		if err != nil {
-			continue
-		}
-		n := node(id)
-		n.HasRoute = true
-		if m := portRe.FindSubmatch(raw); m != nil {
-			n.Port, _ = strconv.Atoi(string(m[1]))
+	for _, dir := range caddyRouteDirs() {
+		for _, e := range readDir(dir) {
+			id, ok := stem(e, ".caddy")
+			if !ok {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, e))
+			if err != nil {
+				continue
+			}
+			n := node(id)
+			n.HasRoute = true
+			// A port already read stands: the same id is not expected on two shelves, and if it were, the
+			// first reading is the one that answered.
+			if n.Port == 0 {
+				if m := portRe.FindSubmatch(raw); m != nil {
+					n.Port, _ = strconv.Atoi(string(m[1]))
+				}
+			}
 		}
 	}
 
 	return nodes
+}
+
+// caddyRouteDirs — WHERE a delivered route can stand on this host, in the order it is read.
+//
+// A route used to be one file, flat in the route directory. It is now filed by KIND: a uniform service's
+// naked `/api/services/<id>/*` fragment goes on the `services/` shelf, a root application's whole site
+// block on the `apps/` shelf — because a Caddyfile treats the two differently, and one flat directory made
+// them indistinguishable, which is how two applications came to share a single site block and fight over
+// `/api/*` (measured on production 2026-08-09).
+//
+// This reflection has to FOLLOW the routes, not the other way round. Reading only the flat directory on a
+// migrated host would report every service as unrouted with port 0 — and since the production roster is
+// derived from exactly these routed ids, the entire landscape would read as empty while every service ran.
+// The flat directory stays in the list because a grown, hand-built edge still keeps its routes there:
+// Atlas reports what is deployed, never what ought to be.
+func caddyRouteDirs() []string {
+	base := caddyDir()
+	return []string{base, filepath.Join(base, "services"), filepath.Join(base, "apps")}
 }
 
 func readDir(dir string) []string {

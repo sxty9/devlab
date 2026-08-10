@@ -157,6 +157,13 @@ type DeliverPRIn struct {
 type Detection struct {
 	Kind     string
 	Evidence string
+	// EdgeGap is the ONE named deficiency a detection carries beyond its kind: a repository that declares
+	// itself a ROOT APPLICATION — reached under a hostname of its own — on a host that names no hostname
+	// for it. Empty when there is none. It is carried across the seam rather than derived here because
+	// only the deploy package reads the host's declaration; the motor's job is to make sure the user hears
+	// about it. Left unsaid it would be the quietest failure in the landscape: the program runs, its port
+	// answers, every stage is green, and the application is simply not reachable from outside.
+	EdgeGap string
 }
 
 // DeployOutcome reports one dev delivery honestly (F10): installed AND running, the held
@@ -440,6 +447,13 @@ const deliveryAlarmNotice = "delivery-alarm"
 
 // structureViolationNotice labels the REQ-028.4 code-structure violation notices.
 const structureViolationNotice = "code-structure-violation"
+
+// edgeUnreachableNotice labels the "delivered, but unreachable" fault: a repository that declares itself a
+// ROOT APPLICATION — reached under a hostname of its own — on a target host that names no hostname for it.
+// Everything else about such a delivery would read green (the program installs, the unit comes up, the
+// port is held), and nobody could reach it, so it is a fault to be DELIVERED to the user rather than a
+// line in a wrapper's output. It reuses the one notice path (Kein stummes Ausbleiben), never a second.
+const edgeUnreachableNotice = "edge-unreachable"
 
 // questionUnresolvableNotice labels a disturbance raised INSTEAD of a question, when no answer could
 // resolve the state (a contradiction between two checks, or an approval that was granted but proved
