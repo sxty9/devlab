@@ -626,18 +626,24 @@ ${global}(holistic_service_routes) {
 	import ${services}/*.caddy
 }
 
+# Die Argument-Schreibweise ist '{args.0}', NICHT '{args[0]}'. Die eckige Form gibt es erst ab
+# Caddy 2.7; auf einem Wirt mit 2.6 wird sie NICHT ersetzt, sondern woertlich durchgereicht — der
+# file-Matcher sucht dann ein Verzeichnis, das '{args[0]}' heisst, findet keines, und JEDE
+# Oberflaeche faellt auf die 503-Absage. Gemessen an Caddy 2.6.2 auf einem Produktions-Wirt: die
+# 503-Antwort enthielt den Platzhalter woertlich. Die Punkt-Form wirkt in BEIDEN Versionen (ab 2.7
+# nur mit einer Verfallswarnung im Protokoll). Nicht 'modernisieren', solange ein Wirt < 2.7 traegt.
 (app_web) {
 	@face_installed file {
-		root {args[0]}
+		root {args.0}
 		try_files /index.html
 	}
 	handle @face_installed {
-		root * {args[0]}
+		root * {args.0}
 		try_files {path} /index.html
 		file_server
 	}
 	handle {
-		respond "This application is installed on this host, but its interface is not: nothing is served from {args[0]}. The package's face did not arrive on this host, so there is nothing to show at the root of this name. No other application's interface is served in its place." 503
+		respond "This application is installed on this host, but its interface is not: nothing is served from {args.0}. The package's face did not arrive on this host, so there is nothing to show at the root of this name. No other application's interface is served in its place." 503
 	}
 }
 
