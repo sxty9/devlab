@@ -50,8 +50,18 @@ func recvFixture(t *testing.T, repo, userLine string, withRoute, withRights bool
 			t.Fatal(err)
 		}
 	}
-	return map[string]string{"DEVLAB_STAGING": staging, "DEVLAB_UNIT_DIR": unitDir},
-		filepath.Join(unitDir, repo+".service")
+	return map[string]string{
+		"DEVLAB_STAGING":  staging,
+		"DEVLAB_UNIT_DIR": unitDir,
+		// The host's own edge configuration at FIXTURE paths, so what the test measures is the fixture and
+		// never the machine it runs on. Without this the receiver read the REAL /etc/holistic/edge/hosts,
+		// so on a machine that happens to declare a hostname for this repo the delivery was refused as
+		// "contradictory" and the test failed for a reason it never staged — while the same test passed on
+		// a machine without that file. An empty hosts directory is the honest default: this fixture stages
+		// a UNIFORM service, which claims no hostname of its own.
+		"DEVLAB_EDGE_ADDRESS_FILE": edgeAddressFixture(t),
+		"DEVLAB_EDGE_HOSTS_DIR":    edgeHostsFixture(t, nil),
+	}, filepath.Join(unitDir, repo+".service")
 }
 
 // runRecv drives the receiver in --check mode against the given systemd FragmentPath answer.
