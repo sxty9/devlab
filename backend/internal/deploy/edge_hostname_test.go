@@ -105,8 +105,10 @@ func TestRootApplicationWithoutAHostnameIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the prepared route must be staged: %v", err)
 	}
+	// The site block states its OWN serve root as a plain directive and imports the shared face snippet
+	// WITHOUT an argument — the version-independent shape (see edge_snippet_argument_test.go).
 	for _, want := range []string{"http://dash.example.test:8080 {", "import holistic_service_routes",
-		"handle /api/* {", "reverse_proxy 127.0.0.1:8770", "import app_web /opt/holistic/www"} {
+		"handle /api/* {", "reverse_proxy 127.0.0.1:8770", "root * /opt/holistic/www", "import app_web\n"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("the dashboard's site block is missing %q:\n%s", want, string(b))
 		}

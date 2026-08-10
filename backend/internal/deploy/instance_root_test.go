@@ -88,13 +88,33 @@ func serveEdge(t *testing.T, edge string, port int) func(host, path string) (int
 	if _, err := exec.LookPath("caddy"); err != nil {
 		t.Skip("caddy not installed — the edge cannot be measured on this machine")
 	}
+	return serveEdgeWith(t, "caddy", edge, port)
+}
+
+// serveEdgeWith is serveEdge against a NAMED caddy binary. The edge's correctness turned out to be
+// VERSION-dependent (see edge_snippet_argument_test.go), so the one runner had to be able to answer "and
+// what does THAT caddy do with it" — the version is the variable, everything else stays identical.
+func serveEdgeWith(t *testing.T, bin, edge string, port int) func(host, path string) (int, string) {
+	t.Helper()
 	dir := t.TempDir()
 	edgeFile := filepath.Join(dir, "Caddyfile")
 	if err := os.WriteFile(edgeFile, []byte(edge), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A DECOY page in the edge's working directory, and the edge started FROM that directory. Caddy
+	// resolves a root it cannot resolve to an absolute path against its own working directory, so a serve
+	// root that silently came out empty or relative would be answered out of wherever the process happens
+	// to stand — which is how a template fault once served an unrelated page under a Holistic hostname
+	// instead of admitting the interface was missing. Every measurement therefore runs from a directory
+	// that WOULD answer if the root ever stopped being absolute, so "503, interface missing" is proved to
+	// mean the interface is missing, and not merely that this directory had nothing to offer. It also
+	// removes a hidden variable: the result no longer depends on where `go test` was invoked.
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>the working directory</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "caddy", "run", "--config", edgeFile, "--adapter", "caddyfile")
+	cmd := exec.CommandContext(ctx, bin, "run", "--config", edgeFile, "--adapter", "caddyfile")
+	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "CADDY_ADMIN=unix/"+filepath.Join(dir, "admin.sock"))
 	var log strings.Builder
 	cmd.Stdout, cmd.Stderr = &log, &log
