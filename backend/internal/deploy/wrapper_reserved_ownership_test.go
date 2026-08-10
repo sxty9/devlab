@@ -72,6 +72,12 @@ func reservedInstallFixture(t *testing.T, repo, unit, onHostUser string) (env ma
 		// needs a foreign or an own-shape account overrides DEVLAB_GETENT.
 		"DEVLAB_GETENT": fakeGetent(t, nil),
 		"DEVLAB_DPKG":   noPackages(t),
+		// …and it declares NO hostname for any application, at a fixture path. What this fixture measures is
+		// the reserved-NAME decision, so the host's edge configuration must not reach into it: reading the
+		// REAL /etc/holistic/edge/hosts made these tests refuse the delivery as "contradictory" on a machine
+		// that declares a hostname for `holistic`, and pass on a machine that does not.
+		"DEVLAB_EDGE_ADDRESS_FILE": edgeAddressFixture(t),
+		"DEVLAB_EDGE_HOSTS_DIR":    edgeHostsFixture(t, nil),
 	}
 	return env, artifact
 }
@@ -202,6 +208,11 @@ func recvReservedFixture(t *testing.T, repo, unit, onHostUser string) (env map[s
 		// own-shape account overrides DEVLAB_GETENT.
 		"DEVLAB_GETENT": fakeGetent(t, nil),
 		"DEVLAB_DPKG":   noPackages(t),
+		// …and no hostname declared for any application, at a fixture path — the same isolation the dev
+		// installer's fixture takes, and for the same reason: what is measured here is the reserved-NAME
+		// decision, which the machine's own /etc/holistic must not be able to change.
+		"DEVLAB_EDGE_ADDRESS_FILE": edgeAddressFixture(t),
+		"DEVLAB_EDGE_HOSTS_DIR":    edgeHostsFixture(t, nil),
 	}, fragment
 }
 

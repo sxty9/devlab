@@ -567,6 +567,40 @@ migrate_edge_layout() {
   [ "$moved" = 0 ] || log "moved $moved delivered service route(s) from $CADDY_CONF onto the services shelf $services (unchanged, only relocated)"
   [ "$dropped" = 0 ] || log "removed $dropped colliding root-application fragment(s); each is backed up and its successor is a site block written at the next delivery"
   [ -z "$left" ] || log "left untouched in $CADDY_CONF (not ours to move, and no longer imported by the edge — check them): $left"
+
+  # THE SECOND SHAPE CHANGE the current shell requires, here for exactly the reason the move above is here.
+  # The shared `app_web` snippet no longer takes the serve root as a snippet ARGUMENT: an application's own
+  # site block states `root * <path>` and imports the snippet bare. A block still carrying the old
+  # `import app_web <path>` would meet the new shell with no site root at all, and answer 503 for an
+  # interface that is demonstrably present — on EVERY caddy version, which is worse than the fault being
+  # repaired (measured: both mixed combinations answer 503 with the face in place). The blocks are written
+  # at DELIVERY and the shell is written HERE, so without this they would disagree from the moment the new
+  # shell lands until every root application happened to be delivered again.
+  #
+  # The rewrite needs nothing the file does not already carry: the path it used to pass as an argument
+  # becomes the path it states as its root. A block that already states a root keeps it and only loses the
+  # stale argument. Backed up first, like everything else this function touches, and idempotent — a block
+  # already in the current shape matches nothing here.
+  local rewritten=0 path tmp hasroot
+  for f in "$apps"/*.caddy; do
+    [ -f "$f" ] || continue
+    path="$(sed -nE 's/^[[:space:]]*import[[:space:]]+app_web[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' -- "$f" | head -n1)"
+    [ -n "$path" ] || continue
+    hasroot=0
+    grep -qE '^[[:space:]]*root[[:space:]]+\*[[:space:]]' -- "$f" 2>/dev/null && hasroot=1
+    tmp="$(mktemp)" || die "could not stage the rewrite of the app block $f"
+    awk -v root="$path" -v hasroot="$hasroot" '
+      /^[[:space:]]*import[[:space:]]+app_web[[:space:]]/ { print "\timport app_web"; next }
+      { print }
+      !placed && hasroot == 0 && /^http:\/\// && /\{[[:space:]]*$/ { print "\troot * " root; placed = 1 }
+    ' "$f" > "$tmp" || die "could not rewrite the app block $f"
+    backup_file "$f"
+    install "${own[@]}" -m 0644 "$tmp" "$f" || die "could not write the rewritten app block $f"
+    rm -f -- "$tmp"
+    rewritten=$((rewritten + 1))
+    log "rewrote $f to state its own serve root ($path) instead of passing it to the face snippet as an argument"
+  done
+  [ "$rewritten" = 0 ] || log "brought $rewritten root-application site block(s) onto the argument-free face snippet; without this each would answer 503 for an interface that is present, on every caddy version"
 }
 
 ensure_caddy() {

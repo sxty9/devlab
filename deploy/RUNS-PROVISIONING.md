@@ -264,7 +264,16 @@ route directory, told plainly that no delivered route reaches it any more. Any o
 named and refused, never destroyed. A host whose routes still lie FLAT in the route directory has them
 MOVED onto the two shelves in the same run, by rule: a `/api/services/` fragment is relocated byte for
 byte, a naked `handle /api/*` fragment (the collision itself) is removed and its successor is written as a
-proper site block at that application's next delivery, and anything else is left where it is and named. It writes the locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
+proper site block at that application's next delivery, and anything else is left where it is and named. In
+the same pass, a root application's site block that still hands its serve root to the shared face snippet
+as a snippet ARGUMENT (`import app_web <path>`) is rewritten to state `root * <path>` itself and import the
+snippet bare. That rewrite belongs in the same run as the new shell and not in a later delivery: the shell
+is written here while the blocks are written at delivery, so a host carrying the new shell beside an old
+block would have a face snippet with no serve root at all and would answer 503 for an interface that is
+present — on every Caddy version, which is worse than the fault the argument-free snippet repairs (an
+argument spelled `{args[0]}` is passed through verbatim by Caddy below 2.7, so every interface on such a
+host answered 503 with the placeholder printed in the message). The rewrite needs nothing the file does not
+already carry, is backed up like everything else here, and is idempotent. It writes the locked-down deploy-key line — `command="/usr/local/sbin/devlab-deploy-recv",restrict <pubkey>` — into
 the receiver login's `authorized_keys` (default `root`, override with `--recv-user`); and installs the
 receiver + shared library themselves (the SAME install path the receiver-only mode uses — no second
 copy). It closes with a self-check: `rrsync` resolves, the forced command actually rejects a shell
